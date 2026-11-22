@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, powerSaveBlocker } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, powerSaveBlocker, shell } from 'electron'
 import { readFile, writeFile } from 'node:fs/promises'
 import { PairingHost } from '../../../../packages/opencode-adapter/src/pairing'
 import { RemotePairing, automaticTunnel } from '../../../../packages/opencode-adapter/src/remote-pairing'
@@ -6,6 +6,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
 import { Workspaces } from '../../../../packages/ide-core/src/workspace'
+import { validateWorkspacePath } from '../../../../packages/ide-core/src/workspace-fs'
 import { Terminals } from '../../../../packages/ide-core/src/terminal'
 import { OpenCodeAdapter } from '../../../../packages/opencode-adapter/src/index'
 import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtime'
@@ -55,6 +56,20 @@ async function startBackend() {
 const text = z.string().max(200000)
 const id = z.string().min(1).max(512)
 const relative = z.string().max(4096)
+const workspacePath = relative.min(1).refine(value => !value.includes('\0'))
+const branchName = z.string().min(1).max(512).refine(value => !value.includes('\0'))
+const content = z.string().max(4 * 1024 * 1024).refine(value => Buffer.byteLength(value, 'utf8') <= 4 * 1024 * 1024, 'FILE_TOO_LARGE')
+const searchQuery = z.object({
+  query: z.string().max(20000),
+  caseSensitive: z.boolean().optional(), wholeWord: z.boolean().optional(), regex: z.boolean().optional(),
+  include: z.array(z.string().min(1).max(4096)).max(100).optional(),
+  exclude: z.array(z.string().min(1).max(4096)).max(100).optional(),
+  maxFiles: z.number().int().min(1).max(10000).optional(),
+  maxMatches: z.number().int().min(1).max(100000).optional()
+}).strict()
+const replaceOptions = searchQuery.extend({
+  replacement: z.string().max(200000), files: z.array(workspacePath).max(5000).optional(), dryRun: z.boolean().optional()
+}).strict()
 const schema = {
   terminalProfiles: z.tuple([]), terminalList: z.tuple([id]),
   terminalCreate: z.tuple([id, id.optional(), z.number().int().min(2).max(500).optional(), z.number().int().min(1).max(300).optional()]),
@@ -62,6 +77,12 @@ const schema = {
   terminalResize: z.tuple([id, id, z.number().int().min(2).max(500), z.number().int().min(1).max(300)]), terminalClose: z.tuple([id, id]),
   projects: z.tuple([]), pickProject: z.tuple([]), removeProject: z.tuple([id]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
   save: z.tuple([id, relative, z.string().max(4 * 1024 * 1024), z.string().regex(/^[a-f0-9]{64}$/)]),
+  createFile: z.tuple([id, workspacePath, content.optional()]), createDirectory: z.tuple([id, workspacePath]),
+  renamePath: z.tuple([id, workspacePath, workspacePath]), deletePath: z.tuple([id, workspacePath]),
+  revealPath: z.tuple([id, relative.refine(value => !value.includes('\0'))]),
+  searchProject: z.tuple([id, searchQuery]), replaceInProject: z.tuple([id, replaceOptions]),
+  stageAll: z.tuple([id]), unstageAll: z.tuple([id]), discardFile: z.tuple([id, workspacePath]),
+  gitBranches: z.tuple([id]), checkoutBranch: z.tuple([id, branchName]), createBranch: z.tuple([id, branchName, z.boolean().optional()]),
   git: z.tuple([id]), diff: z.tuple([id, relative]), stage: z.tuple([id, relative, z.boolean()]), commit: z.tuple([id, z.string().min(1).max(10000)]),
   connection: z.tuple([]), startBackend: z.tuple([]), discover: z.tuple([]), connect: z.tuple([z.string().max(2048), z.string().max(512).optional(), z.string().max(8192).optional()]),
   sessions: z.tuple([id]), createSession: z.tuple([id]), messages: z.tuple([id, id]), sessionDiff: z.tuple([id, id, id.optional()]), models: z.tuple([id]), agents: z.tuple([id]),
@@ -110,7 +131,34 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'save': return workspace.save(a, b, c, d)
     case 'git': return workspace.status(a)
     case 'diff': return workspace.diff(a, b)
-    case 'stage': await confirmation(`${c ? 'Stage' : 'Unstage'} ${b}?`); return workspace.stage(a, b, c)
+    case 'createFile': return workspace.createFile(a, b, c)
+    case 'createDirectory': return workspace.createDirectory(a, b)
+    case 'renamePath': return workspace.renamePath(a, b, c)
+    case 'deletePath':
+      await confirmation(`Xóa ${b} khỏi ổ đĩa? Hành động này không thể hoàn tác.`)
+      return workspace.deletePath(a, b)
+    case 'revealPath': {
+      const { target } = await validateWorkspacePath(workspace.get(a).directory, b, { allowRoot: true })
+      shell.showItemInFolder(target)
+      return
+    }
+    case 'searchProject': return workspace.searchProject(a, b)
+    case 'replaceInProject': {
+      if (b.dryRun === true) return workspace.replaceInProject(a, b)
+      const preview = await workspace.replaceInProject(a, { ...b, dryRun: true })
+      if (preview.replacements === 0) return preview
+      await confirmation(`Thay thế ${preview.replacements} vị trí trong ${preview.filesChanged} tệp?`)
+      return workspace.replaceInProject(a, b)
+    }
+    case 'stageAll': return workspace.stageAll(a)
+    case 'unstageAll': return workspace.unstageAll(a)
+    case 'discardFile':
+      await confirmation(`Hủy mọi thay đổi chưa lưu trong ${b}? Hành động này không thể hoàn tác.`)
+      return workspace.discardFile(a, b)
+    case 'gitBranches': return workspace.gitBranches(a)
+    case 'checkoutBranch': return workspace.checkoutBranch(a, b)
+    case 'createBranch': return workspace.createBranch(a, b, c)
+    case 'stage': return workspace.stage(a, b, c)
     case 'commit': await confirmation(`Commit các thay đổi đã stage?\n${b}`); return workspace.commit(a, b)
     case 'connection': return adapter.connection()
     case 'startBackend': return startBackend()

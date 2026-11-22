@@ -8,10 +8,10 @@ import { z } from 'zod'
 import { simpleGit } from 'simple-git'
 import { Workspaces } from '../packages/ide-core/src/workspace'
 
-async function fixture(t: { after(fn: () => Promise<void>): void }) {
+async function fixture(t: { after(fn: () => Promise<void>): void }, changed?: (projectID: string) => void) {
   const root = await mkdtemp(path.join(process.cwd(), '.ame-workspace-test-'))
   const directory = path.join(root, 'project'); await mkdir(directory)
-  const workspaces = new Workspaces(path.join(root, 'projects.json'))
+  const workspaces = new Workspaces(path.join(root, 'projects.json'), changed)
   const project = await workspaces.add(directory)
   t.after(async () => { workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   return { root, directory, workspaces, project }
@@ -162,4 +162,87 @@ test('real Git HEAD diff, stage/unstage, commit and deleted file diff', async t 
   assert.equal((await workspaces.status(project.id)).changes.length, 0)
   await rm(path.join(directory, 'file with space.ts'))
   assert.deepEqual(await workspaces.diff(project.id, 'file with space.ts'), { original: 'after\n', modified: '' })
+})
+
+test('Explorer and search delegates persist mutations and notify only after actual writes', async t => {
+  const changes: string[] = []
+  const { workspaces, project, directory } = await fixture(t, id => changes.push(id))
+  workspaces.dispose()
+  const check = async <T>(operation: Promise<T>, expectedChanges: number): Promise<T> => {
+    const before = changes.length
+    const result = await operation
+    assert.deepEqual(changes.slice(before), Array(expectedChanges).fill(project.id))
+    return result
+  }
+  assert.deepEqual(await check(workspaces.createDirectory(project.id, 'src'), 1), { path: 'src' })
+  assert.deepEqual(await check(workspaces.createFile(project.id, 'src/hello.txt', 'hello hello\n'), 1), { path: 'src/hello.txt' })
+  await check(workspaces.createFile(project.id, 'empty.txt'), 1)
+  assert.equal(await readFile(path.join(directory, 'empty.txt'), 'utf8'), '')
+  assert.deepEqual(await check(workspaces.renamePath(project.id, 'src/hello.txt', 'src/renamed.txt'), 1), { from: 'src/hello.txt', to: 'src/renamed.txt' })
+  const found = await check(workspaces.searchProject(project.id, { query: 'hello', include: ['src/**'] }), 0)
+  assert.equal(found.totalMatches, 2)
+  assert.equal(found.results[0].path, 'src/renamed.txt')
+  const [entry] = await workspaces.entries(project.id, 'src')
+  assert.equal(entry.path, found.results[0].path, 'Explorer and Search use the same path identity on Windows')
+  assert.deepEqual(await check(workspaces.renamePath(project.id, entry.path, 'src/moved.txt'), 1), { from: entry.path, to: 'src/moved.txt' })
+  await check(workspaces.renamePath(project.id, 'src/moved.txt', entry.path), 1)
+  const preview = await check(workspaces.replaceInProject(project.id, { query: 'hello', replacement: 'bye', dryRun: true }), 0)
+  assert.equal(preview.replacements, 2)
+  assert.equal(await readFile(path.join(directory, 'src', 'renamed.txt'), 'utf8'), 'hello hello\n')
+  const replaced = await check(workspaces.replaceInProject(project.id, { query: 'hello', replacement: 'bye' }), 1)
+  assert.deepEqual(replaced, preview)
+  assert.equal(await readFile(path.join(directory, 'src', 'renamed.txt'), 'utf8'), 'bye bye\n')
+  await check(workspaces.replaceInProject(project.id, { query: 'missing', replacement: 'bye' }), 0)
+  assert.deepEqual(await check(workspaces.deletePath(project.id, 'empty.txt'), 1), { path: 'empty.txt', directory: false })
+  assert.deepEqual(await check(workspaces.deletePath(project.id, 'src'), 1), { path: 'src', directory: true })
+  const before = changes.length
+  await assert.rejects(workspaces.createFile(project.id, '../escape.txt'), /PATH_OUTSIDE_WORKSPACE/)
+  await assert.rejects(workspaces.deletePath(project.id, ''), /INVALID_PATH/)
+  await assert.rejects(workspaces.renamePath(project.id, 'missing', 'other'))
+  await assert.rejects(workspaces.replaceInProject(project.id, { query: '[', regex: true, replacement: 'x' }), /INVALID_REGEX/)
+  assert.equal(changes.length, before)
+  await assert.rejects(workspaces.searchProject('missing', { query: 'hello' }), /UNKNOWN_PROJECT/)
+})
+
+test('advanced Git delegates preserve index, branch defaults and mutation notifications', async t => {
+  const changes: string[] = []
+  const { directory, workspaces, project } = await fixture(t, id => changes.push(id))
+  workspaces.dispose()
+  const git = simpleGit(directory)
+  await git.init()
+  await git.addConfig('user.name', 'Ame Test'); await git.addConfig('user.email', 'test@example.invalid'); await git.addConfig('commit.gpgSign', 'false')
+  await git.addConfig('core.autocrlf', 'false')
+  await writeFile(path.join(directory, 'file.txt'), 'before\n')
+  const check = async <T>(operation: Promise<T>, expectedChanges: number): Promise<T> => {
+    const before = changes.length
+    const result = await operation
+    assert.deepEqual(changes.slice(before), Array(expectedChanges).fill(project.id))
+    return result
+  }
+  await check(workspaces.stageAll(project.id), 1)
+  assert.equal((await workspaces.status(project.id)).changes[0].index, 'A')
+  await check(workspaces.unstageAll(project.id), 1)
+  assert.equal((await workspaces.status(project.id)).changes[0].working, '?')
+  await workspaces.stageAll(project.id); await workspaces.commit(project.id, 'initial')
+  const initial = await check(workspaces.gitBranches(project.id), 0)
+  assert.equal(initial.branches.find(branch => branch.current)?.name, initial.current)
+  await check(workspaces.createBranch(project.id, 'feature/no-checkout', false), 1)
+  assert.equal((await workspaces.gitBranches(project.id)).current, initial.current)
+  await check(workspaces.createBranch(project.id, 'feature/default'), 1)
+  assert.equal((await workspaces.gitBranches(project.id)).current, 'feature/default')
+  await check(workspaces.checkoutBranch(project.id, 'feature/no-checkout'), 1)
+  assert.equal((await workspaces.gitBranches(project.id)).current, 'feature/no-checkout')
+  await writeFile(path.join(directory, 'file.txt'), 'changed\n')
+  await check(workspaces.discardFile(project.id, 'file.txt'), 1)
+  assert.equal(await readFile(path.join(directory, 'file.txt'), 'utf8'), 'before\n')
+  await writeFile(path.join(directory, 'file.txt'), 'staged\n')
+  await check(workspaces.stageAll(project.id), 1)
+  await check(workspaces.unstageAll(project.id), 1)
+  assert.equal((await workspaces.status(project.id)).changes[0].working, 'M')
+  const before = changes.length
+  await assert.rejects(workspaces.createBranch(project.id, '--bad'), /INVALID_BRANCH_NAME/)
+  await assert.rejects(workspaces.checkoutBranch(project.id, 'missing'))
+  await assert.rejects(workspaces.discardFile(project.id, '../outside.txt'), /INVALID_PATH/)
+  await assert.rejects(workspaces.stageAll('missing'), /UNKNOWN_PROJECT/)
+  assert.equal(changes.length, before)
 })

@@ -3,6 +3,23 @@ export type FileEntry = { path: string; name: string; directory: boolean }
 export type FileDocument = { path: string; content: string; revision: string }
 export type Change = { path: string; index: string; working: string }
 export type GitState = { branch: string; changes: Change[] }
+export type GitBranch = { name: string; current: boolean; commit: string }
+export type GitBranches = { current: string; branches: GitBranch[] }
+export type SearchQuery = {
+  query: string
+  caseSensitive?: boolean
+  wholeWord?: boolean
+  regex?: boolean
+  include?: string[]
+  exclude?: string[]
+  maxFiles?: number
+  maxMatches?: number
+}
+export type SearchMatch = { line: number; column: number; length: number; lineText: string; matchText: string }
+export type SearchFileResult = { path: string; matches: SearchMatch[] }
+export type SearchResponse = { results: SearchFileResult[]; totalMatches: number; filesSearched: number; truncated: boolean; engine: 'ripgrep' | 'node' }
+export type ReplaceOptions = SearchQuery & { replacement: string; files?: string[]; dryRun?: boolean }
+export type ReplaceResult = { filesChanged: number; replacements: number; previews: { path: string; count: number; sampleBefore: string; sampleAfter: string }[] }
 export type Session = { id: string; title: string; updatedAt?: number; parentID?: string; agent?: string; status?: 'running' | 'idle'; outcome?: 'succeeded' | 'failed' | 'interrupted' }
 export type SessionDiff = { file: string; patch: string; additions: number; deletions: number; status: 'added' | 'deleted' | 'modified'; more?: true }
 export type ChatItem = { id: string; role: string; text: string; kind?: string; turn?: { from: string; files: string[] } }
@@ -33,6 +50,19 @@ export interface DesktopApi {
   entries(projectID: string, relative: string): Promise<FileEntry[]>
   read(projectID: string, relative: string): Promise<FileDocument>
   save(projectID: string, relative: string, content: string, revision: string): Promise<FileDocument>
+  createFile(projectID: string, relative: string, content?: string): Promise<{ path: string }>
+  createDirectory(projectID: string, relative: string): Promise<{ path: string }>
+  renamePath(projectID: string, fromRelative: string, toRelative: string): Promise<{ from: string; to: string }>
+  deletePath(projectID: string, relative: string): Promise<{ path: string; directory: boolean }>
+  revealPath(projectID: string, relative: string): Promise<void>
+  searchProject(projectID: string, query: SearchQuery): Promise<SearchResponse>
+  replaceInProject(projectID: string, options: ReplaceOptions): Promise<ReplaceResult>
+  stageAll(projectID: string): Promise<void>
+  unstageAll(projectID: string): Promise<void>
+  discardFile(projectID: string, relative: string): Promise<void>
+  gitBranches(projectID: string): Promise<GitBranches>
+  checkoutBranch(projectID: string, name: string): Promise<void>
+  createBranch(projectID: string, name: string, checkout?: boolean): Promise<void>
   git(projectID: string): Promise<GitState>
   diff(projectID: string, relative: string): Promise<{ original: string; modified: string }>
   stage(projectID: string, relative: string, staged: boolean): Promise<void>

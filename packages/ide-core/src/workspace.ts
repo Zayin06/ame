@@ -3,7 +3,10 @@ import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { readFile, readdir, realpath, stat, writeFile, mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { simpleGit } from 'simple-git'
-import type { Project, FileDocument, FileEntry, GitState } from '../../protocol/src/index'
+import type { Project, FileDocument, FileEntry, GitState, GitBranches, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
+import * as workspaceFs from './workspace-fs'
+import { searchWorkspace, replaceInWorkspace } from './search'
+import * as gitOps from './git-ops'
 
 const revision = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
 export class Workspaces {
@@ -64,7 +67,7 @@ export class Workspaces {
   async entries(id: string, relative = ''): Promise<FileEntry[]> {
     const target = await this.resolve(id, relative)
     const entries = await readdir(target, { withFileTypes: true })
-    return entries.filter(e => e.name !== '.git' && e.name !== 'node_modules' && !e.isSymbolicLink()).map(e => ({ path: path.join(relative, e.name), name: e.name, directory: e.isDirectory() })).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name))
+    return entries.filter(e => e.name !== '.git' && e.name !== 'node_modules' && !e.isSymbolicLink()).map(e => ({ path: path.join(relative, e.name).split(path.sep).join('/'), name: e.name, directory: e.isDirectory() })).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name))
   }
   async read(id: string, relative: string): Promise<FileDocument> {
     const target = await this.resolve(id, relative)
@@ -88,6 +91,57 @@ export class Workspaces {
     })
     this.saves.set(key, task)
     try { return await task } finally { if (this.saves.get(key) === task) this.saves.delete(key) }
+  }
+  async createFile(id: string, relative: string, content?: string): Promise<{ path: string }> {
+    const result = await workspaceFs.createFile(this.get(id).directory, relative, content)
+    this.changed(id)
+    return result
+  }
+  async createDirectory(id: string, relative: string): Promise<{ path: string }> {
+    const result = await workspaceFs.createDirectory(this.get(id).directory, relative)
+    this.changed(id)
+    return result
+  }
+  async renamePath(id: string, fromRelative: string, toRelative: string): Promise<{ from: string; to: string }> {
+    const result = await workspaceFs.renameOrMove(this.get(id).directory, fromRelative, toRelative)
+    this.changed(id)
+    return result
+  }
+  async deletePath(id: string, relative: string): Promise<{ path: string; directory: boolean }> {
+    const result = await workspaceFs.deletePath(this.get(id).directory, relative)
+    this.changed(id)
+    return result
+  }
+  async searchProject(id: string, query: SearchQuery): Promise<SearchResponse> {
+    return searchWorkspace(this.get(id).directory, query)
+  }
+  async replaceInProject(id: string, options: ReplaceOptions): Promise<ReplaceResult> {
+    const result = await replaceInWorkspace(this.get(id).directory, options)
+    if (options.dryRun !== true && result.filesChanged > 0) this.changed(id)
+    return result
+  }
+  async stageAll(id: string): Promise<void> {
+    await gitOps.stageAll(this.get(id).directory)
+    this.changed(id)
+  }
+  async unstageAll(id: string): Promise<void> {
+    await gitOps.unstageAll(this.get(id).directory)
+    this.changed(id)
+  }
+  async discardFile(id: string, relative: string): Promise<void> {
+    await gitOps.discardFile(this.get(id).directory, relative)
+    this.changed(id)
+  }
+  async gitBranches(id: string): Promise<GitBranches> {
+    return gitOps.listBranches(this.get(id).directory)
+  }
+  async checkoutBranch(id: string, name: string): Promise<void> {
+    await gitOps.checkoutBranch(this.get(id).directory, name)
+    this.changed(id)
+  }
+  async createBranch(id: string, name: string, checkout?: boolean): Promise<void> {
+    await gitOps.createBranch(this.get(id).directory, name, checkout)
+    this.changed(id)
   }
   private git(id: string) {
     const directory = this.get(id).directory

@@ -13,6 +13,7 @@ import { SessionChanges } from './components/SessionChanges'
 import { watchSessionChanges, type SessionChangesState } from './session-changes'
 import { TerminalPanel } from './components/TerminalPanel'
 import { createProjectTerminal, isTerminalKey, newTerminalShortcut } from './terminal-controls'
+import { changePathDocuments, deleteFromView, renameBuffers, renamedPath, renameView, type NavigationTarget } from './workspace-paths'
 
 const storageKey = 'ame.ide.layout.v1'
 const readPreferences = () => { try { return parsePreferences(localStorage.getItem(storageKey)) } catch { return defaults() } }
@@ -38,6 +39,9 @@ export function App() {
   const [creating, setCreating] = useState(false)
   const [maximized, setMaximized] = useState(false)
   const [createdTerminal, setCreatedTerminal] = useState<TerminalInfo>()
+  const [navigation, setNavigation] = useState<NavigationTarget>()
+  const navigationNonce = useRef(0)
+  const pathsEpoch = useRef(0)
   const removedProjects = useRef(new Set<string>())
   const projectsRef = useRef(projects); projectsRef.current = projects
   const buffersRef = useRef(buffers); buffersRef.current = buffers
@@ -136,13 +140,14 @@ export function App() {
     const key = documentID(id, path)
     if (buffersRef.current[key] || pendingReads.current.has(key)) return
     pendingReads.current.add(key)
+    const epoch = pathsEpoch.current
     try {
       const doc = await window.ame.read(id, path)
-      if (removedProjects.current.has(id)) return
+      if (removedProjects.current.has(id) || epoch !== pathsEpoch.current) return
       setBuffers(current => current[key] ? current : { ...current, [key]: { ...doc, projectID: id, text: doc.content, conflict: false } })
-    } catch (e) { report(e) } finally { pendingReads.current.delete(key) }
-  }, [report])
-  useEffect(() => { if (projectID && activeTab?.mode === 'file' && window.ame) void loadFile(projectID, activeTab.path) }, [projectID, activeTab?.path, activeTab?.mode, loadFile])
+    } catch (e) { if (epoch === pathsEpoch.current) report(e) } finally { pendingReads.current.delete(key); if (epoch !== pathsEpoch.current) refresh() }
+  }, [report, refresh])
+  useEffect(() => { if (projectID && activeTab?.mode === 'file' && window.ame) void loadFile(projectID, activeTab.path) }, [projectID, activeTab?.path, activeTab?.mode, loadFile, generation])
   useEffect(() => {
     if (!projectID || !activeTab || activeTab.mode !== 'diff' || !window.ame) return
     let alive = true
@@ -187,11 +192,26 @@ export function App() {
       refreshSessions()
     } catch (e) { report(e) } finally { setCreating(false) }
   }
-  const openTab = (path: string, mode: Tab['mode']) => {
+  const openTab = (path: string, mode: Tab['mode'], line?: number, column?: number) => {
     if (!projectID) return
+    setNavigation(mode === 'file' && line !== undefined ? { projectID, path, line, column, nonce: ++navigationNonce.current } : undefined)
     const tab = { path, mode }
     updateView(projectID, current => activateTab({ ...current, tabs: current.tabs.some(t => tabID(t) === tabID(tab)) ? current.tabs : [...current.tabs, tab] }, tab))
     setPreferences(p => ({ ...p, stage: true, panel: mode === 'diff' ? 'diff' : 'files', layoutMode: mode === 'diff' ? 'swe' : p.layoutMode }))
+  }
+  const renameOpenPath = (id: string, from: string, to: string) => {
+    pathsEpoch.current++
+    updateView(id, current => renameView(current, from, to))
+    setBuffers(current => renameBuffers(current, id, from, to))
+    setDiffs(current => changePathDocuments(current, id, from, to))
+    setNavigation(current => current?.projectID === id ? { ...current, path: renamedPath(current.path, from, to) } : current)
+  }
+  const deleteOpenPath = (id: string, path: string) => {
+    pathsEpoch.current++
+    updateView(id, current => deleteFromView(current, path))
+    setBuffers(current => changePathDocuments(current, id, path))
+    setDiffs(current => changePathDocuments(current, id, path))
+    setNavigation(current => current?.projectID === id ? undefined : current)
   }
   const save = async () => {
     const p = preferencesRef.current
@@ -271,12 +291,12 @@ export function App() {
     {error && <div className="error-banner" role="alert"><span>{error}</span><IconButton label="Đóng thông báo" onClick={() => setError('')}><Icon name="close" /></IconButton></div>}
     <div className={`workspace-body ${!preferences.rail ? 'is-sidebar-collapsed' : ''} ${!preferences.inspector ? 'is-inspector-collapsed' : ''} ${!preferences.stage ? 'is-sidepanel-collapsed' : ''} ${maximized && preferences.stage ? 'is-sidepanel-maximized' : ''}`} style={{ '--sidebar-w': `${preferences.widths.rail}px`, '--inspector-w': `${preferences.widths.inspector}px`, '--sidepanel-w': `${preferences.widths.stage}px` } as CSSProperties}>
       {preferences.rail && <><ProjectRail projects={projects} projectID={projectID} sessions={sessions} sessionCache={sessionCache} onRemove={id => void removeProject(id)} onSessions={(id, items) => setSessionCache(current => removedProjects.current.has(id) ? current : ({ ...current, [id]: items }))} sessionID={view.session} loading={projectsLoading} sessionsLoading={sessionsLoading} error={sessionError} connected={connection.connected} creating={creating} git={git} generation={generation} onSelect={id => setPreferences(p => ({ ...p, project: id }))} onSession={(id, session) => { setPreferences(p => ({ ...p, project: id })); updateView(id, current => ({ ...current, session })) }} onTool={(id, tab) => setPreferences(p => ({ ...p, project: id, inspector: true, inspectorTab: tab }))} onCreate={id => void createSession(id)} onPick={() => void pickProject()} onRetry={refreshSessions} /><Resizer pane="rail" width={preferences.widths.rail} onChange={w => setWidth('rail', w)} /></>}
-      {preferences.inspector && <><Inspector projectID={projectID} name={project?.name} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={path => openTab(path, 'file')} onDiff={path => openTab(path, 'diff')} onHide={() => toggle('inspector')} report={report} /><Resizer pane="inspector" width={preferences.widths.inspector} onChange={w => setWidth('inspector', w)} /></>}
-      <Chat key={projectID || ''} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!sessions.length || !!activeSession) && !sessionError} onCreated={session => { if (projectID) { updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={path => openTab(path, 'file')} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) updateView(projectID, current => ({ ...current, session: id })) }} />
+      {preferences.inspector && <><Inspector projectID={projectID} name={project?.name} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={(path, line, column) => openTab(path, 'file', line, column)} onRename={(from, to) => { if (projectID) renameOpenPath(projectID, from, to) }} onDelete={path => { if (projectID) deleteOpenPath(projectID, path) }} onDiff={path => openTab(path, 'diff')} onHide={() => toggle('inspector')} report={report} /><Resizer pane="inspector" width={preferences.widths.inspector} onChange={w => setWidth('inspector', w)} /></>}
+      <Chat key={projectID || ''} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!sessions.length || !!activeSession) && !sessionError} onCreated={session => { if (projectID) { updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={(path, line) => openTab(path, 'file', line)} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) updateView(projectID, current => ({ ...current, session: id })) }} />
       {preferences.stage && <><Resizer pane="stage" width={preferences.widths.stage} onChange={w => setWidth('stage', w)} /><section className="side-panel" data-testid="side-panel" data-region="Auxiliary Side Panel">
         <div className="side-panel__tabs"><div className="side-panel__tab-list" role="tablist" aria-label="Workspace panel">{(['files', 'changes', 'diff', 'artifact'] as const).filter(tab => preferences.layoutMode !== 'knowledge' || tab !== 'diff').map(tab => <button key={tab} role="tab" aria-selected={preferences.panel === tab} className={`panel-tab ${preferences.panel === tab ? 'is-active' : ''}`} onClick={() => selectPanel(tab)}>{({ files: 'Code', changes: 'Session Changes', diff: 'Git Diff', artifact: 'Artifact' })[tab]}</button>)}</div><div className="stage-actions"><IconButton label="Toggle Terminal" active={preferences.terminalOpen} onClick={() => setPreferences(p => ({ ...p, terminalOpen: !p.terminalOpen }))}><Icon name="terminal" /></IconButton><IconButton label="Phóng to Side Panel" active={maximized} onClick={() => setMaximized(v => !v)}><Icon name="maximize" /></IconButton><IconButton label="Close Side Panel" onClick={() => toggle('stage')}><Icon name="close" /></IconButton></div></div>
         <div className="editor-breadcrumb"><span className="truncate"><strong>{project?.name || 'Local Workspace'}</strong> &rsaquo; {preferences.panel === 'changes' ? activeSession?.title || 'Session Changes' : activeTab?.path || (preferences.panel === 'diff' ? 'VS Code Diff' : 'Code')}</span><span>{preferences.panel === 'changes' ? 'OpenCode snapshots' : preferences.panel === 'diff' ? 'Git Engine' : 'UTF-8'}</span></div>
-        <div className="side-panel__content"><div className="workspace-tools" hidden={!['files', 'diff'].includes(preferences.panel)}><EditorStage projectID={projectID || ''} dirtyPaths={projectDirtyPaths(buffers, projectID)} tabs={view.tabs.filter(t => t.mode === (preferences.panel === 'diff' ? 'diff' : 'file'))} active={activeTab?.mode === (preferences.panel === 'diff' ? 'diff' : 'file') ? activeTab : undefined} buffer={activeBuffer} diff={projectID && activeTab ? diffs[documentID(projectID, activeTab.path)] : undefined} theme={preferences.theme} onSelect={tab => { if (projectID) updateView(projectID, current => activateTab(current, tab)) }} onClose={closeTab} onChange={text => { if (projectID && activeTab) { const key = documentID(projectID, activeTab.path); setBuffers(current => current[key] ? { ...current, [key]: { ...current[key], text } } : current) } }} onSave={() => void save()} onReload={() => void reload()} onHide={() => toggle('stage')} /></div>{preferences.panel === 'changes' && <SessionChanges key={changesKey} state={changesState} theme={preferences.theme} onRetry={() => setChangesAttempt(value => value + 1)} />}{!['files', 'diff', 'changes'].includes(preferences.panel) && <Empty><Icon name="file" /><h3>Artifacts</h3><p>Artifacts API is not available yet.</p></Empty>}</div>
+        <div className="side-panel__content"><div className="workspace-tools" hidden={!['files', 'diff'].includes(preferences.panel)}><EditorStage projectID={projectID || ''} target={navigation} dirtyPaths={projectDirtyPaths(buffers, projectID)} tabs={view.tabs.filter(t => t.mode === (preferences.panel === 'diff' ? 'diff' : 'file'))} active={activeTab?.mode === (preferences.panel === 'diff' ? 'diff' : 'file') ? activeTab : undefined} buffer={activeBuffer} diff={projectID && activeTab ? diffs[documentID(projectID, activeTab.path)] : undefined} theme={preferences.theme} onSelect={tab => { if (projectID) updateView(projectID, current => activateTab(current, tab)) }} onClose={closeTab} onChange={text => { if (projectID && activeTab) { const key = documentID(projectID, activeTab.path); setBuffers(current => current[key] ? { ...current, [key]: { ...current[key], text } } : current) } }} onSave={() => void save()} onReload={() => void reload()} onHide={() => toggle('stage')} /></div>{preferences.panel === 'changes' && <SessionChanges key={changesKey} state={changesState} theme={preferences.theme} onRetry={() => setChangesAttempt(value => value + 1)} />}{!['files', 'diff', 'changes'].includes(preferences.panel) && <Empty><Icon name="file" /><h3>Artifacts</h3><p>Artifacts API is not available yet.</p></Empty>}</div>
         <TerminalPanel projectID={projectID} createdTerminal={createdTerminal} theme={preferences.theme} visible={preferences.terminalOpen && preferences.layoutMode !== 'knowledge'} close={() => setPreferences(p => ({ ...p, terminalOpen: false }))} />
         <footer className="side-panel__status statusbar"><span className="truncate">{project?.name || 'Local Workspace'}{git?.branch ? ` · ${git.branch}` : ''}</span><span>{dirtyCount ? `${dirtyCount} tệp chưa lưu` : 'Đã lưu'}</span></footer>
       </section></>}

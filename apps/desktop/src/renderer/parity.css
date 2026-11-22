@@ -48,6 +48,34 @@
 .inspector-pane .file-tree { padding: 0; }
 .inspector-pane .file-tree .file-tree { padding-left: 12px; }
 .inspector-pane .tree-row { justify-content: flex-start; }
+.inspector-pane__body { overflow-x: hidden; }
+.inspector-pane__body .inline-error { overflow-wrap: anywhere; }
+.inspector-pane__body .file-tree, .inspector-pane__body .file-tree li { min-width: 0; max-width: 100%; }
+.insp-tree-entry { display: flex; align-items: center; min-width: 0; max-width: 100%; }
+.insp-tree-entry .tree-row { flex: 1; min-width: 0; width: auto; }
+.insp-tree-entry .tree-row .truncate { min-width: 0; }
+.insp-tree-more { flex: 0 0 22px; width: 22px; height: 24px; padding: 0; border: 0; background: transparent; color: var(--text-muted); opacity: 0; }
+.insp-tree-entry:hover .insp-tree-more, .insp-tree-entry:focus-within .insp-tree-more, .insp-tree-more[aria-expanded="true"] { opacity: 1; }
+.insp-explorer-toolbar, .insp-tree-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; min-width: 0; max-width: 100%; padding: 3px; }
+.insp-tree-actions { margin: 1px 0 4px 4px; border-left: 1px solid var(--border-subtle); }
+.insp-explorer-toolbar button, .insp-tree-actions button { min-width: 0; max-width: 100%; padding: 2px 5px; font-size: 11px; overflow-wrap: anywhere; }
+.insp-inline-name { min-width: 0; max-width: 100%; margin: 4px 2px; }
+.insp-inline-name__prefix { display: block; color: var(--text-muted); font-size: 10px; }
+.insp-inline-name > div { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.insp-inline-name input { flex: 1; width: 0; min-width: 0; max-width: 100%; padding: 3px 5px; font-size: 12px; }
+.insp-inline-name button { flex: 0 0 22px; width: 22px; height: 24px; padding: 0; }
+.scm-branch-controls { display: flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 3px 2px 6px; font-size: 11px; }
+.scm-branch-controls label { flex-shrink: 0; color: var(--text-muted); }
+.scm-branch-controls select { flex: 1; min-width: 0; width: 0; max-width: 100%; padding: 3px; }
+.inspector-pane__body .scm-section__head .icon-btn, .inspector-pane__body .scm-file-row .icon-btn, .scm-branch-controls .icon-btn { flex: 0 0 22px; min-width: 22px; width: 22px; height: 22px; padding: 0; }
+.inspector-pane__body .scm-file-row { min-width: 0; max-width: 100%; gap: 4px; }
+.inspector-pane__body .scm-file-row__main > svg { flex-shrink: 0; }
+.inspector-pane__body .search-options { display: flex; flex-direction: column; gap: 5px; min-width: 0; max-width: 100%; margin-top: 6px; font-size: 11px; }
+.inspector-pane__body .search-options label { display: flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; color: var(--text-muted); }
+.inspector-pane__body .search-options input { flex: 1; min-width: 0; max-width: 100%; width: 100%; padding: 3px 5px; font-size: 11px; }
+.inspector-pane__body .search-options button { min-width: 0; max-width: 100%; padding: 3px 5px; font-size: 11px; }
+.inspector-pane__body .search-options .button-row { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; max-width: 100%; }
+.inspector-pane__body .search-options [role="status"] { overflow-wrap: anywhere; }
 .scm-file-row__main { padding: 0; border: 0; background: transparent; min-width: 0; text-align: left; }
 .scm-file-row__main:hover:not(:disabled) { background: transparent; }
 .inspector-pane__footer .icon-btn { height: 24px; min-width: 24px; }
