@@ -7,6 +7,8 @@ import { scan } from "./bundle/scan"
 import * as installer from "./installer"
 import { runtimeDiscovery, type Discover } from "./runtime"
 import { readUsagePrices } from "./usage-pricing"
+import { generatePetDialogue as generateDialogue } from "./pet-generation"
+import type { DialogueSet } from "./pet-dialogue"
 
 export type AmeKitOptions = {
   userData: string
@@ -15,7 +17,12 @@ export type AmeKitOptions = {
   pickImport: () => Promise<string | null>
   cli?: string
 }
-export type AmeKit = { call(operation: string, payload: Record<string, string>): Promise<unknown>; dispose(): Promise<void> }
+export type AmeKit = {
+  call(operation: string, payload: Record<string, string>): Promise<unknown>
+  /** Main-process only; retain categorized dialogue for createPetHost. */
+  generatePetDialogue(model: string, signal: AbortSignal): Promise<DialogueSet>
+  dispose(): Promise<void>
+}
 type ElectronMain = { safeStorage: Encryption; dialog: Pick<typeof import("electron")["dialog"], "showMessageBox"> }
 /** Main-process test seams; never accept these dependencies over renderer IPC. */
 export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number }
@@ -247,6 +254,17 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   timer.unref?.()
   return {
     call,
+    async generatePetDialogue(model, callerSignal) {
+      await ready
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      const generationSignal = AbortSignal.any([signal, callerSignal])
+      generationSignal.throwIfAborted()
+      if (!api?.account || !api.provider) throw new Error("AMECODE_LOGIN_REQUIRED")
+      if (!policyReady) throw new Error(blocker ?? "MODEL_POLICY_UNAVAILABLE")
+      assertModel(modelPolicy(api.account.role, api.provider.catalog), { providerID: managedProvider, id: model })
+      providerURL(api.provider.provider.base_url)
+      return generateDialogue(api, model, generationSignal, fetcher)
+    },
     dispose() {
       return disposal ??= (async () => {
         disposed = true; clearInterval(timer); lifetime.abort()

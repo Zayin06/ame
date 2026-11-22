@@ -348,6 +348,148 @@ test('commit generation sends staged context and selected model, strips fences, 
   } finally { adapter.dispose() }
 })
 
+test('artifacts use project location, map native summaries and files, validate ids and enforce session ownership', async () => {
+  const directory = process.cwd(), other = directory + '-other'
+  const calls: { url: URL; init: RequestInit }[] = []
+  const info = { id: 'artifact1', provider: 'local', sessionID: 's1', title: 'Preview', entry: 'index.html', url: 'http://localhost:4096/view/artifact1', time: { created: 10, updated: 20 } }
+  const files = { 'index.html': '<h1>Preview</h1>', 'notes.md': '# Notes' }
+  const summary = { id: info.id, provider: info.provider, sessionID: info.sessionID, title: info.title, entry: info.entry, url: info.url, createdAt: 10, updatedAt: 20 }
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push({ url, init })
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname.startsWith('/api/session/')) return json({ data: { location: { directory: url.pathname.endsWith('/s1') ? directory : other } } })
+    if (url.pathname.startsWith('/api/experimental/artifacts')) {
+      if (url.searchParams.get('location[directory]') === other) return json({ _tag: 'ArtifactNotFoundError', message: 'Not found', artifactID: info.id }, 404)
+      if (init.method === 'DELETE') return new Response(null, { status: 204 })
+      return json({ location: { directory }, data: url.pathname.endsWith('/artifacts') ? [info] : { info, files } })
+    }
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory); adapter.attach('other', other)
+  try {
+    await adapter.connect('http://localhost:4096')
+    assert.deepEqual(await adapter.artifacts('p'), [summary])
+    assert.equal(calls.at(-1)!.url.searchParams.has('sessionID'), false)
+    calls.length = 0
+    assert.deepEqual(await adapter.artifacts('p', 's1'), [summary])
+    assert.deepEqual(calls.map(c => c.url.pathname), ['/api/session/s1', '/api/experimental/artifacts'])
+    assert.equal(calls[1].url.searchParams.get('sessionID'), 's1')
+    assert.deepEqual(await adapter.artifact('p', '  artifact1 \n'), { info: summary, files })
+    await adapter.deleteArtifact('p', ' artifact1 ')
+    assert.equal(calls.at(-1)!.init.method, 'DELETE')
+    await adapter.artifact('p', 'a'.repeat(200))
+    await adapter.deleteArtifact('p', 'x')
+    for (const call of calls.filter(c => c.url.pathname.startsWith('/api/experimental/artifacts'))) assert.equal(call.url.searchParams.get('location[directory]'), directory)
+    const before = calls.length
+    for (const id of ['', ' \n ', 'a'.repeat(201), null, 123]) {
+      await assert.rejects(adapter.artifact('p', id as string), /INVALID_ARTIFACT_ID/)
+      await assert.rejects(adapter.deleteArtifact('p', id as string), /INVALID_ARTIFACT_ID/)
+    }
+    for (const operation of [() => adapter.artifacts('missing'), () => adapter.artifact('missing', info.id), () => adapter.deleteArtifact('missing', info.id)]) await assert.rejects(operation(), /UNKNOWN_PROJECT/)
+    assert.equal(calls.length, before, 'invalid input never reaches the SDK')
+    calls.length = 0
+    await assert.rejects(adapter.artifacts('p', 'foreign'), /SESSION_PROJECT_MISMATCH/)
+    assert.deepEqual(calls.map(c => c.url.pathname), ['/api/session/foreign'])
+    await assert.rejects(adapter.artifact('other', info.id))
+    await assert.rejects(adapter.deleteArtifact('other', info.id))
+    for (const call of calls.slice(1)) assert.equal(call.url.searchParams.get('location[directory]'), other, 'artifact access stays in the requested project')
+  } finally { adapter.dispose() }
+})
+
+test('artifact.updated SSE refreshes only matching attached projects and broadcasts when location is absent', async () => {
+  const notifications: IdeEvent[] = [], directory = process.cwd(), other = directory + '-other'
+  let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+  const adapter = new OpenCodeAdapter(event => notifications.push(event), async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { stream = c; init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  const send = (location?: { directory: string }) => stream!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'artifact.updated', location, data: {} })}\n\n`))
+  adapter.attach('p', directory); adapter.attach('other', other)
+  try {
+    await adapter.connect('http://localhost:4096'); await waitFor(() => !!stream)
+    notifications.length = 0
+    send({ directory: directory + '\\.' }); send({ directory: other }); send()
+    await waitFor(() => notifications.length === 4)
+    assert.deepEqual(notifications, [{ type: 'opencode', projectID: 'p' }, { type: 'opencode', projectID: 'other' }, { type: 'opencode', projectID: 'p' }, { type: 'opencode', projectID: 'other' }])
+    notifications.length = 0
+    adapter.detach('p'); send({ directory }); send({ directory: other })
+    await waitFor(() => notifications.length === 1)
+    assert.deepEqual(notifications, [{ type: 'opencode', projectID: 'other' }])
+  } finally { adapter.dispose() }
+})
+
+test('btwAsk validates owned trimmed questions, switches selected model and generates with a 45s timeout without prompting', async t => {
+  const directory = process.cwd(), calls: { url: URL; init: RequestInit }[] = [], timeouts: number[] = []
+  const timeout = AbortSignal.timeout.bind(AbortSignal)
+  t.mock.method(AbortSignal, 'timeout', (ms: number) => { timeouts.push(ms); return timeout(ms) })
+  let failModel = false, failGenerate = false
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push({ url, init })
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session/s1' || url.pathname === '/api/session/foreign') return json({ data: { location: { directory: url.pathname.endsWith('foreign') ? directory + '-other' : directory } } })
+    if (url.pathname.endsWith('/model')) return failModel ? json({ _tag: 'ForbiddenError', message: 'Model denied' }, 403) : new Response(null, { status: 204 })
+    if (url.pathname.endsWith('/generate')) return failGenerate ? json({ _tag: 'SessionBusyError', sessionID: 's1', message: 'Busy' }, 409) : json({ data: { text: ' \n Side answer \n ', tokens: emptyTokens(), cost: 1 } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  const model = { id: 'server-model', modelID: 'catalog-model', providerID: 'amecode', name: 'Model' }
+  try {
+    await adapter.connect('http://localhost:4096')
+    calls.length = 0; timeouts.length = 0
+    assert.deepEqual(await adapter.btwAsk('p', 's1', ' \n Side question \n ', model), { answer: 'Side answer' })
+    assert.deepEqual(calls.map(c => c.url.pathname), ['/api/session/s1', '/api/session/s1/model', '/api/session/s1/generate'])
+    assert.deepEqual(JSON.parse(String(calls[1].init.body)), { model: { id: 'server-model', providerID: 'amecode' } })
+    assert.deepEqual(JSON.parse(String(calls[2].init.body)), { prompt: 'Side question' })
+    assert.equal(calls[2].init.method, 'POST')
+    assert.ok(calls[2].init.signal instanceof AbortSignal)
+    assert.equal(calls[2].init.signal.aborted, false)
+    assert.deepEqual(timeouts, [45000])
+    calls.length = 0
+    await adapter.btwAsk('p', 's1', ' ' + 'a'.repeat(20000) + ' ')
+    assert.deepEqual(calls.map(c => c.url.pathname), ['/api/session/s1', '/api/session/s1/generate'], 'omitted model retains the session model')
+    calls.length = 0
+    for (const question of ['', ' \n ', 'a'.repeat(20001)]) await assert.rejects(adapter.btwAsk('p', 's1', question, model), /INVALID_PROMPT/)
+    await assert.rejects(adapter.btwAsk('p', 'foreign', 'Question', model), /SESSION_PROJECT_MISMATCH/)
+    assert.equal(calls.every(c => c.url.pathname === '/api/session/s1' || c.url.pathname === '/api/session/foreign'), true, 'invalid or foreign questions cause no mutation')
+    calls.length = 0; failModel = true
+    await assert.rejects(adapter.btwAsk('p', 's1', 'Question', model))
+    assert.equal(calls.some(c => c.url.pathname.endsWith('/generate')), false)
+    failModel = false; failGenerate = true
+    await assert.rejects(adapter.btwAsk('p', 's1', 'Question', model))
+  } finally { adapter.dispose() }
+})
+
+test('forkSession checks ownership and maps native session activity, parent, agent and fallback title', async () => {
+  const directory = process.cwd(), calls: { url: URL; init: RequestInit }[] = []
+  let forked = { id: 'fork1', parentID: 's1', agent: 'architect', title: 'Forked', outcome: 'succeeded', time: { created: 1, updated: 50, busy: 40, idle: 30 } }
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push({ url, init })
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname.endsWith('/fork')) return json({ data: forked })
+    if (url.pathname.startsWith('/api/session/')) return json({ data: { location: { directory: url.pathname.endsWith('foreign') ? directory + '-other' : directory } } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096'); calls.length = 0
+    await assert.rejects(adapter.forkSession('p', 'foreign'), /SESSION_PROJECT_MISMATCH/)
+    assert.equal(calls.some(c => c.url.pathname.endsWith('/fork')), false)
+    calls.length = 0
+    assert.deepEqual(await adapter.forkSession('p', 's1'), { id: 'fork1', parentID: 's1', agent: 'architect', title: 'Forked', updatedAt: 50, status: 'running', outcome: 'succeeded' })
+    assert.deepEqual(calls.map(c => c.url.pathname), ['/api/session/s1', '/api/session/s1/fork'])
+    assert.equal(calls[1].init.method, 'POST')
+    assert.equal(calls[1].url.searchParams.has('before'), false)
+    forked = { ...forked, title: '', time: { ...forked.time, idle: 45 } }
+    const idle = await adapter.forkSession('p', 's1')
+    assert.equal(idle.title, 'Untitled'); assert.equal(idle.status, 'idle')
+  } finally { adapter.dispose() }
+})
+
 const usageSession = (id: string, parentID?: string): SessionInfo => ({
   id, parentID, projectID: 'p', title: id, location: { directory: process.cwd() },
   time: { created: 0, updated: 1 }, cost: 999, tokens: emptyTokens(),

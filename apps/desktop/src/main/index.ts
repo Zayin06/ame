@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, powerSaveBlocker, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, powerSaveBlocker, screen, shell } from 'electron'
 import { readFile, writeFile } from 'node:fs/promises'
 import { PairingHost } from '../../../../packages/opencode-adapter/src/pairing'
 import { RemotePairing, automaticTunnel } from '../../../../packages/opencode-adapter/src/remote-pairing'
@@ -11,8 +11,10 @@ import { Terminals } from '../../../../packages/ide-core/src/terminal'
 import { OpenCodeAdapter } from '../../../../packages/opencode-adapter/src/index'
 import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtime'
 import { createAmeKit } from '../../../../packages/amekit/src/index'
+import { createPetHost } from '../../../../packages/amekit/src/pet-host'
+import { loadPetSprite } from '../../../../packages/amekit/src/pet'
 import type { UsagePrices } from '../../../../packages/amekit/src/usage-pricing'
-import type { IdeEvent } from '../../../../packages/protocol/src/index'
+import type { IdeEvent, Model } from '../../../../packages/protocol/src/index'
 
 if (!app.isPackaged && process.env.AME_IDE_TEST_DATA) app.setPath('userData', path.resolve(process.env.AME_IDE_TEST_DATA))
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -21,6 +23,8 @@ let workspace: Workspaces
 let terminals: Terminals
 let adapter: OpenCodeAdapter
 let account: ReturnType<typeof createAmeKit>
+let petHost: ReturnType<typeof createPetHost> | undefined
+let sprite = ''
 let runtime: PrivateRuntime
 let managed = true
 let shuttingDown = false
@@ -61,6 +65,20 @@ const workspacePath = relative.min(1).refine(value => !value.includes('\0'))
 const branchName = z.string().min(1).max(512).refine(value => !value.includes('\0'))
 const sessionTitle = z.string().min(1).max(500).refine(value => !!value.trim() && !value.includes('\0'))
 const modelSchema = z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).strict()
+const boundedID = id.refine(value => !!value.trim() && !value.includes('\0'))
+const artifactID = text.min(1).max(200).refine(value => value === value.trim() && !value.includes('\0'))
+const question = text.min(1).max(20000).refine(value => !!value.trim() && !value.includes('\0'))
+const petModel = z.string().min(1).max(200).refine(value => value === value.trim() && !value.includes('\0'))
+const petConfigure = z.object({ enabled: z.boolean().optional(), scale: z.number().min(0.25).max(2).optional(), resetPosition: z.boolean().optional() }).strict()
+const petSpeech = z.object({ enabled: z.boolean().optional(), sound: z.boolean().optional() }).strict()
+const petColor = z.string().min(1).max(160).regex(/^(?:#[\da-f]{3,8}|(?:rgba?|hsla?|oklch|oklab|lch|lab|color)\([a-z\d.,%+\- /]+\))$/i)
+const petPalette = z.object({ background: petColor, foreground: petColor, border: petColor }).strict()
+const petSession = z.object({
+  key: boundedID, running: z.boolean(), waiting: z.boolean(), thinking: z.boolean(), child: z.boolean(),
+  outcome: z.enum(['succeeded', 'failed', 'interrupted']).optional(),
+  busy: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  idle: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional()
+}).strict()
 const content = z.string().max(4 * 1024 * 1024).refine(value => Buffer.byteLength(value, 'utf8') <= 4 * 1024 * 1024, 'FILE_TOO_LARGE')
 const searchQuery = z.object({
   query: z.string().max(20000),
@@ -74,6 +92,12 @@ const replaceOptions = searchQuery.extend({
   replacement: z.string().max(200000), files: z.array(workspacePath).max(5000).optional(), dryRun: z.boolean().optional()
 }).strict()
 const schema = {
+  platform: z.tuple([]),
+  artifacts: z.tuple([boundedID, boundedID.optional()]), artifact: z.tuple([boundedID, artifactID]), deleteArtifact: z.tuple([boundedID, artifactID]),
+  btwAsk: z.tuple([boundedID, boundedID, question, modelSchema.optional()]), forkSession: z.tuple([boundedID, boundedID]),
+  petState: z.tuple([]), petSprite: z.tuple([]), petConfigure: z.tuple([petConfigure]), petSpeech: z.tuple([petSpeech]),
+  petTheme: z.tuple([petPalette]), petReport: z.tuple([z.array(petSession).max(2000)]),
+  petTestSpeech: z.tuple([]), petGenerateDialogue: z.tuple([petModel.optional()]),
   terminalProfiles: z.tuple([]), terminalList: z.tuple([id]),
   terminalCreate: z.tuple([id, id.optional(), z.number().int().min(2).max(500).optional(), z.number().int().min(1).max(300).optional()]),
   terminalSnapshot: z.tuple([id, id]), terminalWrite: z.tuple([id, id, z.string().max(65536)]),
@@ -98,19 +122,60 @@ const schema = {
   account: z.tuple([z.string().max(64), z.record(z.string(), z.string().max(8192))]), pickImport: z.tuple([]), window: z.tuple([z.enum(['minimize', 'maximize', 'close'])])
 } as const
 function notify(event: IdeEvent) { if (window && !window.isDestroyed()) window.webContents.send('ame:event', event) }
-async function confirmation(message: string) {
-  const result = await dialog.showMessageBox(window!, { type: 'question', buttons: ['Hủy', 'Xác nhận'], defaultId: 0, cancelId: 0, message })
+async function confirmation(message: string, detail?: string) {
+  const result = await dialog.showMessageBox(window!, { type: 'question', buttons: ['Hủy', 'Xác nhận'], defaultId: 0, cancelId: 0, message, ...(detail ? { detail } : {}) })
   if (result.response !== 1) throw new Error('CANCELLED')
 }
 async function pickImport() {
   const selected = await dialog.showOpenDialog(window!, { title: 'Import AmeKit agents / skills', properties: ['openDirectory'] })
   return selected.canceled ? null : selected.filePaths[0] ?? null
 }
+async function resolveModel(projectID: string, requested?: Model | string, requireRequested = false, preferDefault = false): Promise<Model> {
+  const models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')
+  if (!models.length) throw new Error('AMEKIT_MODEL_REQUIRED')
+  const status = await account.call('status', {}) as { account?: { role?: string }; models?: { default_model?: string; models?: { id: string }[] } } | null
+  if (!status?.account) throw new Error('AMECODE_LOGIN_REQUIRED')
+  const role = status.account.role, catalog = status.models
+  if (!['user', 'admin'].includes(role ?? '') || !catalog?.models?.length || !catalog.default_model) throw new Error('MODEL_POLICY_UNAVAILABLE')
+  const allowed = models.filter(model => catalog.models!.some(entry => entry.id === (model.modelID ?? model.id)))
+  const requestedID = typeof requested === 'string' ? requested : requested?.id
+  // A User's server-fixed canonical model always wins over renderer preferences.
+  const selected = role === 'user'
+    ? allowed.find(model => (model.modelID ?? model.id) === catalog.default_model)
+    : requestedID ? allowed.find(model => model.id === requestedID || (typeof requested === 'string' && model.modelID === requestedID))
+      : requireRequested ? undefined : preferDefault ? allowed.find(model => (model.modelID ?? model.id) === catalog.default_model) : allowed[0]
+  if (!selected) throw new Error('AMEKIT_MODEL_REQUIRED')
+  await account.call('assert-model', { modelID: selected.modelID ?? selected.id, providerID: selected.providerID })
+  if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
+  return selected
+}
 async function call(method: keyof typeof schema, args: unknown[]) {
   schema[method].parse(args)
+  if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
   // Dispatch remains explicit: renderer never chooses arbitrary Node functions or IPC channels.
   const [a, b, c, d, e] = args as any[]
   switch (method) {
+    case 'platform': return process.platform
+    case 'artifacts': return adapter.artifacts(a, b)
+    case 'artifact': return adapter.artifact(a, b)
+    case 'deleteArtifact':
+      await confirmation('Xóa artifact này?', 'Hành động này không thể hoàn tác.')
+      return adapter.deleteArtifact(a, b)
+    case 'btwAsk': return adapter.btwAsk(a, b, c, await resolveModel(a, d))
+    case 'forkSession': return adapter.forkSession(a, b)
+    case 'petState': return petHost!.state()
+    case 'petSprite': return sprite
+    case 'petConfigure': return petHost!.configure(a)
+    case 'petSpeech': return petHost!.speech(a)
+    case 'petTheme': petHost!.theme(a); return petHost!.state()
+    case 'petReport': petHost!.report('main', a); return petHost!.state()
+    case 'petTestSpeech': petHost!.testSpeech(); return petHost!.state()
+    case 'petGenerateDialogue': {
+      const project = workspace.list()[0]
+      if (!project) throw new Error('AMEKIT_MODEL_REQUIRED')
+      const selected = await resolveModel(project.id, a, false, true)
+      return petHost!.generate(selected.modelID ?? selected.id)
+    }
     case 'terminalProfiles': return terminals.available()
     case 'terminalList': return terminals.list(a)
     case 'terminalCreate': return terminals.create(a, b, c, d)
@@ -195,10 +260,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'commands': return adapter.commands(a)
     case 'skills': return adapter.skills(a)
     case 'generateCommitMessage': {
-      const models = (await adapter.models(a)).filter(model => model.providerID === 'amecode')
-      const selected = b ? models.find(model => model.id === b.id) : models[0]
-      if (!selected) throw new Error('AMEKIT_MODEL_REQUIRED')
-      await account.call('assert-model', { modelID: selected.modelID ?? selected.id, providerID: selected.providerID })
+      const selected = await resolveModel(a, b)
       const summary = await workspace.stagedDiffSummary(a, 24576)
       if (summary.files.length === 0) throw new Error('NO_STAGED_CHANGES')
       return adapter.generateCommitMessage(summary, selected)
@@ -212,9 +274,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'models': return adapter.models(a)
     case 'agents': return adapter.agents(a)
     case 'prompt': {
-      const selected = d && (await adapter.models(a)).find(model => model.id === d.id && model.providerID === 'amecode')
-      if (!selected) throw new Error('AMEKIT_MODEL_REQUIRED')
-      await account.call('assert-model', { modelID: selected.modelID ?? selected.id, providerID: selected.providerID })
+      const selected = await resolveModel(a, d, true)
       return adapter.prompt(a, b, c, selected, e)
     }
     case 'cancel': return adapter.cancel(a, b)
@@ -232,14 +292,15 @@ async function call(method: keyof typeof schema, args: unknown[]) {
 }
 let authority: Promise<unknown> = Promise.resolve()
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
+  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
   // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
   return task
 }
 async function openWindow() {
-  window = new BrowserWindow({ width: 1536, height: 960, minWidth: 1000, minHeight: 640, title: 'Ame IDE', backgroundColor: '#16181d', frame: false,
+  window = new BrowserWindow({ width: 1536, height: 960, minWidth: 1000, minHeight: 640, title: 'Ame IDE', backgroundColor: '#16181d',
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' as const, trafficLightPosition: { x: 14, y: 12 } } : { frame: false }),
     webPreferences: { preload: path.join(here, '../preload/index.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } })
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   const devURL = process.env.ELECTRON_RENDERER_URL
@@ -251,25 +312,35 @@ async function openWindow() {
     if (response === 1) event.preventDefault()
   })
   window.webContents.on('render-process-gone', () => terminals.dispose())
-  window.on('closed', () => { terminals.dispose(); window = undefined })
+  window.on('closed', () => { terminals.dispose(); window = undefined; petHost?.reconcile() })
   if (devURL) await window.loadURL(devURL)
   else await window.loadFile(path.join(here, '../renderer/index.html'))
+  petHost?.reconcile()
 }
 const primaryInstance = app.requestSingleInstanceLock()
 if (!primaryInstance) app.quit()
 app.on('second-instance', () => { if (window?.isMinimized()) window.restore(); window?.focus() })
 void app.whenReady().then(async () => {
   if (!primaryInstance) return
+  if (process.platform === 'darwin') Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { role: 'appMenu' }, { role: 'fileMenu' }, { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' }
+  ]))
   workspace = new Workspaces(path.join(app.getPath('userData'), 'projects.json'), projectID => notify({ type: 'files', projectID }))
   await workspace.load()
   terminals = new Terminals(projectID => workspace.get(projectID).directory, notify)
   adapter = new OpenCodeAdapter(notify)
   for (const project of workspace.list()) adapter.attach(project.id, project.directory)
+  const spritePath = app.isPackaged ? path.join(process.resourcesPath, 'ame-chibi.png') : path.join(app.getAppPath(), 'packages/amekit/src/assets/ame-chibi.png')
+  sprite = await loadPetSprite(spritePath).catch(() => '')
+  petHost = createPetHost({ userData: app.getPath('userData'), electron: { BrowserWindow, screen }, sprite, defaultEnabled: false,
+    hasMainWindow: () => Boolean(window && !window.isDestroyed()), onStateChanged: state => notify({ type: 'pet', state }),
+    generateDialogue: (model, signal) => account.generatePetDialogue(model, signal) })
   runtime = new PrivateRuntime({ resources: app.isPackaged ? process.resourcesPath : path.join(app.getAppPath(), 'resources'), profile: path.join(app.getPath('userData'), 'backend'), onExit: () => {
     if (managed && !shuttingDown) { void pairing?.stop(); adapter.disconnected('OpenCode tích hợp đã dừng. Mở Cài đặt để thử lại.') }
   } })
   pairing = new RemotePairing(new PairingHost(() => managed ? adapter.endpoint() : undefined), automaticTunnel(path.join(app.getPath('userData'), 'remote-access')))
   account = createAmeKit({ userData: app.getPath('userData'), endpoint: () => adapter.endpoint(), project: async projectID => workspace.get(projectID).directory, pickImport, cli: runtime.executable() })
+  await petHost.init()
   ipcMain.handle('ame:call', async (event, method: unknown, args: unknown) => {
     if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame) throw new Error('UNTRUSTED_CALLER')
     if (typeof method !== 'string' || !Object.hasOwn(schema, method) || !Array.isArray(args)) throw new Error('INVALID_REQUEST')
@@ -299,5 +370,7 @@ app.on('will-quit', event => {
   event.preventDefault(); quitting = true; shuttingDown = true
   screenActive(false)
   terminals?.dispose()
-  void authority.catch(() => {}).then(() => pairing.stop()).finally(() => account.dispose()).finally(async () => { adapter.dispose(); workspace.dispose(); await runtime.stop(); app.quit() })
+  // Abort in-flight pet generation before waiting for authority; queued calls fail closed.
+  void Promise.resolve().then(() => petHost?.dispose()).finally(() => authority.catch(() => {}))
+    .finally(() => pairing.stop()).finally(() => account.dispose()).finally(async () => { adapter.dispose(); workspace.dispose(); await runtime.stop(); app.quit() })
 })

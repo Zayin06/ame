@@ -1,3 +1,14 @@
+export type { PetHostState } from '../../amekit/src/pet-host'
+export type { PetPalette } from '../../amekit/src/pet-appearance'
+export type { PetSession } from '../../amekit/src/pet'
+import type { PetHostState } from '../../amekit/src/pet-host'
+import type { PetPalette } from '../../amekit/src/pet-appearance'
+import type { PetSession } from '../../amekit/src/pet'
+export type PetConfigureInput = { enabled?: boolean; scale?: number; resetPosition?: boolean }
+export type PetPreferencesInput = PetConfigureInput
+export type PetSpeechInput = { enabled?: boolean; sound?: boolean }
+export type ArtifactSummary = { id: string; provider: string; sessionID?: string; title: string; entry: string; url: string; createdAt: number; updatedAt: number }
+export type ArtifactDetail = { info: ArtifactSummary; files: Record<string, string> }
 export type Project = { id: string; name: string; directory: string }
 export type FileEntry = { path: string; name: string; directory: boolean }
 export type FileDocument = { path: string; content: string; revision: string }
@@ -51,8 +62,22 @@ export type TerminalProfile = { id: string; name: string; executable: string; ar
 export type TerminalInfo = { id: string; projectID: string; title: string; cols: number; rows: number; exitCode?: number }
 export type TerminalSnapshot = TerminalInfo & { output: string; sequence: number }
 export type TerminalEvent = { type: 'terminal'; projectID: string; terminalID: string; sequence: number; data?: string; exitCode?: number }
-export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent
+export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState }
 export interface DesktopApi {
+  platform(): Promise<string>
+  artifacts(projectID: string, sessionID?: string): Promise<ArtifactSummary[]>
+  artifact(projectID: string, artifactID: string): Promise<ArtifactDetail>
+  deleteArtifact(projectID: string, artifactID: string): Promise<void>
+  btwAsk(projectID: string, sessionID: string, question: string, model?: Model): Promise<{ answer: string }>
+  forkSession(projectID: string, sessionID: string): Promise<Session>
+  petState(): Promise<PetHostState>
+  petSprite(): Promise<string>
+  petConfigure(input: PetConfigureInput): Promise<PetHostState>
+  petSpeech(input: PetSpeechInput): Promise<PetHostState>
+  petTheme(palette: PetPalette): Promise<PetHostState>
+  petReport(sessions: PetSession[]): Promise<PetHostState>
+  petTestSpeech(): Promise<PetHostState>
+  petGenerateDialogue(model?: string): Promise<PetHostState>
   terminalProfiles(): Promise<Pick<TerminalProfile, 'id' | 'name'>[]>
   terminalList(projectID: string): Promise<TerminalInfo[]>
   terminalCreate(projectID: string, profileID?: string, cols?: number, rows?: number): Promise<TerminalInfo>

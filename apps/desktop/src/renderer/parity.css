@@ -1,4 +1,18 @@
 #root { height: 100%; }
+.app-shell.is-macos .titlebar__left { padding-left: 74px; }
+.app-shell.is-macos .win-controls { display: none; }
+.artifact-viewer, .btw-panel { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.artifact-viewer { display: flex; flex-direction: column; min-height: 0; height: 100%; overflow: auto; padding: 12px; gap: 10px; }
+.artifact-viewer select { width: 100%; }
+.artifact-viewer pre { margin: 0; max-width: 100%; overflow: auto; padding: 12px; background: var(--bg-code); font: 12px/1.6 var(--font-mono); }
+.artifact-viewer iframe { width: 100%; min-height: 280px; border: 1px solid var(--border-default); background: white; }
+.artifact-viewer button, .btw-panel button { max-width: 100%; }
+.artifact-viewer .button-row, .btw-panel .button-row { flex-wrap: wrap; }
+.artifact-viewer__detail, .artifact-viewer__file, .artifact-viewer__actions label { min-width: 0; max-width: 100%; }
+.btw-panel { max-height: 60vh; overflow: auto; padding: 12px; }
+.btw-panel textarea { width: 100%; min-height: 72px; }
+.btw-panel p { white-space: pre-wrap; }
+.btw-panel article { border-bottom: 1px solid var(--border-subtle); margin-bottom: 10px; padding-bottom: 10px; }
 .app-shell { position: relative; }
 .titlebar { -webkit-app-region: drag; }
 .titlebar button { -webkit-app-region: no-drag; }

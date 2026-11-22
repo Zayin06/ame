@@ -71,6 +71,10 @@
       {
         "from": "resources/amekit-models",
         "to": "amekit-models"
+      },
+      {
+        "from": "packages/amekit/src/assets/ame-chibi.png",
+        "to": "ame-chibi.png"
       }
     ],
     "win": {

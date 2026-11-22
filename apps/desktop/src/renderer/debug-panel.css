@@ -1,0 +1,56 @@
+.debug-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 18px;
+  overflow: auto;
+  color: var(--text-primary);
+  background: var(--bg-canvas);
+  font: 13px/1.5 var(--font-sans);
+}
+.debug-panel h2, .debug-panel h3, .debug-panel p, .debug-panel pre { margin: 0; }
+.debug-panel h2 { font-size: 18px; }
+.debug-panel h3 { font-size: 14px; }
+.debug-panel button, .debug-panel input {
+  box-sizing: border-box;
+  padding: 6px 9px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font: inherit;
+}
+.debug-panel button { cursor: pointer; }
+.debug-panel button:hover:not(:disabled) { background: var(--bg-hover-strong); }
+.debug-panel button:disabled, .debug-panel input:disabled { color: var(--text-muted); cursor: default; }
+.debug-panel button:focus-visible, .debug-panel input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.debug-panel input { min-width: 0; width: 100%; font-family: var(--font-mono); }
+.debug-panel input::placeholder { color: var(--text-muted); }
+.debug-header, .debug-entry, .debug-actions, .debug-evaluate, .debug-breakpoint { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.debug-header h2, .debug-header h3 { flex: 1; }
+.debug-entry, .debug-evaluate { align-items: end; }
+.debug-entry label, .debug-evaluate label { display: flex; flex: 1; flex-direction: column; gap: 4px; min-width: 140px; color: var(--text-secondary); }
+.debug-status { padding: 3px 8px; border: 1px solid currentColor; border-radius: var(--radius-pill); }
+.debug-muted, .debug-tone-muted { color: var(--text-secondary); }
+.debug-tone-success { color: var(--success); }
+.debug-tone-warning { color: var(--warning); }
+.debug-section { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-canvas-subtle); }
+.debug-list { display: flex; flex-direction: column; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.debug-panel .debug-location { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; text-align: start; overflow-wrap: anywhere; }
+.debug-location span { font-family: var(--font-mono); }
+.debug-location[aria-current="true"] { border-color: var(--accent-border); background: var(--bg-active); }
+.debug-breakpoint .debug-location { flex: 1; min-width: 100px; }
+.debug-variables { display: grid; gap: 6px; margin: 0; font-family: var(--font-mono); overflow-wrap: anywhere; }
+.debug-variables > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 8px; }
+.debug-variables dt small, .debug-result > span { color: var(--text-secondary); }
+.debug-variables dd { margin: 0; white-space: pre-wrap; }
+.debug-output, .debug-result pre { font: 12px/1.5 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.debug-panel .debug-output { max-height: 280px; overflow: auto; padding: 8px; background: var(--bg-code); border-radius: var(--radius-sm); }
+.debug-output-stderr, .debug-evaluation-error { color: var(--danger); }
+.debug-output-console { color: var(--accent); }
+.debug-evaluation-error { white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .debug-panel { padding: 10px; }
+  .debug-variables > div { grid-template-columns: minmax(0, 1fr); }
+}

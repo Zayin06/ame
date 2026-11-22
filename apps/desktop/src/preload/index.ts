@@ -3,6 +3,16 @@ import type { DesktopApi, IdeEvent } from '../../../../packages/protocol/src/ind
 
 const invoke = (method: string, ...args: unknown[]) => ipcRenderer.invoke('ame:call', method, args)
 const api: DesktopApi = {
+  platform: () => invoke('platform'),
+  artifacts: (id, session) => invoke('artifacts', id, session),
+  artifact: (id, artifact) => invoke('artifact', id, artifact),
+  deleteArtifact: (id, artifact) => invoke('deleteArtifact', id, artifact),
+  btwAsk: (id, session, question, model) => invoke('btwAsk', id, session, question, model),
+  forkSession: (id, session) => invoke('forkSession', id, session),
+  petState: () => invoke('petState'), petSprite: () => invoke('petSprite'),
+  petConfigure: input => invoke('petConfigure', input), petSpeech: input => invoke('petSpeech', input),
+  petTheme: palette => invoke('petTheme', palette), petReport: sessions => invoke('petReport', sessions),
+  petTestSpeech: () => invoke('petTestSpeech'), petGenerateDialogue: model => invoke('petGenerateDialogue', model),
   terminalProfiles: () => invoke('terminalProfiles'), terminalList: id => invoke('terminalList', id),
   terminalCreate: (id, profile, cols, rows) => invoke('terminalCreate', id, profile, cols, rows),
   terminalSnapshot: (id, terminal) => invoke('terminalSnapshot', id, terminal),

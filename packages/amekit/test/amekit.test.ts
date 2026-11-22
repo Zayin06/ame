@@ -9,6 +9,8 @@ import { openSessionVault, type Encryption } from "../src/session-vault"
 import { pack, preview, safePath } from "../src/bundle/package"
 import { installed, install, uninstall } from "../src/installer"
 import type { Release } from "../src/api"
+import { dialoguePrompt, localDialogue } from "../src/pet-dialogue"
+import type { PetHostOptions } from "../src/pet-host"
 
 const root = path.resolve("packages", "amekit", "test", `.work-${randomUUID()}`)
 after(async () => { await rm(root, { recursive: true, force: true }) })
@@ -37,13 +39,27 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   const rpc: unknown[] = [], requests: string[] = [], dialogs: string[] = []
   let role: unknown = settings.role ?? "user", plugin = settings.plugin !== false, accepted = settings.confirm !== false, failAuth = false, failStorage = false, pickerCount = 0
   let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
+  let rpcResponse: (() => Promise<Response | undefined>) | undefined
+  let dialogueResponse: ((signal: AbortSignal) => Promise<Response>) | undefined
   const fetcher: typeof fetch = async (request, init) => {
     const url = new URL(String(request)); requests.push(url.pathname)
     if (url.origin === "http://127.0.0.1:3210") {
       assert.equal(url.pathname, "/api/rpc/amekit-models/update")
       assert.equal(new Headers(init?.headers).get("authorization"), "Basic fixture-owner")
       rpc.push(JSON.parse(String(init?.body)).input)
+      const response = await rpcResponse?.(); if (response) return response
       return Response.json(plugin ? { output: true } : { type: "rpc.unavailable" }, { status: plugin ? 200 : 400 })
+    }
+    if (url.origin === "http://localhost:3212") {
+      assert.equal(url.pathname, "/v1/chat/completions")
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer fixture-provider-key")
+      const body = JSON.parse(String(init?.body))
+      assert.deepEqual(body.messages, [{ role: "user", content: dialoguePrompt }])
+      assert.equal(body.stream, false)
+      assert.equal(init?.redirect, "error")
+      assert.ok(init?.signal)
+      init.signal.throwIfAborted()
+      return dialogueResponse ? dialogueResponse(init.signal) : Response.json({ choices: [{ message: { content: JSON.stringify(localDialogue) } }] })
     }
     assert.equal(url.origin, "http://localhost:3211", "no real API calls")
     if (failAuth) return Response.json({ error: { code: "USER_DISABLED" } }, { status: 401 })
@@ -69,6 +85,8 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   return { service, folder, project, imported, data, rpc, requests, dialogs, options, dependencies, artifact,
     role: (value: unknown) => { role = value }, plugin: (value: boolean) => { plugin = value }, confirm: (value: boolean) => { accepted = value }, disable: () => { failAuth = true }, breakStorage: () => { failStorage = true }, pickerCount: () => pickerCount,
     sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
+    rpcResponse: (value?: () => Promise<Response | undefined>) => { rpcResponse = value },
+    dialogueResponse: (value: (signal: AbortSignal) => Promise<Response>) => { dialogueResponse = value },
     cleanup: async () => { await service.dispose(); await rm(folder, { recursive: true, force: true }) } }
 }
 const login = (service: AmeKit) => service.call("login", { server: "http://localhost:3211", username: "fixture", password: "fixture-password" })
@@ -93,6 +111,135 @@ test("AmeKit account role views, fresh prompt authorization, encryption and logo
     assert.equal(f.rpc.at(-1), null)
     await assert.rejects(f.service.call("assert-model", { modelID: "default" }), /SIGNED_OUT/)
   } finally { await f.cleanup() }
+})
+
+test("pet dialogue preserves categorized host contract and enforces admin/user model policy", async t => {
+  for (const role of ["admin", "user"] as const) await t.test(role, async () => {
+    const f = await fixture({ role })
+    try {
+      await login(f.service)
+      const generate: NonNullable<PetHostOptions["generateDialogue"]> = f.service.generatePetDialogue
+      const result = await generate(role === "admin" ? "other" : "default", new AbortController().signal)
+      assert.deepEqual(result, localDialogue)
+      assert.equal(Array.isArray(result), false, "host requires a DialogueSet, not flattened strings")
+      assert.doesNotMatch(JSON.stringify(result), /fixture-(session-token|provider-key|password)/)
+      assert.equal(f.requests.filter(request => request === "/v1/chat/completions").length, 1)
+      const before = f.requests.length
+      await assert.rejects(generate(role === "user" ? "other" : "missing", new AbortController().signal), /AMECODE_MODEL_NOT_ALLOWED/)
+      assert.equal(f.requests.length, before, "denied models never refresh or call provider")
+      await assert.rejects(f.service.call("generatePetDialogue", { model: "default" }), /UNKNOWN_OPERATION/, "main-only method is not an IPC operation")
+    } finally { await f.cleanup() }
+  })
+})
+
+test("pet dialogue rejects signed-out, unavailable policy and disposed services without provider calls", async t => {
+  await t.test("signed-out and disposed", async () => {
+    const f = await fixture()
+    try {
+      await assert.rejects(f.service.generatePetDialogue("default", new AbortController().signal), /AMECODE_LOGIN_REQUIRED/)
+      await login(f.service)
+      await f.service.dispose()
+      const before = f.requests.length
+      await assert.rejects(f.service.generatePetDialogue("default", new AbortController().signal), /AMEKIT_DISPOSED/)
+      assert.equal(f.requests.length, before)
+      assert.equal(f.requests.includes("/v1/chat/completions"), false)
+    } finally { await f.cleanup() }
+  })
+  await t.test("policy synchronization in progress", async () => {
+    const f = await fixture()
+    let release: (() => void) | undefined
+    try {
+      await login(f.service)
+      const entered = new Promise<void>(resolve => {
+        f.rpcResponse(() => new Promise(done => { release = () => done(undefined); resolve() }))
+      })
+      const refreshing = f.service.call("refresh", {})
+      await entered
+      try {
+        await assert.rejects(f.service.generatePetDialogue("default", new AbortController().signal), /MODEL_POLICY_UNAVAILABLE/)
+        assert.equal(f.requests.includes("/v1/chat/completions"), false)
+      } finally { f.rpcResponse(); release?.(); await refreshing }
+    } finally { release?.(); await f.cleanup() }
+  })
+  await t.test("missing plugin", async () => {
+    const f = await fixture({ plugin: false })
+    try {
+      await assert.rejects(login(f.service), /MODEL_POLICY_PLUGIN_REQUIRED/)
+      await assert.rejects(f.service.generatePetDialogue("default", new AbortController().signal), /AMECODE_LOGIN_REQUIRED/)
+      assert.equal(f.requests.includes("/v1/chat/completions"), false)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("pet dialogue waits for encrypted-session restoration and ready policy", async () => {
+  const f = await fixture()
+  let restored: AmeKit | undefined, release: (() => void) | undefined
+  try {
+    await login(f.service); await f.service.dispose()
+    const entered = new Promise<void>(resolve => {
+      f.rpcResponse(() => new Promise(done => { release = () => done(undefined); resolve() }))
+    })
+    restored = createAmeKit(f.options, f.dependencies)
+    let settled = false
+    const generating = restored.generatePetDialogue("default", new AbortController().signal).finally(() => { settled = true })
+    await entered
+    assert.equal(settled, false)
+    assert.equal(f.requests.includes("/v1/chat/completions"), false)
+    f.rpcResponse(); release?.()
+    assert.deepEqual(await generating, localDialogue)
+  } finally { f.rpcResponse(); release?.(); await restored?.dispose(); await f.cleanup() }
+})
+
+test("pet dialogue rechecks fresh account model policy before provider access", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    await login(f.service)
+    f.role("user")
+    await assert.rejects(f.service.generatePetDialogue("other", new AbortController().signal), /AMECODE_MODEL_NOT_ALLOWED/)
+    assert.equal(f.requests.includes("/v1/chat/completions"), false)
+    f.disable()
+    await assert.rejects(f.service.generatePetDialogue("default", new AbortController().signal), /USER_DISABLED/)
+    assert.equal(f.requests.includes("/v1/chat/completions"), false)
+  } finally { await f.cleanup() }
+})
+
+test("pet dialogue combines caller and service lifetime cancellation", async t => {
+  await t.test("already cancelled", async () => {
+    const f = await fixture()
+    try {
+      await login(f.service)
+      const caller = new AbortController(); caller.abort()
+      const before = f.requests.length
+      await assert.rejects(f.service.generatePetDialogue("default", caller.signal), { name: "AbortError" })
+      assert.equal(f.requests.length, before)
+    } finally { await f.cleanup() }
+  })
+  for (const cancellation of ["caller", "dispose"] as const) await t.test(cancellation, async () => {
+    const f = await fixture()
+    try {
+      await login(f.service)
+      let providerSignal: AbortSignal | undefined
+      let started!: () => void
+      const entered = new Promise<void>(resolve => { started = resolve })
+      f.dialogueResponse(signal => new Promise((_, reject) => {
+        providerSignal = signal
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+        started()
+      }))
+      const caller = new AbortController()
+      const generating = f.service.generatePetDialogue("default", caller.signal)
+      const rejected = assert.rejects(generating, { name: "AbortError" })
+      await entered
+      if (cancellation === "caller") caller.abort()
+      else await f.service.dispose()
+      await rejected
+      assert.equal(providerSignal?.aborted, true)
+      if (cancellation === "caller") {
+        f.dialogueResponse(async () => Response.json({ choices: [{ message: { content: JSON.stringify(localDialogue) } }] }))
+        assert.deepEqual(await f.service.generatePetDialogue("default", new AbortController().signal), localDialogue)
+      }
+    } finally { await f.cleanup() }
+  })
 })
 
 test("usage-prices is read-only, signed-out safe and exposes only validated pricing without credentials", async () => {

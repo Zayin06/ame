@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
+import { useEffect, useId, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react'
 import type { Agent, ChatItem, Model, Permission, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
 import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
@@ -8,12 +8,14 @@ import { Empty, errorText, IconButton } from './Primitives'
 import { chatSubmit } from '../chat-submit'
 import { TurnChanges } from './SessionChanges'
 import { ToolCard } from './ToolCard'
+import { ArtifactViewer } from './ArtifactViewer'
 import { applyComposerCompletion, composePromptWithAttachments, detectComposerTrigger, filterFileMentions, filterSlashEntries, type ComposerAttachment, type ComposerTrigger } from '../composer-mentions'
 
-export function Chat({ projectID, sessionID, title, connected, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, ready, files = [], activeFile, onRequestFiles }: { files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; ready: boolean; onCreated: (session: Session) => void; projectID?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+export function Chat({ projectID, sessionID, title, connected, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, ready, files = [], activeFile, onRequestFiles }: { files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
   const [models, setModels] = useState<Model[]>([])
+  const [modelProject, setModelProject] = useState<string>()
   const [agents, setAgents] = useState<Agent[]>([])
   const [model, setModel] = useState('')
   const [role, setRole] = useState<string>()
@@ -98,11 +100,13 @@ export function Chat({ projectID, sessionID, title, connected, onCreate, report,
     let alive = true, generation = 0
     const load = async () => {
       const current = ++generation
+      setModelProject(undefined)
       try {
         const [m, a] = await Promise.all([window.ame.models(projectID), window.ame.agents(projectID)])
         if (alive && current === generation) {
           const allowed = m.filter(item => item.providerID === 'amecode')
           setModels(allowed)
+          setModelProject(projectID)
           setModel(value => allowed.some(item => `${item.providerID}/${item.id}` === value) ? value : allowed[0] ? `${allowed[0].providerID}/${allowed[0].id}` : '')
           setAgents(a)
         }
@@ -131,7 +135,8 @@ export function Chat({ projectID, sessionID, title, connected, onCreate, report,
   useEffect(() => {
     if (role === 'user' && models[0]) setModel(`${models[0].providerID}/${models[0].id}`)
   }, [role, models])
-  const activeModel = role === 'user' ? models[0] : models.find(item => `${item.providerID}/${item.id}` === model)
+  const activeModel = projectID && connected && modelProject === projectID ? role === 'user' ? models[0] : models.find(item => `${item.providerID}/${item.id}` === model) : undefined
+  useEffect(() => { onModelChange?.(ready ? activeModel : undefined) }, [activeModel, onModelChange, connected, ready, projectID])
   useEffect(() => {
     if (!projectID || !sessionID || !connected) return
     let alive = true, loading = false, queued = false
@@ -260,7 +265,7 @@ export function Chat({ projectID, sessionID, title, connected, onCreate, report,
     {!connected && <div className="warning">Đang kết nối OpenCode. Có thể thử lại trong Cài đặt.</div>}
     {error && <div className="inline-error" role="status">{error}</div>}
     <div className="chat-pane__body">{menu && <div className="chat-corner-drawer is-open" role="menu"><button className="chat-drawer__row" role="menuitem" onClick={() => { onCreate(); setMenu(false) }}>Cuộc trò chuyện mới</button><button className="chat-drawer__row" role="menuitem" onClick={() => { void navigator.clipboard.writeText(messages.map(item => `${item.role}: ${item.text}`).join('\n\n')).catch(report); setMenu(false) }}>Copy conversation</button></div>}
-      <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? <Empty>Nhánh /btw chưa được backend cung cấp.</Empty> : <><button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Artifacts <span className="muted">Chưa có</span></button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
+      <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? projectID && sessionID ? <BtwPanel key={JSON.stringify([projectID, sessionID])} projectID={projectID} sessionID={sessionID} connected={connected} ready={ready} model={activeModel} onCreated={onCreated} onSelectSession={onSelectSession} onActivity={onActivity} /> : <Empty>Chọn một phiên để mở luồng phụ /btw.</Empty> : <>{drawer === 'artifacts' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={sessionID} /> : <Empty>Mở dự án để xem artifacts.</Empty>)}<button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Mở bảng Artifacts</button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
       <div ref={timeline} className="chat-stream" onScroll={e => { const el = e.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
         {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty> : messages.map(item => <article key={item.id} className={item.role === 'user' ? 'msg-user' : 'msg-agent'}>
           {item.kind === 'tool' && item.tool ? <ToolCard call={item.tool} onOpenFile={onOpenFile} /> : item.turn && projectID && sessionID ? <TurnChanges key={`${sessionID}:${item.id}`} projectID={projectID} sessionID={sessionID} from={item.turn.from} files={item.turn.files} theme={theme} /> : item.kind === 'tool' ? <details className="tool-card"><summary><Icon name="terminal" /> Công cụ</summary><pre>{item.text || 'Đang cập nhật công cụ…'}</pre></details> : item.kind === 'reasoning' ? <details className="thought-block"><summary>Suy nghĩ</summary><div className="thought-block__content"><MessageContent text={item.text || '…'} onOpenFile={onOpenFile} /></div></details> : <MessageContent text={item.text || '…'} onOpenFile={onOpenFile} />}
@@ -279,4 +284,105 @@ export function Chat({ projectID, sessionID, title, connected, onCreate, report,
     </div>
     </div>
   </main>
+}
+
+type BtwItem = { id: number; question: string; answer?: string; error?: string }
+type BtwState = { draft: string; items: BtwItem[]; pending: boolean; forking: boolean; error: string }
+type BtwThread = { state: BtwState; listeners: Set<() => void>; sequence: number }
+// Renderer-only storage survives Chat's project-keyed remounts, never persisting to OpenCode.
+const btwThreads = new Map<string, BtwThread>()
+function btwThread(projectID: string, sessionID: string): BtwThread {
+  const key = JSON.stringify([projectID, sessionID])
+  let thread = btwThreads.get(key)
+  if (!thread) {
+    thread = { state: { draft: '', items: [], pending: false, forking: false, error: '' }, listeners: new Set(), sequence: 0 }
+    btwThreads.set(key, thread)
+  }
+  return thread
+}
+function updateBtw(thread: BtwThread, update: (state: BtwState) => BtwState) {
+  thread.state = update(thread.state)
+  thread.listeners.forEach(listener => listener())
+}
+
+function BtwPanel({ projectID, sessionID, connected, ready, model, onCreated, onSelectSession, onActivity }: { projectID: string; sessionID: string; connected: boolean; ready: boolean; model?: Model; onCreated: (session: Session) => void; onSelectSession: (id: string) => void; onActivity: () => void }) {
+  const thread = btwThread(projectID, sessionID)
+  const state = useSyncExternalStore(listener => {
+    thread.listeners.add(listener)
+    return () => { thread.listeners.delete(listener) }
+  }, () => thread.state)
+  const mounted = useRef(false)
+  const composing = useRef(false)
+  const callbacks = useRef({ onCreated, onSelectSession, onActivity })
+  callbacks.current = { onCreated, onSelectSession, onActivity }
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+  const available = connected && ready && !!model && !state.pending && !state.forking
+  const ask = async () => {
+    const question = thread.state.draft.trim()
+    if (!connected || !ready || !model || thread.state.pending || thread.state.forking || composing.current || !question) return
+    if (question.length > 20000) { updateBtw(thread, current => ({ ...current, error: 'Câu hỏi không được vượt quá 20.000 ký tự.' })); return }
+    const id = ++thread.sequence
+    updateBtw(thread, current => ({ ...current, draft: '', pending: true, error: '', items: [...current.items, { id, question }] }))
+    try {
+      const result = await window.ame.btwAsk(projectID, sessionID, question, model)
+      updateBtw(thread, current => ({ ...current, items: current.items.map(item => item.id === id ? { ...item, answer: result.answer } : item) }))
+    } catch (e) {
+      updateBtw(thread, current => ({ ...current, draft: current.draft || question, items: current.items.map(item => item.id === id ? { ...item, error: errorText(e) } : item) }))
+    } finally { updateBtw(thread, current => ({ ...current, pending: false })) }
+  }
+  const fork = async () => {
+    if (!connected || !ready || !model || thread.state.pending || thread.state.forking) return
+    updateBtw(thread, current => ({ ...current, forking: true, error: '' }))
+    try {
+      const session = await window.ame.forkSession(projectID, sessionID)
+      // Never navigate the newly selected context when an old fork finishes late.
+      if (mounted.current) {
+        callbacks.current.onCreated(session)
+        callbacks.current.onSelectSession(session.id)
+        callbacks.current.onActivity()
+      }
+    } catch (e) { updateBtw(thread, current => ({ ...current, error: errorText(e) })) }
+    finally { updateBtw(thread, current => ({ ...current, forking: false })) }
+  }
+  return <section className="btw-panel" aria-label="Luồng phụ /btw">
+    <p className="muted">Hỏi nhanh mà không thêm vào lịch sử chat chính. Fork tách lịch sử chat chính, không gồm luồng phụ này.</p>
+    <div className="btw-panel__actions button-row">
+      <button type="button" disabled={state.pending || state.forking || (!state.items.length && !state.draft && !state.error)} onClick={() => updateBtw(thread, current => ({ ...current, draft: '', items: [], error: '' }))}>Xóa luồng phụ</button>
+      <button type="button" disabled={!available} onClick={() => void fork()}>{state.forking ? 'Đang tách…' : 'Tách thành chat mới (Fork)'}</button>
+    </div>
+    {state.error && <div className="inline-error" role="status">{state.error}</div>}
+    <div className="btw-panel__messages" aria-live="polite">
+      {!state.items.length && <Empty>Chưa có câu hỏi trong luồng phụ.</Empty>}
+      {state.items.map(item => <article className="btw-panel__turn" key={item.id}>
+        <div className="btw-panel__question"><strong>Bạn</strong><MessageContent text={item.question} /></div>
+        {item.answer !== undefined ? <div className="btw-panel__answer"><strong>Trợ lý</strong><MessageContent text={item.answer || 'Không có nội dung trả lời.'} /><BtwCopy text={item.answer} /></div> : item.error ? <div className="inline-error" role="status">{item.error}</div> : <p role="status">Đang trả lời…</p>}
+      </article>)}
+    </div>
+    <form className="btw-panel__form" onSubmit={event => { event.preventDefault(); void ask() }}>
+      <label htmlFor="btw-question">Câu hỏi /btw</label>
+      <textarea id="btw-question" aria-label="Câu hỏi /btw" placeholder="Hỏi trong luồng phụ…" rows={3} maxLength={20000} value={state.draft} disabled={!available} onChange={event => updateBtw(thread, current => ({ ...current, draft: event.target.value }))} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} onKeyDown={event => {
+        if (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
+        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void ask() }
+      }} />
+      <button type="submit" disabled={!available || !state.draft.trim()}>{state.pending ? 'Đang gửi…' : 'Gửi /btw'}</button>
+      {!connected ? <p role="status">Đang ngắt kết nối OpenCode.</p> : !ready || !model ? <p role="status">Đang chờ phiên và mô hình sẵn sàng.</p> : null}
+    </form>
+  </section>
+}
+
+function BtwCopy({ text }: { text: string }) {
+  const [feedback, setFeedback] = useState('')
+  const generation = useRef(0)
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  useEffect(() => () => { generation.current++; clearTimeout(timer.current) }, [])
+  const copy = async () => {
+    const current = ++generation.current
+    clearTimeout(timer.current)
+    let result = 'Đã sao chép'
+    try { await navigator.clipboard.writeText(text) } catch { result = 'Không thể sao chép' }
+    if (current !== generation.current) return
+    setFeedback(result)
+    timer.current = setTimeout(() => setFeedback(''), 1500)
+  }
+  return <button type="button" aria-label="Sao chép câu trả lời" onClick={() => void copy()}><span role="status">{feedback || 'Sao chép'}</span></button>
 }

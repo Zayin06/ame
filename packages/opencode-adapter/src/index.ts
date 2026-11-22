@@ -1,9 +1,9 @@
-import { OpenCode, type OpenCodeClient, type OpenCodeEvent, type SessionInfo, type SessionMessageInfo } from '@opencode/client'
+import { OpenCode, type ArtifactInfo, type OpenCodeClient, type OpenCodeEvent, type SessionInfo, type SessionMessageInfo } from '@opencode/client'
 import { Service } from '@opencode/client/service'
 import path from 'node:path'
 import { summarizeUsage, usageFamily, type UsageNode } from '../../amekit/src/usage'
 import type { UsagePrices } from '../../amekit/src/usage-pricing'
-import type { Agent, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
+import type { Agent, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
 
 export function localURL(value: string) {
   const url = new URL(value)
@@ -50,6 +50,23 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
       return { id, role: 'assistant', kind: 'tool', text: `${part.name} · ${part.state.status}`, tool }
     })
   })
+}
+function mapSession(s: SessionInfo): Session {
+  return {
+    id: s.id, title: s.title || 'Untitled', updatedAt: s.time?.updated, parentID: s.parentID, agent: s.agent,
+    status: s.time ? s.time.busy !== undefined && (s.time.idle === undefined || s.time.busy > s.time.idle) ? 'running' : 'idle' : undefined,
+    outcome: s.outcome,
+  }
+}
+function mapArtifact(info: ArtifactInfo): ArtifactSummary {
+  return {
+    id: info.id, provider: info.provider, sessionID: info.sessionID, title: info.title, entry: info.entry, url: info.url,
+    createdAt: info.time.created, updatedAt: info.time.updated,
+  }
+}
+function artifactID(value: string) {
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > 200) throw new Error('INVALID_ARTIFACT_ID')
+  return value.trim()
 }
 export class OpenCodeAdapter {
   private client?: OpenCodeClient
@@ -101,11 +118,7 @@ export class OpenCodeAdapter {
     let cursor: string | undefined
     do {
       const list = await this.api().session.list({ directory: this.directory(projectID), archived: false, limit: 100, cursor })
-      for (const s of list.data) sessions.set(s.id, {
-        id: s.id, title: s.title || 'Untitled', updatedAt: s.time?.updated, parentID: s.parentID, agent: s.agent,
-        status: s.time ? s.time.busy !== undefined && (s.time.idle === undefined || s.time.busy > s.time.idle) ? 'running' : 'idle' : undefined,
-        outcome: s.outcome,
-      })
+      for (const s of list.data) sessions.set(s.id, mapSession(s))
       cursor = list.cursor.next ?? undefined
       if (cursor && cursors.has(cursor)) throw new Error('SESSION_CURSOR_REPEATED')
       if (cursor) cursors.add(cursor)
@@ -115,6 +128,33 @@ export class OpenCodeAdapter {
   async createSession(projectID: string): Promise<Session> {
     const s = await this.api().session.create({ location: { directory: this.directory(projectID) } })
     return { id: s.id, title: s.title || 'New conversation', updatedAt: s.time.updated }
+  }
+  async forkSession(projectID: string, sessionID: string): Promise<Session> {
+    await this.owned(projectID, sessionID)
+    return mapSession(await this.api().session.fork({ sessionID }))
+  }
+  async btwAsk(projectID: string, sessionID: string, question: string, model?: Model): Promise<{ answer: string }> {
+    await this.owned(projectID, sessionID)
+    const trimmed = question.trim()
+    if (!trimmed || trimmed.length > 20000) throw new Error('INVALID_PROMPT')
+    if (model) await this.api().session.switchModel({ sessionID, model: { id: model.id, providerID: model.providerID } })
+    const result = await this.api().session.generate({ sessionID, prompt: trimmed }, { signal: AbortSignal.timeout(45_000) })
+    return { answer: result.text.trim() }
+  }
+  async artifacts(projectID: string, sessionID?: string): Promise<ArtifactSummary[]> {
+    const directory = this.directory(projectID)
+    if (sessionID !== undefined) await this.owned(projectID, sessionID)
+    const list = await this.api().experimental.artifacts.list({ location: { directory }, sessionID })
+    return list.data.map(mapArtifact)
+  }
+  async artifact(projectID: string, id: string): Promise<ArtifactDetail> {
+    const directory = this.directory(projectID)
+    const result = await this.api().experimental.artifacts.get({ artifactID: artifactID(id), location: { directory } })
+    return { info: mapArtifact(result.data.info), files: result.data.files }
+  }
+  async deleteArtifact(projectID: string, id: string): Promise<void> {
+    const directory = this.directory(projectID)
+    await this.api().experimental.artifacts.delete({ artifactID: artifactID(id), location: { directory } })
   }
   async renameSession(projectID: string, sessionID: string, title: string): Promise<void> {
     await this.owned(projectID, sessionID)
@@ -270,7 +310,7 @@ export class OpenCodeAdapter {
     const sessionID = 'data' in event && event.data && typeof event.data === 'object' && 'sessionID' in event.data ? String(event.data.sessionID) : undefined
     const directory = 'location' in event ? event.location?.directory : undefined
     for (const [projectID, root] of this.projects) {
-      if (!directory || path.resolve(directory) === path.resolve(root)) this.notify({ type: 'opencode', projectID, sessionID })
+      if (!directory || path.resolve(directory) === path.resolve(root)) this.notify(sessionID === undefined ? { type: 'opencode', projectID } : { type: 'opencode', projectID, sessionID })
     }
   }
   dispose() { this.stream?.abort(); this.client = undefined; this.credentials = undefined; this.live.clear() }
