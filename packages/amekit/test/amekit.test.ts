@@ -29,7 +29,7 @@ async function bundle(mode: "native" | "raw" = "native") {
   const release: Release = { releaseId: "ef2b4502-3b3f-4ac7-a223-81fdb4b77557", version: "1.2.3", channel: "stable", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"], publishedAt: 1, downloadUrl: "/ignored" }
   return { packed, release, latest: { release, revision: 1, activatedAt: 1 } }
 }
-async function fixture(settings: { role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number } = {}) {
+async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number } = {}) {
   const folder = await area(), project = path.join(folder, "project"), imported = path.join(folder, "source"), data = path.join(folder, "data")
   await mkdir(project); await mkdir(imported)
   for (const file of input()) { const target = path.join(imported, ...file.path.split("/")); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data) }
@@ -54,7 +54,7 @@ async function fixture(settings: { role?: unknown; plugin?: boolean; confirm?: b
     if (url.pathname.endsWith("/activate")) return Response.json(artifact.latest)
     if (url.pathname === "/v1/amekit/bundles/uploads") return Response.json({ uploadId: artifact.release.releaseId })
     if (url.pathname === "/v1/amekit/releases" && init?.method === "POST") return Response.json({ release: artifact.release })
-    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: "1", name: "Fixture", username: "fixture", role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog, registry: {} })
+    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: "1", name: "Fixture", username: "fixture", role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog: settings.catalog ?? catalog, registry: {} })
   }
   const dependencies: AmeKitDependencies = {
     fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs,
@@ -92,6 +92,45 @@ test("AmeKit account role views, fresh prompt authorization, encryption and logo
     await assert.rejects(readFile(path.join(f.data, "amekit-session.enc")), { code: "ENOENT" })
     assert.equal(f.rpc.at(-1), null)
     await assert.rejects(f.service.call("assert-model", { modelID: "default" }), /SIGNED_OUT/)
+  } finally { await f.cleanup() }
+})
+
+test("usage-prices is read-only, signed-out safe and exposes only validated pricing without credentials", async () => {
+  const price = { model_id: "catalog-default", upstream_model_id: "default", provider_route: "amecode", status: "priced",
+    price_kind: "catalog_estimate", currency: "USD", unit: "per_1m_tokens", source: { id: "catalog", source_model_id: "default" },
+    profiles: { standard: { base: { input: "1", output: "2" }, overrides: [] } }, revision: 1 }
+  const f = await fixture({ catalog: { ...catalog, token: "fixture-catalog-token", api_key: "fixture-catalog-key", models: [
+    { ...catalog.models[0], pricing: price, api_key: "fixture-model-key" },
+    { ...catalog.models[1], pricing: { ...price, upstream_model_id: "other", api_key: "fixture-price-key" } },
+  ] } })
+  const read = () => f.service.call("usage-prices", {}) as Promise<{ origin: string | null; prices: Record<string, unknown> }>
+  try {
+    const signedOut = await read()
+    assert.equal(signedOut.origin, null)
+    assert.deepEqual(Object.keys(signedOut.prices), [])
+    await login(f.service)
+    const requests = f.requests.length, policies = f.rpc.length
+    const stored = await readFile(path.join(f.data, "amekit-session.enc"))
+    f.breakStorage(); f.plugin(false); f.disable()
+    const result = await read()
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), { origin: "http://localhost:3211", prices: { default: price } })
+    assert.doesNotMatch(JSON.stringify(result), /fixture-.*(?:token|key|password)|api_key|authorization|credential/)
+    assert.equal(f.requests.length, requests, "no refresh or policy update")
+    assert.equal(f.rpc.length, policies)
+    assert.deepEqual(await readFile(path.join(f.data, "amekit-session.enc")), stored, "no credential persistence")
+    await f.service.call("logout", {})
+    const loggedOut = await read()
+    assert.equal(loggedOut.origin, null)
+    assert.deepEqual(Object.keys(loggedOut.prices), [])
+  } finally { await f.cleanup() }
+})
+
+test("usage-prices remains available when secure storage is unavailable", async () => {
+  const f = await fixture({ encryption: { ...encryption, isEncryptionAvailable: () => false } })
+  try {
+    const result = await f.service.call("usage-prices", {}) as { origin: string | null; prices: Record<string, unknown> }
+    assert.equal(result.origin, null)
+    assert.deepEqual(Object.keys(result.prices), [])
   } finally { await f.cleanup() }
 })
 

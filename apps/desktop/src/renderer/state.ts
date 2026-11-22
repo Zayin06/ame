@@ -27,7 +27,7 @@ export function removeTab(view: ProjectView, tab: Tab): ProjectView {
 }
 export type Preferences = {
   theme: 'dark' | 'light'; widths: Record<Pane, number>; rail: boolean; inspector: boolean; stage: boolean;
-  terminalOpen: boolean; inspectorTab: 'files' | 'search' | 'git'; panel: 'artifact' | 'files' | 'diff' | 'changes' | 'terminal' | 'subagents' | 'btw';
+  terminalOpen: boolean; inspectorTab: 'files' | 'search' | 'git'; panel: 'artifact' | 'files' | 'diff' | 'changes' | 'usage' | 'terminal' | 'subagents' | 'btw';
   layoutMode: 'swe' | 'knowledge'; tint: 'default' | 'nord' | 'everforest'; chatWidth: 640 | 760 | 960;
   project?: string; projects: Record<string, ProjectView>
 }
@@ -48,7 +48,7 @@ export function parsePreferences(raw: string | null): Preferences {
     }
     if (typeof value.terminalOpen === 'boolean') result.terminalOpen = value.terminalOpen
     if (value.inspectorTab === 'git' || value.inspectorTab === 'search') result.inspectorTab = value.inspectorTab
-    if (['artifact', 'files', 'diff', 'changes'].includes(value.panel)) result.panel = value.panel
+    if (['artifact', 'files', 'diff', 'changes', 'usage'].includes(value.panel)) result.panel = value.panel
     else if (value.panel === 'terminal') result.terminalOpen = true
     else if (value.inspectorTab === 'git') result.panel = 'diff'
     if (value.layoutMode === 'knowledge') result.layoutMode = 'knowledge'

@@ -10,6 +10,8 @@ import type { DesktopApi } from '../packages/protocol/src/index'
 
 type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
+  { method: 'listFiles', args: ['p'] },
+  { method: 'sessionUsage', args: ['p', 's'] },
   { method: 'createFile', args: ['p', 'new.txt', 'hello'] },
   { method: 'createDirectory', args: ['p', 'folder'] },
   { method: 'renamePath', args: ['p', 'old.txt', 'new.txt'] },
@@ -48,10 +50,11 @@ async function harness(directory = 'workspace') {
   workspace.get = (id: unknown) => { if (id !== 'p') throw new Error('UNKNOWN_PROJECT'); return { directory } }
   let models = [{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }]
   let summary = { diff: '+change', files: ['new.txt'], truncated: false }
+  let pricing = { origin: 'https://usage.example', prices: { model: { revision: 1 } } }
   let policyError = ''
   let policyGate: Promise<void> | undefined
   workspace.stagedDiffSummary = async (...args: unknown[]) => { calls.push({ method: 'stagedDiffSummary', args }); return summary }
-  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage'].map(method => [method, async (...args: unknown[]) => {
+  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args }); return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
   }]))
   adapter.models = async (...args: unknown[]) => { calls.push({ method: 'models', args }); return models }
@@ -59,6 +62,7 @@ async function harness(directory = 'workspace') {
     calls.push({ method: 'account', args })
     if (policyGate) await policyGate
     if (policyError) throw new Error(policyError)
+    if (args[0] === 'usage-prices') return pricing
   } }
   const parent = {}
   const context = {
@@ -79,7 +83,7 @@ async function harness(directory = 'workspace') {
   }
   const dispatch = runInNewContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\ndispatch', context) as (method: string, args: unknown[]) => Promise<unknown>
   return {
-    dispatch, calls, messages, result,
+    dispatch, calls, messages, result, setPricing: (value: typeof pricing) => { pricing = value },
     setModels: (value: typeof models) => { models = value }, setSummary: (value: typeof summary) => { summary = value },
     failPolicy: (value: string) => { policyError = value }, gatePolicy: (value: Promise<void>) => { policyGate = value },
     cancel: () => { response = 0 }, approve: () => { response = 1 }, empty: () => { preview = { filesChanged: 0, replacements: 0, previews: [] } }
@@ -111,6 +115,7 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
     ...['', '   ', 'bad\0title', 'a'.repeat(501), 42].map(title => ({ method: 'renameSession', args: ['p', 's', title] })),
     { method: 'archiveSession', args: ['p', 's', 'true'] },
     { method: 'deleteSession', args: ['p', ''] },
+    ...[undefined, '', 42, null, 'x'.repeat(513)].map(session => ({ method: 'sessionUsage', args: ['p', session] })),
     ...[{}, { id: 'model', name: 'Model' }, { id: 'model', name: 'Model', providerID: 1 }, { id: 'model', name: 'Model', providerID: 'amecode', extra: true }].map(model => ({ method: 'generateCommitMessage', args: ['p', model] }))
   ]
   const invalidQueries = [
@@ -133,7 +138,7 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
 
 test('new IPC dispatch preserves arguments and optional defaults without stage or dry-run dialogs', async () => {
   const { dispatch, calls, messages } = await harness()
-  for (const { method, args } of examples.filter(({ method }) => !['deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage'].includes(method))) {
+  for (const { method, args } of examples.filter(({ method }) => !['deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage', 'sessionUsage'].includes(method))) {
     calls.length = 0
     const result = await dispatch(method, args)
     assert.deepEqual(plain(calls), [{ method, args }])
@@ -149,6 +154,26 @@ test('new IPC dispatch preserves arguments and optional defaults without stage o
     assert.deepEqual(calls[0].args.slice(0, args.length), args)
   }
   assert.deepEqual(messages, [])
+})
+
+test('sessionUsage dispatch passes safe prices and falls back without policy authorization or confirmation', async () => {
+  const h = await harness()
+  const pricing = { origin: 'https://usage.example', prices: { model: { revision: 7 } } }
+  h.setPricing(pricing)
+  assert.equal(await h.dispatch('sessionUsage', ['p', 's']), 'sessionUsage')
+  assert.deepEqual(plain(h.calls), [
+    { method: 'account', args: ['usage-prices', {}] },
+    { method: 'sessionUsage', args: ['p', 's', pricing.prices, pricing.origin] }
+  ])
+  for (const error of ['SIGNED_OUT', 'OPERATION_BUSY', 'NETWORK_ERROR', 'UNKNOWN_OPERATION']) {
+    h.calls.length = 0; h.failPolicy(error)
+    assert.equal(await h.dispatch('sessionUsage', ['p', 's']), 'sessionUsage')
+    assert.deepEqual(plain(h.calls), [
+      { method: 'account', args: ['usage-prices', {}] },
+      { method: 'sessionUsage', args: ['p', 's', {}, null] }
+    ])
+  }
+  assert.deepEqual(h.messages, [])
 })
 
 test('delete and discard require approval before mutation and propagate cancellation', async () => {

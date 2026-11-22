@@ -11,6 +11,7 @@ import { Terminals } from '../../../../packages/ide-core/src/terminal'
 import { OpenCodeAdapter } from '../../../../packages/opencode-adapter/src/index'
 import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtime'
 import { createAmeKit } from '../../../../packages/amekit/src/index'
+import type { UsagePrices } from '../../../../packages/amekit/src/usage-pricing'
 import type { IdeEvent } from '../../../../packages/protocol/src/index'
 
 if (!app.isPackaged && process.env.AME_IDE_TEST_DATA) app.setPath('userData', path.resolve(process.env.AME_IDE_TEST_DATA))
@@ -78,6 +79,7 @@ const schema = {
   terminalSnapshot: z.tuple([id, id]), terminalWrite: z.tuple([id, id, z.string().max(65536)]),
   terminalResize: z.tuple([id, id, z.number().int().min(2).max(500), z.number().int().min(1).max(300)]), terminalClose: z.tuple([id, id]),
   projects: z.tuple([]), pickProject: z.tuple([]), removeProject: z.tuple([id]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
+  listFiles: z.tuple([id]), sessionUsage: z.tuple([id, id]),
   save: z.tuple([id, relative, z.string().max(4 * 1024 * 1024), z.string().regex(/^[a-f0-9]{64}$/)]),
   createFile: z.tuple([id, workspacePath, content.optional()]), createDirectory: z.tuple([id, workspacePath]),
   renamePath: z.tuple([id, workspacePath, workspacePath]), deletePath: z.tuple([id, workspacePath]),
@@ -131,6 +133,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       return
     }
     case 'entries': return workspace.entries(a, b)
+    case 'listFiles': return workspace.listFiles(a)
     case 'read': return workspace.read(a, b)
     case 'save': return workspace.save(a, b, c, d)
     case 'git': return workspace.status(a)
@@ -202,6 +205,10 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     }
     case 'messages': return adapter.messages(a, b)
     case 'sessionDiff': return adapter.sessionDiff(a, b, c)
+    case 'sessionUsage': {
+      const pricing = await account.call('usage-prices', {}).catch(() => ({ origin: null, prices: {} })) as { origin: string | null; prices: UsagePrices }
+      return adapter.sessionUsage(a, b, pricing.prices, pricing.origin)
+    }
     case 'models': return adapter.models(a)
     case 'agents': return adapter.agents(a)
     case 'prompt': {

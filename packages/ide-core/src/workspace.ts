@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, watch, type FSWatcher } from 'node:fs'
-import { readFile, readdir, realpath, stat, writeFile, mkdir } from 'node:fs/promises'
+import { readFile, readdir, realpath, stat, lstat, writeFile, mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { simpleGit } from 'simple-git'
 import type { Project, FileDocument, FileEntry, GitState, GitBranches, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
@@ -68,6 +68,35 @@ export class Workspaces {
     const target = await this.resolve(id, relative)
     const entries = await readdir(target, { withFileTypes: true })
     return entries.filter(e => e.name !== '.git' && e.name !== 'node_modules' && !e.isSymbolicLink()).map(e => ({ path: path.join(relative, e.name).split(path.sep).join('/'), name: e.name, directory: e.isDirectory() })).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name))
+  }
+  async listFiles(id: string): Promise<string[]> {
+    const root = this.get(id).directory
+    const ignored = new Set(['.git', 'node_modules', 'dist', 'out', '.next'])
+    const files: string[] = [], pending = [root]
+    while (pending.length && files.length < 20000) {
+      const directory = pending.pop()!
+      try {
+        if ((await lstat(directory)).isSymbolicLink()) continue
+        const actual = await realpath(directory)
+        this.inside(root, actual)
+        const entries = (await readdir(actual, { withFileTypes: true }))
+          .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+        const directories: string[] = []
+        for (const entry of entries) {
+          if (ignored.has(entry.name.toLowerCase()) || entry.isSymbolicLink()) continue
+          const target = path.join(actual, entry.name)
+          if (entry.isDirectory()) directories.push(target)
+          else if (entry.isFile()) {
+            files.push(path.relative(root, target).split(path.sep).join('/'))
+            if (files.length === 20000) break
+          }
+        }
+        pending.push(...directories.reverse())
+      } catch (error) {
+        if (!['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
+      }
+    }
+    return files.sort()
   }
   async read(id: string, relative: string): Promise<FileDocument> {
     const target = await this.resolve(id, relative)

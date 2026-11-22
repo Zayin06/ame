@@ -78,6 +78,25 @@ test('rejects escapes, Git metadata, alternate streams, binary and oversized fil
   await assert.rejects(workspaces.read(project.id, path.join('escape', 'outside.txt')), /PATH_OUTSIDE_WORKSPACE/)
   assert.ok(!(await workspaces.entries(project.id)).some(e => e.name === '.git' || e.name === 'escape'))
 })
+test('listFiles returns deterministic POSIX paths and skips generated directories, metadata and links', async t => {
+  const { root, directory, workspaces, project } = await fixture(t)
+  for (const folder of ['src/nested', '.git', 'node_modules', 'dist', 'out', '.next', 'src/node_modules']) {
+    await mkdir(path.join(directory, folder), { recursive: true })
+    await writeFile(path.join(directory, folder, 'file.ts'), 'fixture')
+  }
+  await writeFile(path.join(directory, 'z.txt'), '')
+  await writeFile(path.join(directory, 'a.txt'), '')
+  await mkdir(path.join(root, 'outside'))
+  await writeFile(path.join(root, 'outside', 'secret.txt'), 'outside')
+  await symlink(path.join(root, 'outside'), path.join(directory, 'escape'), process.platform === 'win32' ? 'junction' : 'dir')
+  await symlink(path.join(directory, 'src'), path.join(directory, 'alias'), process.platform === 'win32' ? 'junction' : 'dir')
+  if (process.platform !== 'win32') await symlink(path.join(root, 'outside', 'secret.txt'), path.join(directory, 'secret.txt'))
+  const expected = ['a.txt', 'src/nested/file.ts', 'z.txt']
+  assert.deepEqual(await workspaces.listFiles(project.id), expected)
+  assert.deepEqual(await workspaces.listFiles(project.id), expected)
+  await assert.rejects(workspaces.listFiles('missing'), /UNKNOWN_PROJECT/)
+})
+
 test('removeProject IPC validates its tuple, requires native confirmation and propagates cancellation or persistence failure', async () => {
   const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'main', 'index.ts'), 'utf8')
   const start = source.indexOf('const text ='), end = source.indexOf('let authority:')

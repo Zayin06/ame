@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { OpenCodeAdapter, localURL, normalizeMessages } from '../packages/opencode-adapter/src/index'
 import type { IdeEvent } from '../packages/protocol/src/index'
-import type { SessionMessageInfo } from '@opencode/client'
+import type { SessionInfo, SessionMessageInfo } from '@opencode/client'
+import { aggregateUsageTree, emptyTokens } from '../packages/amekit/src/usage'
+import type { UsagePrices } from '../packages/amekit/src/usage-pricing'
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 const waitFor = async (check: () => boolean) => { for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)) }; throw new Error('TIMED_OUT') }
@@ -344,6 +346,113 @@ test('commit generation sends staged context and selected model, strips fences, 
     assert.deepEqual(await adapter.generateCommitMessage({ diff: '', files: [], truncated: false }, model), { message: 'fix: keep plain messages', truncated: false })
     for (output of ['  \n ', '```\n\n```', '```text\n```']) await assert.rejects(adapter.generateCommitMessage({ diff: '', files: [], truncated: false }, model), /EMPTY_COMMIT_MESSAGE/)
   } finally { adapter.dispose() }
+})
+
+const usageSession = (id: string, parentID?: string): SessionInfo => ({
+  id, parentID, projectID: 'p', title: id, location: { directory: process.cwd() },
+  time: { created: 0, updated: 1 }, cost: 999, tokens: emptyTokens(),
+})
+const usageMessage = (id: string): SessionMessageInfo => ({
+  id, type: 'assistant', agent: 'coder', model: { id: 'model', providerID: 'amecode' }, content: [],
+  tokens: { ...emptyTokens(), input: 100, output: 20 }, time: { created: 0, completed: 10 },
+})
+async function usageHarness(sessions: SessionInfo[], histories: Record<string, { data: SessionMessageInfo[]; cursor: { next?: string } }> = {}) {
+  const lists: URL[] = [], messages: { url: URL; init: RequestInit }[] = []
+  let active = 0, peak = 0, repeated = false
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) {
+      init.signal?.addEventListener('abort', () => c.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session') {
+      lists.push(url)
+      const offset = Number(url.searchParams.get('cursor') || 0)
+      return json({ data: sessions.slice(offset, offset + 100), cursor: {
+        next: repeated ? '100' : offset + 100 < sessions.length ? String(offset + 100) : null,
+      } })
+    }
+    const match = /^\/api\/session\/([^/]+)(\/message)?$/.exec(url.pathname)
+    if (match?.[2]) {
+      messages.push({ url, init }); active++; peak = Math.max(peak, active)
+      await new Promise(resolve => setImmediate(resolve))
+      active--
+      return json(histories[match[1]] ?? { data: [], cursor: {} })
+    }
+    if (match) return json({ data: match[1] === 'foreign' ? {
+      ...usageSession('foreign'), location: { directory: process.cwd() + '-other' },
+    } : sessions.find(session => session.id === match[1]) ?? usageSession(match[1]) })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', process.cwd())
+  await adapter.connect('http://localhost:4096')
+  return { adapter, lists, messages, peak: () => peak, repeat: () => { repeated = true } }
+}
+
+test('sessionUsage paginates a four-level subagent family, reverses history and preserves pricing and partial flags', async t => {
+  const sessions = [usageSession('L0'), usageSession('L1', 'L0'),
+    ...Array.from({ length: 99 }, (_, index) => usageSession(`unrelated-${index}`)),
+    usageSession('L2', 'L1'), usageSession('L3', 'L2')]
+  sessions[1].fork = { sessionID: 'L0', boundary: { type: 'through', messageID: 'boundary' } }
+  const prices: UsagePrices = { model: {
+    model_id: 'catalog-model', upstream_model_id: 'model', provider_route: 'amecode', status: 'priced',
+    price_kind: 'catalog_estimate', currency: 'USD', unit: 'per_1m_tokens', source: { id: 'catalog', source_model_id: 'model' },
+    profiles: { standard: { base: { input: '1', output: '2' }, overrides: [] } }, revision: 1,
+  } }
+  const h = await usageHarness(sessions, {
+    L0: { data: [usageMessage('root')], cursor: {} },
+    L1: { data: [usageMessage('own'), usageMessage('boundary'), usageMessage('inherited')], cursor: { next: 'older' } },
+    L2: { data: [usageMessage('child')], cursor: {} },
+    L3: { data: [usageMessage('grandchild')], cursor: {} },
+  })
+  t.after(() => h.adapter.dispose())
+  const result = await h.adapter.sessionUsage('p', 'L0', prices, 'https://usage.example')
+  assert.equal(result.origin, 'https://usage.example')
+  assert.equal(result.limited, false)
+  assert.deepEqual(result.nodes.map(node => [node.id, node.depth, node.parentID]), [
+    ['L0', 0, undefined], ['L1', 1, 'L0'], ['L2', 2, 'L1'], ['L3', 3, 'L2'],
+  ])
+  assert.deepEqual(h.lists.map(url => url.searchParams.get('cursor')), [null, '100'])
+  for (const url of h.lists) {
+    assert.equal(url.searchParams.get('directory'), process.cwd())
+    assert.equal(url.searchParams.get('archived'), 'false')
+    assert.equal(url.searchParams.get('limit'), '100')
+  }
+  for (const { url, init } of h.messages) {
+    assert.equal(url.searchParams.get('limit'), '200')
+    assert.equal(url.searchParams.get('order'), 'desc')
+    assert.ok(init.signal instanceof AbortSignal)
+  }
+  assert.equal(h.messages.length, 4, 'history is bounded to one page per family node')
+  assert.equal(result.nodes[0].partial, false)
+  assert.equal(result.nodes[1].partial, true)
+  assert.equal(result.nodes[1].groups[0].requests, 1, 'fork excludes inherited messages after chronological reversal')
+  const total = aggregateUsageTree(result.nodes)
+  assert.equal(total.tokens.input, 400)
+  assert.equal(total.tokens.output, 80)
+  assert.equal(total.priced, 4)
+  assert.ok(Math.abs(total.knownCost - 0.00056) < 1e-12, 'uses safe prices rather than reported legacy cost')
+  h.messages.length = 0; h.lists.length = 0
+  await assert.rejects(h.adapter.sessionUsage('p', 'foreign', prices, null), /SESSION_PROJECT_MISMATCH/)
+  assert.equal(h.messages.length, 0)
+  assert.equal(h.lists.length, 0, 'ownership is checked before listing any history')
+  h.repeat()
+  await assert.rejects(h.adapter.sessionUsage('p', 'L0', prices, null), /SESSION_CURSOR_REPEATED/)
+  assert.equal(h.messages.length, 0)
+})
+
+test('sessionUsage limits large families to 200 ordered nodes with at most six concurrent histories', async t => {
+  const sessions = [usageSession('root'), ...Array.from({ length: 204 }, (_, index) => usageSession(`child-${index}`, 'root'))]
+  const h = await usageHarness(sessions)
+  t.after(() => h.adapter.dispose())
+  const result = await h.adapter.sessionUsage('p', 'root', {}, null)
+  assert.equal(result.origin, null)
+  assert.equal(result.limited, true)
+  assert.equal(result.nodes.length, 200)
+  assert.deepEqual(result.nodes.map(node => node.id), sessions.slice(0, 200).map(session => session.id))
+  assert.equal(h.lists.length, 3, 'all session pages are read before limiting the family')
+  assert.equal(h.messages.length, 200)
+  assert.equal(h.peak(), 6)
 })
 
 test('session pagination preserves nested activity and rejects repeated cursors', async () => {

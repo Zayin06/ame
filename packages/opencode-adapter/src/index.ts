@@ -1,6 +1,8 @@
-import { OpenCode, type OpenCodeClient, type OpenCodeEvent, type SessionMessageInfo } from '@opencode/client'
+import { OpenCode, type OpenCodeClient, type OpenCodeEvent, type SessionInfo, type SessionMessageInfo } from '@opencode/client'
 import { Service } from '@opencode/client/service'
 import path from 'node:path'
+import { summarizeUsage, usageFamily, type UsageNode } from '../../amekit/src/usage'
+import type { UsagePrices } from '../../amekit/src/usage-pricing'
 import type { Agent, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
 
 export function localURL(value: string) {
@@ -160,6 +162,32 @@ export class OpenCodeAdapter {
       if (index >= 0) { if (!items[index].tool && item.text.length >= items[index].text.length) items[index] = item } else items.push(item)
     }
     return items
+  }
+  async sessionUsage(projectID: string, sessionID: string, prices: UsagePrices, origin: string | null): Promise<{ origin: string | null; nodes: UsageNode[]; limited: boolean }> {
+    await this.owned(projectID, sessionID)
+    const sessions = new Map<string, SessionInfo>()
+    const cursors = new Set<string>()
+    let cursor: string | undefined
+    do {
+      const list = await this.api().session.list({ directory: this.directory(projectID), archived: false, limit: 100, cursor })
+      for (const session of list.data) sessions.set(session.id, session)
+      cursor = list.cursor.next ?? undefined
+      if (cursor && cursors.has(cursor)) throw new Error('SESSION_CURSOR_REPEATED')
+      if (cursor) cursors.add(cursor)
+    } while (cursor)
+    const family = usageFamily([...sessions.values()], sessionID)
+    const limited = family.length > 200
+    const selected = family.slice(0, 200)
+    const nodes: UsageNode[] = new Array(selected.length)
+    let next = 0
+    await Promise.all(Array.from({ length: Math.min(6, selected.length) }, async () => {
+      while (next < selected.length) {
+        const index = next++, node = selected[index]
+        const list = await this.api().message.list({ sessionID: node.id, limit: 200, order: 'desc' }, { signal: AbortSignal.timeout(15_000) })
+        nodes[index] = summarizeUsage({ id: node.id, depth: node.depth, info: node.info, messages: [...list.data].reverse(), prices, historyComplete: !list.cursor.next })
+      }
+    }))
+    return { origin, nodes, limited }
   }
   async sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]> {
     await this.owned(projectID, sessionID)

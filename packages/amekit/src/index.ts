@@ -6,6 +6,7 @@ import { pack, type Preview } from "./bundle/package"
 import { scan } from "./bundle/scan"
 import * as installer from "./installer"
 import { runtimeDiscovery, type Discover } from "./runtime"
+import { readUsagePrices } from "./usage-pricing"
 
 export type AmeKitOptions = {
   userData: string
@@ -115,6 +116,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     if (disposed) throw new Error("AMEKIT_DISPOSED")
     if (!payload || typeof payload !== "object" || Array.isArray(payload) || Object.values(payload).some(value => typeof value !== "string")) throw new Error("INVALID_PAYLOAD")
     if (operation === "status") return { ...viewOrEmpty(), ...(storageError ? { ready: false, blocker: storageError } : {}) }
+    if (operation === "usage-prices") return { origin: api?.account ? api.origin : null, prices: readUsagePrices(api?.provider?.catalog) }
     if (operation === "logout") {
       api?.suspend(); resetImport(); await revoke()
       try { if (!vault) throw new Error(); await vault.save(undefined); storageError = undefined }
@@ -204,7 +206,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       let result: unknown, failure: unknown
       try { result = await execute(operation, payload) }
       catch (error) { failure = error }
-      if (!["status", "installed", "offline", "uninstall", "logout"].includes(operation)) {
+      if (!["status", "usage-prices", "installed", "offline", "uninstall", "logout"].includes(operation)) {
         if (failure && (["login", "refresh", "assert-ready", "assert-model"].includes(operation) || !api?.account)) {
           api?.suspend(); resetImport(); blocker = code(failure); await revoke()
         } else if (!["login", "refresh", "assert-ready", "assert-model"].includes(operation)) {

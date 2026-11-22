@@ -21,6 +21,11 @@ export type SearchResponse = { results: SearchFileResult[]; totalMatches: number
 export type ReplaceOptions = SearchQuery & { replacement: string; files?: string[]; dryRun?: boolean }
 export type ReplaceResult = { filesChanged: number; replacements: number; previews: { path: string; count: number; sampleBefore: string; sampleAfter: string }[] }
 export type Session = { id: string; title: string; updatedAt?: number; parentID?: string; agent?: string; status?: 'running' | 'idle'; outcome?: 'succeeded' | 'failed' | 'interrupted' }
+export type SessionUsageView = {
+  origin: string | null
+  nodes: import('../../amekit/src/usage').UsageNode[]
+  limited: boolean
+}
 export type SessionDiff = { file: string; patch: string; additions: number; deletions: number; status: 'added' | 'deleted' | 'modified'; more?: true }
 export type ToolCallInfo = {
   name: string
@@ -59,6 +64,7 @@ export interface DesktopApi {
   pickProject(): Promise<Project | null>
   removeProject(projectID: string): Promise<void>
   entries(projectID: string, relative: string): Promise<FileEntry[]>
+  listFiles(projectID: string): Promise<string[]>
   read(projectID: string, relative: string): Promise<FileDocument>
   save(projectID: string, relative: string, content: string, revision: string): Promise<FileDocument>
   createFile(projectID: string, relative: string, content?: string): Promise<{ path: string }>
@@ -95,6 +101,7 @@ export interface DesktopApi {
   generateCommitMessage(projectID: string, model?: Model): Promise<{ message: string; truncated: boolean }>
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
+  sessionUsage(projectID: string, sessionID: string): Promise<SessionUsageView>
   models(projectID: string): Promise<Model[]>
   agents(projectID: string): Promise<Agent[]>
   prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string): Promise<void>
