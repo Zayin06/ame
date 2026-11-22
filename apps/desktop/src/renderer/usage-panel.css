@@ -1,4 +1,5 @@
 .usage-panel {
+  container-type: inline-size;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -66,3 +67,6 @@
 .usage-panel footer { font-size: 11px; }
 @media (max-width: 1000px) { .usage-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 480px) { .usage-kpis { grid-template-columns: minmax(0, 1fr); } .usage-panel { padding: 10px; } }
+@container (min-width: 621px) { .usage-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@container (max-width: 620px) { .usage-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@container (max-width: 320px) { .usage-kpis { grid-template-columns: minmax(0, 1fr); } }

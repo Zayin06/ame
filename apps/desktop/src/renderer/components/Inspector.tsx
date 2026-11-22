@@ -90,8 +90,9 @@ function Explorer({ projectID, name, generation, onOpen, onRename, onDelete, bus
     }
   }
   return <div data-testid="explorer">
-    <div className="insp-folder-label"><Icon name="down" /><span className="truncate">{name}</span></div>
-    <div className="insp-explorer-toolbar" role="group" aria-label="Explorer actions"><button title="New File ở thư mục gốc" aria-label="New File" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'file', parent: '' }) }}>+ File</button><button title="New Folder ở thư mục gốc" aria-label="New Folder" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'directory', parent: '' }) }}>+ Folder</button></div>
+    <div className="insp-folder-label"><Icon name="down" /><span className="truncate" title={name}>{name}</span>
+      <div className="insp-explorer-toolbar" role="group" aria-label="Explorer actions"><button title="New File ở thư mục gốc" aria-label="New File" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'file', parent: '' }) }}>+ File</button><button title="New Folder ở thư mục gốc" aria-label="New Folder" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'directory', parent: '' }) }}>+ Folder</button></div>
+    </div>
     {naming && naming.kind !== 'rename' && !naming.parent && <InlineName key={naming.kind} label={naming.kind === 'file' ? 'Tên tệp mới' : 'Tên thư mục mới'} busy={busy} submit={submitName} cancel={() => setNaming(null)} />}
     <Directory projectID={projectID} path="" generation={generation} onOpen={onOpen} busy={busy} naming={naming} startNaming={setNaming} submitName={submitName} menu={menu} setMenu={setMenu} mutate={mutate} onDelete={onDelete} />
   </div>

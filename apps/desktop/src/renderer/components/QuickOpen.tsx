@@ -17,7 +17,7 @@ export type QuickOpenProps = {
 
 function HighlightedPath({ item }: { item: QuickOpenItem }) {
   const matched = new Set(item.indices)
-  return <>{item.path.split('').map((character, index) => matched.has(index) ? <mark key={index}>{character}</mark> : <span key={index}>{character}</span>)}</>
+  return <>{item.path.split('').map((character, index) => matched.has(index) ? <mark className="quick-open__mark" key={index}>{character}</mark> : <span key={index}>{character}</span>)}</>
 }
 
 function QuickOpenDialog({ mode, files, recentPaths, activeFile, activeLineCount, loading, onSelectFile, onGoToLine, onClose }: QuickOpenProps) {
@@ -51,8 +51,8 @@ function QuickOpenDialog({ mode, files, recentPaths, activeFile, activeLineCount
   }
 
   return <Modal title={title} close={onClose}>
-    <div className="quick-open" style={{ display: 'grid', gap: 8 }}>
-      <input ref={inputRef} type="text" role="combobox" aria-label={title} aria-autocomplete={lineMode ? 'none' : 'list'} aria-expanded={!lineMode} aria-controls={lineMode ? undefined : `${id}-list`} aria-activedescendant={!lineMode && !loading && items[index] ? `${id}-option-${index}` : undefined} aria-describedby={`${id}-status`} autoComplete="off" spellCheck={false}
+    <div className="quick-open">
+      <input className="quick-open__input" ref={inputRef} type="text" role="combobox" aria-label={title} aria-autocomplete={lineMode ? 'none' : 'list'} aria-expanded={!lineMode} aria-controls={lineMode ? undefined : `${id}-list`} aria-activedescendant={!lineMode && !loading && items[index] ? `${id}-option-${index}` : undefined} aria-describedby={`${id}-status`} autoComplete="off" spellCheck={false}
         placeholder={mode === 'line' ? ':dòng:cột' : 'Tìm tệp hoặc :dòng:cột'} value={input}
         onChange={event => { setInput(event.target.value); setSelected(0) }}
         onKeyDown={event => {
@@ -63,17 +63,17 @@ function QuickOpenDialog({ mode, files, recentPaths, activeFile, activeLineCount
             if (items.length) setSelected((index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length)
           }
         }} />
-      <div id={`${id}-status`} role="status" aria-live="polite">
+      <div className="quick-open__status" id={`${id}-status`} role="status" aria-live="polite">
         {lineMode ? <>{activeFile && <span>{activeFile}: </span>}{parsed.mode !== 'line' ? 'Nhập số dòng lớn hơn 0.' : overflow ? `Tệp có ${activeLineCount} dòng; sẽ chuyển đến dòng cuối.` : `Dòng ${parsed.line}${parsed.column === undefined ? '' : `, cột ${parsed.column}`}`}</> : loading ? 'Đang tải danh sách tệp…' : `${items.length} kết quả`}
       </div>
-      {!lineMode && <ul ref={optionsRef} id={`${id}-list`} role="listbox" aria-label="Tệp" aria-busy={loading || false} style={{ listStyle: 'none', margin: 0, padding: 0, maxHeight: '50vh', overflowY: 'auto' }}>
-        {!loading && items.map((item, itemIndex) => <li key={item.path} id={`${id}-option-${itemIndex}`} role="option" aria-selected={itemIndex === index} className={itemIndex === index ? 'is-active' : ''}
-          style={{ padding: '8px 12px', cursor: 'pointer', background: itemIndex === index ? 'var(--surface-hover, rgba(128,128,128,.18))' : undefined }}
+      {!lineMode && <ul className="quick-open__list" ref={optionsRef} id={`${id}-list`} role="listbox" aria-label="Tệp" aria-busy={loading || false}>
+        {!loading && items.map((item, itemIndex) => <li key={item.path} id={`${id}-option-${itemIndex}`} role="option" aria-selected={itemIndex === index} className={`quick-open__option ${itemIndex === index ? 'is-active' : ''}`}
           onMouseDown={event => event.preventDefault()} onMouseEnter={() => setSelected(itemIndex)} onClick={() => selectFile(item)}>
-          <HighlightedPath item={item} /> {item.recent && <small>(đang mở)</small>}
+          <span className="quick-open__path"><HighlightedPath item={item} /></span> {item.recent && <small className="quick-open__badge">(đang mở)</small>}
         </li>)}
       </ul>}
-      {!lineMode && !loading && !items.length && <p>Không tìm thấy tệp.</p>}
+      {!lineMode && !loading && !items.length && <p className="quick-open__empty">Không tìm thấy tệp.</p>}
+      <footer className="quick-open__hints">↑↓ di chuyển · Enter mở · Esc đóng</footer>
     </div>
   </Modal>
 }

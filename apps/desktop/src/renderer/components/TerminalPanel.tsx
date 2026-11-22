@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -79,12 +79,19 @@ function Shell({ terminal, theme, instance }: { terminal: TerminalInfo; theme: s
   return <><div ref={container} className="terminal-surface" data-terminal-id={terminal.id} />{error && <div className="terminal-error" role="alert">{error}</div>}</>
 }
 
-export function TerminalPanel({ projectID, theme, visible, close, createdTerminal, activeTab, onSelectTab, problemsProps, debugProps, problemCounts = { error: 0, warning: 0 }, debugStatus = 'idle' }: {
+export function TerminalPanel({ projectID, theme, visible, close, createdTerminal, height, onHeightChange, activeTab, onSelectTab, problemsProps, debugProps, problemCounts = { error: 0, warning: 0 }, debugStatus = 'idle' }: {
   projectID?: string; theme: string; visible: boolean; close: () => void; createdTerminal?: TerminalInfo;
+  height?: number; onHeightChange?: (height: number) => void;
   activeTab?: BottomPanelTab; onSelectTab?: (tab: BottomPanelTab) => void;
   problemsProps?: ProblemsPanelProps; debugProps?: DebugPanelProps;
   problemCounts?: { error: number; warning: number }; debugStatus?: DebugStatus
 }) {
+  const [localHeight, setLocalHeight] = useState(185)
+  const panelHeight = Math.min(520, Math.max(130, height ?? localHeight))
+  const resizePanel = (next: number) => { const clamped = Math.min(520, Math.max(130, next)); setLocalHeight(clamped); onHeightChange?.(clamped) }
+  const drag = useRef<{ y: number; height: number } | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const finishResize = () => { drag.current = null; setDragging(false) }
   const [localTab, setLocalTab] = useState<BottomPanelTab>('terminal')
   const tab = activeTab ?? localTab
   const selectTab = (next: BottomPanelTab) => { setLocalTab(next); onSelectTab?.(next) }
@@ -140,7 +147,14 @@ export function TerminalPanel({ projectID, theme, visible, close, createdTermina
     } catch (error) { if (current === generation.current) setError(errorText(error)) }
   }
   const active = terminals.find(item => item.id === selected)
-  return <section className={`editor-terminal ${visible ? '' : 'is-hidden'}`} aria-label="Terminal">
+  return <section className={`editor-terminal ${visible ? '' : 'is-hidden'} ${dragging ? 'is-resizing' : ''}`} style={{ '--bottom-panel-h': `${panelHeight}px` } as CSSProperties} aria-label="Terminal">
+    <div className={`bottom-panel-resizer ${dragging ? 'is-dragging' : ''}`} role="separator" aria-orientation="horizontal" aria-label="Chiều cao Bottom Panel" aria-valuemin={130} aria-valuemax={520} aria-valuenow={panelHeight} tabIndex={0}
+      onDoubleClick={() => resizePanel(185)}
+      onKeyDown={event => { if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); resizePanel(panelHeight + (event.key === 'ArrowUp' ? 20 : -20)) } else if (event.key === 'Home') { event.preventDefault(); resizePanel(185) } }}
+      onPointerDown={event => { if (event.button !== 0) return; event.preventDefault(); drag.current = { y: event.clientY, height: panelHeight }; setDragging(true); event.currentTarget.setPointerCapture(event.pointerId) }}
+      onPointerMove={event => { if (drag.current) resizePanel(drag.current.height + drag.current.y - event.clientY) }}
+      onPointerUp={event => { finishResize(); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }}
+      onPointerCancel={finishResize} onLostPointerCapture={finishResize} />
     <div className="editor-terminal__head"><div className="term-head__left"><div className="bottom-panel-tabs" role="tablist" aria-label="Bottom panel">{(['terminal', 'problems', 'debug'] as const).map(value => <button type="button" role="tab" key={value} aria-selected={tab === value} onClick={() => selectTab(value)}>{value === 'terminal' ? 'TERMINAL' : value === 'problems' ? <>Vấn đề <span className="bottom-panel-count">{problemCounts.error + problemCounts.warning}</span></> : <><span className={`debug-indicator debug-indicator--${debugStatus}`} />Gỡ lỗi</>}</button>)}</div><div className="term-tabs" hidden={tab !== 'terminal'} role="tablist" aria-label="Shell terminals">{terminals.map((item, index) => <div className={`term-tab ${item.id === selected ? 'is-active' : ''}`} key={item.id}><button role="tab" aria-selected={item.id === selected} onClick={() => setSelected(item.id)}>{item.title} {index + 1}{item.exitCode !== undefined ? ` (${item.exitCode})` : ''}</button><button className="term-tab__close" aria-label={`Kill terminal ${index + 1}`} onClick={() => void remove(item)}>×</button></div>)}</div></div>
       <div className="term-head__actions"><select hidden={tab !== 'terminal'} aria-label="Terminal profile" value={profile} onChange={event => setProfile(event.target.value)}>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><button hidden={tab !== 'terminal'} className="icon-btn term-act-btn" aria-label="New Terminal" title="New Terminal" disabled={!projectID || !profiles.length || busy} onClick={() => void create()}><Icon name="plus" /></button><button hidden={tab !== 'terminal'} className="icon-btn term-act-btn" aria-label="Clear Terminal" title="Clear Terminal" disabled={!active} onClick={() => clearTerminal(instance.current)}><Icon name="refresh" /></button><IconButton label="Close Terminal Panel" onClick={close}><Icon name="close" /></IconButton></div></div>
     <div className="terminal-wrap" hidden={tab !== 'terminal'}>{error && <div className="terminal-error" role="alert">{error}</div>}{active ? <Shell key={active.id} terminal={active} theme={theme} instance={instance} /> : <div className="terminal-empty">{projectID ? <button disabled={busy || !profiles.length} onClick={() => void create()}>Mở terminal tại project</button> : 'Mở project để dùng terminal.'}</div>}</div>
