@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArtifactViewer } from './components/ArtifactViewer'
 import { formatShortcut, isMacPlatform } from './platform'
-import type { Connection, GitState, Model, PetHostState, PetSession, Project, Session, TerminalInfo } from '../../../../packages/protocol/src/index'
+import type { Connection, DebugSessionSnapshot, LspDiagnostic, GitState, Model, PetHostState, PetSession, Project, Session, TerminalInfo } from '../../../../packages/protocol/src/index'
 import { activateTab, defaults, dirty, documentID, languageFor, parsePreferences, projectDirtyPaths, reconcileDocument, removeTab, savedDocument, selectedTab, tabID, withoutKey, withoutProject, withoutProjectDocuments, type Buffer, type Pane, type Preferences, type ProjectView, type Tab } from './state'
 import { Icon } from './components/Icon'
 import { ProjectRail } from './components/ProjectRail'
@@ -17,13 +17,16 @@ import { Empty, errorText, IconButton, Modal, Resizer } from './components/Primi
 import { Settings } from './components/Settings'
 import { SessionChanges } from './components/SessionChanges'
 import { watchSessionChanges, type SessionChangesState } from './session-changes'
-import { TerminalPanel } from './components/TerminalPanel'
+import { TerminalPanel, type BottomPanelTab } from './components/TerminalPanel'
 import { createProjectTerminal, isTerminalKey, newTerminalShortcut } from './terminal-controls'
 import { changePathDocuments, deleteFromView, renameBuffers, renamedPath, renameView, type NavigationTarget } from './workspace-paths'
 
 const storageKey = 'ame.ide.layout.v1'
 const readPreferences = () => { try { return parsePreferences(localStorage.getItem(storageKey)) } catch { return defaults() } }
 const emptyView: ProjectView = { tabs: [] }
+const isSourceFile = (path: string) => /\.(?:[cm]?[jt]s|[jt]sx)$/i.test(path)
+const idleDebug: DebugSessionSnapshot = { status: 'idle', frames: [], variables: [], breakpoints: [] }
+type DebugOutput = { stream: 'stdout' | 'stderr' | 'console'; text: string }
 export function App() {
   const [preferences, setPreferences] = useState<Preferences>(readPreferences)
   const [projects, setProjects] = useState<Project[]>([])
@@ -51,6 +54,21 @@ export function App() {
   const [creating, setCreating] = useState(false)
   const [maximized, setMaximized] = useState(false)
   const [createdTerminal, setCreatedTerminal] = useState<TerminalInfo>()
+  const [bottomTab, setBottomTab] = useState<BottomPanelTab>('terminal')
+  const [diagnosticsByProject, setDiagnosticsByProject] = useState<Record<string, LspDiagnostic[]>>({})
+  const [problemsLoading, setProblemsLoading] = useState(false)
+  const diagnosticRequest = useRef(0)
+  const overlayTexts = useRef(new Map<string, string>())
+  const overlayQueues = useRef(new Map<string, Promise<void>>())
+  const [debugByProject, setDebugByProject] = useState<Record<string, DebugSessionSnapshot>>({})
+  const debugRevision = useRef(new Map<string, number>())
+  const [breakpointsByProject, setBreakpointsByProject] = useState<Record<string, Record<string, number[]>>>({})
+  const breakpointRef = useRef(breakpointsByProject); breakpointRef.current = breakpointsByProject
+  const breakpointQueues = useRef(new Map<string, Promise<void>>())
+  const [debugEntries, setDebugEntries] = useState<Record<string, string>>({})
+  const [selectedFrames, setSelectedFrames] = useState<Record<string, string | undefined>>({})
+  const [debugOutputs, setDebugOutputs] = useState<Record<string, DebugOutput[]>>({})
+  const navigateRef = useRef<(id: string, path: string, line: number, column: number) => void>(() => {})
   const [navigation, setNavigation] = useState<NavigationTarget>()
   const [splits, setSplits] = useState<Record<string, EditorSplitState>>({})
   const splitsRef = useRef(splits); splitsRef.current = splits
@@ -96,6 +114,67 @@ export function App() {
   const toggle = (pane: Pane) => setPreferences(p => ({ ...p, [pane]: !p[pane] }))
   const setWidth = (pane: Pane, width: number) => setPreferences(p => ({ ...p, widths: { ...p.widths, [pane]: width } }))
 
+  const diagnostics = projectID ? diagnosticsByProject[projectID] ?? [] : []
+  const problemCounts = diagnostics.reduce((counts, item) => { if (item.severity !== 'info') counts[item.severity]++; return counts }, { error: 0, warning: 0 })
+  const debugSnapshot = projectID ? debugByProject[projectID] ?? idleDebug : idleDebug
+  const selectedFrameId = projectID ? selectedFrames[projectID] : undefined
+  const pausedFrame = debugSnapshot.status === 'paused' ? debugSnapshot.frames.find(frame => frame.callFrameId === selectedFrameId) ?? debugSnapshot.frames[0] : undefined
+  const debugEntry = projectID ? debugEntries[projectID] ?? view.tabs.find(tab => tab.mode === 'file' && /\.(?:ts|js|mjs)$/i.test(tab.path))?.path ?? '' : ''
+  const requestDiagnostics = useCallback(async (id: string, reload = false) => {
+    const request = ++diagnosticRequest.current
+    if (preferencesRef.current.project === id) setProblemsLoading(true)
+    try {
+      await Promise.all([...overlayQueues.current].filter(([key]) => (JSON.parse(key) as string[])[0] === id).map(([, queue]) => queue))
+      if (removedProjects.current.has(id)) return
+      if (reload) await window.ame.lspRefresh(id)
+      const items = await window.ame.lspDiagnostics(id)
+      if (request === diagnosticRequest.current && preferencesRef.current.project === id && !removedProjects.current.has(id)) setDiagnosticsByProject(current => ({ ...current, [id]: items }))
+    } catch (e) { if (request === diagnosticRequest.current && preferencesRef.current.project === id && !removedProjects.current.has(id)) report(e) }
+    finally { if (request === diagnosticRequest.current) setProblemsLoading(false) }
+  }, [report])
+  const acceptDebugSnapshot = useCallback((id: string, snapshot: DebugSessionSnapshot) => {
+    setDebugByProject(current => ({ ...current, [id]: snapshot }))
+    const byPath: Record<string, number[]> = {}
+    for (const point of snapshot.breakpoints) (byPath[point.path] ??= []).push(point.line)
+    for (const key of breakpointQueues.current.keys()) {
+      const [project, path] = JSON.parse(key) as string[]
+      if (project === id) byPath[path] = breakpointRef.current[id]?.[path] ?? []
+    }
+    breakpointRef.current = { ...breakpointRef.current, [id]: byPath }
+    setBreakpointsByProject(breakpointRef.current)
+    setSelectedFrames(current => ({ ...current, [id]: snapshot.status === 'paused' ? snapshot.frames.some(frame => frame.callFrameId === current[id]) ? current[id] : snapshot.frames[0]?.callFrameId : undefined }))
+  }, [])
+  useEffect(() => {
+    diagnosticRequest.current++
+    setProblemsLoading(false)
+    if (!projectID || !window.ame) return
+    let alive = true
+    const revision = debugRevision.current.get(projectID) ?? 0
+    void window.ame.debugState(projectID).then(snapshot => {
+      if (alive && !removedProjects.current.has(projectID) && revision === (debugRevision.current.get(projectID) ?? 0)) acceptDebugSnapshot(projectID, snapshot)
+    }).catch(e => { if (alive) report(e) })
+    const timer = setTimeout(() => { void requestDiagnostics(projectID) }, 450)
+    return () => { alive = false; clearTimeout(timer); diagnosticRequest.current++ }
+  }, [projectID, requestDiagnostics, acceptDebugSnapshot, report])
+  useEffect(() => {
+    if (!projectID || !window.ame) return
+    const timer = setTimeout(() => {
+      let changed = false
+      for (const [key, buffer] of Object.entries(buffers)) {
+        if (buffer.projectID !== projectID || !isSourceFile(buffer.path) || overlayTexts.current.get(key) === buffer.text) continue
+        changed = true
+        overlayTexts.current.set(key, buffer.text)
+        const queue = (overlayQueues.current.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+          if (!removedProjects.current.has(projectID)) await window.ame.lspUpdateDocument(projectID, buffer.path, buffer.text)
+        })
+        overlayQueues.current.set(key, queue)
+        void queue.catch(e => { overlayTexts.current.delete(key); if (preferencesRef.current.project === projectID && !removedProjects.current.has(projectID)) report(e) }).finally(() => { if (overlayQueues.current.get(key) === queue) overlayQueues.current.delete(key) })
+      }
+      if (changed) void requestDiagnostics(projectID)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [projectID, buffers, requestDiagnostics, report])
+
   const requestFiles = () => setFilesRequested(true)
   const showQuickOpen = (mode: 'files' | 'line') => { requestFiles(); setQuickOpen(mode) }
   useEffect(() => {
@@ -134,6 +213,25 @@ export function App() {
       if (event.type === 'pet') { setPet(event.state); return }
       if (event.type === 'connection') { setConnection(event.connection); refreshSessions(); window.dispatchEvent(new Event('ame-account-changed')); return }
       if (event.type === 'terminal') return
+      if (event.type === 'debug') {
+        const id = event.projectID, update = event.event
+        if (removedProjects.current.has(id)) return
+        debugRevision.current.set(id, (debugRevision.current.get(id) ?? 0) + 1)
+        if (update.type === 'output') setDebugOutputs(current => ({ ...current, [id]: [...(current[id] ?? []), { stream: update.stream, text: update.text }].slice(-500) }))
+        else if (update.type === 'exited') {
+          setDebugByProject(current => ({ ...current, [id]: { ...(current[id] ?? idleDebug), status: 'exited', frames: [], variables: [], exitCode: update.code ?? undefined } }))
+          setSelectedFrames(current => ({ ...current, [id]: undefined }))
+        } else {
+          acceptDebugSnapshot(id, update.snapshot)
+          if (update.type === 'stopped') {
+            setBottomTab('debug')
+            setPreferences(p => ({ ...p, project: id, stage: true, terminalOpen: true, layoutMode: 'swe' }))
+            const frame = update.snapshot.frames[0]
+            if (frame?.path) navigateRef.current(id, frame.path, frame.line, frame.column)
+          }
+        }
+        return
+      }
       if (event.type === 'opencode') {
         if (event.projectID === preferencesRef.current.project && !chatTimer) chatTimer = setTimeout(() => { chatTimer = undefined; refreshSessions() }, 300)
         else if (event.projectID !== preferencesRef.current.project && sessionCacheRef.current[event.projectID] && !sessionTimers.has(event.projectID)) {
@@ -149,7 +247,10 @@ export function App() {
       clearTimeout(fileTimers.get(event.projectID))
       fileTimers.set(event.projectID, setTimeout(() => {
         fileTimers.delete(event.projectID)
-        if (event.projectID === preferencesRef.current.project) refresh()
+        if (event.projectID === preferencesRef.current.project) {
+          refresh()
+          if (preferencesRef.current.stage || preferencesRef.current.terminalOpen) void requestDiagnostics(event.projectID, true)
+        }
         for (const [id, buffer] of Object.entries(buffersRef.current)) {
           if (buffer.projectID !== event.projectID) continue
           void window.ame.read(buffer.projectID, buffer.path).then(incoming => { if (alive) setBuffers(current => current[id] ? { ...current, [id]: reconcileDocument(current[id], incoming) } : current) }).catch(() => {
@@ -159,7 +260,7 @@ export function App() {
       }, 180))
     })
     return () => { alive = false; unsubscribe(); for (const timer of fileTimers.values()) clearTimeout(timer); for (const timer of sessionTimers.values()) clearTimeout(timer); clearTimeout(chatTimer) }
-  }, [report, refresh, refreshSessions])
+  }, [report, refresh, refreshSessions, requestDiagnostics, acceptDebugSnapshot])
   useEffect(() => {
     if (!window.ame) return
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -251,9 +352,17 @@ export function App() {
       setDiffs(current => withoutProjectDocuments(current, id))
       setPreferences(current => withoutProject(current, id, remaining))
       setCreatedTerminal(current => current?.projectID === id ? undefined : current)
+      setDiagnosticsByProject(current => withoutKey(current, id))
+      setDebugByProject(current => withoutKey(current, id))
+      setBreakpointsByProject(current => withoutKey(current, id))
+      setDebugEntries(current => withoutKey(current, id))
+      setSelectedFrames(current => withoutKey(current, id))
+      setDebugOutputs(current => withoutKey(current, id))
+      for (const key of overlayTexts.current.keys()) if ((JSON.parse(key) as string[])[0] === id) { overlayTexts.current.delete(key); overlayQueues.current.delete(key) }
     } catch (e) { if (!errorText(e).includes('CANCELLED')) report(e) }
   }
   const newTerminal = async () => {
+    setBottomTab('terminal')
     setPreferences(p => ({ ...p, stage: true, terminalOpen: true, layoutMode: 'swe' }))
     try {
       const item = await createProjectTerminal(window.ame, projectID)
@@ -283,15 +392,52 @@ export function App() {
     setPreferences(current => ({ ...current, panel: 'files', stage: true }))
     updateSplit(projectID, current => current.secondary ? unsplit(current) : splitRight(current))
   }
-  const openTab = (path: string, mode: Tab['mode'], line?: number, column?: number) => {
-    if (!projectID) return
-    setNavigation(mode === 'file' && line !== undefined ? { projectID, path, line, column, nonce: ++navigationNonce.current } : undefined)
+  const openProjectTab = (id: string, path: string, mode: Tab['mode'], line?: number, column?: number) => {
+    if (removedProjects.current.has(id)) return
+    setNavigation(mode === 'file' && line !== undefined ? { projectID: id, path, line, column, nonce: ++navigationNonce.current } : undefined)
     const tab = { path, mode }
-    if (mode === 'file') updateSplit(projectID, current => openTabInGroup(current, tab))
-    updateView(projectID, current => activateTab({ ...current, tabs: current.tabs.some(t => tabID(t) === tabID(tab)) ? current.tabs : [...current.tabs, tab] }, tab))
-    setPreferences(p => ({ ...p, stage: true, panel: mode === 'diff' ? 'diff' : 'files', layoutMode: mode === 'diff' ? 'swe' : p.layoutMode }))
+    if (mode === 'file') updateSplit(id, current => openTabInGroup(current, tab))
+    updateView(id, current => activateTab({ ...current, tabs: current.tabs.some(t => tabID(t) === tabID(tab)) ? current.tabs : [...current.tabs, tab] }, tab))
+    setPreferences(p => ({ ...p, project: id, stage: true, panel: mode === 'diff' ? 'diff' : 'files', layoutMode: mode === 'diff' ? 'swe' : p.layoutMode }))
+  }
+  const openTab = (path: string, mode: Tab['mode'], line?: number, column?: number) => { if (projectID) openProjectTab(projectID, path, mode, line, column) }
+  navigateRef.current = (id, path, line, column) => openProjectTab(id, path, 'file', line, column)
+  const closeOverlay = (id: string, path: string) => {
+    if (!isSourceFile(path)) return
+    const key = documentID(id, path)
+    overlayTexts.current.delete(key)
+    const queue = (overlayQueues.current.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (!removedProjects.current.has(id)) await window.ame.lspCloseDocument(id, path)
+    }).catch(() => {})
+    overlayQueues.current.set(key, queue)
+    void queue.then(() => { if (overlayQueues.current.get(key) === queue) overlayQueues.current.delete(key); if (preferencesRef.current.project === id) void requestDiagnostics(id) })
+  }
+  const toggleBreakpoint = (path: string, line: number) => {
+    if (!projectID) return
+    const id = projectID, byPath = breakpointRef.current[id] ?? {}, previous = byPath[path] ?? []
+    const next = previous.includes(line) ? previous.filter(item => item !== line) : [...previous, line].sort((a, b) => a - b)
+    const updated = { ...breakpointRef.current, [id]: { ...byPath, [path]: next } }
+    breakpointRef.current = updated
+    setBreakpointsByProject(updated)
+    const key = documentID(id, path)
+    const queue = (breakpointQueues.current.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (!removedProjects.current.has(id)) await window.ame.debugSetBreakpoints(id, path, next)
+    })
+    breakpointQueues.current.set(key, queue)
+    void queue.catch(e => {
+      if (!removedProjects.current.has(id)) report(e)
+    }).finally(() => {
+      if (breakpointQueues.current.get(key) !== queue) return
+      breakpointQueues.current.delete(key)
+      if (removedProjects.current.has(id)) return
+      const revision = debugRevision.current.get(id) ?? 0
+      void window.ame.debugState(id).then(snapshot => {
+        if (!removedProjects.current.has(id) && !breakpointQueues.current.has(key) && revision === (debugRevision.current.get(id) ?? 0)) acceptDebugSnapshot(id, snapshot)
+      }).catch(report)
+    })
   }
   const renameOpenPath = (id: string, from: string, to: string) => {
+    for (const buffer of Object.values(buffersRef.current)) if (buffer.projectID === id && renamedPath(buffer.path, from, to) !== buffer.path) closeOverlay(id, buffer.path)
     pathsEpoch.current++
     updateView(id, current => renameView(current, from, to))
     updateSplit(id, current => renameInSplitState(current, from, to))
@@ -300,6 +446,7 @@ export function App() {
     setNavigation(current => current?.projectID === id ? { ...current, path: renamedPath(current.path, from, to) } : current)
   }
   const deleteOpenPath = (id: string, path: string) => {
+    for (const buffer of Object.values(buffersRef.current)) if (buffer.projectID === id && (buffer.path === path || buffer.path.startsWith(`${path}/`))) closeOverlay(id, buffer.path)
     pathsEpoch.current++
     updateView(id, current => deleteFromView(current, path))
     updateSplit(id, current => deleteInSplitState(current, path))
@@ -321,6 +468,16 @@ export function App() {
     try {
       const saved = await window.ame.save(p.project, tab.path, buffer.text, buffer.revision)
       setBuffers(current => current[key] ? { ...current, [key]: savedDocument(current[key], saved, buffer.text) } : current)
+      if (isSourceFile(tab.path)) {
+        const text = buffersRef.current[key]?.text ?? buffer.text
+        overlayTexts.current.set(key, text)
+        const queue = (overlayQueues.current.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+          if (!removedProjects.current.has(p.project!) && buffersRef.current[key]) await window.ame.lspUpdateDocument(p.project!, tab.path, text)
+        })
+        overlayQueues.current.set(key, queue)
+        void queue.catch(e => { overlayTexts.current.delete(key); if (!removedProjects.current.has(p.project!)) report(e) }).finally(() => { if (overlayQueues.current.get(key) === queue) overlayQueues.current.delete(key) })
+        void requestDiagnostics(p.project, true)
+      }
       refresh()
     } catch (e) {
       report(e)
@@ -341,11 +498,14 @@ export function App() {
     if (!retained && tab.mode === 'file' && buffer && dirty(buffer) && !window.confirm(`Bỏ các thay đổi chưa lưu trong ${tab.path}?`)) return
     if (tab.mode === 'file') updateSplit(projectID, current => closeTabInGroup(current, tab, group))
     if (!retained) updateView(projectID, current => removeTab(current, tab))
-    if (!retained && tab.mode === 'file') setBuffers(current => { const next = { ...current }; delete next[key]; return next })
+    if (!retained && tab.mode === 'file') {
+      closeOverlay(projectID, tab.path)
+      setBuffers(current => { const next = { ...current }; delete next[key]; return next })
+    }
   }
   const selectPanel = (panel: Preferences['panel']) => {
     if (panel === 'subagents' || panel === 'btw') { window.dispatchEvent(new CustomEvent('ame-chat-drawer', { detail: panel === 'subagents' ? 'agents' : 'btw' })); return }
-    if (panel === 'terminal') { setPreferences(p => ({ ...p, terminalOpen: true, stage: true })); return }
+    if (panel === 'terminal') { setBottomTab('terminal'); setPreferences(p => ({ ...p, terminalOpen: true, stage: true, layoutMode: 'swe' })); return }
     setPreferences(p => ({ ...p, panel, stage: true, layoutMode: ['diff', 'terminal', 'subagents'].includes(panel) ? 'swe' : p.layoutMode }))
     if (projectID && (panel === 'files' || panel === 'diff')) {
       const mode = panel === 'files' ? 'file' : 'diff'
@@ -398,6 +558,10 @@ export function App() {
     const buffer = projectID && tab ? buffers[documentID(projectID, tab.path)] : undefined
     return <div key={group} className={`editor-group ${splitState.focused === group ? 'is-focused' : ''}`} onFocusCapture={() => { if (projectID && !diffMode) updateSplit(projectID, current => focusGroup(current, group)) }} onPointerDownCapture={() => { if (projectID && !diffMode) updateSplit(projectID, current => focusGroup(current, group)) }}>
       <EditorStage projectID={projectID || ''} target={group === splitState.focused || diffMode ? navigation : undefined} dirtyPaths={projectDirtyPaths(buffers, projectID)} tabs={diffMode ? view.tabs.filter(tab => tab.mode === 'diff') : editorGroup?.tabs || []} active={tab} buffer={buffer} diff={projectID && tab ? diffs[documentID(projectID, tab.path)] : undefined} theme={preferences.theme}
+        diagnostics={diagnostics} breakpoints={projectID && tab ? breakpointsByProject[projectID]?.[tab.path] ?? [] : []}
+        pausedLine={tab?.path === pausedFrame?.path ? pausedFrame?.line : undefined}
+        onToggleBreakpoint={line => { if (tab?.mode === 'file') toggleBreakpoint(tab.path, line) }}
+        onNavigateLocation={(path, line, column) => openTab(path, 'file', line, column)}
         onSelect={selected => { if (projectID) { if (!diffMode) updateSplit(projectID, current => selectTabInGroup(current, selected, group)); updateView(projectID, current => activateTab(current, selected)) } }}
         onClose={tab => closeTab(tab, group)} onChange={text => { if (projectID && tab) { const key = documentID(projectID, tab.path); setBuffers(current => current[key] ? { ...current, [key]: { ...current[key], text } } : current) } }}
         onSave={() => void save(tab)} onReload={() => void reload(tab)} onToggleSplit={toggleSplit} isSplit={!!splitState.secondary}
@@ -415,8 +579,24 @@ export function App() {
         <div className="side-panel__tabs"><div className="side-panel__tab-list" role="tablist" aria-label="Workspace panel">{(['files', 'changes', 'diff', 'artifact', 'usage'] as const).filter(tab => preferences.layoutMode !== 'knowledge' || tab !== 'diff').map(tab => <button key={tab} role="tab" aria-selected={preferences.panel === tab} className={`panel-tab ${preferences.panel === tab ? 'is-active' : ''}`} onClick={() => selectPanel(tab)}>{({ files: 'Code', changes: 'Session Changes', diff: 'Git Diff', artifact: 'Artifact', usage: 'Usage' })[tab]}</button>)}</div><div className="stage-actions"><IconButton label="Toggle Terminal" active={preferences.terminalOpen} onClick={() => setPreferences(p => ({ ...p, terminalOpen: !p.terminalOpen }))}><Icon name="terminal" /></IconButton><IconButton label="Phóng to Side Panel" active={maximized} onClick={() => setMaximized(v => !v)}><Icon name="maximize" /></IconButton><IconButton label="Close Side Panel" onClick={() => toggle('stage')}><Icon name="close" /></IconButton></div></div>
         <div className="editor-breadcrumb"><span className="truncate"><strong>{project?.name || 'Local Workspace'}</strong> &rsaquo; {preferences.panel === 'changes' ? activeSession?.title || 'Session Changes' : activeTab?.path || (preferences.panel === 'diff' ? 'VS Code Diff' : 'Code')}</span><span>{preferences.panel === 'changes' ? 'OpenCode snapshots' : preferences.panel === 'diff' ? 'Git Engine' : 'UTF-8'}</span></div>
         <div className="side-panel__content"><div className={`workspace-tools ${preferences.panel === 'files' && splitState.secondary ? 'is-split' : ''}`} hidden={!['files', 'diff'].includes(preferences.panel)}>{renderEditor('primary')}{preferences.panel === 'files' && splitState.secondary && renderEditor('secondary')}</div>{preferences.panel === 'changes' && <SessionChanges key={changesKey} state={changesState} theme={preferences.theme} onRetry={() => setChangesAttempt(value => value + 1)} />}{preferences.panel === 'usage' && <><UsagePanel nodes={usage?.key === usageKey ? usage.value?.nodes || [] : []} loading={!!projectID && !!view.session && (usage?.key !== usageKey || usage.loading)} error={usage?.key === usageKey ? usage.error : undefined} origin={usage?.key === usageKey ? usage.value?.origin : null} selectedSessionID={view.session} onSelectSession={id => { if (projectID) updateView(projectID, current => ({ ...current, session: id })) }} onRefresh={() => setUsageAttempt(value => value + 1)} />{usage?.key === usageKey && usage.value?.limited && <p role="status">Giới hạn hiển thị 200 phiên.</p>}</>}{preferences.panel === 'artifact' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={view.session} /> : <Empty>Chọn dự án để xem artifact.</Empty>)}</div>
-        <TerminalPanel projectID={projectID} createdTerminal={createdTerminal} theme={preferences.theme} visible={preferences.terminalOpen && preferences.layoutMode !== 'knowledge'} close={() => setPreferences(p => ({ ...p, terminalOpen: false }))} />
-        <footer className="side-panel__status statusbar"><span className="truncate">{project?.name || 'Local Workspace'}{git?.branch ? ` · ${git.branch}` : ''}</span>{preferences.panel === 'files' && activeTab && <span className="statusbar__editor">Ln {editorStatus?.line || 1}, Col {editorStatus?.column || 1} · {editorStatus?.language || languageFor(activeTab.path)} · UTF-8 · {editorStatus?.indent || 'Spaces: 2'}</span>}<span>{dirtyCount ? `${dirtyCount} tệp chưa lưu` : 'Đã lưu'}</span></footer>
+        <TerminalPanel projectID={projectID} createdTerminal={createdTerminal} theme={preferences.theme} visible={preferences.terminalOpen && preferences.layoutMode !== 'knowledge'} close={() => setPreferences(p => ({ ...p, terminalOpen: false }))}
+          activeTab={bottomTab} onSelectTab={setBottomTab} problemCounts={problemCounts} debugStatus={debugSnapshot.status}
+          problemsProps={{ problems: diagnostics, loading: problemsLoading, onOpenLocation: (path, line, column) => openTab(path, 'file', line, column), onRefresh: projectID ? () => void requestDiagnostics(projectID, true) : undefined }}
+          debugProps={{ snapshot: debugSnapshot, output: projectID ? debugOutputs[projectID] ?? [] : [], entry: debugEntry, selectedFrameId,
+            onEntryChange: entry => { if (projectID) setDebugEntries(current => ({ ...current, [projectID]: entry })) },
+            onStart: entry => { if (projectID) { setDebugOutputs(current => ({ ...current, [projectID]: [] })); void window.ame.debugStart(projectID, { entry, runtime: /\.(?:[cm]?ts|tsx)$/i.test(entry) ? 'tsx' : 'node' }).catch(report) } },
+            onStop: () => { if (projectID) void window.ame.debugStop(projectID).catch(report) },
+            onContinue: () => { if (projectID) void window.ame.debugContinue(projectID).catch(report) },
+            onPause: () => { if (projectID) void window.ame.debugPause(projectID).catch(report) },
+            onStepOver: () => { if (projectID) void window.ame.debugStepOver(projectID).catch(report) },
+            onStepInto: () => { if (projectID) void window.ame.debugStepInto(projectID).catch(report) },
+            onStepOut: () => { if (projectID) void window.ame.debugStepOut(projectID).catch(report) },
+            onSelectFrame: (callFrameId, path, line, column) => { if (projectID) { setSelectedFrames(current => ({ ...current, [projectID]: callFrameId })); if (path) openTab(path, 'file', line, column) } },
+            onOpenLocation: (path, line, column) => openTab(path, 'file', line, column), onRemoveBreakpoint: toggleBreakpoint,
+            onEvaluate: expression => projectID ? window.ame.debugEvaluate(projectID, expression, selectedFrameId) : Promise.resolve({ value: '', type: 'error', error: 'Chưa mở project.' }),
+            onClearOutput: () => { if (projectID) setDebugOutputs(current => ({ ...current, [projectID]: [] })) }
+          }} />
+        <footer className="side-panel__status statusbar"><button type="button" className="statusbar__problems" aria-label={`Vấn đề: ${problemCounts.error} lỗi, ${problemCounts.warning} cảnh báo`} onClick={() => { setBottomTab('problems'); setPreferences(p => ({ ...p, terminalOpen: true, stage: true, layoutMode: 'swe' })) }}>✕ {problemCounts.error} ⚠ {problemCounts.warning}</button><span className="truncate">{project?.name || 'Local Workspace'}{git?.branch ? ` · ${git.branch}` : ''}</span>{preferences.panel === 'files' && activeTab && <span className="statusbar__editor">Ln {editorStatus?.line || 1}, Col {editorStatus?.column || 1} · {editorStatus?.language || languageFor(activeTab.path)} · UTF-8 · {editorStatus?.indent || 'Spaces: 2'}</span>}<span>{dirtyCount ? `${dirtyCount} tệp chưa lưu` : 'Đã lưu'}</span></footer>
       </section></>}
     </div>
     {(modal === 'settings' || modal === 'account') && <Settings isMac={isMac} pet={pet} sprite={sprite} selectedModel={selectedModel?.modelID ?? selectedModel?.id} onPet={setPet} initialSection={modal === 'account' ? 'amekit' : 'appearance'} preferences={preferences} setLayout={patch => setPreferences(p => ({ ...p, ...patch, panel: patch.layoutMode === 'knowledge' && ['diff', 'terminal', 'subagents'].includes(p.panel) ? 'files' : p.panel }))} theme={preferences.theme} setTheme={theme => setPreferences(p => ({ ...p, theme }))} connection={connection} setConnection={setConnection} close={() => setModal(null)} />}

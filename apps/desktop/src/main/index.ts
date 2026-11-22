@@ -8,6 +8,8 @@ import { z } from 'zod'
 import { Workspaces } from '../../../../packages/ide-core/src/workspace'
 import { validateWorkspacePath } from '../../../../packages/ide-core/src/workspace-fs'
 import { Terminals } from '../../../../packages/ide-core/src/terminal'
+import { createTsLanguageService, type TsLanguageService } from '../../../../packages/ide-core/src/ts-lsp'
+import { createNodeDebugger, type NodeDebugger } from '../../../../packages/ide-core/src/debugger'
 import { OpenCodeAdapter } from '../../../../packages/opencode-adapter/src/index'
 import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtime'
 import { createAmeKit } from '../../../../packages/amekit/src/index'
@@ -80,6 +82,19 @@ const petSession = z.object({
   idle: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional()
 }).strict()
 const content = z.string().max(4 * 1024 * 1024).refine(value => Buffer.byteLength(value, 'utf8') <= 4 * 1024 * 1024, 'FILE_TOO_LARGE')
+const sourcePath = workspacePath.refine(value => !/^[\\/]|:/.test(value) && value.split(/[\\/]/).every(part =>
+  part !== '..' && part.toLowerCase() !== '.git' && (!part || part === '.' || !/[. ]$/.test(part))) && value.split(/[\\/]/).some(part => part && part !== '.'))
+const debugCwd = z.union([z.literal('.'), sourcePath])
+const position = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
+const safeString = z.string().max(8192).refine(value => !value.includes('\0'))
+const debugConfig = z.object({
+  entry: sourcePath,
+  args: z.array(safeString).max(100).optional(),
+  cwd: debugCwd.optional(),
+  env: z.record(z.string().min(1).max(200).regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/), safeString)
+    .refine(value => Object.keys(value).length <= 100).optional(),
+  runtime: z.enum(['node', 'tsx']).optional()
+}).strict()
 const searchQuery = z.object({
   query: z.string().max(20000),
   caseSensitive: z.boolean().optional(), wholeWord: z.boolean().optional(), regex: z.boolean().optional(),
@@ -102,6 +117,19 @@ const schema = {
   terminalCreate: z.tuple([id, id.optional(), z.number().int().min(2).max(500).optional(), z.number().int().min(1).max(300).optional()]),
   terminalSnapshot: z.tuple([id, id]), terminalWrite: z.tuple([id, id, z.string().max(65536)]),
   terminalResize: z.tuple([id, id, z.number().int().min(2).max(500), z.number().int().min(1).max(300)]), terminalClose: z.tuple([id, id]),
+  lspUpdateDocument: z.tuple([boundedID, sourcePath, content, z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional()]),
+  lspCloseDocument: z.tuple([boundedID, sourcePath]), lspRefresh: z.tuple([boundedID]),
+  lspDiagnostics: z.tuple([boundedID, sourcePath.optional()]),
+  lspCompletions: z.tuple([boundedID, sourcePath, position, position]),
+  lspHover: z.tuple([boundedID, sourcePath, position, position]),
+  lspDefinition: z.tuple([boundedID, sourcePath, position, position]),
+  lspReferences: z.tuple([boundedID, sourcePath, position, position]),
+  lspRenamePreview: z.tuple([boundedID, sourcePath, position, position, z.string().min(1).max(200).refine(value => !!value.trim() && !value.includes('\0'))]),
+  debugState: z.tuple([boundedID]), debugSetBreakpoints: z.tuple([boundedID, sourcePath, z.array(position).max(1000)]),
+  debugStart: z.tuple([boundedID, debugConfig]), debugStop: z.tuple([boundedID]),
+  debugContinue: z.tuple([boundedID]), debugPause: z.tuple([boundedID]),
+  debugStepOver: z.tuple([boundedID]), debugStepInto: z.tuple([boundedID]), debugStepOut: z.tuple([boundedID]),
+  debugEvaluate: z.tuple([boundedID, question, boundedID.optional()]),
   projects: z.tuple([]), pickProject: z.tuple([]), removeProject: z.tuple([id]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
   listFiles: z.tuple([id]), sessionUsage: z.tuple([id, id]),
   save: z.tuple([id, relative, z.string().max(4 * 1024 * 1024), z.string().regex(/^[a-f0-9]{64}$/)]),
@@ -121,6 +149,20 @@ const schema = {
   pairingStatus: z.tuple([]), pairingConfigure: z.tuple([pairingSchema]), pairingCode: z.tuple([]),
   account: z.tuple([z.string().max(64), z.record(z.string(), z.string().max(8192))]), pickImport: z.tuple([]), window: z.tuple([z.enum(['minimize', 'maximize', 'close'])])
 } as const
+const lspServices = new Map<string, TsLanguageService>()
+const debuggers = new Map<string, NodeDebugger>()
+function lspFor(projectID: string) {
+  const { directory } = workspace.get(projectID)
+  let service = lspServices.get(projectID)
+  if (!service) { service = createTsLanguageService(directory); lspServices.set(projectID, service) }
+  return service
+}
+function debuggerFor(projectID: string) {
+  const { directory } = workspace.get(projectID)
+  let service = debuggers.get(projectID)
+  if (!service) { service = createNodeDebugger(directory, event => notify({ type: 'debug', projectID, event })); debuggers.set(projectID, service) }
+  return service
+}
 function notify(event: IdeEvent) { if (window && !window.isDestroyed()) window.webContents.send('ame:event', event) }
 async function confirmation(message: string, detail?: string) {
   const result = await dialog.showMessageBox(window!, { type: 'question', buttons: ['Hủy', 'Xác nhận'], defaultId: 0, cancelId: 0, message, ...(detail ? { detail } : {}) })
@@ -183,6 +225,25 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'terminalWrite': return terminals.write(a, b, c)
     case 'terminalResize': return terminals.resize(a, b, c, d)
     case 'terminalClose': return terminals.close(a, b)
+    case 'lspUpdateDocument': return lspFor(a).updateDocument(b, c, d)
+    case 'lspCloseDocument': return lspFor(a).closeDocument(b)
+    case 'lspRefresh': return lspFor(a).refreshFiles()
+    case 'lspDiagnostics': return lspFor(a).diagnostics(b)
+    case 'lspCompletions': return lspFor(a).completions(b, c, d)
+    case 'lspHover': return lspFor(a).hover(b, c, d)
+    case 'lspDefinition': return lspFor(a).definition(b, c, d)
+    case 'lspReferences': return lspFor(a).references(b, c, d)
+    case 'lspRenamePreview': return lspFor(a).renamePreview(b, c, d, e)
+    case 'debugState': return debuggerFor(a).state()
+    case 'debugSetBreakpoints': return debuggerFor(a).setBreakpoints(b, c)
+    case 'debugStart': return debuggerFor(a).start(b)
+    case 'debugStop': return debuggerFor(a).stop()
+    case 'debugContinue': return debuggerFor(a).continue()
+    case 'debugPause': return debuggerFor(a).pause()
+    case 'debugStepOver': return debuggerFor(a).stepOver()
+    case 'debugStepInto': return debuggerFor(a).stepInto()
+    case 'debugStepOut': return debuggerFor(a).stepOut()
+    case 'debugEvaluate': return debuggerFor(a).evaluate(b, c)
     case 'projects': return workspace.list()
     case 'pickProject': {
       const result = await dialog.showOpenDialog(window!, { title: 'Mở project', properties: ['openDirectory'] })
@@ -194,7 +255,12 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       await confirmation(`Gỡ dự án ${project.name} khỏi danh sách? Tệp trên ổ đĩa sẽ KHÔNG bị xóa.`)
       terminals.closeProject(a)
       await workspace.remove(a)
-      adapter.detach(a)
+      try { lspServices.get(a)?.dispose() }
+      finally {
+        lspServices.delete(a)
+        try { await debuggers.get(a)?.dispose() }
+        finally { debuggers.delete(a); adapter.detach(a) }
+      }
       return
     }
     case 'entries': return workspace.entries(a, b)
@@ -325,7 +391,10 @@ void app.whenReady().then(async () => {
   if (process.platform === 'darwin') Menu.setApplicationMenu(Menu.buildFromTemplate([
     { role: 'appMenu' }, { role: 'fileMenu' }, { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' }
   ]))
-  workspace = new Workspaces(path.join(app.getPath('userData'), 'projects.json'), projectID => notify({ type: 'files', projectID }))
+  workspace = new Workspaces(path.join(app.getPath('userData'), 'projects.json'), projectID => {
+    void lspServices.get(projectID)?.refreshFiles().catch(() => {})
+    notify({ type: 'files', projectID })
+  })
   await workspace.load()
   terminals = new Terminals(projectID => workspace.get(projectID).directory, notify)
   adapter = new OpenCodeAdapter(notify)
@@ -371,6 +440,11 @@ app.on('will-quit', event => {
   screenActive(false)
   terminals?.dispose()
   // Abort in-flight pet generation before waiting for authority; queued calls fail closed.
-  void Promise.resolve().then(() => petHost?.dispose()).finally(() => authority.catch(() => {}))
+  void Promise.resolve().then(() => petHost?.dispose()).finally(async () => {
+    for (const service of lspServices.values()) { try { service.dispose() } catch { /* Continue disposing other projects. */ } }
+    lspServices.clear()
+    await Promise.allSettled([...debuggers.values()].map(async service => service.dispose()))
+    debuggers.clear()
+  }).finally(() => authority.catch(() => {}))
     .finally(() => pairing.stop()).finally(() => account.dispose()).finally(async () => { adapter.dispose(); workspace.dispose(); await runtime.stop(); app.quit() })
 })

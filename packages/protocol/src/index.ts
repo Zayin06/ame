@@ -1,3 +1,7 @@
+export type { LspSeverity, LspRange, LspDiagnostic, LspCompletion, LspHover, LspLocation, LspReference, LspTextEdit, LspRenameResult } from '../../ide-core/src/ts-lsp'
+export type { DebugStatus, DebugBreakpoint, DebugCallFrame, DebugVariable, DebugSessionSnapshot, DebugEvent, DebugStartConfig } from '../../ide-core/src/debugger'
+import type { LspDiagnostic, LspCompletion, LspHover, LspLocation, LspReference, LspRenameResult } from '../../ide-core/src/ts-lsp'
+import type { DebugBreakpoint, DebugSessionSnapshot, DebugEvent, DebugStartConfig } from '../../ide-core/src/debugger'
 export type { PetHostState } from '../../amekit/src/pet-host'
 export type { PetPalette } from '../../amekit/src/pet-appearance'
 export type { PetSession } from '../../amekit/src/pet'
@@ -62,7 +66,7 @@ export type TerminalProfile = { id: string; name: string; executable: string; ar
 export type TerminalInfo = { id: string; projectID: string; title: string; cols: number; rows: number; exitCode?: number }
 export type TerminalSnapshot = TerminalInfo & { output: string; sequence: number }
 export type TerminalEvent = { type: 'terminal'; projectID: string; terminalID: string; sequence: number; data?: string; exitCode?: number }
-export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState }
+export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState } | { type: 'debug'; projectID: string; event: DebugEvent }
 export interface DesktopApi {
   platform(): Promise<string>
   artifacts(projectID: string, sessionID?: string): Promise<ArtifactSummary[]>
@@ -85,6 +89,25 @@ export interface DesktopApi {
   terminalWrite(projectID: string, terminalID: string, data: string): Promise<void>
   terminalResize(projectID: string, terminalID: string, cols: number, rows: number): Promise<void>
   terminalClose(projectID: string, terminalID: string): Promise<void>
+  lspUpdateDocument(projectID: string, relativePath: string, content: string, version?: number): Promise<void>
+  lspCloseDocument(projectID: string, relativePath: string): Promise<void>
+  lspRefresh(projectID: string): Promise<void>
+  lspDiagnostics(projectID: string, relativePath?: string): Promise<LspDiagnostic[]>
+  lspCompletions(projectID: string, relativePath: string, line: number, column: number): Promise<LspCompletion[]>
+  lspHover(projectID: string, relativePath: string, line: number, column: number): Promise<LspHover | null>
+  lspDefinition(projectID: string, relativePath: string, line: number, column: number): Promise<LspLocation[]>
+  lspReferences(projectID: string, relativePath: string, line: number, column: number): Promise<LspReference[]>
+  lspRenamePreview(projectID: string, relativePath: string, line: number, column: number, newName: string): Promise<LspRenameResult>
+  debugState(projectID: string): Promise<DebugSessionSnapshot>
+  debugSetBreakpoints(projectID: string, relativePath: string, lines: number[]): Promise<DebugBreakpoint[]>
+  debugStart(projectID: string, config: DebugStartConfig): Promise<void>
+  debugStop(projectID: string): Promise<void>
+  debugContinue(projectID: string): Promise<void>
+  debugPause(projectID: string): Promise<void>
+  debugStepOver(projectID: string): Promise<void>
+  debugStepInto(projectID: string): Promise<void>
+  debugStepOut(projectID: string): Promise<void>
+  debugEvaluate(projectID: string, expression: string, callFrameId?: string): Promise<{ value: string; type: string; error?: string }>
   projects(): Promise<Project[]>
   pickProject(): Promise<Project | null>
   removeProject(projectID: string): Promise<void>

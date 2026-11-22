@@ -105,9 +105,31 @@
 .side-panel__tabs .stage-actions .icon-btn { min-width: 24px; width: 24px; padding: 0; }
 .side-panel__status.statusbar { height: 26px; min-height: 26px; max-height: 26px; gap: 8px; white-space: nowrap; overflow: hidden; }
 .statusbar > span { min-width: 0; }
-.statusbar > span:first-child { flex: 1 1 auto; }
+.statusbar > .truncate { flex: 1 1 auto; }
 .statusbar > span:last-child { flex-shrink: 0; }
-.statusbar__editor { flex: 0 1 auto; font-size: 10px; }
+.statusbar__editor { flex: 0 1 auto; font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
+.statusbar__problems { flex: 0 0 auto; padding: 0 3px; height: 22px; border: 0; background: transparent; color: inherit; font: inherit; white-space: nowrap; }
+.editor-terminal { height: 185px; min-height: 185px; max-height: 185px; overflow: hidden; }
+.editor-terminal__head { padding-inline: 5px; gap: 4px; }
+.term-head__left { gap: 4px; overflow: hidden; }
+.bottom-panel-tabs { display: flex; flex: 0 0 auto; align-items: stretch; height: 100%; gap: 1px; }
+.bottom-panel-tabs button { display: inline-flex; align-items: center; gap: 3px; padding: 0 4px; min-width: 0; border: 0; border-radius: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-muted); font-size: 10px; white-space: nowrap; }
+.bottom-panel-tabs button[aria-selected="true"] { color: var(--text-primary); border-bottom-color: var(--accent); }
+.bottom-panel-count { font-size: 9px; padding-inline: 3px; border-radius: 6px; background: var(--bg-elevated); }
+.debug-indicator { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
+.debug-indicator--running { background: #4caf77; }
+.debug-indicator--paused { background: #e5b84e; }
+.bottom-panel-body { flex: 1; min-width: 0; min-height: 0; overflow: auto; }
+.bottom-panel-body > section { min-height: 0; }
+.bottom-panel-body .problems-panel, .bottom-panel-body .debug-panel { padding: 8px; gap: 8px; }
+.bottom-panel-body .problems-panel h2, .bottom-panel-body .debug-panel h2 { font-size: 14px; }
+.bottom-panel-body .problems-panel button, .bottom-panel-body .debug-panel button { padding: 3px 6px; }
+.editor-terminal [hidden] { display: none !important; }
+.ame-breakpoint-glyph { background: radial-gradient(circle, #e65353 0 5px, transparent 6px) center no-repeat; cursor: pointer; }
+.ame-debug-paused-line { background: rgba(229, 184, 78, .18); }
+.ame-debug-paused-glyph { background: #e5b84e; clip-path: polygon(24% 20%, 80% 50%, 24% 80%); }
+.term-head__actions select { max-width: 70px; }
+@media (max-width: 1100px) { .side-panel__status.statusbar { gap: 4px; padding-inline: 5px; } .term-head__actions select { max-width: 45px; } }
 .workspace-tools.is-split { flex-direction: row; }
 .editor-group { display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .workspace-tools.is-split .editor-group + .editor-group { border-left: 1px solid var(--border-default); }

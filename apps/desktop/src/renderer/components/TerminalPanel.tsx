@@ -8,6 +8,18 @@ import { Icon } from './Icon'
 import { errorText, IconButton } from './Primitives'
 import { clearTerminal, terminalTheme, updateTerminalTheme } from '../terminal-controls'
 import type { MutableRefObject } from 'react'
+import type { DebugStatus } from '../../../../../packages/protocol/src/index'
+import { ProblemsPanel, type ProblemsPanelProps } from './ProblemsPanel'
+import { DebugPanel, type DebugPanelProps } from './DebugPanel'
+
+export type BottomPanelTab = 'terminal' | 'problems' | 'debug'
+const idleDebugProps: DebugPanelProps = {
+  snapshot: { status: 'idle', frames: [], variables: [], breakpoints: [] }, output: [], entry: '',
+  onEntryChange: () => {}, onStart: () => {}, onStop: () => {}, onContinue: () => {}, onPause: () => {},
+  onStepOver: () => {}, onStepInto: () => {}, onStepOut: () => {}, onSelectFrame: () => {},
+  onOpenLocation: () => {}, onRemoveBreakpoint: () => {},
+  onEvaluate: async () => ({ value: '', type: 'error', error: 'Chưa mở project.' })
+}
 
 function Shell({ terminal, theme, instance }: { terminal: TerminalInfo; theme: string; instance: MutableRefObject<Terminal | null> }) {
   const container = useRef<HTMLDivElement>(null)
@@ -67,7 +79,15 @@ function Shell({ terminal, theme, instance }: { terminal: TerminalInfo; theme: s
   return <><div ref={container} className="terminal-surface" data-terminal-id={terminal.id} />{error && <div className="terminal-error" role="alert">{error}</div>}</>
 }
 
-export function TerminalPanel({ projectID, theme, visible, close, createdTerminal }: { projectID?: string; theme: string; visible: boolean; close: () => void; createdTerminal?: TerminalInfo }) {
+export function TerminalPanel({ projectID, theme, visible, close, createdTerminal, activeTab, onSelectTab, problemsProps, debugProps, problemCounts = { error: 0, warning: 0 }, debugStatus = 'idle' }: {
+  projectID?: string; theme: string; visible: boolean; close: () => void; createdTerminal?: TerminalInfo;
+  activeTab?: BottomPanelTab; onSelectTab?: (tab: BottomPanelTab) => void;
+  problemsProps?: ProblemsPanelProps; debugProps?: DebugPanelProps;
+  problemCounts?: { error: number; warning: number }; debugStatus?: DebugStatus
+}) {
+  const [localTab, setLocalTab] = useState<BottomPanelTab>('terminal')
+  const tab = activeTab ?? localTab
+  const selectTab = (next: BottomPanelTab) => { setLocalTab(next); onSelectTab?.(next) }
   const instance = useRef<Terminal | null>(null)
   const createdRef = useRef(createdTerminal); createdRef.current = createdTerminal
   const handledCreated = useRef(createdTerminal)
@@ -121,8 +141,9 @@ export function TerminalPanel({ projectID, theme, visible, close, createdTermina
   }
   const active = terminals.find(item => item.id === selected)
   return <section className={`editor-terminal ${visible ? '' : 'is-hidden'}`} aria-label="Terminal">
-    <div className="editor-terminal__head"><div className="term-head__left"><span className="term-head__label">TERMINAL</span><div className="term-tabs" role="tablist" aria-label="Shell terminals">{terminals.map((item, index) => <div className={`term-tab ${item.id === selected ? 'is-active' : ''}`} key={item.id}><button role="tab" aria-selected={item.id === selected} onClick={() => setSelected(item.id)}>{item.title} {index + 1}{item.exitCode !== undefined ? ` (${item.exitCode})` : ''}</button><button className="term-tab__close" aria-label={`Kill terminal ${index + 1}`} onClick={() => void remove(item)}>×</button></div>)}</div></div>
-      <div className="term-head__actions"><select aria-label="Terminal profile" value={profile} onChange={event => setProfile(event.target.value)}>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><button className="icon-btn term-act-btn" aria-label="New Terminal" title="New Terminal" disabled={!projectID || !profiles.length || busy} onClick={() => void create()}><Icon name="plus" /></button><button className="icon-btn term-act-btn" aria-label="Clear Terminal" title="Clear Terminal" disabled={!active} onClick={() => clearTerminal(instance.current)}><Icon name="refresh" /></button><IconButton label="Close Terminal Panel" onClick={close}><Icon name="close" /></IconButton></div></div>
-    <div className="terminal-wrap">{error && <div className="terminal-error" role="alert">{error}</div>}{active ? <Shell key={active.id} terminal={active} theme={theme} instance={instance} /> : <div className="terminal-empty">{projectID ? <button disabled={busy || !profiles.length} onClick={() => void create()}>Mở terminal tại project</button> : 'Mở project để dùng terminal.'}</div>}</div>
+    <div className="editor-terminal__head"><div className="term-head__left"><div className="bottom-panel-tabs" role="tablist" aria-label="Bottom panel">{(['terminal', 'problems', 'debug'] as const).map(value => <button type="button" role="tab" key={value} aria-selected={tab === value} onClick={() => selectTab(value)}>{value === 'terminal' ? 'TERMINAL' : value === 'problems' ? <>Vấn đề <span className="bottom-panel-count">{problemCounts.error + problemCounts.warning}</span></> : <><span className={`debug-indicator debug-indicator--${debugStatus}`} />Gỡ lỗi</>}</button>)}</div><div className="term-tabs" hidden={tab !== 'terminal'} role="tablist" aria-label="Shell terminals">{terminals.map((item, index) => <div className={`term-tab ${item.id === selected ? 'is-active' : ''}`} key={item.id}><button role="tab" aria-selected={item.id === selected} onClick={() => setSelected(item.id)}>{item.title} {index + 1}{item.exitCode !== undefined ? ` (${item.exitCode})` : ''}</button><button className="term-tab__close" aria-label={`Kill terminal ${index + 1}`} onClick={() => void remove(item)}>×</button></div>)}</div></div>
+      <div className="term-head__actions"><select hidden={tab !== 'terminal'} aria-label="Terminal profile" value={profile} onChange={event => setProfile(event.target.value)}>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><button hidden={tab !== 'terminal'} className="icon-btn term-act-btn" aria-label="New Terminal" title="New Terminal" disabled={!projectID || !profiles.length || busy} onClick={() => void create()}><Icon name="plus" /></button><button hidden={tab !== 'terminal'} className="icon-btn term-act-btn" aria-label="Clear Terminal" title="Clear Terminal" disabled={!active} onClick={() => clearTerminal(instance.current)}><Icon name="refresh" /></button><IconButton label="Close Terminal Panel" onClick={close}><Icon name="close" /></IconButton></div></div>
+    <div className="terminal-wrap" hidden={tab !== 'terminal'}>{error && <div className="terminal-error" role="alert">{error}</div>}{active ? <Shell key={active.id} terminal={active} theme={theme} instance={instance} /> : <div className="terminal-empty">{projectID ? <button disabled={busy || !profiles.length} onClick={() => void create()}>Mở terminal tại project</button> : 'Mở project để dùng terminal.'}</div>}</div>
+    {tab !== 'terminal' && <div className="bottom-panel-body">{tab === 'problems' ? <ProblemsPanel {...(problemsProps ?? { problems: [], onOpenLocation: () => {} })} /> : <DebugPanel {...(debugProps ?? idleDebugProps)} />}</div>}
   </section>
 }

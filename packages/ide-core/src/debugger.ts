@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { createRequire, SourceMap, type SourceMapPayload, type SourceMapping } from 'node:module'
 import path from 'node:path'
@@ -58,6 +58,16 @@ type Session = {
   stderr: string
   waitingForDisconnect?: boolean
   detachTimer?: ReturnType<typeof setTimeout>
+}
+
+function resolveTsxLoaderPath(): string {
+  const resolved = createRequire(import.meta.url).resolve('tsx')
+  const asarSegment = `${path.sep}app.asar${path.sep}`
+  if (resolved.includes(asarSegment)) {
+    const unpacked = resolved.replace(asarSegment, `${path.sep}app.asar.unpacked${path.sep}`)
+    if (existsSync(unpacked)) return unpacked
+  }
+  return resolved
 }
 
 function failure(code: string): Error { return Object.assign(new Error(code), { code }) }
@@ -364,7 +374,7 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
       }
       if (process.versions.electron) env.ELECTRON_RUN_AS_NODE = '1'
       const args = ['--inspect-brk=127.0.0.1:0']
-      if (config.runtime === 'tsx' || /\.tsx?$/i.test(entry.target)) args.push('--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href)
+      if (config.runtime === 'tsx' || /\.tsx?$/i.test(entry.target)) args.push('--import', pathToFileURL(resolveTsxLoaderPath()).href)
       args.push('--', entry.target, ...(config.args ?? []))
       check(s)
       snapshot = { status: 'running', entry: entry.normalized, frames: [], variables: [], breakpoints: [] }
