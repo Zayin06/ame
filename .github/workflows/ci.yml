@@ -1,0 +1,45 @@
+name: CI
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ide/ is the Git repository root; all commands run at the checkout root.
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      AME_OPENCODE_CLI: ${{ secrets.AME_OPENCODE_CLI || vars.AME_OPENCODE_CLI }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Build without private runtime
+        if: env.AME_OPENCODE_CLI == ''
+        run: npm run build:server
+      - name: Build Electron without private runtime
+        if: env.AME_OPENCODE_CLI == ''
+        run: npx electron-vite build
+      - name: Prepare configured trusted OpenCode 2.3.2
+        if: env.AME_OPENCODE_CLI != ''
+        run: npm run runtime:prepare
+      - name: Full build with private runtime
+        if: env.AME_OPENCODE_CLI != ''
+        run: npm run build

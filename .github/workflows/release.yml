@@ -1,0 +1,125 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build unsigned artifacts without signing or notarization
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# ide/ is the checkout root. Runtime paths refer to trusted files provisioned
+# on the runner; alternatively provide an HTTPS raw executable plus its pinned
+# SHA-256. Each runtime must be OpenCode 2.3.2 for the indicated architecture.
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+            arch: x64
+            targets: nsis portable
+            runtime_path: AME_OPENCODE_CLI_WIN32_X64
+            runtime_url: AME_OPENCODE_URL_WIN32_X64
+            runtime_sha: AME_OPENCODE_SHA256_WIN32_X64
+          - os: macos-latest
+            platform: mac
+            arch: x64
+            targets: dmg zip
+            runtime_path: AME_OPENCODE_CLI_DARWIN_X64
+            runtime_url: AME_OPENCODE_URL_DARWIN_X64
+            runtime_sha: AME_OPENCODE_SHA256_DARWIN_X64
+          - os: macos-latest
+            platform: mac
+            arch: arm64
+            targets: dmg zip
+            runtime_path: AME_OPENCODE_CLI_DARWIN_ARM64
+            runtime_url: AME_OPENCODE_URL_DARWIN_ARM64
+            runtime_sha: AME_OPENCODE_SHA256_DARWIN_ARM64
+    runs-on: ${{ matrix.os }}
+    env:
+      AME_OPENCODE_CLI: ${{ secrets[matrix.runtime_path] || vars[matrix.runtime_path] || secrets.AME_OPENCODE_CLI || vars.AME_OPENCODE_CLI }}
+      AME_OPENCODE_URL: ${{ secrets[matrix.runtime_url] || vars[matrix.runtime_url] }}
+      AME_OPENCODE_SHA256: ${{ secrets[matrix.runtime_sha] || vars[matrix.runtime_sha] }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable x64 execution on Apple Silicon
+        if: runner.os == 'macOS' && matrix.arch == 'x64'
+        shell: bash
+        run: |
+          if [ "$(uname -m)" = arm64 ]; then
+            softwareupdate --install-rosetta --agree-to-license
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          architecture: ${{ matrix.arch }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Require native target execution for runtime version validation
+        shell: bash
+        run: node -e "if (process.arch !== '${{ matrix.arch }}') throw new Error('Target Node architecture is required')"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # Node-based tests must finish before switching node-pty to Electron's ABI.
+      - name: Rebuild node-pty for target Electron architecture
+        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
+      - name: Acquire pinned runtime if no trusted local path is configured
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { appendFile, chmod, writeFile } from 'node:fs/promises'
+          import path from 'node:path'
+          if (!process.env.AME_OPENCODE_CLI) {
+            const url = new URL(process.env.AME_OPENCODE_URL || 'https://invalid.invalid')
+            const expected = process.env.AME_OPENCODE_SHA256 || ''
+            if (url.protocol !== 'https:' || !/^[a-f\d]{64}$/i.test(expected)) throw new Error('Trusted runtime path or HTTPS URL and pinned SHA-256 required')
+            const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(120000) })
+            if (!response.ok) throw new Error(`Runtime download failed: ${response.status}`)
+            const bytes = Buffer.from(await response.arrayBuffer())
+            if (createHash('sha256').update(bytes).digest('hex') !== expected.toLowerCase()) throw new Error('Runtime SHA-256 mismatch')
+            const file = path.join(process.env.RUNNER_TEMP, process.platform === 'win32' ? 'opencode.exe' : 'opencode')
+            await writeFile(file, bytes)
+            if (process.platform !== 'win32') await chmod(file, 0o755)
+            await appendFile(process.env.GITHUB_ENV, `AME_OPENCODE_CLI=${file}\n`)
+          }
+          NODE
+      - name: Stage and verify exact OpenCode 2.3.2 for target architecture
+        run: npm run runtime:prepare
+      - run: npm run build
+      - name: Package platform artifacts without publishing
+        shell: bash
+        env:
+          CSC_LINK: ${{ inputs.dry_run != true && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ inputs.dry_run != true && secrets.CSC_KEY_PASSWORD || '' }}
+          APPLE_ID: ${{ inputs.dry_run != true && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ inputs.dry_run != true && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.dry_run != true && secrets.APPLE_TEAM_ID || '' }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          signing=()
+          if [ '${{ matrix.platform }}' = win ] && [ -n "$CSC_LINK" ]; then
+            signing+=(--config.win.signAndEditExecutable=true)
+          fi
+          npx electron-builder --${{ matrix.platform }} ${{ matrix.targets }} --${{ matrix.arch }} --publish never "${signing[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ame-ide-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
