@@ -1,0 +1,7 @@
+.terminal-surface { flex: 1; min-height: 0; min-width: 0; padding: 4px 6px; overflow: hidden; background: #14161a; }
+[data-theme="light"] .terminal-surface { background: #ffffff; }
+.terminal-surface .xterm { height: 100%; }
+.terminal-empty { padding: 12px; color: var(--text-muted); font-size: 12px; }
+.terminal-error { padding: 4px 8px; color: var(--text-danger, #e87979); font-size: 12px; overflow-wrap: anywhere; }
+.term-tab > button { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+.term-head__actions select { max-width: 110px; min-width: 45px; height: 22px; background: var(--bg-canvas); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 3px; font-size: 11px; }

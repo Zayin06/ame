@@ -1,0 +1,956 @@
+/* ==========================================================================
+   layout.css — Kiến trúc Layout 4 Cột Project-Centric (Antigravity × VS Code)
+   --------------------------------------------------------------------------
+   [ 1. Projects & Chats ] | [ 2. Project Inspector (Explorer/Git) ] |
+   [ 3. Chat Canvas (+ Corner Artifacts/Agents/btw) ] |
+   [ 4. File & Diff Stage (+ Bottom Terminal) ]
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--bg-shell);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* ==========================================================================
+   1. ROOT APP SHELL (CSS Grid 2 hàng: Titlebar 40px + Workspace 1fr)
+   ========================================================================== */
+.app-shell {
+  display: grid;
+  grid-template-rows: var(--titlebar-h) minmax(0, 1fr);
+  height: 100dvh;
+  width: 100vw;
+  overflow: hidden;
+  background: var(--bg-shell);
+}
+
+/* ==========================================================================
+   2. CUSTOM TITLEBAR (40px — Grid 3 cột: Left / Center / Right)
+   ========================================================================== */
+.titlebar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  height: var(--titlebar-h);
+  padding-left: 10px;
+  background: var(--bg-shell);
+  gap: 8px;
+  position: relative;
+  z-index: var(--z-sticky);
+}
+
+.titlebar__left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.titlebar__center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  max-width: 420px;
+}
+
+.titlebar__right {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 0;
+}
+
+.titlebar-avatar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) ease, opacity var(--dur-fast) ease;
+}
+.titlebar-avatar-btn:hover {
+  opacity: 0.9;
+  transform: scale(1.05);
+}
+.titlebar-avatar {
+  width: 22px !important;
+  height: 22px !important;
+  font-size: 11px !important;
+}
+
+.brand-mark--icon-only {
+  padding-right: 2px;
+}
+
+/* Login Modal (User & Password) */
+.login-card {
+  max-width: 340px !important;
+}
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.login-field input {
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+}
+.login-field input:focus {
+  border-color: var(--accent-border);
+}
+.login-submit-btn {
+  height: 34px;
+  margin-top: 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.login-submit-btn:hover {
+  background: var(--accent-strong);
+}
+.login-signed-in {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.login-signout-btn {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--danger);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.login-signout-btn:hover {
+  background: var(--danger-soft);
+}
+
+/* ==========================================================================
+   3. WORKSPACE BODY (4-Pane Flex + 3 Resizers)
+   ========================================================================== */
+.workspace-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  padding: 0 8px 8px 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.workspace-body:not(.is-sidebar-collapsed) {
+  padding-left: 0;
+}
+
+.workspace-body.is-resizing .sidebar,
+.workspace-body.is-resizing .inspector-pane,
+.workspace-body.is-resizing .side-panel {
+  transition: none !important;
+}
+
+/* ==========================================================================
+   4. CỘT 1: PROJECTS & CHATS SIDEBAR
+   ========================================================================== */
+.sidebar {
+  width: var(--sidebar-w);
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-sidebar);
+  padding: 4px 6px 4px 10px;
+  overflow: hidden;
+  transition: width var(--dur-base) var(--ease-out),
+              opacity var(--dur-fast) ease,
+              padding var(--dur-base) var(--ease-out);
+}
+
+.workspace-body.is-sidebar-collapsed .sidebar {
+  width: 0 !important;
+  padding-left: 0;
+  padding-right: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.sidebar__top {
+  flex-shrink: 0;
+  padding-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidebar__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+}
+
+.sidebar__footer {
+  flex-shrink: 0;
+  padding-top: 8px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Project Search & Filter Controls */
+.proj-search-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-subtle);
+}
+.proj-search-box:focus-within {
+  border-color: var(--accent-border);
+}
+.proj-search-box svg {
+  width: 13px;
+  height: 13px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.proj-search-box input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12px;
+}
+.proj-search-box input::placeholder {
+  color: var(--text-muted);
+}
+
+.proj-filter-bar {
+  display: flex;
+  gap: 4px;
+}
+.proj-filter-btn {
+  flex: 1;
+  height: 23px;
+  border-radius: var(--radius-xs);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--dur-fast) ease;
+}
+.proj-filter-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+.proj-filter-btn.is-active {
+  background: var(--bg-canvas-subtle);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+
+/* Project Group Card + Inline Actions (Explorer | Git Diff | New Chat) */
+.proj-group {
+  margin-bottom: 6px;
+  border-radius: var(--radius-sm);
+  padding: 2px;
+}
+.proj-group.is-active-proj {
+  background: rgba(138, 180, 248, 0.045);
+}
+
+.proj-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  height: 30px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--dur-fast) ease;
+}
+.proj-row:hover {
+  background: var(--bg-hover);
+}
+.proj-group.is-active-proj > .proj-row {
+  background: var(--bg-active);
+}
+
+.proj-row__left {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 1;
+}
+.proj-chevron {
+  width: 12px;
+  height: 12px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) ease;
+}
+.proj-group.is-folded .proj-chevron {
+  transform: rotate(-90deg);
+}
+.proj-group.is-folded .proj-chats {
+  display: none;
+}
+.proj-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.proj-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.proj-act-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: 22px;
+  min-width: 22px;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  transition: all var(--dur-fast) ease;
+}
+.proj-act-btn svg {
+  width: 13px;
+  height: 13px;
+}
+.proj-row:hover .proj-act-btn,
+.proj-group.is-active-proj .proj-act-btn {
+  color: var(--text-secondary);
+}
+.proj-act-btn:hover {
+  background: var(--bg-hover-strong);
+  color: var(--text-primary);
+}
+.proj-act-btn.is-active-tool {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+.proj-act-btn {
+  position: relative;
+}
+.diff-dot {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--vsc-git-m);
+  opacity: 0.9;
+  pointer-events: none;
+}
+.diff-dot.is-hidden {
+  display: none;
+}
+
+.proj-chats {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 12px;
+  margin-top: 2px;
+}
+
+/* ==========================================================================
+   5. CỘT 2: PROJECT INSPECTOR (IDE DRAWER — Explorer / Git Diff + Sticky-Hide)
+   ========================================================================== */
+.inspector-pane {
+  width: var(--inspector-w, 240px);
+  flex: 0 0 auto;
+  min-width: 190px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--vsc-sidebar-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--pane-radius);
+  overflow: hidden;
+  transition: width var(--dur-base) var(--ease-out),
+              opacity var(--dur-fast) ease;
+}
+
+.workspace-body.is-inspector-collapsed .inspector-pane {
+  width: 0 !important;
+  min-width: 0 !important;
+  border-width: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Chi tiết UI bên trong Cột 2 được tách riêng sang css/inspector.css */
+
+/* ==========================================================================
+   6. RESIZER HANDLES (3 thanh kéo giữa 4 cột)
+   ========================================================================== */
+.pane-resizer {
+  flex: 0 0 7px;
+  position: relative;
+  cursor: col-resize;
+  z-index: var(--z-resizer);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+
+.pane-resizer::after {
+  content: "";
+  width: 2px;
+  height: 44px;
+  border-radius: 999px;
+  background: transparent;
+  transition: background var(--dur-fast) ease, height var(--dur-fast) ease;
+}
+
+.pane-resizer:hover::after,
+.pane-resizer.is-dragging::after {
+  background: var(--accent);
+  height: 100%;
+  opacity: 0.75;
+}
+
+.workspace-body.is-sidebar-collapsed .pane-resizer[data-resize="sidebar"],
+.workspace-body.is-inspector-collapsed .pane-resizer[data-resize="inspector"],
+.workspace-body.is-sidepanel-collapsed .pane-resizer[data-resize="sidepanel"] {
+  display: none;
+}
+
+/* ==========================================================================
+   7. CỘT 3: CHAT CANVAS (+ CHAT-SCOPED CORNER DRAWER)
+   ========================================================================== */
+.chat-pane {
+  flex: 1 1 0%;
+  min-width: 320px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--pane-radius);
+  overflow: hidden;
+}
+
+.chat-pane__header {
+  flex-shrink: 0;
+  height: 42px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-canvas);
+}
+
+.chat-pane__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+}
+
+.chat-column {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.chat-stream {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 20px 22px 34px 22px;
+  scroll-behavior: smooth;
+  user-select: text;
+}
+
+.chat-stream__inner {
+  width: 100%;
+  max-width: var(--chat-max-w);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* Chat-scoped Corner Drawer (Artifacts / Subagents / /btw gắn góc Chat) */
+.chat-corner-drawer {
+  display: none;
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 300px;
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  z-index: var(--z-overview-float);
+  padding: 10px;
+  flex-direction: column;
+  gap: 8px;
+}
+.chat-corner-drawer.is-open {
+  display: flex;
+}
+.chat-drawer__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.chat-drawer__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.chat-drawer__row:hover {
+  border-color: var(--accent-border);
+}
+
+/* Sticky Composer Dock + Context Strip */
+.composer-dock {
+  flex-shrink: 0;
+  position: relative;
+  padding: 6px 18px 14px 18px;
+  background: var(--bg-canvas);
+  z-index: var(--z-sticky);
+}
+
+.composer-dock::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -28px;
+  height: 28px;
+  background: linear-gradient(to bottom, var(--canvas-fade-top), var(--canvas-fade-bottom));
+  pointer-events: none;
+}
+
+.composer-dock__inner {
+  width: 100%;
+  max-width: var(--chat-max-w);
+  margin: 0 auto;
+  position: relative;
+}
+
+.composer-context-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.ctx-strip-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-canvas-subtle);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.ctx-strip-chip:hover {
+  border-color: var(--accent-border);
+  color: var(--text-primary);
+}
+
+/* ==========================================================================
+   8. CỘT 4: FILE & DIFF STAGE (+ INTEGRATED BOTTOM TERMINAL)
+   ========================================================================== */
+.side-panel {
+  width: clamp(300px, var(--sidepanel-w), 50vw);
+  flex: 0 1 auto;
+  min-width: 300px;
+  max-width: calc(100% - 340px);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--pane-radius);
+  overflow: hidden;
+  transition: width var(--dur-base) var(--ease-out),
+              opacity var(--dur-fast) ease;
+}
+
+.workspace-body.is-sidepanel-collapsed .side-panel {
+  width: 0 !important;
+  min-width: 0 !important;
+  border-width: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.workspace-body.is-sidepanel-maximized .chat-pane,
+.workspace-body.is-sidepanel-maximized .pane-resizer[data-resize="sidepanel"] {
+  display: none;
+}
+.workspace-body.is-sidepanel-maximized .side-panel {
+  width: auto !important;
+  max-width: none;
+  flex: 1 1 0%;
+}
+
+.side-panel__tabs {
+  flex-shrink: 0;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 8px 0 6px;
+  gap: 6px;
+  background: var(--bg-canvas-subtle);
+}
+
+.side-panel__tab-list {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.side-panel__tab-list::-webkit-scrollbar {
+  display: none;
+}
+
+.editor-breadcrumb {
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-canvas);
+}
+.editor-breadcrumb strong {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.side-panel__content {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  user-select: text;
+}
+
+/* Integrated Bottom Terminal Drawer (gắn đáy cột 4 — File Stage) */
+.editor-terminal {
+  flex-shrink: 0;
+  height: 185px;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border-default);
+  background: var(--bg-code);
+}
+.editor-terminal.is-hidden {
+  display: none;
+}
+.editor-terminal__head {
+  flex-shrink: 0;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-canvas-subtle);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.term-head__left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.term-head__label {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.term-tabs {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.term-tabs::-webkit-scrollbar {
+  display: none;
+}
+.term-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.term-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.term-tab.is-active {
+  background: var(--bg-canvas);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+.term-tab__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  opacity: 0.55;
+  font-family: var(--font-sans);
+}
+.term-tab__close:hover {
+  background: var(--bg-hover-strong);
+  opacity: 1;
+}
+
+.term-head__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.term-new-group {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.term-act-btn {
+  height: 22px;
+  min-width: 22px;
+  width: 22px;
+  padding: 0;
+}
+.term-act-btn svg {
+  width: 13px;
+  height: 13px;
+}
+.term-act-btn--caret {
+  min-width: 16px;
+  width: 16px;
+}
+.term-act-btn--caret svg {
+  width: 11px;
+  height: 11px;
+}
+
+.term-profile-menu {
+  width: 268px;
+}
+.term-menu-kbd {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+}
+
+.terminal-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.side-panel__status {
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 12px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-canvas-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ==========================================================================
+   9. RESPONSIVE ADAPTATION
+   ========================================================================== */
+@media (max-width: 1180px) {
+  .sidebar {
+    width: min(var(--sidebar-w), 220px);
+  }
+  .inspector-pane {
+    width: min(var(--inspector-w, 240px), 210px);
+  }
+  .chat-pane {
+    min-width: 280px;
+  }
+  .side-panel {
+    width: clamp(260px, var(--sidepanel-w), 40vw);
+    min-width: 260px;
+  }
+}
+
+@media (max-width: 960px) {
+  .titlebar__center {
+    display: none;
+  }
+  .workspace-body:not(.is-sidebar-collapsed) .sidebar {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 8px;
+    width: 248px;
+    z-index: var(--z-popover);
+    box-shadow: var(--shadow-md);
+    border-right: 1px solid var(--border-default);
+  }
+  .workspace-body:not(.is-sidebar-collapsed) {
+    padding-left: 8px;
+  }
+  .pane-resizer[data-resize="sidebar"] {
+    display: none;
+  }
+}

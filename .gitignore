@@ -1,0 +1,11 @@
+node_modules/
+out/
+resources/opencode/
+resources/amekit-models/server.js
+release/
+.pm/
+release-*/
+*.log
+.env
+.env.*
+!.env.example

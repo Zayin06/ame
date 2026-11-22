@@ -1,0 +1,91 @@
+{
+  "name": "ame-ide",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "runtime:prepare": "node scripts/prepare-runtime.mjs",
+    "build:server": "vite build --config vite.server.config.ts",
+    "dev": "npm run runtime:prepare && npm run build:server && electron-vite dev",
+    "build": "npm run runtime:prepare && npm run build:server && electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts packages/amekit/test/*.test.ts apps/desktop/src/renderer/test/*.test.ts",
+    "test:desktop": "npm run build && node scripts/smoke-desktop.mjs",
+    "test:terminal": "npm run build && node scripts/smoke-terminal.mjs",
+    "package": "npm run build && electron-builder --dir"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "4.7.0",
+    "@opencode/client": "2.3.2",
+    "@opentunnel/client": "0.6.2",
+    "@pierre/diffs": "1.6.1",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "fflate": "0.8.2",
+    "monaco-editor": "0.55.1",
+    "node-pty": "1.1.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "simple-git": "3.30.0",
+    "yaml": "2.8.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.3.2",
+    "@opencode/schema": "2.3.2",
+    "@types/node": "22.10.2",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@vitejs/plugin-react": "4.7.0",
+    "electron": "45.4.1",
+    "electron-builder": "26.0.12",
+    "electron-vite": "4.0.1",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vite": "6.4.6"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "build": {
+    "appId": "tech.ameno.ide",
+    "productName": "Ame IDE",
+    "asarUnpack": ["node_modules/node-pty/**/*"],
+    "files": [
+      "out/**/*",
+      "package.json",
+      "THIRD_PARTY_NOTICES.md",
+      "references/OPENCODE_LICENSE.txt",
+      "references/PIERRE_DIFFS_LICENSE.txt"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "extraResources": [
+      {
+        "from": "resources/opencode",
+        "to": "opencode"
+      },
+      {
+        "from": "resources/amekit-models",
+        "to": "amekit-models"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools"
+    }
+  }
+}

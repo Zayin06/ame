@@ -1,0 +1,284 @@
+/* ==========================================================================
+   tokens.css — Design System Tokens cho Antigravity App Window
+   --------------------------------------------------------------------------
+   Tách toàn bộ màu sắc, kích thước, bo góc, z-index ra CSS Custom Properties
+   giúp chuyển Dark / Light theme và Workspace Accent mượt mà chỉ bằng cách
+   đổi data-attribute trên <html> mà không phải sửa CSS của từng component.
+   ========================================================================== */
+
+:root {
+  /* --- Typography --- */
+  --font-sans: "Inter", "Segoe UI Variable", "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", Consolas, ui-monospace, monospace;
+
+  /* --- Core Layout Geometry (Có thể thay đổi động bằng JS khi drag resize) --- */
+  --titlebar-h: 40px;
+  --sidebar-w: 256px;
+  --inspector-w: 240px;
+  --sidepanel-w: 480px;
+  --chat-max-w: 760px;
+  --pane-gap: 8px;
+  --pane-radius: 12px;
+
+  /* --- Spacing & Radii --- */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  /* --- Motion --- */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+
+  /* --- Z-index Layering --- */
+  --z-base: 1;
+  --z-sticky: 10;
+  --z-resizer: 20;
+  --z-overview-float: 30;
+  --z-popover: 40;
+  --z-modal: 60;
+  --z-xray: 80;
+
+  /* ========================================================================
+     DARK THEME (Mặc định — phong cách Desktop App tối giản, dịu mắt)
+     Kỹ thuật "Shell + Framed Canvas":
+     - --bg-shell & --bg-sidebar dùng nền tối trầm (#121316) làm khung cửa sổ.
+     - --bg-canvas sáng hơn một bậc (#191b20) tạo chiều sâu tự nhiên mà
+       không cần đổ bóng nặng.
+     ======================================================================== */
+  --bg-shell: #121316;
+  --bg-sidebar: #121316;
+  --bg-canvas: #191b20;
+  --bg-canvas-subtle: #1e2027;
+  --bg-elevated: #23262f;
+  --bg-composer: #20232b;
+  --bg-hover: rgba(255, 255, 255, 0.055);
+  --bg-hover-strong: rgba(255, 255, 255, 0.09);
+  --bg-active: rgba(138, 180, 248, 0.13);
+  --bg-user-bubble: #262a34;
+  --bg-code: #14161a;
+  --bg-overlay: rgba(8, 10, 14, 0.62);
+
+  /* Borders */
+  --border-subtle: rgba(255, 255, 255, 0.075);
+  --border-default: rgba(255, 255, 255, 0.11);
+  --border-strong: rgba(255, 255, 255, 0.18);
+
+  /* Text */
+  --text-primary: #e8eaed;
+  --text-secondary: #9aa0a6;
+  --text-muted: #6f7682;
+  --text-on-accent: #0f131a;
+
+  /* Brand / Semantic Accents */
+  --accent: #8ab4f8;
+  --accent-strong: #669df6;
+  --accent-soft: rgba(138, 180, 248, 0.14);
+  --accent-border: rgba(138, 180, 248, 0.35);
+
+  --success: #6dd58c;
+  --success-soft: rgba(109, 213, 140, 0.13);
+  --warning: #fdd663;
+  --warning-soft: rgba(253, 214, 99, 0.14);
+  --danger: #f28b82;
+  --danger-soft: rgba(242, 139, 130, 0.14);
+  --purple: #c58af9;
+  --purple-soft: rgba(197, 138, 249, 0.14);
+
+  /* Diff Colors */
+  --diff-add-bg: rgba(109, 213, 140, 0.12);
+  --diff-add-gutter: rgba(109, 213, 140, 0.22);
+  --diff-del-bg: rgba(242, 139, 130, 0.12);
+  --diff-del-gutter: rgba(242, 139, 130, 0.22);
+
+  /* Shadows */
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.42);
+  --shadow-composer: 0 6px 24px rgba(0, 0, 0, 0.32), 0 0 0 1px var(--border-default);
+
+  /* Scrollbar */
+  --scrollbar-thumb: rgba(255, 255, 255, 0.14);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.26);
+
+  /* Gradient fade behind composer */
+  --canvas-fade-top: rgba(25, 27, 32, 0);
+  --canvas-fade-bottom: rgba(25, 27, 32, 1);
+
+  /* ========================================================================
+     VS CODE DIFF & SYNTAX TOKENS (Dark+ Theme)
+     ======================================================================== */
+  --vsc-editor-bg: #1e1e1e;
+  --vsc-sidebar-bg: #181818;
+  --vsc-tab-bar-bg: #181818;
+  --vsc-tab-active-bg: #1e1e1e;
+  --vsc-border: #2b2b2b;
+  --vsc-hover: rgba(255, 255, 255, 0.06);
+  --vsc-selection: #2a2d2e;
+  --vsc-focus-row: #37373d;
+  --vsc-gutter: #6e7681;
+  --vsc-commit-bg: #0078d4;
+  --vsc-commit-hover: #026ec1;
+
+  /* 2-tier Diff Highlights (Line tint + Intra-line word highlight) */
+  --vsc-del-line: rgba(244, 67, 54, 0.14);
+  --vsc-del-word: rgba(244, 67, 54, 0.30);
+  --vsc-del-gutter: #f14c4c;
+  --vsc-add-line: rgba(88, 175, 80, 0.15);
+  --vsc-add-word: rgba(78, 201, 100, 0.32);
+  --vsc-add-gutter: #4ec968;
+  --vsc-diag-warn: #e06c4e;
+  --vsc-gap-stripe: rgba(255, 255, 255, 0.045);
+
+  /* Git Status Badges */
+  --vsc-git-m: #e2c08d;
+  --vsc-git-u: #73c991;
+  --vsc-git-d: #f14c4c;
+
+  /* Syntax Highlighting (VS Code Dark+) */
+  --syn-text: #d4d4d4;
+  --syn-kw: #c586c0;
+  --syn-decl: #569cd6;
+  --syn-type: #4ec9b0;
+  --syn-fn: #dcdcaa;
+  --syn-var: #9cdcfe;
+  --syn-const: #4fc1ff;
+  --syn-str: #ce9178;
+  --syn-comment: #6a9955;
+  --syn-tag: #569cd6;
+  --syn-num: #b5cea8;
+}
+
+/* ==========================================================================
+   LIGHT THEME
+   ========================================================================== */
+:root[data-theme="light"] {
+  --bg-shell: #eef1f5;
+  --bg-sidebar: #eef1f5;
+  --bg-canvas: #ffffff;
+  --bg-canvas-subtle: #f7f9fc;
+  --bg-elevated: #ffffff;
+  --bg-composer: #f8f9fc;
+  --bg-hover: rgba(15, 23, 42, 0.05);
+  --bg-hover-strong: rgba(15, 23, 42, 0.09);
+  --bg-active: rgba(26, 115, 232, 0.11);
+  --bg-user-bubble: #edf2fa;
+  --bg-code: #f5f7fa;
+  --bg-overlay: rgba(15, 23, 42, 0.35);
+
+  --border-subtle: rgba(15, 23, 42, 0.08);
+  --border-default: rgba(15, 23, 42, 0.13);
+  --border-strong: rgba(15, 23, 42, 0.22);
+
+  --text-primary: #1c1f26;
+  --text-secondary: #535c6b;
+  --text-muted: #7b8494;
+  --text-on-accent: #ffffff;
+
+  --accent: #1a73e8;
+  --accent-strong: #1557b0;
+  --accent-soft: rgba(26, 115, 232, 0.1);
+  --accent-border: rgba(26, 115, 232, 0.32);
+
+  --success: #188038;
+  --success-soft: rgba(24, 128, 56, 0.1);
+  --warning: #b06000;
+  --warning-soft: rgba(234, 134, 0, 0.12);
+  --danger: #d93025;
+  --danger-soft: rgba(217, 48, 37, 0.1);
+  --purple: #8430ce;
+  --purple-soft: rgba(132, 48, 206, 0.1);
+
+  --diff-add-bg: rgba(24, 128, 56, 0.09);
+  --diff-add-gutter: rgba(24, 128, 56, 0.16);
+  --diff-del-bg: rgba(217, 48, 37, 0.09);
+  --diff-del-gutter: rgba(217, 48, 37, 0.16);
+
+  --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.08);
+  --shadow-md: 0 12px 32px rgba(15, 23, 42, 0.14);
+  --shadow-composer: 0 4px 18px rgba(15, 23, 42, 0.08), 0 0 0 1px var(--border-default);
+
+  --scrollbar-thumb: rgba(15, 23, 42, 0.16);
+  --scrollbar-thumb-hover: rgba(15, 23, 42, 0.3);
+
+  --canvas-fade-top: rgba(255, 255, 255, 0);
+  --canvas-fade-bottom: rgba(255, 255, 255, 1);
+
+  /* VS Code Diff & Syntax Tokens (Light+ Theme) */
+  --vsc-editor-bg: #ffffff;
+  --vsc-sidebar-bg: #f3f3f3;
+  --vsc-tab-bar-bg: #f3f3f3;
+  --vsc-tab-active-bg: #ffffff;
+  --vsc-border: #e5e5e5;
+  --vsc-hover: rgba(0, 0, 0, 0.05);
+  --vsc-selection: #e8e8e8;
+  --vsc-focus-row: #dce6f5;
+  --vsc-gutter: #6e7681;
+  --vsc-commit-bg: #0078d4;
+  --vsc-commit-hover: #026ec1;
+
+  --vsc-del-line: rgba(255, 0, 0, 0.09);
+  --vsc-del-word: rgba(255, 0, 0, 0.21);
+  --vsc-del-gutter: #d1242f;
+  --vsc-add-line: rgba(40, 167, 69, 0.11);
+  --vsc-add-word: rgba(40, 167, 69, 0.26);
+  --vsc-add-gutter: #1a7f37;
+  --vsc-diag-warn: #d15704;
+  --vsc-gap-stripe: rgba(0, 0, 0, 0.045);
+
+  --vsc-git-m: #895503;
+  --vsc-git-u: #007100;
+  --vsc-git-d: #cd3131;
+
+  --syn-text: #1f2328;
+  --syn-kw: #af00db;
+  --syn-decl: #0000ff;
+  --syn-type: #267f99;
+  --syn-fn: #795e26;
+  --syn-var: #001080;
+  --syn-const: #0070c1;
+  --syn-str: #a31515;
+  --syn-comment: #008000;
+  --syn-tag: #0000ff;
+  --syn-num: #098658;
+}
+
+/* ==========================================================================
+   WORKSPACE ACCENT PRESETS (Giống Workspace Theme trong Antigravity App)
+   ========================================================================== */
+:root[data-workspace-tint="nord"] {
+  --accent: #88c0d0;
+  --accent-strong: #81a1c1;
+  --accent-soft: rgba(136, 192, 208, 0.14);
+  --accent-border: rgba(136, 192, 208, 0.36);
+  --bg-shell: #181c24;
+  --bg-sidebar: #181c24;
+  --bg-canvas: #1f242f;
+}
+
+:root[data-workspace-tint="everforest"] {
+  --accent: #a7c080;
+  --accent-strong: #83c092;
+  --accent-soft: rgba(167, 192, 128, 0.14);
+  --accent-border: rgba(167, 192, 128, 0.36);
+  --bg-shell: #1b211e;
+  --bg-sidebar: #1b211e;
+  --bg-canvas: #222925;
+}
+
+:root[data-theme="light"][data-workspace-tint="nord"] {
+  --accent: #2d6f85;
+  --accent-strong: #23586b;
+  --bg-shell: #eaf0f4;
+  --bg-sidebar: #eaf0f4;
+  --bg-canvas: #ffffff;
+}
+
+:root[data-theme="light"][data-workspace-tint="everforest"] {
+  --accent: #4c7a34;
+  --accent-strong: #396024;
+  --bg-shell: #eef2ea;
+  --bg-sidebar: #eef2ea;
+  --bg-canvas: #ffffff;
+}
