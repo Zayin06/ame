@@ -22,7 +22,13 @@ const examples: Invocation[] = [
   { method: 'discardFile', args: ['p', 'new.txt'] },
   { method: 'gitBranches', args: ['p'] },
   { method: 'checkoutBranch', args: ['p', 'feature/test'] },
-  { method: 'createBranch', args: ['p', 'feature/test', false] }
+  { method: 'createBranch', args: ['p', 'feature/test', false] },
+  { method: 'renameSession', args: ['p', 's', 'New title'] },
+  { method: 'archiveSession', args: ['p', 's', true] },
+  { method: 'deleteSession', args: ['p', 's'] },
+  { method: 'commands', args: ['p'] },
+  { method: 'skills', args: ['p'] },
+  { method: 'generateCommitMessage', args: ['p', { id: 'model', name: 'Model', providerID: 'amecode' }] }
 ]
 
 async function harness(directory = 'workspace') {
@@ -40,9 +46,23 @@ async function harness(directory = 'workspace') {
     return method
   }]))
   workspace.get = (id: unknown) => { if (id !== 'p') throw new Error('UNKNOWN_PROJECT'); return { directory } }
+  let models = [{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }]
+  let summary = { diff: '+change', files: ['new.txt'], truncated: false }
+  let policyError = ''
+  let policyGate: Promise<void> | undefined
+  workspace.stagedDiffSummary = async (...args: unknown[]) => { calls.push({ method: 'stagedDiffSummary', args }); return summary }
+  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage'].map(method => [method, async (...args: unknown[]) => {
+    calls.push({ method, args }); return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
+  }]))
+  adapter.models = async (...args: unknown[]) => { calls.push({ method: 'models', args }); return models }
+  const account = { call: async (...args: unknown[]) => {
+    calls.push({ method: 'account', args })
+    if (policyGate) await policyGate
+    if (policyError) throw new Error(policyError)
+  } }
   const parent = {}
   const context = {
-    z, Buffer, window: parent, workspace, validateWorkspacePath,
+    z, Buffer, window: parent, workspace, adapter, account, validateWorkspacePath,
     pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
     managed: true,
     pairing: { status: () => ({ enabled: false }) },
@@ -58,7 +78,12 @@ async function harness(directory = 'workspace') {
     } }
   }
   const dispatch = runInNewContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\ndispatch', context) as (method: string, args: unknown[]) => Promise<unknown>
-  return { dispatch, calls, messages, result, cancel: () => { response = 0 }, approve: () => { response = 1 }, empty: () => { preview = { filesChanged: 0, replacements: 0, previews: [] } } }
+  return {
+    dispatch, calls, messages, result,
+    setModels: (value: typeof models) => { models = value }, setSummary: (value: typeof summary) => { summary = value },
+    failPolicy: (value: string) => { policyError = value }, gatePolicy: (value: Promise<void>) => { policyGate = value },
+    cancel: () => { response = 0 }, approve: () => { response = 1 }, empty: () => { preview = { filesChanged: 0, replacements: 0, previews: [] } }
+  }
 }
 
 function plain(value: unknown) { return JSON.parse(JSON.stringify(value)) }
@@ -82,7 +107,11 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
     { method: 'revealPath', args: ['p', 'bad\0path'] },
     { method: 'checkoutBranch', args: ['p', 'x'.repeat(513)] },
     { method: 'createBranch', args: ['p', '', true] },
-    { method: 'createBranch', args: ['p', 'feature', 'true'] }
+    { method: 'createBranch', args: ['p', 'feature', 'true'] },
+    ...['', '   ', 'bad\0title', 'a'.repeat(501), 42].map(title => ({ method: 'renameSession', args: ['p', 's', title] })),
+    { method: 'archiveSession', args: ['p', 's', 'true'] },
+    { method: 'deleteSession', args: ['p', ''] },
+    ...[{}, { id: 'model', name: 'Model' }, { id: 'model', name: 'Model', providerID: 1 }, { id: 'model', name: 'Model', providerID: 'amecode', extra: true }].map(model => ({ method: 'generateCommitMessage', args: ['p', model] }))
   ]
   const invalidQueries = [
     {}, { query: 42 }, { query: 'x'.repeat(20001) }, { query: 'x', unknown: true },
@@ -104,7 +133,7 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
 
 test('new IPC dispatch preserves arguments and optional defaults without stage or dry-run dialogs', async () => {
   const { dispatch, calls, messages } = await harness()
-  for (const { method, args } of examples.filter(({ method }) => !['deletePath', 'discardFile', 'revealPath'].includes(method))) {
+  for (const { method, args } of examples.filter(({ method }) => !['deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage'].includes(method))) {
     calls.length = 0
     const result = await dispatch(method, args)
     assert.deepEqual(plain(calls), [{ method, args }])
@@ -125,7 +154,8 @@ test('new IPC dispatch preserves arguments and optional defaults without stage o
 test('delete and discard require approval before mutation and propagate cancellation', async () => {
   for (const [method, message] of [
     ['deletePath', 'Xóa new.txt khỏi ổ đĩa? Hành động này không thể hoàn tác.'],
-    ['discardFile', 'Hủy mọi thay đổi chưa lưu trong new.txt? Hành động này không thể hoàn tác.']
+    ['discardFile', 'Hủy mọi thay đổi chưa lưu trong new.txt? Hành động này không thể hoàn tác.'],
+    ['deleteSession', 'Xóa cuộc trò chuyện này? Hành động này không thể hoàn tác.']
   ]) {
     const h = await harness()
     h.cancel()
@@ -137,6 +167,56 @@ test('delete and discard require approval before mutation and propagate cancella
     assert.equal(await h.dispatch(method, ['p', 'new.txt']), method)
     assert.deepEqual(h.calls.map(call => call.method), ['confirm', method])
   }
+})
+
+test('AI commit uses a fresh authorized model and bounded staged summary without mutating git', async () => {
+  const h = await harness()
+  const selected = { id: 'second', modelID: 'canonical', name: 'Second', providerID: 'amecode' }
+  h.setModels([{ id: 'other', modelID: 'other', name: 'Other', providerID: 'external' }, selected])
+  for (const model of [undefined, { id: 'second', name: 'Forged name', providerID: 'external', modelID: 'forged' }]) {
+    h.calls.length = 0
+    assert.deepEqual(plain(await h.dispatch('generateCommitMessage', model ? ['p', model] : ['p'])), { message: 'feat: change', truncated: false })
+    assert.deepEqual(plain(h.calls), [
+      { method: 'models', args: ['p'] },
+      { method: 'account', args: ['assert-model', { modelID: 'canonical', providerID: 'amecode' }] },
+      { method: 'stagedDiffSummary', args: ['p', 24576] },
+      { method: 'generateCommitMessage', args: [{ diff: '+change', files: ['new.txt'], truncated: false }, selected] }
+    ])
+  }
+  assert.deepEqual(h.messages, [])
+})
+
+test('AI commit fails closed for unavailable models, rejected policy, or no staged changes', async () => {
+  const h = await harness()
+  for (const models of [[], [{ id: 'model', modelID: 'model', name: 'Model', providerID: 'external' }]]) {
+    h.setModels(models); h.calls.length = 0
+    await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /AMEKIT_MODEL_REQUIRED/)
+    assert.deepEqual(h.calls.map(call => call.method), ['models'])
+  }
+  h.setModels([{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }])
+  h.calls.length = 0
+  await assert.rejects(h.dispatch('generateCommitMessage', ['p', { id: 'missing', name: 'Missing', providerID: 'amecode' }]), /AMEKIT_MODEL_REQUIRED/)
+  assert.deepEqual(h.calls.map(call => call.method), ['models'])
+  h.calls.length = 0; h.failPolicy('USER_DISABLED')
+  await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /USER_DISABLED/)
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account'])
+  h.failPolicy(''); h.calls.length = 0; h.setSummary({ diff: '', files: [], truncated: false })
+  await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /NO_STAGED_CHANGES/)
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'stagedDiffSummary'])
+})
+
+test('AI commit holds the authority queue through policy validation and generation', async () => {
+  const h = await harness()
+  let release!: () => void
+  h.gatePolicy(new Promise<void>(resolve => { release = resolve }))
+  const generate = h.dispatch('generateCommitMessage', ['p'])
+  await new Promise(resolve => setImmediate(resolve))
+  const following = h.dispatch('account', ['status', {}])
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account'])
+  release()
+  await Promise.all([generate, following])
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'stagedDiffSummary', 'generateCommitMessage', 'account'])
 })
 
 test('replacement previews before confirmation, cancels without writes, and skips zero-match dialogs', async () => {
@@ -231,4 +311,6 @@ test('preload forwards all new methods, optional arguments, return values and re
   assert.deepEqual(calls.pop(), { method: 'createFile', args: ['p', 'empty.txt', undefined] })
   await api.createBranch('p', 'feature')
   assert.deepEqual(calls.pop(), { method: 'createBranch', args: ['p', 'feature', undefined] })
+  await api.generateCommitMessage('p')
+  assert.deepEqual(calls.pop(), { method: 'generateCommitMessage', args: ['p', undefined] })
 })

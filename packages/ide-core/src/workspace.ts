@@ -120,6 +120,9 @@ export class Workspaces {
     if (options.dryRun !== true && result.filesChanged > 0) this.changed(id)
     return result
   }
+  async stagedDiffSummary(id: string, maxBytes?: number) {
+    return gitOps.stagedDiffSummary(this.get(id).directory, maxBytes)
+  }
   async stageAll(id: string): Promise<void> {
     await gitOps.stageAll(this.get(id).directory)
     this.changed(id)

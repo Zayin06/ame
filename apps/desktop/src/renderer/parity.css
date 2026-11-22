@@ -27,12 +27,16 @@
 .code-block { overflow: hidden; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-code); }
 .code-block__header { padding: 5px 12px; font: 11px var(--font-mono); color: var(--text-muted); border-bottom: 1px solid var(--border-subtle); }
 .code-block pre { margin: 0; padding: 12px; overflow: auto; font: 12px/1.65 var(--font-mono); }
-.composer-card { margin: 0; }
+.composer-card { margin: 0; height: 103px; }
+.composer-toolbar { height: 30px; flex-shrink: 0; }
 .composer-input { padding: 0; border-radius: 0; }
 .composer-input:focus-visible { outline: none; }
 .composer-toolbar__left { min-width: 0; flex: 1; flex-wrap: nowrap; }
 .composer-toolbar__right { flex-shrink: 0; flex-wrap: nowrap; }
 .composer-toolbar .select-pill { min-width: 0; max-width: 150px; flex: 1; }
+.composer-toolbar .select-pill--locked { height: 26px; display: inline-flex; align-items: center; gap: 4px; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; }
+.scm-commit-input-bar button:not(:disabled) { color: var(--accent); cursor: pointer; }
+.scm-commit-input-bar button:disabled { cursor: not-allowed; }
 .policy-inline__select { padding: 0 2px 0 0; border-radius: 0; max-width: 100px; }
 .policy-inline > svg { width: 14px; height: 14px; }
 .vsc-search-file-head { width: 100%; border: 0; background: transparent; text-align: left; }

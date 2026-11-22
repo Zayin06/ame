@@ -46,6 +46,11 @@ function decode<T>(schema: z.ZodType<T>, value: unknown): T { const parsed = sch
 export class ClientError extends Error {
   constructor(readonly code: string, readonly status = 0) { super(code) }
 }
+export function isTransientError(error: unknown): error is ClientError {
+  return error instanceof ClientError && error.status !== 401 && error.status !== 403 &&
+    !["USER_DISABLED", "INVALID_ROLE", "INVALID_AUTH_RESPONSE", "MODEL_POLICY_PLUGIN_REQUIRED"].includes(error.code) &&
+    (error.code === "NETWORK_ERROR" || error.status === 429 || error.status >= 500)
+}
 export function serverURL(value: string) {
   const url = new URL(value)
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/" ||
@@ -101,10 +106,10 @@ export class AmeApi {
     this.clear()
     return this.accept(await json(await this.request("/v1/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password, client: { editor: "AmeKit", app_version: "0.1.0" } }), signal }, false)))
   }
-  async refresh(signal?: AbortSignal) {
+  async refresh(signal?: AbortSignal, options?: { preserveOnTransient?: boolean }) {
     try { return this.accept(await json(await this.request("/v1/session", { signal }))) }
     catch (error) {
-      this.auth = undefined
+      if (!(options?.preserveOnTransient && isTransientError(error) && this.auth && this.expires > Date.now())) this.auth = undefined
       if (!(error instanceof ClientError) || !["NETWORK_ERROR", "CANCELLED"].includes(error.code) && !(error.status >= 500 || error.status === 429)) this.clear()
       throw error
     }

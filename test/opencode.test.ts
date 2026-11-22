@@ -173,6 +173,179 @@ test('history normalizes reasoning and tool state without rendering HTML', () =>
   assert.equal(items[1].kind, 'reasoning'); assert.equal(items[2].text, 'edit · completed')
 })
 
+test('tool metadata preserves inputs, text and file output, errors and execution timing', () => {
+  const states = [
+    { status: 'streaming', input: '{"file"' },
+    { status: 'running', input: { file: 'a.ts' } },
+    { status: 'completed', input: { file: 'a.ts' }, content: [
+      { type: 'text', text: 'Updated' },
+      { type: 'file', name: 'a.ts', uri: 'file:///a.ts' },
+      { type: 'file', uri: 'file:///b.ts' },
+    ] },
+    { status: 'error', input: {}, error: { type: 'ToolError', message: 'Denied' }, content: [{ type: 'text', text: 'Partial output' }] },
+    { status: 'error', input: {}, error: 'String error' },
+    { status: 'error', input: {}, error: { type: 'Unknown' } },
+    { status: 'completed', input: {}, content: [] },
+  ]
+  const items = normalizeMessages([{ id: 'a', type: 'assistant', content: states.map((state, i) => ({
+    type: 'tool', name: 'edit', state,
+    time: i === 2 ? { created: 10, ran: 20, completed: 55 } : i === 3 ? { created: 10, completed: 25 } : { created: 10, completed: 5 },
+  })) }] as SessionMessageInfo[])
+  assert.deepEqual(items[2], {
+    id: 'a:2', role: 'assistant', kind: 'tool', text: 'edit · completed',
+    tool: { name: 'edit', status: 'completed', input: { file: 'a.ts' }, output: 'Updated\n[file: a.ts]\n[file: file:///b.ts]', error: undefined, durationMs: 35 },
+  })
+  assert.equal(items[0].tool?.status, 'streaming')
+  assert.equal(items[0].tool?.input, '{"file"')
+  assert.deepEqual(items[1].tool?.input, { file: 'a.ts' })
+  assert.equal(items[1].tool?.status, 'running')
+  assert.equal(items[1].tool?.durationMs, 0)
+  assert.equal(items[1].tool?.output, undefined)
+  assert.equal(items[3].tool?.error, 'Denied')
+  assert.equal(items[3].tool?.output, 'Partial output')
+  assert.equal(items[3].tool?.durationMs, 15)
+  assert.equal(items[4].tool?.error, 'String error')
+  assert.equal(items[5].tool?.error, '{"type":"Unknown"}')
+  assert.equal(items[6].tool?.output, undefined)
+})
+
+test('tool output is bounded including its truncation suffix and preserves Unicode boundaries', () => {
+  const suffix = '\n…[truncated]'
+  const normalize = (content: unknown[], time?: unknown) => normalizeMessages([{ id: 'a', type: 'assistant', content: [
+    { type: 'tool', name: 'read', state: { status: 'completed', input: {}, content }, time },
+  ] }] as SessionMessageInfo[])[0].tool!
+  const exact = 'a'.repeat(65536)
+  assert.equal(normalize([{ type: 'text', text: exact }]).output, exact)
+  const truncated = normalize([{ type: 'text', text: exact + 'b' }])
+  assert.equal(truncated.output, 'a'.repeat(65536 - suffix.length) + suffix)
+  assert.equal(truncated.output!.length, 65536)
+  assert.equal(truncated.durationMs, undefined)
+  const split = normalize([{ type: 'text', text: 'a'.repeat(65536 - suffix.length - 1) + '😀' + exact }]).output!
+  assert.ok(split.endsWith(suffix))
+  assert.ok(split.length <= 65536)
+  assert.equal(split.charAt(split.length - suffix.length - 1), 'a')
+  const combined = normalize([{ type: 'text', text: exact }, { type: 'file', uri: 'file:///extra' }]).output!
+  assert.equal(combined, truncated.output)
+  assert.equal(normalize([{ type: 'text', text: '' }]).output, undefined)
+})
+
+test('session mutations enforce ownership, validate titles and clean deleted live history; catalogs use project location', async () => {
+  const calls: { url: URL; init: RequestInit }[] = []
+  const directory = process.cwd()
+  let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+  let deleted = false, failDelete = false, delivered = false
+  const adapter = new OpenCodeAdapter(event => { if (event.type === 'opencode' && event.sessionID === 's1') delivered = true }, async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push({ url, init })
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) {
+      stream = c; init.signal?.addEventListener('abort', () => c.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session/s1' || url.pathname === '/api/session/foreign') {
+      if (init.method === 'PATCH') return new Response(null, { status: 204 })
+      if (init.method === 'DELETE') {
+        if (failDelete) return json({ name: 'UnknownError', message: 'Delete failed' }, 500)
+        deleted = true; return new Response(null, { status: 204 })
+      }
+      return json({ data: { id: 's1', location: { directory: url.pathname.endsWith('foreign') ? directory + '-other' : directory } } })
+    }
+    if (url.pathname.endsWith('/message')) return json({ data: [], cursor: {} })
+    if (url.pathname === '/api/command') return json({ data: [{ name: 'review', description: 'Review changes', ignored: true }, { name: 'compact' }] })
+    if (url.pathname === '/api/skill') return json({ data: [{ id: 'skill1', name: 'testing', description: 'Run tests', path: directory, content: 'Not forwarded' }] })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    await waitFor(() => !!stream)
+    for (const mutation of [
+      () => adapter.renameSession('p', 'foreign', 'Title'),
+      () => adapter.archiveSession('p', 'foreign', true),
+      () => adapter.deleteSession('p', 'foreign'),
+    ]) await assert.rejects(mutation(), /SESSION_PROJECT_MISMATCH/)
+    for (const title of ['', '  \n ', 'a'.repeat(501)]) await assert.rejects(adapter.renameSession('p', 's1', title), /INVALID_SESSION_TITLE/)
+    assert.equal(calls.some(c => c.init.method === 'PATCH' || c.init.method === 'DELETE'), false)
+    await adapter.renameSession('p', 's1', '  New title \n')
+    await adapter.renameSession('p', 's1', 'a'.repeat(500))
+    await adapter.archiveSession('p', 's1', true)
+    await adapter.archiveSession('p', 's1', false)
+    assert.deepEqual(calls.filter(c => c.init.method === 'PATCH').map(c => JSON.parse(String(c.init.body))), [
+      { title: 'New title' }, { title: 'a'.repeat(500) }, { archived: true }, { archived: false },
+    ])
+    assert.deepEqual(await adapter.commands('p'), [{ name: 'review', description: 'Review changes' }, { name: 'compact', description: undefined }])
+    assert.deepEqual(await adapter.skills('p'), [{ id: 'skill1', name: 'testing', description: 'Run tests', path: directory }])
+    for (const route of ['/api/command', '/api/skill']) assert.equal(calls.find(c => c.url.pathname === route)!.url.searchParams.get('location[directory]'), directory)
+    await assert.rejects(adapter.commands('missing'), /UNKNOWN_PROJECT/)
+    await assert.rejects(adapter.skills('missing'), /UNKNOWN_PROJECT/)
+    stream!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'session.text.delta', data: { sessionID: 's1', assistantMessageID: 'a', ordinal: 0, delta: 'Live' } })}\n\n`))
+    await waitFor(() => delivered)
+    assert.equal((await adapter.messages('p', 's1'))[0].text, 'Live')
+    failDelete = true
+    await assert.rejects(adapter.deleteSession('p', 's1'))
+    assert.equal((await adapter.messages('p', 's1'))[0].text, 'Live')
+    failDelete = false
+    await adapter.deleteSession('p', 's1')
+    assert.equal(deleted, true)
+    assert.deepEqual(await adapter.messages('p', 's1'), [])
+  } finally { adapter.dispose() }
+})
+
+test('persisted tool metadata wins over colliding live text while longer text deltas still merge', async () => {
+  const directory = process.cwd()
+  let delivered = 0
+  const adapter = new OpenCodeAdapter(event => { if (event.type === 'opencode' && event.sessionID) delivered++ }, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/session/s1') return json({ data: { location: { directory } } })
+    if (url.pathname.endsWith('/message')) return json({ data: [{ id: 'a', type: 'assistant', content: [
+      { type: 'tool', name: 'read', time: { created: 1, completed: 5 }, state: { status: 'completed', input: { path: 'a.ts' }, content: [{ type: 'text', text: 'File contents' }] } },
+      { type: 'text', text: 'Saved' },
+    ] }], cursor: {} })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) {
+      const events = [0, 1].map(ordinal => ({ type: 'session.text.delta', data: { sessionID: 's1', assistantMessageID: 'a', ordinal, delta: 'A longer live text that must not erase a tool' } }))
+      c.enqueue(new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('')))
+      init.signal?.addEventListener('abort', () => c.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    await waitFor(() => delivered === 2)
+    const items = await adapter.messages('p', 's1')
+    assert.equal(items[0].text, 'read · completed')
+    assert.equal(items[0].kind, 'tool')
+    assert.deepEqual(items[0].tool, { name: 'read', status: 'completed', input: { path: 'a.ts' }, output: 'File contents', error: undefined, durationMs: 4 })
+    assert.equal(items[1].text, 'A longer live text that must not erase a tool')
+  } finally { adapter.dispose() }
+})
+
+test('commit generation sends staged context and selected model, strips fences, rejects empty output and preserves truncation', async () => {
+  const calls: { url: URL; init: RequestInit }[] = []
+  let output = '  ```text\nfeat: improve tools\n\n- Preserve metadata\n```  '
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push({ url, init })
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/experimental/generate/text') return json({ data: { text: output } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  const model = { id: 'server-model', modelID: 'catalog-model', providerID: 'amecode', name: 'Model' }
+  try {
+    await adapter.connect('http://localhost:4096')
+    assert.deepEqual(await adapter.generateCommitMessage({ diff: '+new behavior', files: ['a.ts', 'b.ts'], truncated: true }, model), { message: 'feat: improve tools\n\n- Preserve metadata', truncated: true })
+    const call = calls.find(c => c.url.pathname === '/api/experimental/generate/text')!
+    assert.equal(call.init.method, 'POST')
+    const body = JSON.parse(String(call.init.body))
+    assert.deepEqual(body.model, { id: 'server-model', providerID: 'amecode' })
+    for (const expected of ['Conventional Commits', '72 characters', '3 short bullets', 'only the commit message', 'without markdown fences', 'a.ts\nb.ts', '+new behavior']) assert.ok(body.prompt.includes(expected), expected)
+    assert.ok(call.init.signal instanceof AbortSignal)
+    assert.equal(call.init.signal.aborted, false)
+    output = '  fix: keep plain messages  '
+    assert.deepEqual(await adapter.generateCommitMessage({ diff: '', files: [], truncated: false }, model), { message: 'fix: keep plain messages', truncated: false })
+    for (output of ['  \n ', '```\n\n```', '```text\n```']) await assert.rejects(adapter.generateCommitMessage({ diff: '', files: [], truncated: false }, model), /EMPTY_COMMIT_MESSAGE/)
+  } finally { adapter.dispose() }
+})
+
 test('session pagination preserves nested activity and rejects repeated cursors', async () => {
   let repeated = false
   const seen: string[] = []

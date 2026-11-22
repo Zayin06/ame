@@ -22,7 +22,18 @@ export type ReplaceOptions = SearchQuery & { replacement: string; files?: string
 export type ReplaceResult = { filesChanged: number; replacements: number; previews: { path: string; count: number; sampleBefore: string; sampleAfter: string }[] }
 export type Session = { id: string; title: string; updatedAt?: number; parentID?: string; agent?: string; status?: 'running' | 'idle'; outcome?: 'succeeded' | 'failed' | 'interrupted' }
 export type SessionDiff = { file: string; patch: string; additions: number; deletions: number; status: 'added' | 'deleted' | 'modified'; more?: true }
-export type ChatItem = { id: string; role: string; text: string; kind?: string; turn?: { from: string; files: string[] } }
+export type ToolCallInfo = {
+  name: string
+  status: 'streaming' | 'running' | 'completed' | 'error'
+  target?: string
+  input?: unknown
+  output?: string
+  error?: string
+  durationMs?: number
+}
+export type SlashCommand = { name: string; description?: string }
+export type SkillSummary = { id: string; name: string; description?: string; path: string }
+export type ChatItem = { id: string; role: string; text: string; kind?: string; tool?: ToolCallInfo; turn?: { from: string; files: string[] } }
 export type Model = { id: string; modelID?: string; name: string; providerID: string }
 export type Agent = { id: string; name: string }
 export type Permission = { id: string; sessionID: string; title: string }
@@ -76,6 +87,12 @@ export interface DesktopApi {
   discover(): Promise<Connection>
   sessions(projectID: string): Promise<Session[]>
   createSession(projectID: string): Promise<Session>
+  renameSession(projectID: string, sessionID: string, title: string): Promise<void>
+  archiveSession(projectID: string, sessionID: string, archived: boolean): Promise<void>
+  deleteSession(projectID: string, sessionID: string): Promise<void>
+  commands(projectID: string): Promise<SlashCommand[]>
+  skills(projectID: string): Promise<SkillSummary[]>
+  generateCommitMessage(projectID: string, model?: Model): Promise<{ message: string; truncated: boolean }>
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
   models(projectID: string): Promise<Model[]>

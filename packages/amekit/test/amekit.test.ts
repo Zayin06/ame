@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
+import { setTimeout as delay } from "node:timers/promises"
 import { createAmeKit, type AmeKitDependencies, type AmeKit } from "../src/index"
 import { openSessionVault, type Encryption } from "../src/session-vault"
 import { pack, preview, safePath } from "../src/bundle/package"
@@ -28,13 +29,14 @@ async function bundle(mode: "native" | "raw" = "native") {
   const release: Release = { releaseId: "ef2b4502-3b3f-4ac7-a223-81fdb4b77557", version: "1.2.3", channel: "stable", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"], publishedAt: 1, downloadUrl: "/ignored" }
   return { packed, release, latest: { release, revision: 1, activatedAt: 1 } }
 }
-async function fixture(settings: { role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; discover?: AmeKitDependencies["discover"] } = {}) {
+async function fixture(settings: { role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number } = {}) {
   const folder = await area(), project = path.join(folder, "project"), imported = path.join(folder, "source"), data = path.join(folder, "data")
   await mkdir(project); await mkdir(imported)
   for (const file of input()) { const target = path.join(imported, ...file.path.split("/")); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data) }
   const artifact = await bundle(settings.mode)
   const rpc: unknown[] = [], requests: string[] = [], dialogs: string[] = []
   let role: unknown = settings.role ?? "user", plugin = settings.plugin !== false, accepted = settings.confirm !== false, failAuth = false, failStorage = false, pickerCount = 0
+  let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
   const fetcher: typeof fetch = async (request, init) => {
     const url = new URL(String(request)); requests.push(url.pathname)
     if (url.origin === "http://127.0.0.1:3210") {
@@ -45,16 +47,17 @@ async function fixture(settings: { role?: unknown; plugin?: boolean; confirm?: b
     }
     assert.equal(url.origin, "http://localhost:3211", "no real API calls")
     if (failAuth) return Response.json({ error: { code: "USER_DISABLED" } }, { status: 401 })
+    if (url.pathname === "/v1/session") { const response = await sessionResponse?.(); if (response) return response }
     if (url.pathname === "/v1/amekit/releases/latest") return Response.json(artifact.latest)
     if (url.pathname.endsWith("/download")) return new Response(Uint8Array.from(artifact.packed.bytes))
     if (url.pathname === "/v1/amekit/releases" && init?.method !== "POST") return Response.json({ releases: [artifact.release], active: { release_id: artifact.release.releaseId, revision: 1, activated_at: 1 }, nextCursor: null })
     if (url.pathname.endsWith("/activate")) return Response.json(artifact.latest)
     if (url.pathname === "/v1/amekit/bundles/uploads") return Response.json({ uploadId: artifact.release.releaseId })
     if (url.pathname === "/v1/amekit/releases" && init?.method === "POST") return Response.json({ release: artifact.release })
-    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(Date.now() + 3600_000).toISOString() }, user: { id: "1", name: "Fixture", username: "fixture", role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog, registry: {} })
+    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: "1", name: "Fixture", username: "fixture", role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog, registry: {} })
   }
   const dependencies: AmeKitDependencies = {
-    fetch: fetcher,
+    fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs,
     electron: async () => ({ safeStorage: { ...(settings.encryption ?? encryption), encryptString(text: string) { if (failStorage) throw new Error("contains-sensitive-material"); return (settings.encryption ?? encryption).encryptString(text) } }, dialog: { showMessageBox: async (options: { message?: string; detail?: string }) => { dialogs.push(options.detail ?? options.message ?? ""); return { response: accepted ? 1 : 0, checkboxChecked: false } } } as never }),
     discover: settings.discover ?? (async directory => {
       try { await readFile(path.join(directory, ".opencode", "agents", "helper.md")) } catch { return { agents: [], skills: [] } }
@@ -65,6 +68,7 @@ async function fixture(settings: { role?: unknown; plugin?: boolean; confirm?: b
   const service = createAmeKit(options, dependencies)
   return { service, folder, project, imported, data, rpc, requests, dialogs, options, dependencies, artifact,
     role: (value: unknown) => { role = value }, plugin: (value: boolean) => { plugin = value }, confirm: (value: boolean) => { accepted = value }, disable: () => { failAuth = true }, breakStorage: () => { failStorage = true }, pickerCount: () => pickerCount,
+    sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
     cleanup: async () => { await service.dispose(); await rm(folder, { recursive: true, force: true }) } }
 }
 const login = (service: AmeKit) => service.call("login", { server: "http://localhost:3211", username: "fixture", password: "fixture-password" })
@@ -237,6 +241,146 @@ test("encrypted session restore and disposal keep credentials main-only", async 
     await assert.rejects(restored.call("status", {}), /AMEKIT_DISPOSED/)
     assert.equal(f.rpc.at(-1), null)
   } finally { await restored?.dispose(); await f.cleanup() }
+})
+
+async function settledStatus(service: AmeKit) {
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    try { return await service.call("status", {}) as { ready: boolean; blocker?: string; account?: unknown } }
+    catch (error) { if (!(error instanceof Error) || error.message !== "OPERATION_BUSY") throw error }
+    await delay(1)
+  }
+  throw new Error("AmeKit operation did not settle")
+}
+
+const transientResponse = (failure: number | "network") => async () => {
+  if (failure === "network") throw new TypeError("fixture network failure")
+  return Response.json({ error: { code: "HTTP_ERROR" } }, { status: failure })
+}
+
+test("background heartbeats tolerate only two transient failures without revoking or renewing", async t => {
+  for (const failure of [503, "network", 429] as const) await t.test(String(failure), async t => {
+    t.mock.timers.enable({ apis: ["setInterval"] })
+    const f = await fixture({ refreshIntervalMs: 100 })
+    try {
+      await login(f.service)
+      const policyCalls = f.rpc.length
+      f.sessionResponse(transientResponse(failure))
+      for (let tick = 1; tick <= 3; tick++) {
+        t.mock.timers.tick(100)
+        const status = await settledStatus(f.service)
+        assert.equal(status.ready, tick < 3)
+        assert.equal(status.blocker, failure === "network" ? "NETWORK_ERROR" : "HTTP_ERROR")
+        if (tick < 3) { assert.ok(status.account); assert.equal(f.rpc.length, policyCalls, "neither revoke nor lease renewal") }
+        else { assert.equal(status.account, undefined); assert.deepEqual(f.rpc.slice(policyCalls), [null]) }
+      }
+    } finally { await f.cleanup() }
+  })
+})
+
+test("a successful background heartbeat renews policy and resets the consecutive failure budget", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
+  const f = await fixture({ refreshIntervalMs: 100 })
+  const tick = async () => { t.mock.timers.tick(100); return settledStatus(f.service) }
+  try {
+    await login(f.service)
+    const policyCalls = f.rpc.length
+    f.sessionResponse(transientResponse(503))
+    await tick(); await tick()
+    f.sessionResponse()
+    assert.equal((await tick()).ready, true)
+    assert.equal(f.rpc.length, policyCalls + 1)
+    assert.notEqual(f.rpc.at(-1), null)
+    f.sessionResponse(transientResponse("network"))
+    assert.equal((await tick()).ready, true)
+    assert.equal((await tick()).ready, true)
+    assert.equal(f.rpc.length, policyCalls + 1)
+    assert.equal((await tick()).ready, false)
+    assert.equal(f.rpc.at(-1), null)
+  } finally { await f.cleanup() }
+})
+
+test("background auth, policy, storage and malformed-response failures revoke immediately", async t => {
+  for (const failure of ["disabled", "forbidden", "role", "plugin", "storage", "invalid", "oversized"] as const) await t.test(failure, async t => {
+    t.mock.timers.enable({ apis: ["setInterval"] })
+    const f = await fixture({ refreshIntervalMs: 100 })
+    try {
+      await login(f.service)
+      const policyCalls = f.rpc.length
+      if (failure === "disabled") f.disable()
+      if (failure === "forbidden") f.sessionResponse(async () => Response.json({ error: { code: "FORBIDDEN" } }, { status: 403 }))
+      if (failure === "role") f.role("invalid")
+      if (failure === "plugin") f.plugin(false)
+      if (failure === "storage") f.breakStorage()
+      if (failure === "invalid") f.sessionResponse(async () => Response.json({}))
+      if (failure === "oversized") f.sessionResponse(async () => new Response(" ".repeat(2 * 1024 * 1024 + 1)))
+      t.mock.timers.tick(100)
+      const status = await settledStatus(f.service)
+      assert.equal(status.ready, false)
+      assert.equal(status.account, undefined)
+      assert.ok(f.rpc.slice(policyCalls).includes(null))
+      assert.equal(f.rpc.at(-1), null)
+      const blockers = { disabled: "USER_DISABLED", forbidden: "FORBIDDEN", role: "INVALID_ROLE", plugin: "MODEL_POLICY_PLUGIN_REQUIRED", storage: "SESSION_STORAGE_UNAVAILABLE", invalid: "INVALID_AUTH_RESPONSE", oversized: "API_RESPONSE_TOO_LARGE" }
+      assert.equal(status.blocker, blockers[failure])
+    } finally { await f.cleanup() }
+  })
+})
+
+test("an expired session cannot retain policy even on the first transient background failure", async t => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() })
+  const f = await fixture({ refreshIntervalMs: 100 })
+  try {
+    f.expiresAt(Date.now() + 100)
+    await login(f.service)
+    const policyCalls = f.rpc.length
+    f.sessionResponse(transientResponse(503))
+    t.mock.timers.tick(100)
+    const status = await settledStatus(f.service)
+    assert.equal(status.ready, false)
+    assert.equal(status.account, undefined)
+    assert.deepEqual(f.rpc.slice(policyCalls), [null])
+  } finally { await f.cleanup() }
+})
+
+test("active assert-model rejects transient failures and revokes policy immediately", async t => {
+  for (const failure of [503, "network"] as const) await t.test(String(failure), async () => {
+    const f = await fixture()
+    try {
+      await login(f.service)
+      const policyCalls = f.rpc.length
+      f.sessionResponse(transientResponse(failure))
+      await assert.rejects(f.service.call("assert-model", { modelID: "default" }), failure === "network" ? /NETWORK_ERROR/ : /HTTP_ERROR/)
+      assert.deepEqual(f.rpc.slice(policyCalls), [null])
+      assert.equal((await f.service.call("status", {}) as { ready: boolean }).ready, false)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("background refresh and active IPC share the same operation mutex", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
+  const f = await fixture({ refreshIntervalMs: 100 })
+  let release: (() => void) | undefined
+  const waitForRelease = async (): Promise<() => void> => {
+    while (!release) await delay(1)
+    return release
+  }
+  try {
+    await login(f.service)
+    const before = f.requests.filter(request => request === "/v1/session").length
+    f.sessionResponse(() => new Promise(resolve => { release = () => resolve(undefined) }))
+    t.mock.timers.tick(100)
+    await assert.rejects(f.service.call("assert-model", { modelID: "default" }), /OPERATION_BUSY/)
+    t.mock.timers.tick(300)
+    const releaseBackground = await waitForRelease()
+    assert.equal(f.requests.filter(request => request === "/v1/session").length, before + 1)
+    releaseBackground(); release = undefined
+    assert.equal((await settledStatus(f.service)).ready, true)
+    const active = f.service.call("assert-model", { modelID: "default" })
+    const releaseActive = await waitForRelease()
+    t.mock.timers.tick(300)
+    assert.equal(f.requests.filter(request => request === "/v1/session").length, before + 2)
+    releaseActive()
+    await active
+  } finally { release?.(); await f.cleanup() }
 })
 
 test("Linux basic_text storage backend is rejected even when encryption reports available", async () => {

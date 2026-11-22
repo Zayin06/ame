@@ -1,7 +1,7 @@
 import { OpenCode, type OpenCodeClient, type OpenCodeEvent, type SessionMessageInfo } from '@opencode/client'
 import { Service } from '@opencode/client/service'
 import path from 'node:path'
-import type { Agent, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff } from '../../protocol/src/index'
+import type { Agent, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
 
 export function localURL(value: string) {
   const url = new URL(value)
@@ -22,7 +22,31 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
     }
     if (message.type !== 'assistant') return []
     message.snapshot?.files?.forEach(file => execution?.files.add(file))
-    return message.content.map((part, i) => ({ id: `${message.id}:${i}`, role: 'assistant', kind: part.type, text: part.type === 'tool' ? `${part.name} · ${part.state.status}` : part.text }))
+    return message.content.map((part, i): ChatItem => {
+      const id = `${message.id}:${i}`
+      if (part.type !== 'tool') return { id, role: 'assistant', kind: part.type, text: part.text }
+      let output: string | undefined
+      if ('content' in part.state) for (const content of part.state.content ?? []) {
+        const text = content.type === 'text' ? content.text : content.type === 'file' ? `[file: ${content.name || content.uri}]` : undefined
+        if (text === undefined) continue
+        output = (output === undefined ? '' : output + '\n') + text.slice(0, 65537 - (output === undefined ? 0 : output.length + 1))
+        if (output.length > 65536) break
+      }
+      if (output && output.length > 65536) {
+        const suffix = '\n…[truncated]'
+        output = output.slice(0, 65536 - suffix.length)
+        // Do not leave half of a UTF-16 surrogate pair at the truncation boundary.
+        if (/[\uD800-\uDBFF]$/.test(output)) output = output.slice(0, -1)
+        output += suffix
+      }
+      const error = part.state.status === 'error' ? part.state.error : undefined
+      const tool: ToolCallInfo = {
+        name: part.name, status: part.state.status, input: part.state.input, output: output || undefined,
+        error: error === undefined ? undefined : typeof error === 'string' ? error : error.message || JSON.stringify(error),
+        durationMs: part.time?.completed === undefined ? undefined : Math.max(0, part.time.completed - (part.time.ran ?? part.time.created)),
+      }
+      return { id, role: 'assistant', kind: 'tool', text: `${part.name} · ${part.state.status}`, tool }
+    })
   })
 }
 export class OpenCodeAdapter {
@@ -90,6 +114,42 @@ export class OpenCodeAdapter {
     const s = await this.api().session.create({ location: { directory: this.directory(projectID) } })
     return { id: s.id, title: s.title || 'New conversation', updatedAt: s.time.updated }
   }
+  async renameSession(projectID: string, sessionID: string, title: string): Promise<void> {
+    await this.owned(projectID, sessionID)
+    const trimmed = title.trim()
+    if (!trimmed || trimmed.length > 500) throw new Error('INVALID_SESSION_TITLE')
+    await this.api().session.update({ sessionID, title: trimmed })
+  }
+  async archiveSession(projectID: string, sessionID: string, archived: boolean): Promise<void> {
+    await this.owned(projectID, sessionID)
+    await this.api().session.update({ sessionID, archived })
+  }
+  async deleteSession(projectID: string, sessionID: string): Promise<void> {
+    await this.owned(projectID, sessionID)
+    await this.api().session.remove({ sessionID })
+    this.live.delete(sessionID)
+  }
+  async commands(projectID: string): Promise<SlashCommand[]> {
+    const list = await this.api().command.list({ location: { directory: this.directory(projectID) } })
+    return list.data.map(({ name, description }) => ({ name, description }))
+  }
+  async skills(projectID: string): Promise<SkillSummary[]> {
+    const list = await this.api().skill.list({ location: { directory: this.directory(projectID) } })
+    return list.data.map(({ id, name, description, path }) => ({ id, name, description, path }))
+  }
+  async generateCommitMessage(summary: { diff: string; files: string[]; truncated: boolean }, model: Model): Promise<{ message: string; truncated: boolean }> {
+    const prompt = [
+      'Write a concise Conventional Commits message for the staged changes below.',
+      'Use a subject of at most 72 characters and at most 3 short bullets if there are multiple changes.',
+      'Return only the commit message, without markdown fences or extra explanation.',
+      `Files:\n${summary.files.join('\n')}`,
+      `Diff:\n${summary.diff}`,
+    ].join('\n\n')
+    const result = await this.api().experimental.generate.text({ prompt, model: { id: model.id, providerID: model.providerID } }, { signal: AbortSignal.timeout(30_000) })
+    const message = result.text.trim().replace(/^```[^\r\n]*\r?\n([\s\S]*?)```$/, '$1').trim()
+    if (!message) throw new Error('EMPTY_COMMIT_MESSAGE')
+    return { message, truncated: summary.truncated }
+  }
   async messages(projectID: string, sessionID: string): Promise<ChatItem[]> {
     await this.owned(projectID, sessionID)
     const list = await this.api().message.list({ sessionID, limit: 200, order: 'desc' })
@@ -97,7 +157,7 @@ export class OpenCodeAdapter {
     const live = this.live.get(sessionID)
     if (live) for (const [key, item] of live) {
       const index = items.findIndex(i => i.id === key)
-      if (index >= 0) { if (item.text.length >= items[index].text.length) items[index] = item } else items.push(item)
+      if (index >= 0) { if (!items[index].tool && item.text.length >= items[index].text.length) items[index] = item } else items.push(item)
     }
     return items
   }

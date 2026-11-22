@@ -58,6 +58,8 @@ const id = z.string().min(1).max(512)
 const relative = z.string().max(4096)
 const workspacePath = relative.min(1).refine(value => !value.includes('\0'))
 const branchName = z.string().min(1).max(512).refine(value => !value.includes('\0'))
+const sessionTitle = z.string().min(1).max(500).refine(value => !!value.trim() && !value.includes('\0'))
+const modelSchema = z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).strict()
 const content = z.string().max(4 * 1024 * 1024).refine(value => Buffer.byteLength(value, 'utf8') <= 4 * 1024 * 1024, 'FILE_TOO_LARGE')
 const searchQuery = z.object({
   query: z.string().max(20000),
@@ -86,6 +88,8 @@ const schema = {
   git: z.tuple([id]), diff: z.tuple([id, relative]), stage: z.tuple([id, relative, z.boolean()]), commit: z.tuple([id, z.string().min(1).max(10000)]),
   connection: z.tuple([]), startBackend: z.tuple([]), discover: z.tuple([]), connect: z.tuple([z.string().max(2048), z.string().max(512).optional(), z.string().max(8192).optional()]),
   sessions: z.tuple([id]), createSession: z.tuple([id]), messages: z.tuple([id, id]), sessionDiff: z.tuple([id, id, id.optional()]), models: z.tuple([id]), agents: z.tuple([id]),
+  renameSession: z.tuple([id, id, sessionTitle]), archiveSession: z.tuple([id, id, z.boolean()]), deleteSession: z.tuple([id, id]),
+  commands: z.tuple([id]), skills: z.tuple([id]), generateCommitMessage: z.tuple([id, modelSchema.optional()]),
   prompt: z.tuple([id, id, text, z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).optional(), id.optional()]),
   cancel: z.tuple([id, id]), permissions: z.tuple([id, id]), replyPermission: z.tuple([id, id, z.enum(['once', 'always', 'reject'])]),
   pairingStatus: z.tuple([]), pairingConfigure: z.tuple([pairingSchema]), pairingCode: z.tuple([]),
@@ -180,6 +184,22 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'pairingCode': return pairing.issue()
     case 'sessions': return adapter.sessions(a)
     case 'createSession': return adapter.createSession(a)
+    case 'renameSession': return adapter.renameSession(a, b, c)
+    case 'archiveSession': return adapter.archiveSession(a, b, c)
+    case 'deleteSession':
+      await confirmation('Xóa cuộc trò chuyện này? Hành động này không thể hoàn tác.')
+      return adapter.deleteSession(a, b)
+    case 'commands': return adapter.commands(a)
+    case 'skills': return adapter.skills(a)
+    case 'generateCommitMessage': {
+      const models = (await adapter.models(a)).filter(model => model.providerID === 'amecode')
+      const selected = b ? models.find(model => model.id === b.id) : models[0]
+      if (!selected) throw new Error('AMEKIT_MODEL_REQUIRED')
+      await account.call('assert-model', { modelID: selected.modelID ?? selected.id, providerID: selected.providerID })
+      const summary = await workspace.stagedDiffSummary(a, 24576)
+      if (summary.files.length === 0) throw new Error('NO_STAGED_CHANGES')
+      return adapter.generateCommitMessage(summary, selected)
+    }
     case 'messages': return adapter.messages(a, b)
     case 'sessionDiff': return adapter.sessionDiff(a, b, c)
     case 'models': return adapter.models(a)
@@ -205,8 +225,8 @@ async function call(method: keyof typeof schema, args: unknown[]) {
 }
 let authority: Promise<unknown> = Promise.resolve()
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'prompt', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
-  // A prompt's fresh policy check and submission cannot straddle an endpoint switch.
+  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
+  // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
   return task

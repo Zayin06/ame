@@ -8,7 +8,7 @@ import { canCommit, commitShortcut } from '../scm-commit'
 type Mutate = <T>(action: () => Promise<T>, success?: (result: T) => void, refreshAfter?: boolean) => Promise<void>
 type Naming = { kind: 'file' | 'directory' | 'rename'; parent: string; entry?: FileEntry }
 type InspectorProps = {
-  projectID?: string; name?: string; tab: 'files' | 'search' | 'git'; setTab: (tab: 'files' | 'search' | 'git') => void; generation: number;
+  projectID?: string; name?: string; connected?: boolean; tab: 'files' | 'search' | 'git'; setTab: (tab: 'files' | 'search' | 'git') => void; generation: number;
   git?: GitState; gitError: string; refresh: () => void; onOpen: (path: string, line?: number, column?: number) => void;
   onRename: (from: string, to: string) => void; onDelete: (path: string) => void;
   onDiff: (path: string) => void; onHide: () => void; report: (error: unknown) => void
@@ -102,7 +102,7 @@ export function Inspector(props: InspectorProps) {
   return <ProjectInspector key={props.projectID || ''} {...props} />
 }
 
-function ProjectInspector({ projectID, name, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report }: InspectorProps) {
+function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report }: InspectorProps) {
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
   const pending = useRef(false)
@@ -135,6 +135,8 @@ function ProjectInspector({ projectID, name, tab, setTab, generation, git, gitEr
     finally { pending.current = false; if (alive.current) setBusy(false) }
   }
   const changes = git?.changes || []
+  const stagedChanges = changes.filter(change => !!change.index.trim() && !['?', '!'].includes(change.index))
+  const enhanceTitle = !connected ? 'Chưa kết nối OpenCode' : !stagedChanges.length ? 'Stage ít nhất một tệp để tạo thông điệp commit' : busy ? 'Đang xử lý…' : 'Tạo thông điệp commit bằng AI từ thay đổi đã stage'
   const commitState = { busy, message, changes }
   const submitCommit = () => {
     if (!projectID || !canCommit(commitState)) return
@@ -156,7 +158,7 @@ function ProjectInspector({ projectID, name, tab, setTab, generation, git, gitEr
         return groupChanges.length ? <section className="scm-section" key={group}><div className="scm-section__head"><span className="truncate">{group === 'staged' ? 'Staged Changes' : 'Changes'}</span><span className="scm-section__right"><span className="badge">{groupChanges.length}</span><IconButton label={group === 'staged' ? 'Unstage All' : 'Stage All'} disabled={busy} onClick={() => void mutate(() => group === 'staged' ? window.ame.unstageAll(projectID) : window.ame.stageAll(projectID))}>{group === 'staged' ? '−' : '+'}</IconButton></span></div>{groupChanges.map(change => <div className="scm-file-row" key={change.path}><button className="scm-file-row__main" title={`Diff với HEAD: ${change.path}`} onClick={() => onDiff(change.path)}><Icon name="file" /><span className="scm-file-name truncate">{change.path}</span></button><span className="git-badge">{group === 'staged' ? change.index : change.working.trim() || change.index}</span><IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged'))}>{group === 'staged' ? '−' : '+'}</IconButton>{group === 'working' && <IconButton label={`Discard ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.discardFile(projectID, change.path))}>↩</IconButton>}</div>)}</section> : null
       })}
     </>}</div>
-    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><span className="muted">Skill /git-commit</span><button type="button" disabled title="AI commit enhancement chưa được kết nối">✦ Enhance</button></div></div><button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : '✓ Commit'}</button></form>}
+    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><span className="muted">Skill /git-commit</span><button type="button" disabled={!connected || busy || !stagedChanges.length} title={enhanceTitle} onClick={() => void mutate(() => window.ame.generateCommitMessage(projectID), result => setMessage(result.message), false)}>✦ Enhance</button></div></div><button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : '✓ Commit'}</button></form>}
     <footer className="inspector-pane__footer"><span>{tab === 'git' ? `${changes.length} changes` : tab === 'search' ? 'Project Search' : 'Explorer'}</span><IconButton label="Làm mới dự án" onClick={refresh}><Icon name="refresh" /></IconButton></footer>
   </aside>
 }

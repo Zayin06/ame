@@ -1,5 +1,5 @@
 import path from "node:path"
-import { AmeApi } from "./api"
+import { AmeApi, isTransientError } from "./api"
 import { assertModel, managedProvider, modelPolicy, providerURL } from "./model-policy"
 import { openSessionVault, type Encryption } from "./session-vault"
 import { pack, type Preview } from "./bundle/package"
@@ -17,7 +17,7 @@ export type AmeKitOptions = {
 export type AmeKit = { call(operation: string, payload: Record<string, string>): Promise<unknown>; dispose(): Promise<void> }
 type ElectronMain = { safeStorage: Encryption; dialog: Pick<typeof import("electron")["dialog"], "showMessageBox"> }
 /** Main-process test seams; never accept these dependencies over renderer IPC. */
-export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover }
+export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number }
 
 export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDependencies = {}): AmeKit {
   const fetcher = dependencies.fetch ?? fetch
@@ -28,6 +28,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   let vault: Awaited<ReturnType<typeof openSessionVault>> | undefined
   let storageError: string | undefined, blocker: string | undefined, policyReady = false, disposed = false, busy = false
   let inFlight: Promise<unknown> | undefined, disposal: Promise<void> | undefined
+  let transientFailures = 0
   const code = (error: unknown) => error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "AMEKIT_OPERATION_FAILED"
   const resetImport = () => { source = undefined; packed = undefined }
   const rpc = async (input: unknown, cleanup = false) => {
@@ -65,7 +66,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       if (api.expires <= Date.now()) throw new Error("AMECODE_LOGIN_REQUIRED")
       await persist()
       await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires })
-      policyReady = true; blocker = undefined
+      policyReady = true; blocker = undefined; transientFailures = 0
     } catch (error) {
       blocker = code(error); api?.suspend(); resetImport(); await revoke()
       throw error
@@ -217,9 +218,30 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     inFlight = task
     return task
   }
-  const timer = setInterval(() => {
-    if (!disposed && !busy && !storageError && api?.credential) void call("refresh", {}).catch(() => {})
-  }, 30_000)
+  const backgroundRefresh = () => {
+    if (disposed || busy || storageError || !api?.credential) return
+    busy = true
+    const task = (async () => {
+      await ready
+      if (disposed) return
+      try {
+        await api!.refresh(signal, { preserveOnTransient: true })
+        await synchronize()
+        await persist()
+      } catch (error) {
+        blocker = code(error)
+        if (isTransientError(error) && api?.account && api.expires > Date.now() && transientFailures < 2) {
+          // Preserve the existing lease only; a missed heartbeat must never renew it.
+          transientFailures++
+          return
+        }
+        api?.suspend(); resetImport(); transientFailures = 0; await revoke()
+      }
+    })().finally(() => { busy = false; if (inFlight === task) inFlight = undefined })
+    inFlight = task
+    void task.catch(() => {})
+  }
+  const timer = setInterval(backgroundRefresh, dependencies.refreshIntervalMs ?? 30_000)
   timer.unref?.()
   return {
     call,
