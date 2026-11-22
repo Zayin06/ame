@@ -13,6 +13,12 @@ export function shellProfiles(platform = process.platform, env: NodeJS.ProcessEn
     ]
     const pwsh = path.win32.join(env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe')
     if (exists(pwsh)) profiles.unshift({ id: 'pwsh', name: 'PowerShell 7', executable: pwsh, args: ['-NoLogo'] })
+    const gitBash = [
+      path.win32.join(env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
+      env['ProgramFiles(x86)'] ? path.win32.join(env['ProgramFiles(x86)'], 'Git', 'bin', 'bash.exe') : '',
+      env.LOCALAPPDATA ? path.win32.join(env.LOCALAPPDATA, 'Programs', 'Git', 'bin', 'bash.exe') : ''
+    ].find(file => file && exists(file))
+    if (gitBash) profiles.push({ id: 'git-bash', name: 'Git Bash', executable: gitBash, args: ['--login', '-i'] })
     return profiles.filter(profile => exists(profile.executable))
   }
   const candidates = [env.SHELL, ...(platform === 'darwin' ? ['/bin/zsh', '/bin/bash'] : ['/bin/bash', '/bin/sh'])]
@@ -67,6 +73,9 @@ export class Terminals {
     session.listeners.forEach(listener => listener.dispose())
     this.sessions.delete(id)
     if (session.info.exitCode === undefined) { try { session.pty.kill() } catch { /* The shell may already have exited. */ } }
+  }
+  closeProject(projectID: string) {
+    for (const { info } of this.sessions.values()) if (info.projectID === projectID) this.close(projectID, info.id)
   }
   dispose() { for (const { info } of this.sessions.values()) this.close(info.projectID, info.id) }
   private get(projectID: string, id: string) {

@@ -3,6 +3,7 @@ import type { FileEntry, GitState } from '../../../../../packages/protocol/src/i
 import { Icon } from './Icon'
 import { Empty, errorText, IconButton } from './Primitives'
 import { ProjectSearch } from './ProjectSearch'
+import { canCommit, commitShortcut } from '../scm-commit'
 
 function Directory({ projectID, path, generation, onOpen }: { projectID: string; path: string; generation: number; onOpen: (path: string) => void }) {
   const [entries, setEntries] = useState<FileEntry[]>([])
@@ -26,6 +27,12 @@ export function Inspector({ projectID, name, tab, setTab, generation, git, gitEr
   useEffect(() => { setMessage('') }, [projectID])
   const mutate = async (action: () => Promise<void>) => { setBusy(true); try { await action(); refresh() } catch (e) { report(e) } finally { setBusy(false) } }
   const changes = git?.changes || []
+  const commitState = { busy, message, changes }
+  const submitCommit = () => {
+    if (!projectID || !canCommit(commitState)) return
+    const text = message.trim()
+    void mutate(async () => { await window.ame.commit(projectID, text); setMessage('') })
+  }
   return <aside data-testid="inspector" className="inspector-pane" data-region="Project Inspector">
     <header className="inspector-pane__header"><span className="inspector-pane__title" title={name}><Icon name="folder" /><span className="truncate">{name || 'Project Inspector'}</span>{git?.branch && <span className="branch-tag">{git.branch}</span>}</span><IconButton label="Đóng Inspector (ẩn cố định)" onClick={onHide}><Icon name="left" /></IconButton></header>
     <nav className="inspector-mode-bar" aria-label="Inspector">{(['files', 'search', 'git'] as const).map(mode => <button key={mode} className={`inspector-mode-btn ${mode === 'git' ? 'inspector-mode-btn--icon' : ''} ${tab === mode ? 'is-active' : ''}`} title={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-pressed={tab === mode} onClick={() => setTab(mode)}>{mode === 'git' && <Icon name="git" />}{mode === 'files' ? 'Explorer' : mode === 'search' ? 'Search' : changes.length > 0 && <span className="diff-dot" />}</button>)}</nav>
@@ -33,7 +40,7 @@ export function Inspector({ projectID, name, tab, setTab, generation, git, gitEr
       const groupChanges = changes.filter(change => group === 'staged' ? !!change.index.trim() && !['?', '!'].includes(change.index) : !!change.working.trim() || change.index === '?')
       return groupChanges.length ? <section className="scm-section" key={group}><div className="scm-section__head"><span>{group === 'staged' ? 'Staged Changes' : 'Changes'}</span><span className="badge">{groupChanges.length}</span></div>{groupChanges.map(change => <div className="scm-file-row" key={change.path}><button className="scm-file-row__main" title={`Diff với HEAD: ${change.path}`} onClick={() => onDiff(change.path)}><Icon name="file" /><span className="scm-file-name truncate">{change.path}</span></button><span className="git-badge">{group === 'staged' ? change.index : change.working || change.index}</span><IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged'))}>{group === 'staged' ? '−' : '+'}</IconButton></div>)}</section> : null
     })}</div>
-    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); const text = message.trim(); if (!text) return; void mutate(async () => { await window.ame.commit(projectID, text); setMessage('') }) }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} placeholder="Message (Ctrl+Enter to commit)" /><div className="scm-commit-input-bar"><span className="muted">Skill /git-commit</span><button type="button" disabled title="AI commit enhancement chưa được kết nối">✦ Enhance</button></div></div><button className="scm-commit-btn" disabled={busy || !message.trim() || !changes.some(c => !!c.index.trim() && !['?', '!'].includes(c.index))}>{busy ? 'Đang xử lý…' : '✓ Commit'}</button></form>}
+    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><span className="muted">Skill /git-commit</span><button type="button" disabled title="AI commit enhancement chưa được kết nối">✦ Enhance</button></div></div><button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : '✓ Commit'}</button></form>}
     <footer className="inspector-pane__footer"><span>{tab === 'git' ? `${changes.length} changes` : tab === 'search' ? 'Project Search' : 'Explorer'}</span><IconButton label="Làm mới dự án" onClick={refresh}><Icon name="refresh" /></IconButton></footer>
   </aside>
 }

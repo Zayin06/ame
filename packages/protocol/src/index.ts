@@ -29,6 +29,7 @@ export interface DesktopApi {
   terminalClose(projectID: string, terminalID: string): Promise<void>
   projects(): Promise<Project[]>
   pickProject(): Promise<Project | null>
+  removeProject(projectID: string): Promise<void>
   entries(projectID: string, relative: string): Promise<FileEntry[]>
   read(projectID: string, relative: string): Promise<FileDocument>
   save(projectID: string, relative: string, content: string, revision: string): Promise<FileDocument>

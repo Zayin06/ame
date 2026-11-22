@@ -9,7 +9,7 @@ const api: DesktopApi = {
   terminalWrite: (id, terminal, data) => invoke('terminalWrite', id, terminal, data),
   terminalResize: (id, terminal, cols, rows) => invoke('terminalResize', id, terminal, cols, rows),
   terminalClose: (id, terminal) => invoke('terminalClose', id, terminal),
-  projects: () => invoke('projects'), pickProject: () => invoke('pickProject'),
+  projects: () => invoke('projects'), pickProject: () => invoke('pickProject'), removeProject: id => invoke('removeProject', id),
   entries: (id, relative) => invoke('entries', id, relative), read: (id, relative) => invoke('read', id, relative),
   save: (id, relative, content, revision) => invoke('save', id, relative, content, revision),
   git: id => invoke('git', id), diff: (id, relative) => invoke('diff', id, relative),

@@ -14,7 +14,7 @@ const server = net.createServer(); await new Promise(resolve => server.listen(0,
 const port = server.address().port; await new Promise(resolve => server.close(resolve))
 const env = { ...process.env, AME_IDE_TEST_DATA: userData }; delete env.ELECTRON_RUN_AS_NODE
 const packaged = process.env.AME_IDE_PACKAGED_EXECUTABLE
-const child = spawn(packaged || electron, [...(packaged ? [] : ['.']), `--user-data-dir=${userData}`, `--remote-debugging-port=${port}`], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] })
+const child = spawn(packaged || electron, [...(packaged ? [] : ['.']), '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', `--user-data-dir=${userData}`, `--remote-debugging-port=${port}`], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] })
 let logs = '', socket, sequence = 0
 const errors = [], pending = new Map()
 child.stdout.on('data', data => logs += data); child.stderr.on('data', data => logs += data)
@@ -71,6 +71,17 @@ try {
   assert.ok(output.includes(project), `Shell must start in selected project: ${output}`)
   assert.match(output, /\x1b\[[0-9;]*m/, 'Native terminal emits ANSI color sequences (ConPTY may normalize colors)')
   await until(`Array.from(document.querySelectorAll('.terminal-surface .xterm-rows span')).some(span => span.textContent.includes('RED_OK') && (span.classList.contains('xterm-fg-1') || span.classList.contains('xterm-fg-9') || /rgb\\(.*\\)/.test(span.style.color)))`)
+  await evaluate(`window.__terminalBeforeTheme = document.querySelector('.terminal-surface textarea')`)
+  await evaluate(`document.querySelector('button[aria-label="Settings"]').click()`)
+  await until('Boolean(document.querySelector(".settings-content select"))')
+  await evaluate(`(()=>{const select=document.querySelector('.settings-content select');const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;setter.call(select,'light');select.dispatchEvent(new Event('change',{bubbles:true}))})()`)
+  await until('document.documentElement.dataset.theme === "light"')
+  assert.equal(await evaluate('window.__terminalBeforeTheme === document.querySelector(".terminal-surface textarea")'), true, 'Theme hot swap must preserve the xterm instance and input node')
+  assert.ok(await evaluate('document.querySelector(".terminal-surface").textContent.includes("AME_TERMINAL_OK")'), 'Theme hot swap retains rendered output')
+  await evaluate(`document.querySelector('.modal button[aria-label="Đóng"]').click()`)
+  await until('!document.querySelector(".settings-content")')
+  await evaluate(`document.querySelector('button[aria-label="Clear Terminal"]').click()`)
+  assert.equal(await evaluate(`(async()=> (await ${snapshot()}).output.includes('AME_TERMINAL_OK'))()`), true, 'Clear affects the visible xterm, not backend history')
   await command('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
   await until(`(async()=> (await ${snapshot()}).cols !== 80)()`)
   const before = await evaluate(`(async()=> (await ${snapshot()}).cols)()`)
@@ -86,8 +97,14 @@ try {
   await evaluate('document.querySelector("button[aria-label=\\"Close Terminal Panel\\"]").click()')
   assert.equal(await evaluate('getComputedStyle(document.querySelector(".editor-terminal")).display'), 'none')
   assert.equal(await evaluate('(async()=> (await window.ame.terminalList("terminal-smoke")).length)()'), 1)
-  await evaluate('document.querySelector("button[aria-label=\\"Toggle Terminal\\"]").click()')
-  await evaluate('document.querySelector("button[aria-label=\\"New Terminal\\"]").click()')
+  await evaluate(`document.querySelector('.terminal-surface textarea').dispatchEvent(new KeyboardEvent('keydown', { key: '~', code: 'Backquote', ctrlKey: true, shiftKey: true, bubbles: true }))`)
+  await until('document.querySelectorAll(".term-tabs [role=tab]").length === 2')
+  assert.notEqual(await evaluate('getComputedStyle(document.querySelector(".editor-terminal")).display'), 'none', 'New-terminal shortcut opens the hidden panel')
+  await evaluate(`document.querySelector('button[aria-label="Close Side Panel"]').click()`)
+  await until('!document.querySelector(".side-panel")')
+  await evaluate(`window.dispatchEvent(new KeyboardEvent('keydown', { key: '~', code: 'Backquote', ctrlKey: true, shiftKey: true, bubbles: true }))`)
+  await until('document.querySelectorAll(".term-tabs [role=tab]").length === 3')
+  await evaluate(`document.querySelector('button[aria-label="Kill terminal 3"]').click()`)
   await until('document.querySelectorAll(".term-tabs [role=tab]").length === 2')
   await evaluate('document.querySelector(".term-tabs [role=tab]").click()')
   await until(`document.querySelector(".terminal-surface").dataset.terminalId === ${JSON.stringify(id)}`)
@@ -112,7 +129,7 @@ try {
   let shellStopped = false
   for (let index = 0; index < 50; index++) { try { process.kill(ownedShellPID, 0) } catch { shellStopped = true; break }; await sleep(100) }
   assert.ok(shellStopped, 'Closing the window stops its owned shell')
-  console.log(`PASS (${process.platform}-${process.arch}): native PTY, shell cwd with spaces, keyboard input, ANSI, resize, Ctrl+C, tabs, panel hide, renderer reload, exit and owned shell cleanup${packaged ? ', packaged native module' : ''}`)
+  console.log(`PASS (${process.platform}-${process.arch}): native PTY, shell cwd with spaces, keyboard input, ANSI, live theme instance/output preservation, Clear, resize, Ctrl+C, new-terminal shortcut from terminal focus and hidden stage, tabs, panel hide, renderer reload, exit and owned shell cleanup${packaged ? ', packaged native module' : ''}`)
 } catch (error) { console.error(logs); throw error }
 finally {
   socket?.close()

@@ -60,7 +60,7 @@ const schema = {
   terminalCreate: z.tuple([id, id.optional(), z.number().int().min(2).max(500).optional(), z.number().int().min(1).max(300).optional()]),
   terminalSnapshot: z.tuple([id, id]), terminalWrite: z.tuple([id, id, z.string().max(65536)]),
   terminalResize: z.tuple([id, id, z.number().int().min(2).max(500), z.number().int().min(1).max(300)]), terminalClose: z.tuple([id, id]),
-  projects: z.tuple([]), pickProject: z.tuple([]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
+  projects: z.tuple([]), pickProject: z.tuple([]), removeProject: z.tuple([id]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
   save: z.tuple([id, relative, z.string().max(4 * 1024 * 1024), z.string().regex(/^[a-f0-9]{64}$/)]),
   git: z.tuple([id]), diff: z.tuple([id, relative]), stage: z.tuple([id, relative, z.boolean()]), commit: z.tuple([id, z.string().min(1).max(10000)]),
   connection: z.tuple([]), startBackend: z.tuple([]), discover: z.tuple([]), connect: z.tuple([z.string().max(2048), z.string().max(512).optional(), z.string().max(8192).optional()]),
@@ -96,6 +96,14 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       const result = await dialog.showOpenDialog(window!, { title: 'Mở project', properties: ['openDirectory'] })
       if (result.canceled || !result.filePaths[0]) return null
       const project = await workspace.add(result.filePaths[0]); adapter.attach(project.id, project.directory); return project
+    }
+    case 'removeProject': {
+      const project = workspace.get(a)
+      await confirmation(`Gỡ dự án ${project.name} khỏi danh sách? Tệp trên ổ đĩa sẽ KHÔNG bị xóa.`)
+      terminals.closeProject(a)
+      await workspace.remove(a)
+      adapter.detach(a)
+      return
     }
     case 'entries': return workspace.entries(a, b)
     case 'read': return workspace.read(a, b)

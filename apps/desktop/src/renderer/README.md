@@ -22,4 +22,12 @@ npm run build
 
 Stable smoke selectors: `data-testid="shell"`, `inspector`, `explorer`, `chat`, `editor`.
 
-Native services own validation, model readiness and destructive-operation confirmations. Account admin controls follow the server-provided role. Live account/backend authorization and streaming require a configured compatible server. Terminal, search, LSP, artifact APIs and detailed running-agent status are outside this slice.
+Native services own validation, model readiness and destructive-operation confirmations. Account admin controls follow the server-provided role. Live account/backend authorization and streaming require a configured compatible server. LSP, artifact APIs and detailed running-agent status are outside this slice.
+
+## Foundation controls
+
+- Ctrl/Cmd+Enter commits only with a nonempty message and staged files, outside IME composition and busy operations; form submission uses the same guard.
+- Ctrl/Cmd+Shift+Backquote opens the stage and creates a terminal for the selected project, even from terminal focus. Ctrl/Cmd+Backquote toggles the panel. Windows discovers Git Bash when installed alongside PowerShell/CMD.
+- Theme changes update the existing xterm options without replacing the terminal or replaying a snapshot. Clear Terminal clears the visible xterm buffer, not the backend output history.
+- The project rail remove button requires native confirmation. Removal closes owned terminals and watchers and forgets in-memory documents, sessions and layout for that project; it never deletes files. Unsaved in-memory edits are discarded on confirmed removal.
+- Every dirty file tab shows a marker, including inactive tabs; diff tabs never show it. Dirty paths are scoped to the selected project.

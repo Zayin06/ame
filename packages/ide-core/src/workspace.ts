@@ -39,6 +39,14 @@ export class Workspaces {
     if (persist) { await mkdir(path.dirname(this.storage), { recursive: true }); await writeFile(this.storage, JSON.stringify(this.list()), 'utf8') }
     return project
   }
+  async remove(id: string): Promise<void> {
+    this.get(id)
+    this.watchers.get(id)?.close()
+    this.watchers.delete(id)
+    this.projects.delete(id)
+    await mkdir(path.dirname(this.storage), { recursive: true })
+    await writeFile(this.storage, JSON.stringify(this.list()), 'utf8')
+  }
   get(id: string) { const project = this.projects.get(id); if (!project) throw new Error('UNKNOWN_PROJECT'); return project }
   async resolve(id: string, relative: string): Promise<string> {
     if (typeof relative !== 'string' || relative.includes('\0') || path.isAbsolute(relative) || /^[a-zA-Z]:/.test(relative) || relative.includes(':')) throw new Error('INVALID_PATH')

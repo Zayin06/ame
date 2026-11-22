@@ -70,6 +70,15 @@ export function parsePreferences(raw: string | null): Preferences {
 }
 export type Buffer = FileDocument & { projectID: string; text: string; conflict: boolean }
 export const dirty = (buffer: Buffer) => buffer.text !== buffer.content
+export const projectDirtyPaths = (buffers: Record<string, Buffer>, projectID?: string): ReadonlySet<string> => new Set(Object.values(buffers).filter(buffer => buffer.projectID === projectID && dirty(buffer)).map(buffer => buffer.path))
+export const tabIsDirty = (tab: Tab, paths: ReadonlySet<string>) => tab.mode === 'file' && paths.has(tab.path)
+export function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...record }; delete next[key]; return next
+}
+export const withoutProjectDocuments = <T>(documents: Record<string, T>, projectID: string) => Object.fromEntries(Object.entries(documents).filter(([key]) => JSON.parse(key)[0] !== projectID))
+export function withoutProject(preferences: Preferences, id: string, remaining: ReadonlyArray<{ id: string }>): Preferences {
+  return { ...preferences, projects: withoutKey(preferences.projects, id), project: preferences.project === id ? remaining[0]?.id : preferences.project }
+}
 export function reconcileDocument(current: Buffer, incoming: FileDocument): Buffer {
   if (current.revision === incoming.revision) return current
   return dirty(current) ? { ...current, conflict: true } : { ...current, ...incoming, text: incoming.content, conflict: false }

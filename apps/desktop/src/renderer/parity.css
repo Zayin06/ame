@@ -11,6 +11,9 @@
 .project-select { border: 0; background: transparent; padding: 0; text-align: left; }
 .project-select:hover:not(:disabled) { background: transparent; }
 .proj-chevron svg { width: 12px; height: 12px; }
+.proj-actions { gap: 1px; }
+.proj-actions .proj-act-btn { min-width: 19px; width: 19px; padding: 0; }
+.proj-remove-btn:focus-visible { outline: 1px solid var(--accent); }
 .chat-header-actions, .stage-actions { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
 .chat-title-group { min-width: 0; }
 .chat-stream__inner { min-height: 100%; }

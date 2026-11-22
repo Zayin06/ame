@@ -3,9 +3,14 @@ import { randomBytes, createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
 
 export type RuntimeEndpoint = { url: string; username: string; password: string }
-export type RuntimeOptions = { resources: string; profile: string; onExit?: () => void }
+export type RuntimeOptions = {
+  resources: string; profile: string; onExit?: () => void
+  /** Total API/plugin readiness budget after listening; defaults to 30 seconds. */
+  readinessTimeoutMs?: number
+}
 const version = '2.3.2'
 export function privateEnvironment(profile: string, password: string, inherited = process.env): NodeJS.ProcessEnv {
   const env = Object.fromEntries(Object.entries(inherited).filter(([key]) => !/^(OPENCODE_|XDG_|OTEL_|ELECTRON_|NODE_OPTIONS$|BUN_OPTIONS$)/i.test(key)))
@@ -70,21 +75,76 @@ export class PrivateRuntime {
         child.once('error', fail); child.once('exit', fail); child.stdout?.on('data', data)
       })
       child.stdout?.resume()
-      const headers = { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` }
-      const response = await fetch(`${url}/api/info`, { headers, signal: AbortSignal.timeout(10000), redirect: 'error' })
-      if (!response.ok || (await response.json() as { version?: string }).version !== version) throw new Error('RUNTIME_VERSION_MISMATCH')
-      const deadline = Date.now() + 30000
-      for (;;) {
-        if (this.stopping || this.child !== child) throw new Error('RUNTIME_STOPPED')
-        const rpc = await fetch(`${url}/api/rpc/amekit-models/status`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ input: null }), signal: AbortSignal.timeout(5000), redirect: 'error' })
-        if (rpc.ok && (await rpc.json() as { output?: { authenticated?: boolean } }).output?.authenticated === false) break
-        if (Date.now() >= deadline) throw new Error('RUNTIME_PLUGIN_NOT_READY')
-        await new Promise(resolve => setTimeout(resolve, 250))
-      }
+      await this.waitUntilReady(child, url, password)
       if (this.stopping || this.child !== child || child.exitCode !== null || child.signalCode !== null) throw new Error('RUNTIME_STOPPED')
       this.endpoint = { url, username: 'opencode', password }
       return this.endpoint
     } catch (error) { child.kill(); await this.closed; throw error }
+  }
+  private async waitUntilReady(child: ChildProcess, url: string, password: string) {
+    const headers = { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error('RUNTIME_PLUGIN_NOT_READY: readiness timeout')), this.options.readinessTimeoutMs ?? 30000)
+    const stopped = () => controller.abort(new Error('RUNTIME_STOPPED'))
+    child.once('exit', stopped)
+    child.once('error', stopped)
+    const check = () => {
+      if (this.stopping || this.child !== child || child.exitCode !== null || child.signalCode !== null) throw new Error('RUNTIME_STOPPED')
+      controller.signal.throwIfAborted()
+    }
+    const request = async (route: string, init?: RequestInit) => {
+      check()
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])
+      try {
+        const response = await fetch(`${url}${route}`, { ...init, headers: { ...headers, ...init?.headers }, signal, redirect: 'error' })
+        // Consume the body under the same deadline, not just the response headers.
+        return { status: response.status, body: await response.text() }
+      } catch (error) {
+        check()
+        if (signal.aborted || error instanceof TypeError) return undefined
+        throw error
+      }
+    }
+    try {
+      let verified = false
+      for (;;) {
+        check()
+        if (!verified) {
+          const info = await request('/api/info')
+          if (info && info.status !== 503) {
+            if (info.status !== 200 || JSON.parse(info.body)?.version !== version) throw new Error('RUNTIME_VERSION_MISMATCH')
+            verified = true
+          }
+        }
+        if (verified) {
+          const response = await request('/api/plugin')
+          if (response && response.status !== 503) {
+            if (response.status !== 200) throw new Error(`RUNTIME_PLUGIN_FAILED: plugin inventory HTTP ${response.status}`)
+            const plugins = JSON.parse(response.body) as { data?: { id?: string; source?: { type?: string }; state?: { status?: string } }[] }
+            if (!Array.isArray(plugins?.data)) throw new Error('RUNTIME_PLUGIN_FAILED: invalid plugin inventory')
+            if (plugins.data.some(p => p.source?.type !== 'builtin' && p.state?.status === 'failed')) throw new Error('RUNTIME_PLUGIN_FAILED: amekit-models setup failed')
+            const plugin = plugins.data.find(p => p.id === 'amekit-models')
+            // RPC handlers can be registered before setup finishes; require the host's active state too.
+            if (plugin?.id === 'amekit-models' && plugin.state?.status === 'active') {
+              const rpc = await request('/api/rpc/amekit-models/status', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ input: null }) })
+              if (rpc && rpc.status !== 404 && rpc.status !== 503) {
+                if (rpc.status !== 200 || JSON.parse(rpc.body)?.output?.authenticated !== false) throw new Error('RUNTIME_PLUGIN_FAILED: invalid signed-out status')
+                check()
+                return
+              }
+            }
+          }
+        }
+        await delay(250, undefined, { signal: controller.signal })
+      }
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason
+      throw error
+    } finally {
+      clearTimeout(timer)
+      child.off('exit', stopped)
+      child.off('error', stopped)
+    }
   }
   async stop() {
     this.stopping = true

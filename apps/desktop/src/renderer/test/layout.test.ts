@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { activateTab, removeTab, selectedTab, defaults, dirty, documentID, parsePreferences, reconcileDocument, savedDocument, type Buffer } from '../state'
+import { activateTab, removeTab, selectedTab, defaults, dirty, documentID, parsePreferences, projectDirtyPaths, reconcileDocument, savedDocument, tabIsDirty, withoutKey, withoutProject, withoutProjectDocuments, type Buffer } from '../state'
 
 test('starts with Explorer hidden but preserves an explicitly saved Inspector choice', () => {
   for (const raw of [null, '{}', 'invalid json']) assert.equal(parsePreferences(raw).inspector, false)
@@ -81,4 +81,31 @@ test('file and diff selection survive switching, closing and preference restore 
   view = removeTab(view, tabs[1])
   assert.equal(selectedTab(view, 'diff'), undefined)
   assert.equal(selectedTab(view, 'file')?.path, 'b.ts')
+})
+
+test('dirty markers cover active and inactive file tabs but never diff or other projects', () => {
+  const buffers = {
+    [documentID('one', 'a.ts')]: { ...clean, text: 'edited' },
+    [documentID('one', 'b.ts')]: { ...clean, path: 'b.ts', text: 'edited' },
+    [documentID('one', 'clean.ts')]: { ...clean, path: 'clean.ts' },
+    [documentID('two', 'other.ts')]: { ...clean, projectID: 'two', path: 'other.ts', text: 'edited' }
+  }
+  const paths = projectDirtyPaths(buffers, 'one')
+  for (const path of ['a.ts', 'b.ts']) assert.equal(tabIsDirty({ path, mode: 'file' }, paths), true)
+  for (const path of ['a.ts', 'b.ts']) assert.equal(tabIsDirty({ path, mode: 'diff' }, paths), false)
+  for (const path of ['clean.ts', 'other.ts']) assert.equal(tabIsDirty({ path, mode: 'file' }, paths), false)
+  assert.equal(projectDirtyPaths(buffers).size, 0)
+})
+test('project removal clears only its preferences, sessions, buffers and diffs and chooses fallback', () => {
+  const preferences = { ...defaults(), project: 'one', projects: { one: { tabs: [] }, two: { tabs: [] } } }
+  const remaining = [{ id: 'two' }]
+  const result = withoutProject(preferences, 'one', remaining)
+  assert.equal(result.project, 'two'); assert.deepEqual(Object.keys(result.projects), ['two'])
+  assert.equal(withoutProject(result, 'one', remaining).project, 'two')
+  assert.equal(withoutProject(result, 'two', []).project, undefined)
+  const sessions = { one: ['s1'], two: ['s2'] }
+  assert.deepEqual(withoutKey(sessions, 'one'), { two: ['s2'] })
+  const documents = { [documentID('one', 'a.ts')]: { text: 'one' }, [documentID('two', 'a.ts')]: { text: 'two' } }
+  assert.deepEqual(withoutProjectDocuments(documents, 'one'), { [documentID('two', 'a.ts')]: { text: 'two' } })
+  assert.ok(preferences.projects.one); assert.ok(sessions.one); assert.ok(documents[documentID('one', 'a.ts')])
 })

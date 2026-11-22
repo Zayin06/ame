@@ -62,6 +62,7 @@ export class OpenCodeAdapter {
   }
   private api() { if (!this.client || !this.state.connected) throw new Error('OPENCODE_DISCONNECTED'); return this.client }
   attach(projectID: string, directory: string) { this.projects.set(projectID, directory) }
+  detach(projectID: string) { this.projects.delete(projectID) }
   private directory(projectID: string) { const value = this.projects.get(projectID); if (!value) throw new Error('UNKNOWN_PROJECT'); return value }
   private async owned(projectID: string, sessionID: string) {
     const session = await this.api().session.get({ sessionID })

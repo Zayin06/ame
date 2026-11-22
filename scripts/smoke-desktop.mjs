@@ -23,7 +23,7 @@ await writeFile(path.join(userData, 'pairing.json'), JSON.stringify({ enabled: t
 let pairingPort, pairingURL
 const env = { ...process.env, AME_IDE_TEST_DATA: userData }; delete env.ELECTRON_RUN_AS_NODE
 const packaged = process.env.AME_IDE_PACKAGED_EXECUTABLE
-const child = spawn(packaged || electron, [...(packaged ? [] : ['.']), `--user-data-dir=${userData}`, `--remote-debugging-port=${port}`], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] })
+const child = spawn(packaged || electron, [...(packaged ? [] : ['.']), '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', `--user-data-dir=${userData}`, `--remote-debugging-port=${port}`], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] })
 let logs = ''; child.stdout.on('data', data => logs += data); child.stderr.on('data', data => logs += data)
 let socket; const pending = new Map(); let sequence = 0; const errors = []
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -43,7 +43,8 @@ async function until(expression) {
     catch (error) { if (!String(error).includes('Inspected target navigated or closed')) throw error }
     await sleep(100)
   }
-  throw new Error('UI_TIMEOUT: ' + expression)
+  const state = await evaluate('JSON.stringify({ tabs: document.querySelector(".editor-tabs")?.textContent, editor: document.querySelector(".monaco-editor")?.textContent, alerts: [...document.querySelectorAll("[role=alert]")].map(node => node.textContent) })')
+  throw new Error('UI_TIMEOUT: ' + expression + '\n' + state)
 }
 try {
   let target
@@ -110,6 +111,8 @@ try {
     await until('[...document.querySelectorAll(".tree-row")].some(b=>b.title==="second.ts")')
     await evaluate('[...document.querySelectorAll(".tree-row")].find(b=>b.title==="second.ts").click()')
     await until('document.querySelector(".editor-tab.selected button").title === "second.ts"')
+    assert.ok(await evaluate(`document.querySelector('.editor-tab:not(.selected) button[title="hello.ts"]').textContent.includes('●')`), 'Inactive unsaved file retains its dirty marker')
+    assert.equal(await evaluate(`document.querySelector('.editor-tab.selected button').textContent.includes('●')`), false, 'Clean active file has no dirty marker')
     await evaluate('[...document.querySelectorAll(".editor-tab button")].find(b=>b.getAttribute("aria-label")==="Đóng second.ts").click()')
     await until('document.querySelector(".editor-tab.selected button").title === "hello.ts"')
     await evaluate('document.querySelector(".editor-toolbar button").click()')

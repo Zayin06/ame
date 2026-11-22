@@ -49,6 +49,41 @@ test('real SDK requests use location, main-only auth, session binding, prompt an
     assert.ok(!JSON.stringify(adapter.connection()).includes('private-password'))
   } finally { adapter.dispose() }
 })
+test('detaching a project rejects its API access and stops its event routing without disconnecting other projects', async () => {
+  const notifications: IdeEvent[] = []
+  const directory = process.cwd(), otherDirectory = directory + '-other'
+  let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+  const adapter = new OpenCodeAdapter(event => notifications.push(event), async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/session') return json({ data: [{ id: 's1', title: 'Kept' }], cursor: {} })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      stream = controller
+      init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  const send = (event: unknown) => stream!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`))
+  adapter.attach('removed', directory); adapter.attach('kept', otherDirectory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    await waitFor(() => !!stream)
+    send({ type: 'server.connected' })
+    await waitFor(() => notifications.some(event => event.type === 'opencode' && event.projectID === 'removed'))
+    adapter.detach('removed'); adapter.detach('removed')
+    notifications.length = 0
+    await assert.rejects(adapter.sessions('removed'), /UNKNOWN_PROJECT/)
+    await assert.rejects(adapter.createSession('removed'), /UNKNOWN_PROJECT/)
+    await assert.rejects(adapter.models('removed'), /UNKNOWN_PROJECT/)
+    assert.equal((await adapter.sessions('kept'))[0].title, 'Kept')
+    send({ type: 'session.text.delta', location: { directory }, data: { sessionID: 's1', assistantMessageID: 'a1', ordinal: 0, delta: 'Ignored' } })
+    send({ type: 'server.connected' })
+    await waitFor(() => notifications.some(event => event.type === 'opencode' && event.projectID === 'kept'))
+    assert.equal(notifications.some(event => event.type === 'opencode' && event.projectID === 'removed'), false)
+    assert.equal(adapter.connection().connected, true)
+  } finally { adapter.dispose() }
+})
+
 test('SSE deltas render before persistence and reconnect resyncs history', async () => {
   const notifications: IdeEvent[] = []; let connections = 0
   const directory = process.cwd()
