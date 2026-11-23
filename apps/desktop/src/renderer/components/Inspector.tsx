@@ -4,6 +4,8 @@ import { Icon } from './Icon'
 import { Empty, errorText, IconButton } from './Primitives'
 import { ProjectSearch } from './ProjectSearch'
 import { canCommit, commitShortcut } from '../scm-commit'
+import { gitStatusMeta, splitFilePath } from '../scm-display'
+import { FileTypeIcon } from '../components/FileTypeIcon'
 
 type Mutate = <T>(action: () => Promise<T>, success?: (result: T) => void, refreshAfter?: boolean) => Promise<void>
 type Naming = { kind: 'file' | 'directory' | 'rename'; parent: string; entry?: FileEntry }
@@ -54,7 +56,7 @@ function Directory(props: DirectoryProps) {
     const editing = naming && (naming.kind === 'rename' ? naming.entry?.path === entry.path : naming.parent === entry.path)
     return <li key={entry.path}>
       <div className="insp-tree-entry">
-        <button className="tree-row insp-row" title={entry.path} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined} onClick={() => entry.directory ? setExpanded(value => ({ ...value, [entry.path]: !value[entry.path] })) : onOpen(entry.path)}><span className="file-symbol"><Icon name={entry.directory ? expanded[entry.path] ? 'down' : 'chevron' : 'file'} /></span><span className="truncate">{entry.name}</span></button>
+        <button className="tree-row insp-row" title={entry.path} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined} onClick={() => entry.directory ? setExpanded(value => ({ ...value, [entry.path]: !value[entry.path] })) : onOpen(entry.path)}><span className="file-symbol">{entry.directory ? <Icon name={expanded[entry.path] ? 'down' : 'chevron'} /> : <FileTypeIcon path={entry.path} />}</span><span className="truncate">{entry.name}</span></button>
         <button className="insp-tree-more" title={`Thao tác ${entry.path}`} aria-label={`Thao tác ${entry.path}`} aria-haspopup="menu" aria-expanded={menu === entry.path} disabled={busy} onClick={() => setMenu(menu === entry.path ? null : entry.path)}><Icon name="more" /></button>
       </div>
       {menu === entry.path && !busy && <div className="insp-tree-popover" role="menu" aria-label={`Thao tác ${entry.path}`}>
@@ -133,6 +135,7 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
   const [branchRevision, setBranchRevision] = useState(0)
   const [newBranch, setNewBranch] = useState(false)
   const [commitEnhanceSkill, setCommitEnhanceSkill] = useState('')
+  const [foldedSections, setFoldedSections] = useState({ staged: false, working: false })
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   useEffect(() => {
     if (!projectID || tab !== 'git') return
@@ -191,7 +194,35 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
       {branchError && <div className="inline-error" role="alert">{branchError}</div>}
       {gitError ? <div className="inline-error">{gitError}</div> : !git ? <Empty>Đang đọc trạng thái Git…</Empty> : !changes.length ? <Empty>Không có thay đổi. Cây làm việc sạch.</Empty> : (['staged', 'working'] as const).map(group => {
         const groupChanges = changes.filter(change => group === 'staged' ? !!change.index.trim() && !['?', '!'].includes(change.index) : !!change.working.trim() || change.index === '?')
-        return groupChanges.length ? <section className="scm-section" key={group}><div className="scm-section__head"><span className="truncate">{group === 'staged' ? 'Staged Changes' : 'Changes'}</span><span className="scm-section__right"><span className="badge">{groupChanges.length}</span><IconButton label={group === 'staged' ? 'Unstage All' : 'Stage All'} disabled={busy} onClick={() => void mutate(() => group === 'staged' ? window.ame.unstageAll(projectID) : window.ame.stageAll(projectID))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton></span></div>{groupChanges.map(change => <div className="scm-file-row" key={change.path}><button className="scm-file-row__main" title={`Diff với HEAD: ${change.path}`} onClick={() => onDiff(change.path)}><Icon name="file" /><span className="scm-file-name truncate">{change.path}</span></button><span className="git-badge">{group === 'staged' ? change.index : change.working.trim() || change.index}</span><IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged'))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton>{group === 'working' && <IconButton label={`Discard ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.discardFile(projectID, change.path))}><Icon name="undo" /></IconButton>}</div>)}</section> : null
+        const folded = foldedSections[group]
+        return groupChanges.length ? <section className={`scm-section${folded ? ' is-folded' : ''}`} key={group}>
+          <div className="scm-section__head">
+            <button type="button" className="scm-section__toggle" aria-expanded={!folded} onClick={() => setFoldedSections(value => ({ ...value, [group]: !value[group] }))}>
+              <span className="scm-section__left"><span className="scm-chevron"><Icon name="down" /></span><span className="truncate">{group === 'staged' ? 'Staged Changes' : 'Changes'}</span></span>
+            </button>
+            <span className="scm-section__right">
+              <span className="scm-section__actions"><IconButton label={group === 'staged' ? 'Unstage All' : 'Stage All'} disabled={busy} onClick={() => void mutate(() => group === 'staged' ? window.ame.unstageAll(projectID) : window.ame.stageAll(projectID))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton></span>
+              <span className="scm-count-pill">{groupChanges.length}</span>
+            </span>
+          </div>
+          <div className="scm-list">{groupChanges.map(change => {
+            const rawStatus = group === 'staged' ? change.index.trim() : change.working.trim() || change.index.trim()
+            const meta = gitStatusMeta(rawStatus)
+            const { name, dir } = splitFilePath(change.path)
+            return <div className="scm-file-row" data-status={meta.dataStatus} key={change.path}>
+              <button type="button" className="scm-file-row__main" title={`Diff với HEAD: ${change.path}`} onClick={() => onDiff(change.path)}>
+                <FileTypeIcon path={change.path} /><span className="scm-file-name">{name}</span>{dir && <span className="scm-file-dir">{dir}</span>}
+              </button>
+              <div className="scm-file-row__right">
+                <span className="scm-row-actions">
+                  <IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged'))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton>
+                  {group === 'working' && <IconButton label={`Discard ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.discardFile(projectID, change.path))}><Icon name="undo" /></IconButton>}
+                </span>
+                <span className={`git-badge git-badge--${meta.dataStatus}`} title={meta.label}>{meta.code}</span>
+              </div>
+            </div>
+          })}</div>
+        </section> : null
       })}
     </>}</div>
     {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><button type="button" className="scm-enhance-icon-btn" disabled={!connected || busy || !stagedChanges.length} title={enhanceTitle} aria-label={enhanceTitle} data-testid="scm-enhance-btn" onClick={() => void mutate(() => window.ame.generateCommitMessage(projectID), result => setMessage(result.message), false)}><Icon name="wand" /></button></div></div><button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : <><Icon name="check" /> Commit</>}</button></form>}

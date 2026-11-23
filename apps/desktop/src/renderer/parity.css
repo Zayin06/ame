@@ -225,8 +225,51 @@
 .scm-branch-controls select { flex: 1; min-width: 0; width: 0; max-width: 100%; padding: 3px; }
 .inspector-pane__body .scm-section__head .icon-btn, .inspector-pane__body .scm-file-row .icon-btn, .scm-branch-controls .icon-btn { flex: 0 0 22px; min-width: 22px; width: 22px; height: 22px; padding: 0; }
 .inspector-pane__body .scm-file-row { min-width: 0; max-width: 100%; gap: 4px; }
-.scm-file-row .icon-btn { display: none; }
-.scm-file-row:hover .icon-btn, .scm-file-row:focus-within .icon-btn { display: inline-flex; }
+.scm-section__toggle, .scm-file-row__main, .scm-row-actions button, .scm-section__actions button { border: 0; background: transparent; color: inherit; font: inherit; }
+.scm-section__toggle { display: flex; align-items: center; flex: 1; min-width: 0; height: 100%; padding: 0; text-align: left; }
+.scm-section__toggle:hover:not(:disabled), .scm-file-row__main:hover:not(:disabled) { background: transparent; }
+.scm-row-actions button:hover:not(:disabled), .scm-section__actions button:hover:not(:disabled) { background: var(--vsc-hover); }
+.scm-section__head:focus-within .scm-section__actions, .scm-file-row:focus-within .scm-row-actions { display: inline-flex; }
+.scm-chevron, .scm-chevron svg { display: block; width: 12px; height: 12px; }
+.scm-file-row[data-status="D"] .scm-file-name { text-decoration: line-through; }
+.file-symbol { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; }
+.file-type-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 16px; width: 16px; height: 16px; line-height: 16px; }
+.file-type-icon svg { display: block; width: 16px; height: 16px; }
+.file-type-icon__glyph { font-family: var(--font-mono); font-size: 11px; font-weight: 800; line-height: 16px; letter-spacing: -1px; }
+.file-type-icon--ts { color: #4b9bea; }
+.file-type-icon--ts-test { color: #e5a04d; }
+.file-type-icon--js { color: #e8c84a; }
+.file-type-icon--js-test { color: #9ccc65; }
+.file-type-icon--md { color: #519aba; }
+.file-type-icon--json { color: #cbcb41; }
+.file-type-icon--css { color: #b180d7; }
+.file-type-icon--markup { color: #e37933; }
+.file-type-icon--config { color: #a8b9cc; }
+.file-type-icon--py { color: #e6cd69; }
+.file-type-icon--kt { color: #c190ef; }
+.file-type-icon--java { color: #e68b48; }
+.file-type-icon--go { color: #51c5d9; }
+.file-type-icon--rs { color: #dea584; }
+.file-type-icon--shell { color: #89d185; }
+.file-type-icon--image { color: #a6c776; }
+.file-type-icon--file { color: var(--text-muted); }
+:root[data-theme="light"] .file-type-icon--ts { color: #2677a8; }
+:root[data-theme="light"] .file-type-icon--ts-test { color: #b5651d; }
+:root[data-theme="light"] .file-type-icon--js { color: #947400; }
+:root[data-theme="light"] .file-type-icon--js-test { color: #527d18; }
+:root[data-theme="light"] .file-type-icon--md { color: #347f9e; }
+:root[data-theme="light"] .file-type-icon--json { color: #857300; }
+:root[data-theme="light"] .file-type-icon--css { color: #8852b2; }
+:root[data-theme="light"] .file-type-icon--markup { color: #b65115; }
+:root[data-theme="light"] .file-type-icon--config { color: #556b82; }
+:root[data-theme="light"] .file-type-icon--py { color: #8c7015; }
+:root[data-theme="light"] .file-type-icon--kt { color: #8752b5; }
+:root[data-theme="light"] .file-type-icon--java { color: #af5618; }
+:root[data-theme="light"] .file-type-icon--go { color: #007f95; }
+:root[data-theme="light"] .file-type-icon--rs { color: #995b38; }
+:root[data-theme="light"] .file-type-icon--shell { color: #317b2d; }
+:root[data-theme="light"] .file-type-icon--image { color: #5a7c25; }
+:root[data-theme="light"] .file-type-icon--file { color: var(--text-muted); }
 .inspector-pane__body .scm-file-row__main > svg { flex-shrink: 0; }
 .inspector-pane__body .search-options { display: flex; flex-direction: column; gap: 5px; min-width: 0; max-width: 100%; margin-top: 6px; font-size: 11px; }
 .inspector-pane__body .search-options label { display: flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; color: var(--text-muted); }

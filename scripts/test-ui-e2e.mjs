@@ -221,7 +221,8 @@ async function main() {
     await command('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 })
   }
   async function key(key, code, windowsVirtualKeyCode, modifiers = 0) {
-    await command('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode, modifiers })
+    const text = key === 'Enter' && !modifiers ? '\r' : undefined
+    await command('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode, modifiers, ...(text ? { text, unmodifiedText: text } : {}) })
     await command('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode, modifiers })
   }
   const primary = process.platform === 'darwin' ? 4 : 2
@@ -409,6 +410,55 @@ async function main() {
       try {
         await until('Boolean(document.querySelector(".scm-commit-dock .scm-enhance-icon-btn svg"))', 'commit Enhance wand icon')
         assert.equal(await evaluate('document.querySelector(".scm-commit-input-bar").textContent.trim()'), '', 'Commit toolbar must contain only the wand icon, without a skill hint or Enhance text')
+        await until(`Boolean(document.querySelector('.scm-file-row__main[title="Diff với HEAD: src/app.ts"] .file-type-icon--ts'))`, 'SCM rows with shared file icons')
+        const scm = await evaluate(`(() => {
+          const inspector=document.querySelector('[data-testid="inspector"]');
+          const style=element=>getComputedStyle(element);
+          const neutral=style(inspector).color;
+          const row=path=>inspector.querySelector('.scm-file-row__main[title="Diff với HEAD: '+path+'"]');
+          const files=['src/app.ts','README.md','package.json'].map(path=>{
+            const main=row(path), container=main.closest('.scm-file-row'), icon=main.querySelector('.file-type-icon'), name=main.querySelector('.scm-file-name'), dir=main.querySelector('.scm-file-dir'), badge=container.querySelector('.git-badge');
+            const box=icon.getBoundingClientRect();
+            return {path,status:container.dataset.status,badge:badge.textContent,badgeColor:style(badge).color,name:name.textContent,nameColor:style(name).color,dir:dir?.textContent||'',dirColor:dir&&style(dir).color,icon:icon.className,iconColor:style(icon).color,iconWidth:box.width,iconHeight:box.height,background:style(main).backgroundColor,border:style(main).borderTopWidth};
+          });
+          return {neutral,pills:[...inspector.querySelectorAll('.scm-count-pill')].map(e=>({background:style(e).backgroundColor,color:style(e).color})),files};
+        })()`)
+        const rgb = color => color.match(/[\d.]+/g).slice(0, 3).map(Number)
+        assert.ok(scm.pills.length > 0, 'SCM sections must show count pills')
+        for (const pill of scm.pills) {
+          const [red, green, blue] = rgb(pill.background)
+          assert.ok(blue > red && blue > green, `SCM count pill must be blue: ${pill.background}`)
+          assert.equal(pill.color, 'rgb(255, 255, 255)')
+        }
+        for (const file of scm.files) {
+          const kind = file.path.endsWith('.ts') ? 'ts' : file.path.endsWith('.md') ? 'md' : 'json'
+          assert.equal(file.status, 'U')
+          assert.equal(file.badge, 'U', 'Untracked files must not show raw ? status')
+          assert.equal(file.name, file.path.split('/').at(-1))
+          assert.equal(file.dir, file.path.includes('/') ? 'src' : '')
+          assert.equal(file.nameColor, file.badgeColor)
+          assert.notEqual(file.nameColor, scm.neutral, 'Git filenames must not inherit neutral text')
+          const [red, green, blue] = rgb(file.badgeColor)
+          assert.ok(green > red && green > blue, `Untracked status must be green: ${file.badgeColor}`)
+          assert.ok(file.icon.includes('file-type-icon--' + kind))
+          assert.notEqual(file.iconColor, scm.neutral)
+          assert.ok(new Set(rgb(file.iconColor)).size > 1, 'File icons must not be monochrome')
+          assert.equal(file.iconWidth, 16)
+          assert.equal(file.iconHeight, 16)
+          assert.equal(file.border, '0px')
+          assert.equal(file.background, 'rgba(0, 0, 0, 0)')
+          if (file.dir) assert.notEqual(file.dirColor, file.nameColor, 'Directory suffix must remain muted')
+        }
+        assert.equal(new Set(scm.files.map(file => file.iconColor)).size, 3, 'TypeScript, Markdown and JSON icons need distinct colors')
+        await evaluate('document.querySelector(".scm-section__toggle").focus()')
+        assert.match(await evaluate('getComputedStyle(document.querySelector(".scm-section__actions")).display'), /^(inline-)?flex$/, 'Keyboard focus must reveal section actions')
+        await key('Enter', 'Enter', 13)
+        await until('document.querySelector(".scm-section").classList.contains("is-folded") && document.querySelector(".scm-section__toggle").getAttribute("aria-expanded") === "false" && getComputedStyle(document.querySelector(".scm-list")).display === "none"', 'folded SCM section')
+        await key('Enter', 'Enter', 13)
+        await until('document.querySelector(".scm-section__toggle").getAttribute("aria-expanded") === "true" && getComputedStyle(document.querySelector(".scm-list")).display === "flex"', 'expanded SCM section')
+        await evaluate('document.querySelector(".scm-file-row__main").focus()')
+        assert.match(await evaluate('getComputedStyle(document.querySelector(".scm-file-row:focus-within .scm-row-actions")).display'), /^(inline-)?flex$/, 'Keyboard focus must reveal file actions')
+        await evaluate('document.activeElement.blur()')
         await shot('03a-scm-commit-wand-dark.png')
       } finally {
         await click('button[aria-label="Explorer"]', 'restore Inspector Explorer tab')
