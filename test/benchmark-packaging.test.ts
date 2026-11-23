@@ -14,6 +14,7 @@ import { findPackagedExecutable, verifyPackagedResources } from '../scripts/smok
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const sourceSprite = path.join(root, 'packages', 'amekit', 'src', 'assets', 'ame-chibi.png')
 const thresholds = { thresholdStartupMs: 15000, thresholdHeapMb: 512 }
+const interactiveThresholds = { thresholdSwitchMs: 300, thresholdEventLoopLagMs: 100 }
 const metrics = { mode: 'packaged', timeToReadyMs: 1200.125, firstPaintMs: 800, jsHeapUsedMB: 100, jsHeapTotalMB: 200, processTreeRssMB: 350.5, thresholds }
 async function fixture(run: (directory: string) => Promise<void>) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'ame-benchmark-packaging-test-'))
@@ -25,14 +26,15 @@ async function file(target: string, data = 'fixture') {
 }
 
 test('argument defaults, all CLI flags, and paths containing spaces', () => {
-  assert.deepEqual(parseBenchmarkArgs([]), { json: false, ...thresholds })
-  assert.deepEqual(parseBenchmarkArgs(['--json', '--executable', 'C:\\Ame IDE\\Ame IDE.exe', '--threshold-startup-ms', '42.5', '--threshold-heap-mb', '256']), {
-    json: true, executable: 'C:\\Ame IDE\\Ame IDE.exe', thresholdStartupMs: 42.5, thresholdHeapMb: 256,
+  assert.deepEqual(parseBenchmarkArgs([]), { json: false, ...thresholds, ...interactiveThresholds })
+  assert.deepEqual(parseBenchmarkArgs(['--dev']), { json: false, dev: true, ...thresholds, ...interactiveThresholds })
+  assert.deepEqual(parseBenchmarkArgs(['--json', '--executable', 'C:\\Ame IDE\\Ame IDE.exe', '--threshold-startup-ms', '42.5', '--threshold-heap-mb', '256', '--threshold-switch-ms', '125.5', '--threshold-event-loop-lag-ms', '75.25']), {
+    json: true, executable: 'C:\\Ame IDE\\Ame IDE.exe', thresholdStartupMs: 42.5, thresholdHeapMb: 256, thresholdSwitchMs: 125.5, thresholdEventLoopLagMs: 75.25,
   })
 })
 
 test('argument parser rejects invalid numbers, missing values, and unknown flags', () => {
-  for (const flag of ['--threshold-startup-ms', '--threshold-heap-mb']) {
+  for (const flag of ['--threshold-startup-ms', '--threshold-heap-mb', '--threshold-switch-ms', '--threshold-event-loop-lag-ms']) {
     for (const value of ['0', '-1', 'NaN', 'Infinity', '', ' ', '12ms', '--json']) assert.throws(() => parseBenchmarkArgs([flag, value]), /positive finite number/)
     assert.throws(() => parseBenchmarkArgs([flag]), /positive finite number/)
   }
@@ -55,6 +57,28 @@ test('thresholds include equality, reject exceeded values and unavailable measur
   assert.equal(evaluateThresholds({ ...metrics, processTreeRssMB: null }, thresholds).ok, true)
 })
 
+test('interactive thresholds are optional and include equality, invalid values, and exceeded limits', () => {
+  const limits = { ...thresholds, ...interactiveThresholds }
+  const interactive = { ...metrics, projectSwitchMaxMs: 300, ipcPingMaxMs: 100 }
+  assert.deepEqual(evaluateThresholds(interactive, limits), { ok: true, failures: [] })
+  assert.equal(evaluateThresholds({ ...interactive, projectSwitchMaxMs: 0, ipcPingMaxMs: 0 }, limits).ok, true)
+  const failed = evaluateThresholds({ ...interactive, projectSwitchMaxMs: 300.01, ipcPingMaxMs: 100.01 }, limits)
+  assert.equal(failed.failures.length, 2)
+  assert.match(failed.failures.join('\n'), /Project switch.*exceeds.*\nIPC ping under LSP load.*exceeds/)
+  for (const invalid of [undefined, null, NaN, Infinity, -1]) {
+    assert.equal(evaluateThresholds({ ...interactive, projectSwitchMaxMs: invalid }, limits).ok, false)
+    assert.equal(evaluateThresholds({ ...interactive, ipcPingMaxMs: invalid }, limits).ok, false)
+  }
+  for (const invalid of [0, -1, NaN, Infinity, null]) {
+    assert.equal(evaluateThresholds(interactive, { ...limits, thresholdSwitchMs: invalid }).ok, false)
+    assert.equal(evaluateThresholds(interactive, { ...limits, thresholdEventLoopLagMs: invalid }).ok, false)
+  }
+  assert.equal(evaluateThresholds({ timeToReadyMs: 1, jsHeapUsedMB: 1 }, limits).ok, true)
+  assert.equal(evaluateThresholds({ ...metrics, projectSwitchMaxMs: null, ipcPingMaxMs: null }, thresholds).ok, true)
+  assert.equal(evaluateThresholds({ ...interactive, ipcPingMaxMs: 101 }, { ...limits, thresholdSwitchMs: undefined }).ok, false)
+  assert.equal(evaluateThresholds({ ...interactive, projectSwitchMaxMs: 301 }, { ...limits, thresholdEventLoopLagMs: undefined }).ok, false)
+})
+
 test('Markdown renders metrics, unavailable RSS/paint, and pass/fail status', () => {
   const markdown = formatBenchmarkMarkdown(metrics)
   assert.match(markdown, /\| Metric \| Value \|/)
@@ -68,6 +92,25 @@ test('Markdown renders metrics, unavailable RSS/paint, and pass/fail status', ()
   assert.match(failed, /\*\*FAIL\*\*/)
   assert.match(failed, /Startup.*exceeds/)
   assert.match(formatBenchmarkMarkdown({ ...metrics, thresholds: undefined, thresholdStatus: { ok: false, failures: ['example'] } }), /FAIL[\s\S]*example/)
+})
+
+test('Markdown appends only present interactive measurements and evaluates their thresholds', () => {
+  assert.doesNotMatch(formatBenchmarkMarkdown(metrics), /Project switch|IPC ping/)
+  const interactive = {
+    ...metrics, projectSwitchAvgMs: 150.125, projectSwitchMaxMs: 301, ipcPingMaxMs: 101,
+    thresholds: { ...thresholds, ...interactiveThresholds },
+  }
+  const markdown = formatBenchmarkMarkdown(interactive)
+  assert.match(markdown, /\| Project switch avg \(ms\) \| 150\.13 \|/)
+  assert.match(markdown, /\| Project switch max \(ms\) \| 301\.00 \|/)
+  assert.match(markdown, /\| IPC ping max under LSP load \(ms\) \| 101\.00 \|/)
+  assert.match(markdown, /\*\*FAIL\*\*[\s\S]*Project switch[\s\S]*IPC ping/)
+  assert.match(formatBenchmarkMarkdown({ ...interactive, projectSwitchAvgMs: null, projectSwitchMaxMs: undefined, ipcPingMaxMs: NaN }), /Project switch avg \(ms\) \| N\/A/)
+  for (const [key, label] of [['projectSwitchAvgMs', 'Project switch avg'], ['projectSwitchMaxMs', 'Project switch max'], ['ipcPingMaxMs', 'IPC ping max under LSP load']]) {
+    const single = formatBenchmarkMarkdown({ ...metrics, [key]: 1 })
+    assert.match(single, new RegExp(label))
+    assert.equal(single.split('\n').filter((line: string) => /Project switch|IPC ping/.test(line)).length, 1)
+  }
 })
 
 test('lookup handles no build, nonexistent roots, and explicit missing overrides', async () => {

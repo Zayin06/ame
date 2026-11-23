@@ -6,7 +6,10 @@ import { monacoHighlightFix } from './scripts/monaco-highlight-fix'
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
-    build: { rollupOptions: { input: resolve('apps/desktop/src/main/index.ts') } }
+    build: { rollupOptions: { input: {
+      index: resolve('apps/desktop/src/main/index.ts'),
+      'ts-lsp-worker': resolve('packages/ide-core/src/ts-lsp-worker.ts')
+    } } }
   },
   preload: {
     plugins: [externalizeDepsPlugin()],

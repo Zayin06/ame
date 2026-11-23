@@ -11,18 +11,43 @@ import { ToolCard } from './ToolCard'
 import { ArtifactViewer } from './ArtifactViewer'
 import { applyComposerCompletion, composePromptWithAttachments, detectComposerTrigger, filterFileMentions, filterSlashEntries, type ComposerAttachment, type ComposerTrigger } from '../composer-mentions'
 
-export function Chat({ projectID, sessionID, title, connected, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, ready, files = [], activeFile, onRequestFiles }: { files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+type ProjectCatalog = { key: string; fetchedAt: number; models: Model[]; agents: Agent[]; commands: SlashCommand[]; skills: SkillSummary[] }
+const projectCatalogCache = new Map<string, ProjectCatalog>()
+let catalogRevision = 0
+const clearProjectCatalogs = () => { projectCatalogCache.clear(); catalogRevision++ }
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((value, index) => sameValue(value, b[index]))
+  const left = a as Record<string, unknown>, right = b as Record<string, unknown>
+  const keys = Object.keys(left)
+  return keys.length === Object.keys(right).length && keys.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameValue(left[key], right[key]))
+}
+
+function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
+  return a === b || a.length === b.length && a.every((item, index) => {
+    const next = b[index]
+    return item.id === next.id && item.role === next.role && item.text === next.text && item.kind === next.kind
+      && sameValue(item.tool, next.tool) && sameValue(item.turn, next.turn)
+  })
+}
+
+export function Chat({ projectID, sessionID, title, connected, connectionUrl = '', accountRole, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, ready, files = [], activeFile, onRequestFiles }: { accountRole?: string; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+  const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
+  const initialCatalog = cached?.key === connectionUrl ? cached : undefined
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
-  const [models, setModels] = useState<Model[]>([])
-  const [modelProject, setModelProject] = useState<string>()
-  const [agents, setAgents] = useState<Agent[]>([])
-  const [model, setModel] = useState('')
-  const [role, setRole] = useState<string>()
+  const [models, setModels] = useState<Model[]>(() => initialCatalog?.models ?? [])
+  const [modelProject, setModelProject] = useState<string | undefined>(() => initialCatalog ? projectID : undefined)
+  const [agents, setAgents] = useState<Agent[]>(() => initialCatalog?.agents ?? [])
+  const [model, setModel] = useState(() => initialCatalog?.models[0] ? `${initialCatalog.models[0].providerID}/${initialCatalog.models[0].id}` : '')
+  const [fallbackRole, setFallbackRole] = useState<string>()
+  const role = accountRole !== undefined ? accountRole : fallbackRole
   const [agent, setAgent] = useState('')
   const [text, setText] = useState('')
-  const [commands, setCommands] = useState<SlashCommand[]>([])
-  const [skills, setSkills] = useState<SkillSummary[]>([])
+  const [commands, setCommands] = useState<SlashCommand[]>(() => initialCatalog?.commands ?? [])
+  const [skills, setSkills] = useState<SkillSummary[]>(() => initialCatalog?.skills ?? [])
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
   const [trigger, setTrigger] = useState<ComposerTrigger | null>(null)
   const [attachmentPicker, setAttachmentPicker] = useState(false)
@@ -83,55 +108,59 @@ export function Chat({ projectID, sessionID, title, connected, onCreate, report,
   const permissionsCountRef = useRef(permissions.length); permissionsCountRef.current = permissions.length
   const fallbackTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   useEffect(() => {
+    if (accountRole !== undefined) return
     let alive = true, generation = 0
     const load = async () => {
       const current = ++generation
       try {
         const status = await window.ame.account('status') as { account?: { role?: string } } | null
-        if (alive && current === generation) setRole(status?.account?.role)
-      } catch (e) { if (alive && current === generation) { setRole(undefined); setError(errorText(e)) } }
+        if (alive && current === generation) setFallbackRole(status?.account?.role)
+      } catch (e) { if (alive && current === generation) { setFallbackRole(undefined); setError(errorText(e)) } }
     }
     void load()
     window.addEventListener('ame-account-changed', load)
     return () => { alive = false; window.removeEventListener('ame-account-changed', load) }
-  }, [connected])
+  }, [connected, accountRole])
   useEffect(() => {
-    if (!projectID || !connected) return
     let alive = true, generation = 0
-    const load = async () => {
-      const current = ++generation
-      setModelProject(undefined)
-      try {
-        const [m, a] = await Promise.all([window.ame.models(projectID), window.ame.agents(projectID)])
-        if (alive && current === generation) {
-          const allowed = m.filter(item => item.providerID === 'amecode')
-          setModels(allowed)
-          setModelProject(projectID)
-          setModel(value => allowed.some(item => `${item.providerID}/${item.id}` === value) ? value : allowed[0] ? `${allowed[0].providerID}/${allowed[0].id}` : '')
-          setAgents(a)
-        }
-      } catch (e) { if (alive && current === generation) setError(errorText(e)) }
+    const hydrate = (catalog?: ProjectCatalog) => {
+      const allowed = catalog?.models ?? []
+      setModels(allowed); setAgents(catalog?.agents ?? [])
+      setCommands(catalog?.commands ?? []); setSkills(catalog?.skills ?? [])
+      setModelProject(catalog ? projectID : undefined)
+      setModel(value => allowed.some(item => `${item.providerID}/${item.id}` === value) ? value : allowed[0] ? `${allowed[0].providerID}/${allowed[0].id}` : '')
     }
-    void load()
-    window.addEventListener('ame-account-changed', load)
-    return () => { alive = false; window.removeEventListener('ame-account-changed', load) }
-  }, [projectID, connected])
-  useEffect(() => {
-    setCommands([]); setSkills([])
-    if (!projectID || !connected) return
-    let alive = true, generation = 0
     const load = async () => {
-      const current = ++generation
-      const results = await Promise.allSettled([window.ame.commands(projectID), window.ame.skills(projectID)])
-      if (!alive || current !== generation) return
-      setCommands(results[0].status === 'fulfilled' ? results[0].value : [])
-      setSkills(results[1].status === 'fulfilled' ? results[1].value : [])
-      for (const result of results) if (result.status === 'rejected') report(result.reason)
+      if (!projectID || !connected) return
+      const current = ++generation, revision = catalogRevision
+      const results = await Promise.allSettled([window.ame.models(projectID), window.ame.agents(projectID), window.ame.commands(projectID), window.ame.skills(projectID)])
+      if (!alive || current !== generation || revision !== catalogRevision) return
+      const cached = projectCatalogCache.get(projectID)
+      const previous = cached?.key === connectionUrl ? cached : undefined
+      const catalog: ProjectCatalog = {
+        key: connectionUrl,
+        fetchedAt: results.every(result => result.status === 'fulfilled') ? Date.now() : 0,
+        models: results[0].status === 'fulfilled' ? results[0].value.filter(item => item.providerID === 'amecode') : previous?.models ?? [],
+        agents: results[1].status === 'fulfilled' ? results[1].value : previous?.agents ?? [],
+        commands: results[2].status === 'fulfilled' ? results[2].value : previous?.commands ?? [],
+        skills: results[3].status === 'fulfilled' ? results[3].value : previous?.skills ?? [],
+      }
+      projectCatalogCache.set(projectID, catalog)
+      hydrate(catalog)
+      for (const [index, result] of results.entries()) if (result.status === 'rejected') {
+        if (index < 2) setError(errorText(result.reason))
+        else report(result.reason)
+      }
     }
-    void load()
-    window.addEventListener('ame-account-changed', load)
-    return () => { alive = false; window.removeEventListener('ame-account-changed', load) }
-  }, [projectID, connected])
+    if (!connected) clearProjectCatalogs()
+    const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
+    const catalog = cached?.key === connectionUrl ? cached : undefined
+    hydrate(catalog)
+    if (!catalog || Date.now() - catalog.fetchedAt >= 30_000) void load()
+    const accountChanged = () => { clearProjectCatalogs(); hydrate(); void load() }
+    window.addEventListener('ame-account-changed', accountChanged)
+    return () => { alive = false; window.removeEventListener('ame-account-changed', accountChanged) }
+  }, [projectID, connected, connectionUrl, report])
   useEffect(() => {
     if (role === 'user' && models[0]) setModel(`${models[0].providerID}/${models[0].id}`)
   }, [role, models])
@@ -149,7 +178,7 @@ export function Chat({ projectID, sessionID, title, connected, onCreate, report,
       clearTimeout(timer); clearTimeout(fallbackTimer.current)
       try {
         const [items, pending] = await Promise.all([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID)])
-        if (alive) { permissionsCountRef.current = pending.length; setMessages(old => JSON.stringify(old) === JSON.stringify(items) ? old : items); setPermissions(pending); setLoaded(true); setError('') }
+        if (alive) { permissionsCountRef.current = pending.length; setMessages(old => sameChatItems(old, items) ? old : items); setPermissions(pending); setLoaded(true); setError('') }
       } catch (e) { if (alive) setError(errorText(e)) }
       finally {
         loading = false

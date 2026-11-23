@@ -14,6 +14,8 @@
     "test": "node --import tsx --test test/*.test.ts packages/amekit/test/*.test.ts apps/desktop/src/renderer/test/*.test.ts",
     "test:desktop": "npm run build && node scripts/smoke-desktop.mjs",
     "test:terminal": "npm run build && node scripts/smoke-terminal.mjs",
+    "bench:desktop": "node scripts/benchmark-desktop.mjs",
+    "test:perf": "node --import tsx --test test/ts-lsp.test.ts test/benchmark-packaging.test.ts && node scripts/benchmark-desktop.mjs",
     "package": "npm run build && electron-builder --dir"
   },
   "dependencies": {
@@ -54,7 +56,8 @@
     "productName": "Ame IDE",
     "asarUnpack": [
       "node_modules/node-pty/**/*",
-      "node_modules/typescript/lib/**/*",
+      "out/main/**/*",
+      "node_modules/typescript/**/*",
       "node_modules/tsx/**/*",
       "node_modules/esbuild/**/*",
       "node_modules/@esbuild/**/*",

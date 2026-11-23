@@ -48,7 +48,7 @@ function SessionRow({ projectID, session, now, active, connected, onSelect, onRe
   </div>
 }
 
-export function ProjectRail({ projects, projectID, sessions, sessionID, loading, sessionsLoading, error, connected, creating, git, generation, onSelect, onSession, onTool, onCreate, onPick, onRetry, onRemove, sessionCache, onSessions, onSessionRemoved }: {
+export function ProjectRail({ projects, projectID, sessions, sessionID, loading, sessionsLoading, error, connected, creating, git, onSelect, onSession, onTool, onCreate, onPick, onRetry, onRemove, sessionCache, onSessions, onSessionRemoved }: {
   sessionCache: Record<string, Session[]>; onSessions: (id: string, sessions: Session[]) => void; onSessionRemoved?: (projectID: string, sessionID: string) => void;
   projects: Project[]; projectID?: string; sessions: Session[]; sessionID?: string; loading: boolean; sessionsLoading: boolean; error: string; connected: boolean; creating: boolean; git?: GitState; generation: number;
   onRemove: (id: string) => void; onSelect: (id: string) => void; onSession: (project: string, session: string) => void; onTool: (id: string, tab: 'files' | 'search' | 'git') => void; onCreate: (id: string) => void; onPick: () => void; onRetry: () => void
@@ -110,22 +110,27 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
     if (!window.ame) return
     let alive = true
     const timers = new Map<string, ReturnType<typeof setTimeout>>()
-    const load = (id: string) => {
-      if (connected) {
-        const request = (sessionLoads.current.get(id) || 0) + 1
-        sessionLoads.current.set(id, request)
-        void window.ame.sessions(id).then(items => { if (alive && sessionLoads.current.get(id) === request) onSessionsRef.current(id, items) }).catch(() => {})
-      }
-      void window.ame.git(id).then(state => { if (alive) setMetadata(current => ({ ...current, [id]: { dirty: !!state.changes.length } })) }).catch(() => {})
+    const load = async (id: string) => {
+      if (!alive) return
+      const request = (sessionLoads.current.get(id) || 0) + 1
+      sessionLoads.current.set(id, request)
+      await Promise.all([
+        connected ? window.ame.sessions(id).then(items => { if (alive && sessionLoads.current.get(id) === request) onSessionsRef.current(id, items) }).catch(() => {}) : Promise.resolve(),
+        window.ame.git(id).then(state => { if (alive) setMetadata(current => ({ ...current, [id]: { dirty: !!state.changes.length } })) }).catch(() => {}),
+      ])
     }
-    for (const project of projects) load(project.id)
+    let next = 0
+    const worker = async () => {
+      while (alive && next < projects.length) await load(projects[next++].id)
+    }
+    void Promise.all(Array.from({ length: Math.min(2, projects.length) }, worker))
     const unsubscribe = window.ame.onEvent(event => {
       if ((event.type !== 'opencode' && event.type !== 'files') || timers.has(event.projectID)) return
       const id = event.projectID
-      timers.set(id, setTimeout(() => { timers.delete(id); load(id) }, 300))
+      timers.set(id, setTimeout(() => { timers.delete(id); void load(id) }, 300))
     })
     return () => { alive = false; unsubscribe(); for (const timer of timers.values()) clearTimeout(timer) }
-  }, [projects, connected, generation])
+  }, [projects, connected])
   const normalized = query.trim().toLocaleLowerCase()
   const visible = projectsByChatActivity(projects, sessionCache).filter(project => {
     const items = sessionCache[project.id] || []

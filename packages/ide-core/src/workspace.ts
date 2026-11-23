@@ -12,6 +12,7 @@ const revision = (bytes: Buffer) => createHash('sha256').update(bytes).digest('h
 export class Workspaces {
   private projects = new Map<string, Project>()
   private watchers = new Map<string, FSWatcher>()
+  private watchTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private saves = new Map<string, Promise<unknown>>()
   constructor(private storage: string, private changed: (projectID: string) => void = () => {}) {}
   async load() {
@@ -33,17 +34,26 @@ export class Workspaces {
     this.projects.set(id, project)
     try {
       const watcher = watch(resolved, { recursive: true }, (_event, file) => {
-        if (file && /(^|[\\/])(node_modules|\.git|dist|out)([\\/]|$)/.test(String(file))) return
-        this.changed(id)
+        if (file && /(^|[\\/])(node_modules|\.git|dist|out|build|coverage|release|release-[^\\/]+|\.next|\.nuxt|\.turbo|\.cache|\.venv|venv|__pycache__|target|vendor|\.pm)([\\/]|$)/i.test(String(file))) return
+        this.scheduleWatchChange(id)
       })
-      watcher.on('error', () => this.changed(id))
+      watcher.on('error', () => this.scheduleWatchChange(id))
       this.watchers.set(id, watcher)
     } catch { /* Read/save remain available on filesystems without recursive watch. */ }
     if (persist) { await mkdir(path.dirname(this.storage), { recursive: true }); await writeFile(this.storage, JSON.stringify(this.list()), 'utf8') }
     return project
   }
+  private scheduleWatchChange(id: string) {
+    clearTimeout(this.watchTimers.get(id))
+    this.watchTimers.set(id, setTimeout(() => {
+      this.watchTimers.delete(id)
+      if (this.projects.has(id)) this.changed(id)
+    }, 150))
+  }
   async remove(id: string): Promise<void> {
     this.get(id)
+    clearTimeout(this.watchTimers.get(id))
+    this.watchTimers.delete(id)
     this.watchers.get(id)?.close()
     this.watchers.delete(id)
     this.projects.delete(id)
@@ -71,7 +81,7 @@ export class Workspaces {
   }
   async listFiles(id: string): Promise<string[]> {
     const root = this.get(id).directory
-    const ignored = new Set(['.git', 'node_modules', 'dist', 'out', '.next'])
+    const ignored = new Set(['.git', 'node_modules', 'dist', 'out', '.next', 'build', 'coverage', 'release', '.nuxt', '.turbo', '.cache', '.venv', 'venv', '__pycache__', 'target', 'vendor', '.pm'])
     const files: string[] = [], pending = [root]
     while (pending.length && files.length < 20000) {
       const directory = pending.pop()!
@@ -83,7 +93,7 @@ export class Workspaces {
           .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
         const directories: string[] = []
         for (const entry of entries) {
-          if (ignored.has(entry.name.toLowerCase()) || entry.isSymbolicLink()) continue
+          if (ignored.has(entry.name.toLowerCase()) || entry.isSymbolicLink() || (entry.isDirectory() && entry.name.toLowerCase().startsWith('release-'))) continue
           const target = path.join(actual, entry.name)
           if (entry.isDirectory()) directories.push(target)
           else if (entry.isFile()) {
@@ -178,7 +188,7 @@ export class Workspaces {
   private git(id: string) {
     const directory = this.get(id).directory
     if (!existsSync(path.join(directory, '.git'))) throw new Error('GIT_ROOT_REQUIRED: Open the repository root for source control.')
-    return simpleGit(directory, { maxConcurrentProcesses: 1, trimmed: false }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+    return simpleGit(directory, { maxConcurrentProcesses: 1, trimmed: false, timeout: { block: 10000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
   }
   private async gitPath(id: string, relative: string) {
     const root = this.get(id).directory
@@ -223,5 +233,10 @@ export class Workspaces {
     await this.git(id).raw(['-c', 'core.hooksPath=', 'commit', '-m', message])
     this.changed(id)
   }
-  dispose() { for (const watcher of this.watchers.values()) watcher.close(); this.watchers.clear() }
+  dispose() {
+    for (const timer of this.watchTimers.values()) clearTimeout(timer)
+    this.watchTimers.clear()
+    for (const watcher of this.watchers.values()) watcher.close()
+    this.watchers.clear()
+  }
 }

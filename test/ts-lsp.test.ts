@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
+import { performance } from 'node:perf_hooks'
 import path from 'node:path'
 import test from 'node:test'
+import { Worker } from 'node:worker_threads'
 import { createTsLanguageService } from '../packages/ide-core/src/ts-lsp'
 
 const math = '/** Add two numbers. */\nexport function add(a: number, b: number): number {\n  return a + b\n}\nexport const answer = 42\n'
@@ -81,6 +83,48 @@ test('multi-file TypeScript operations use unsaved overlays without changing dis
   await assert.rejects(service.diagnostics(), /LSP_DISPOSED/)
 })
 
+test('shared worker keeps workspace diagnostics isolated when another service is disposed', async t => {
+  const workers = new Set<Worker>()
+  const postMessage = Worker.prototype.postMessage
+  t.mock.method(Worker.prototype, 'postMessage', function (this: Worker, ...args: Parameters<Worker['postMessage']>) {
+    workers.add(this)
+    return postMessage.apply(this, args)
+  })
+  const rootA = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-shared-a-'))
+  const rootB = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-shared-b-'))
+  const serviceA = createTsLanguageService(rootA)
+  const serviceB = createTsLanguageService(rootB)
+  try {
+    for (const root of [rootA, rootB]) {
+      await writeFile(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, types: [] }, include: ['*.ts'] }))
+    }
+    await writeFile(path.join(rootA, 'b.ts'), 'export const value: number = 1\n')
+    await writeFile(path.join(rootB, 'b.ts'), 'export const value: number = "bad"\n')
+    const [diagnosticsA, diagnosticsB] = await Promise.all([serviceA.diagnostics(), serviceB.diagnostics()])
+    assert.deepEqual(diagnosticsA, [])
+    assert.deepEqual(diagnosticsB.map(item => [item.path, item.code]), [['b.ts', 2322]])
+    assert.equal(workers.size, 1)
+    await [...workers][0].terminate()
+    const recovered = await Promise.all([serviceA.diagnostics(), serviceB.diagnostics()])
+    assert.deepEqual(recovered, [diagnosticsA, diagnosticsB])
+    assert.equal(workers.size, 2)
+
+    const rejected = assert.rejects(serviceA.diagnostics(), /LSP_DISPOSED/)
+    const stillRunning = serviceB.diagnostics()
+    serviceA.dispose()
+    serviceA.dispose()
+    await rejected
+    await assert.rejects(serviceA.diagnostics(), /LSP_DISPOSED/)
+    assert.deepEqual(await stillRunning, diagnosticsB)
+    assert.deepEqual(await serviceB.diagnostics(), diagnosticsB)
+    assert.equal(workers.size, 2)
+  } finally {
+    serviceA.dispose()
+    serviceB.dispose()
+    await Promise.all([rm(rootA, { recursive: true, force: true }), rm(rootB, { recursive: true, force: true })])
+  }
+})
+
 test('refresh reloads config, discovers files, and drops closed virtual documents', async () => {
   const { root, service } = await fixture()
   try {
@@ -98,7 +142,7 @@ test('refresh reloads config, discovers files, and drops closed virtual document
     await service.refreshFiles()
     assert.ok((await service.diagnostics()).some(item => item.path === 'src/new.ts'))
     await writeFile(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: {
-      target: 'ES2022', module: 'ESNext', moduleResolution: 'Bundler', strict: false, types: [],
+      target: 'ES2022', module: 'ESNext', moduleResolution: 'Bundler', types: [],
     }, files: ['src/math.ts'] }))
     await service.refreshFiles()
     assert.deepEqual(await service.diagnostics(), [])
@@ -164,4 +208,88 @@ test('all document APIs reject traversal, absolute paths, metadata, and escaping
     await rm(root, { recursive: true, force: true })
     await rm(outside, { recursive: true, force: true })
   }
+})
+
+test('worker discovery and diagnostics keep the main event loop responsive and skip generated trees', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-worker-'))
+  const service = createTsLanguageService(root)
+  let timer: ReturnType<typeof setInterval> | undefined
+  try {
+    await service.refreshFiles()
+    await writeFile(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, types: [] }, include: ['**/*.ts'] }))
+    for (let index = 0; index < 60; index++) {
+      await writeFile(path.join(root, `module${index}.ts`), index === 0 ? 'export const value0: number = 0\n'
+        : `import { value${index - 1} } from './module${index - 1}'\nexport const value${index}: number = value${index - 1} + 1\n`)
+    }
+    for (const directory of ['release', '.venv', 'release-example']) {
+      await mkdir(path.join(root, directory))
+      await writeFile(path.join(root, directory, 'broken.ts'), 'export const broken: number = "bad"\n')
+    }
+    let last = performance.now(), maxLagMs = 0, samples = 0
+    timer = setInterval(() => {
+      const now = performance.now()
+      maxLagMs = Math.max(maxLagMs, now - last - 10)
+      last = now
+      samples++
+    }, 10)
+    await service.refreshFiles()
+    const diagnostics = await service.diagnostics()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.deepEqual(diagnostics, [])
+    assert.ok(samples > 0)
+    assert.ok(maxLagMs < 100, `main event-loop lag ${maxLagMs.toFixed(1)}ms`)
+  } finally { clearInterval(timer); service.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('concurrent refresh callers all observe newly discovered files', async () => {
+  const { root, service } = await fixture()
+  try {
+    await service.refreshFiles()
+    await writeFile(path.join(root, 'src', 'new.ts'), 'export const value: number = "bad"\n')
+    await Promise.all(Array.from({ length: 10 }, () => service.refreshFiles()))
+    const diagnostics = await service.diagnostics()
+    assert.deepEqual(diagnostics.map(item => [item.path, item.code]), [['src/new.ts', 2322]])
+  } finally { service.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('Windows mixed-case roots and config paths retain included files and overlay identity', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'Ame-Ts-Case-'))
+  let service: ReturnType<typeof createTsLanguageService> | undefined
+  try {
+    await mkdir(path.join(root, 'Source'))
+    await writeFile(path.join(root, 'Source', 'Mixed.ts'), 'export const value: number = "bad"\n')
+    await writeFile(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, types: [] }, files: ['source/mixed.ts'] }))
+    service = createTsLanguageService(root.toLowerCase())
+    await service.refreshFiles()
+    assert.ok((await service.diagnostics()).some(item => item.code === 2322 && item.path.toLowerCase() === 'source/mixed.ts'))
+    await service.updateDocument('Source/Mixed.ts', 'export const value: number = 1\n')
+    assert.deepEqual(await service.diagnostics('source/mixed.ts'), [])
+    await service.closeDocument('SOURCE/MIXED.ts')
+    assert.ok((await service.diagnostics('Source/Mixed.ts')).some(item => item.code === 2322))
+  } finally { service?.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('disposing a busy worker rejects pending and future operations', async () => {
+  const { root, service } = await fixture()
+  try {
+    const pending = service.diagnostics()
+    const rejected = assert.rejects(pending, /LSP_DISPOSED/)
+    service.dispose()
+    await rejected
+    await assert.rejects(service.refreshFiles(), /LSP_DISPOSED/)
+    await assert.rejects(service.updateDocument('src/app.ts', app), /LSP_DISPOSED/)
+  } finally { service.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('safety caches never hide junctions introduced between operations', async () => {
+  const { root, service } = await fixture()
+  const outside = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-new-link-'))
+  try {
+    assert.deepEqual(await service.diagnostics(), [])
+    await writeFile(path.join(outside, 'math.ts'), 'export const value: number = "bad"\n')
+    await rm(path.join(root, 'src'), { recursive: true })
+    await symlink(outside, path.join(root, 'src'), process.platform === 'win32' ? 'junction' : 'dir')
+    await assert.rejects(service.diagnostics('src/math.ts'), /SYMLINK/)
+    assert.deepEqual(await service.diagnostics(), [])
+  } finally { service.dispose(); await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }) }
 })

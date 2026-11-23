@@ -38,7 +38,8 @@ export function App() {
   const [connection, setConnection] = useState<Connection>({ connected: false, url: '' })
   const [buffers, setBuffers] = useState<Record<string, Buffer>>({})
   const [diffs, setDiffs] = useState<Record<string, { original: string; modified: string }>>({})
-  const [git, setGit] = useState<GitState>()
+  const [gitCache, setGitCache] = useState<Record<string, GitState>>({})
+  const [accountRole, setAccountRole] = useState('')
   const [gitError, setGitError] = useState('')
   const [generation, setGeneration] = useState(0)
   const [sessionGeneration, setSessionGeneration] = useState(0)
@@ -76,7 +77,7 @@ export function App() {
   const [editorStatuses, setEditorStatuses] = useState<Record<string, EditorStatus>>({})
   const [quickOpen, setQuickOpen] = useState<'files' | 'line'>()
   const setModal = (next: typeof modal) => { if (next !== null) setQuickOpen(undefined); setModalState(next) }
-  const [filesRequested, setFilesRequested] = useState(false)
+  const [filesRequestedFor, setFilesRequestedFor] = useState<string>()
   const [fileIndex, setFileIndex] = useState<{ key: string; files: string[]; loading: boolean; error?: string }>()
   const [usage, setUsage] = useState<{ key: string; value?: SessionUsageView; loading: boolean; error?: string }>()
   const [usageAttempt, setUsageAttempt] = useState(0)
@@ -89,10 +90,18 @@ export function App() {
   const saving = useRef(new Set<string>())
   const pendingReads = useRef(new Set<string>())
   const projectID = preferences.project
+  const git = projectID ? gitCache[projectID] : undefined
   const sessions = projectID ? sessionCache[projectID] || [] : []
   const project = projects.find(p => p.id === projectID)
   const view = projectID ? preferences.projects[projectID] || emptyView : emptyView
   const splitState = projectID && splits[projectID] || createSplitState(view.tabs.filter(tab => tab.mode === 'file'), selectedTab(view, 'file'))
+  const problemsOpen = preferences.stage && preferences.terminalOpen && bottomTab === 'problems'
+  const openSourcePaths = preferences.stage && preferences.panel === 'files'
+    ? [...new Set([splitState.primary.active, splitState.secondary?.active].flatMap(tab => tab?.mode === 'file' && isSourceFile(tab.path) ? [tab.path.replace(/\\/g, '/')] : []))]
+    : []
+  const openSourceKey = JSON.stringify(openSourcePaths)
+  const problemsOpenRef = useRef(problemsOpen); problemsOpenRef.current = problemsOpen
+  const openSourcePathsRef = useRef(openSourcePaths); openSourcePathsRef.current = openSourcePaths
   const focusedGroup = splitState[splitState.focused] || splitState.primary
   const activeTab = preferences.panel === 'diff' ? selectedTab(view, 'diff') : focusedGroup.active
   const editorStatus = projectID && activeTab ? editorStatuses[JSON.stringify([projectID, splitState.focused, activeTab.path])] : undefined
@@ -122,15 +131,22 @@ export function App() {
   const selectedFrameId = projectID ? selectedFrames[projectID] : undefined
   const pausedFrame = debugSnapshot.status === 'paused' ? debugSnapshot.frames.find(frame => frame.callFrameId === selectedFrameId) ?? debugSnapshot.frames[0] : undefined
   const debugEntry = projectID ? debugEntries[projectID] ?? view.tabs.find(tab => tab.mode === 'file' && /\.(?:ts|js|mjs)$/i.test(tab.path))?.path ?? '' : ''
-  const requestDiagnostics = useCallback(async (id: string, reload = false) => {
+  const requestDiagnostics = useCallback(async (id: string, reload = false, targetPaths?: readonly string[]) => {
+    if (targetPaths && targetPaths.length === 0) return
     const request = ++diagnosticRequest.current
     if (preferencesRef.current.project === id) setProblemsLoading(true)
     try {
       await Promise.all([...overlayQueues.current].filter(([key]) => (JSON.parse(key) as string[])[0] === id).map(([, queue]) => queue))
       if (removedProjects.current.has(id)) return
       if (reload) await window.ame.lspRefresh(id)
-      const items = await window.ame.lspDiagnostics(id)
-      if (request === diagnosticRequest.current && preferencesRef.current.project === id && !removedProjects.current.has(id)) setDiagnosticsByProject(current => ({ ...current, [id]: items }))
+      const items = targetPaths
+        ? (await Promise.all(targetPaths.map(file => window.ame.lspDiagnostics(id, file)))).flat()
+        : await window.ame.lspDiagnostics(id)
+      const checked = targetPaths && new Set(targetPaths.map(file => file.replace(/\\/g, '/')))
+      if (request === diagnosticRequest.current && preferencesRef.current.project === id && !removedProjects.current.has(id)) setDiagnosticsByProject(current => ({
+        ...current,
+        [id]: checked ? [...(current[id] ?? []).filter(item => !checked.has(item.path.replace(/\\/g, '/'))), ...items] : items,
+      }))
     } catch (e) { if (request === diagnosticRequest.current && preferencesRef.current.project === id && !removedProjects.current.has(id)) report(e) }
     finally { if (request === diagnosticRequest.current) setProblemsLoading(false) }
   }, [report])
@@ -155,16 +171,21 @@ export function App() {
     void window.ame.debugState(projectID).then(snapshot => {
       if (alive && !removedProjects.current.has(projectID) && revision === (debugRevision.current.get(projectID) ?? 0)) acceptDebugSnapshot(projectID, snapshot)
     }).catch(e => { if (alive) report(e) })
-    const timer = setTimeout(() => { void requestDiagnostics(projectID) }, 450)
-    return () => { alive = false; clearTimeout(timer); diagnosticRequest.current++ }
-  }, [projectID, requestDiagnostics, acceptDebugSnapshot, report])
+    return () => { alive = false; diagnosticRequest.current++ }
+  }, [projectID, acceptDebugSnapshot, report])
+  useEffect(() => {
+    if (!projectID || !window.ame || (!problemsOpen && !openSourcePathsRef.current.length)) return
+    const timer = setTimeout(() => { void requestDiagnostics(projectID, false, problemsOpen ? undefined : JSON.parse(openSourceKey) as string[]) }, 450)
+    return () => clearTimeout(timer)
+  }, [projectID, problemsOpen, openSourceKey, requestDiagnostics])
   useEffect(() => {
     if (!projectID || !window.ame) return
     const timer = setTimeout(() => {
-      let changed = false
+      if (!problemsOpenRef.current && !openSourcePathsRef.current.length) return
+      const changedPaths: string[] = []
       for (const [key, buffer] of Object.entries(buffers)) {
         if (buffer.projectID !== projectID || !isSourceFile(buffer.path) || overlayTexts.current.get(key) === buffer.text) continue
-        changed = true
+        changedPaths.push(buffer.path)
         overlayTexts.current.set(key, buffer.text)
         const queue = (overlayQueues.current.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
           if (!removedProjects.current.has(projectID)) await window.ame.lspUpdateDocument(projectID, buffer.path, buffer.text)
@@ -172,20 +193,20 @@ export function App() {
         overlayQueues.current.set(key, queue)
         void queue.catch(e => { overlayTexts.current.delete(key); if (preferencesRef.current.project === projectID && !removedProjects.current.has(projectID)) report(e) }).finally(() => { if (overlayQueues.current.get(key) === queue) overlayQueues.current.delete(key) })
       }
-      if (changed) void requestDiagnostics(projectID)
+      if (changedPaths.length) void requestDiagnostics(projectID, false, problemsOpenRef.current ? undefined : changedPaths)
     }, 300)
     return () => clearTimeout(timer)
-  }, [projectID, buffers, requestDiagnostics, report])
+  }, [projectID, buffers, problemsOpen, openSourceKey, requestDiagnostics, report])
 
-  const requestFiles = () => setFilesRequested(true)
+  const requestFiles = useCallback(() => { if (projectID) setFilesRequestedFor(projectID) }, [projectID])
   const showQuickOpen = (mode: 'files' | 'line') => { setModal(null); requestFiles(); setQuickOpen(mode) }
   useEffect(() => {
-    if (!projectID || !filesRequested || !window.ame) return
+    if (!projectID || filesRequestedFor !== projectID || !window.ame) return
     let alive = true
     setFileIndex({ key: fileIndexKey, files: [], loading: true })
     void window.ame.listFiles(projectID).then(files => { if (alive) setFileIndex({ key: fileIndexKey, files, loading: false }) }).catch(e => { if (alive) setFileIndex({ key: fileIndexKey, files: [], loading: false, error: errorText(e) }) })
     return () => { alive = false }
-  }, [projectID, fileIndexKey, filesRequested])
+  }, [projectID, fileIndexKey, filesRequestedFor])
   useEffect(() => {
     if (preferences.panel !== 'usage' || !projectID || !view.session || !window.ame) return
     let alive = true
@@ -193,6 +214,21 @@ export function App() {
     void window.ame.sessionUsage(projectID, view.session).then(value => { if (alive) setUsage({ key: usageKey, value, loading: false }) }).catch(e => { if (alive) setUsage({ key: usageKey, loading: false, error: errorText(e) }) })
     return () => { alive = false }
   }, [preferences.panel, projectID, view.session, usageKey, usageAttempt])
+
+  useEffect(() => {
+    if (!window.ame) return
+    let alive = true, generation = 0
+    const load = async () => {
+      const current = ++generation
+      try {
+        const status = await window.ame.account('status') as { account?: { role?: string } } | null
+        if (alive && current === generation) setAccountRole(status?.account?.role ?? '')
+      } catch (e) { if (alive && current === generation) { setAccountRole(''); report(e) } }
+    }
+    void load()
+    window.addEventListener('ame-account-changed', load)
+    return () => { alive = false; window.removeEventListener('ame-account-changed', load) }
+  }, [connection.connected, report])
 
   useEffect(() => {
     document.documentElement.dataset.theme = preferences.theme
@@ -251,7 +287,7 @@ export function App() {
         fileTimers.delete(event.projectID)
         if (event.projectID === preferencesRef.current.project) {
           refresh()
-          if (preferencesRef.current.stage || preferencesRef.current.terminalOpen) void requestDiagnostics(event.projectID, true)
+          if (problemsOpenRef.current || openSourcePathsRef.current.length) void requestDiagnostics(event.projectID, true, problemsOpenRef.current ? undefined : openSourcePathsRef.current)
         }
         for (const [id, buffer] of Object.entries(buffersRef.current)) {
           if (buffer.projectID !== event.projectID) continue
@@ -287,11 +323,11 @@ export function App() {
     }).catch(e => { if (alive) setSessionError(errorText(e)) }).finally(() => { if (alive) setSessionsLoading(false) })
     return () => { alive = false }
   }, [projectID, connection.connected, sessionGeneration, updateView])
-  useEffect(() => { setGit(undefined); setGitError('') }, [projectID])
+  useEffect(() => { setGitError('') }, [projectID])
   useEffect(() => {
     if (!projectID || !window.ame) return
     let alive = true
-    void window.ame.git(projectID).then(value => { if (alive) { setGit(value); setGitError('') } }).catch(e => { if (alive) { setGit(undefined); setGitError(errorText(e)) } })
+    void window.ame.git(projectID).then(value => { if (alive && !removedProjects.current.has(projectID)) { setGitCache(current => ({ ...current, [projectID]: value })); setGitError('') } }).catch(e => { if (alive) setGitError(errorText(e)) })
     return () => { alive = false }
   }, [projectID, generation])
   const loadFile = useCallback(async (id: string, path: string) => {
@@ -349,6 +385,7 @@ export function App() {
       projectsRef.current = remaining
       setProjects(remaining)
       setSessionCache(current => withoutKey(current, id))
+      setGitCache(current => withoutKey(current, id))
       setSplits(current => withoutKey(current, id))
       setBuffers(current => withoutProjectDocuments(current, id))
       setDiffs(current => withoutProjectDocuments(current, id))
@@ -412,7 +449,10 @@ export function App() {
       if (!removedProjects.current.has(id)) await window.ame.lspCloseDocument(id, path)
     }).catch(() => {})
     overlayQueues.current.set(key, queue)
-    void queue.then(() => { if (overlayQueues.current.get(key) === queue) overlayQueues.current.delete(key); if (preferencesRef.current.project === id) void requestDiagnostics(id) })
+    void queue.then(() => {
+      if (overlayQueues.current.get(key) === queue) overlayQueues.current.delete(key)
+      if (preferencesRef.current.project === id && (problemsOpenRef.current || openSourcePathsRef.current.length)) void requestDiagnostics(id, false, problemsOpenRef.current ? undefined : openSourcePathsRef.current)
+    })
   }
   const toggleBreakpoint = (path: string, line: number) => {
     if (!projectID) return
@@ -478,7 +518,7 @@ export function App() {
         })
         overlayQueues.current.set(key, queue)
         void queue.catch(e => { overlayTexts.current.delete(key); if (!removedProjects.current.has(p.project!)) report(e) }).finally(() => { if (overlayQueues.current.get(key) === queue) overlayQueues.current.delete(key) })
-        void requestDiagnostics(p.project, true)
+        void requestDiagnostics(p.project, true, problemsOpenRef.current ? undefined : [tab.path])
       }
       refresh()
     } catch (e) {
@@ -576,7 +616,7 @@ export function App() {
     <div className={`workspace-body ${!preferences.rail ? 'is-sidebar-collapsed' : ''} ${!preferences.inspector ? 'is-inspector-collapsed' : ''} ${!preferences.stage ? 'is-sidepanel-collapsed' : ''} ${maximized && preferences.stage ? 'is-sidepanel-maximized' : ''}`} style={{ '--sidebar-w': `${preferences.widths.rail}px`, '--inspector-w': `${preferences.widths.inspector}px`, '--sidepanel-w': `${preferences.widths.stage}px` } as CSSProperties}>
       {preferences.rail && <><ProjectRail projects={projects} projectID={projectID} sessions={sessions} sessionCache={sessionCache} onRemove={id => void removeProject(id)} onSessionRemoved={(id, removed) => { const remaining = (sessionCacheRef.current[id] || []).filter(session => session.id !== removed); setSessionCache(current => ({ ...current, [id]: (current[id] || []).filter(session => session.id !== removed) })); updateView(id, current => current.session === removed ? { ...current, session: remaining[0]?.id } : current); refreshSessions() }} onSessions={(id, items) => { setSessionCache(current => removedProjects.current.has(id) ? current : ({ ...current, [id]: items })); updateView(id, current => ({ ...current, session: items.some(item => item.id === current.session) ? current.session : items[0]?.id })) }} sessionID={view.session} loading={projectsLoading} sessionsLoading={sessionsLoading} error={sessionError} connected={connection.connected} creating={creating} git={git} generation={generation} onSelect={id => setPreferences(p => ({ ...p, project: id }))} onSession={(id, session) => { setPreferences(p => ({ ...p, project: id })); updateView(id, current => ({ ...current, session })) }} onTool={(id, tab) => setPreferences(p => ({ ...p, project: id, inspector: true, inspectorTab: tab }))} onCreate={id => void createSession(id)} onPick={() => void pickProject()} onRetry={refreshSessions} /><Resizer pane="rail" width={preferences.widths.rail} onChange={w => setWidth('rail', w)} /></>}
       {preferences.inspector && <><Inspector projectID={projectID} name={project?.name} connected={connection.connected} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={(path, line, column) => openTab(path, 'file', line, column)} onRename={(from, to) => { if (projectID) renameOpenPath(projectID, from, to) }} onDelete={path => { if (projectID) deleteOpenPath(projectID, path) }} onDiff={path => openTab(path, 'diff')} onHide={() => toggle('inspector')} report={report} /><Resizer pane="inspector" width={preferences.widths.inspector} onChange={w => setWidth('inspector', w)} /></>}
-      <Chat onModelChange={setSelectedModel} key={projectID || ''} files={files} activeFile={activeTab?.mode === 'file' ? activeTab.path : undefined} onRequestFiles={requestFiles} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!sessions.length || !!activeSession) && !sessionError} onCreated={session => { if (projectID) { updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={(path, line) => openTab(path, 'file', line)} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) updateView(projectID, current => ({ ...current, session: id })) }} />
+      <Chat accountRole={accountRole} connectionUrl={connection.url} onModelChange={setSelectedModel} key={projectID || ''} files={files} activeFile={activeTab?.mode === 'file' ? activeTab.path : undefined} onRequestFiles={requestFiles} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!sessions.length || !!activeSession) && !sessionError} onCreated={session => { if (projectID) { updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={(path, line) => openTab(path, 'file', line)} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) updateView(projectID, current => ({ ...current, session: id })) }} />
       {preferences.stage && <><Resizer pane="stage" width={preferences.widths.stage} onChange={w => setWidth('stage', w)} /><section className="side-panel" data-testid="side-panel" data-region="Auxiliary Side Panel">
         <div className="side-panel__tabs"><div className="side-panel__tab-list" role="tablist" aria-label="Workspace panel">{(['files', 'changes', 'diff', 'artifact', 'usage'] as const).filter(tab => preferences.layoutMode !== 'knowledge' || tab !== 'diff').map(tab => <button key={tab} role="tab" aria-selected={preferences.panel === tab} className={`panel-tab ${preferences.panel === tab ? 'is-active' : ''}`} onClick={() => selectPanel(tab)}>{({ files: 'Code', changes: 'Session Changes', diff: 'Git Diff', artifact: 'Artifact', usage: 'Usage' })[tab]}</button>)}</div><div className="stage-actions"><IconButton label="Toggle Terminal" active={preferences.terminalOpen} onClick={() => setPreferences(p => ({ ...p, terminalOpen: !p.terminalOpen }))}><Icon name="terminal" /></IconButton><IconButton label="Phóng to Side Panel" active={maximized} onClick={() => setMaximized(v => !v)}><Icon name="maximize" /></IconButton><IconButton label="Close Side Panel" onClick={() => toggle('stage')}><Icon name="close" /></IconButton></div></div>
         <div className="editor-breadcrumb"><span className="truncate"><strong>{project?.name || 'Local Workspace'}</strong> &rsaquo; {preferences.panel === 'changes' ? activeSession?.title || 'Session Changes' : activeTab?.path || (preferences.panel === 'diff' ? 'VS Code Diff' : 'Code')}</span><span>{preferences.panel === 'changes' ? 'OpenCode snapshots' : preferences.panel === 'diff' ? 'Git Engine' : 'UTF-8'}</span></div>

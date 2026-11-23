@@ -10,11 +10,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 export function parseBenchmarkArgs(argv) {
-  const result = { json: false, thresholdStartupMs: 15000, thresholdHeapMb: 512 }
-  const numbers = { '--threshold-startup-ms': 'thresholdStartupMs', '--threshold-heap-mb': 'thresholdHeapMb' }
+  const result = { json: false, thresholdStartupMs: 15000, thresholdHeapMb: 512, thresholdSwitchMs: 300, thresholdEventLoopLagMs: 100 }
+  const numbers = {
+    '--threshold-startup-ms': 'thresholdStartupMs', '--threshold-heap-mb': 'thresholdHeapMb',
+    '--threshold-switch-ms': 'thresholdSwitchMs', '--threshold-event-loop-lag-ms': 'thresholdEventLoopLagMs',
+  }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
     if (flag === '--json') result.json = true
+    else if (flag === '--dev') result.dev = true
     else if (flag === '--executable') {
       const value = argv[++i]
       if (!value?.trim() || value.startsWith('--')) throw new Error('--executable requires a path')
@@ -42,10 +46,13 @@ export function resolveExecutable(explicitPath, root, platform) {
 
 export function evaluateThresholds(metrics, thresholds) {
   const failures = []
-  for (const [key, limit, label] of [
+  const checks = [
     ['timeToReadyMs', thresholds.thresholdStartupMs, 'Startup'],
     ['jsHeapUsedMB', thresholds.thresholdHeapMb, 'JS heap used'],
-  ]) {
+  ]
+  if ('projectSwitchMaxMs' in metrics && thresholds.thresholdSwitchMs !== undefined) checks.push(['projectSwitchMaxMs', thresholds.thresholdSwitchMs, 'Project switch'])
+  if ('ipcPingMaxMs' in metrics && thresholds.thresholdEventLoopLagMs !== undefined) checks.push(['ipcPingMaxMs', thresholds.thresholdEventLoopLagMs, 'IPC ping under LSP load'])
+  for (const [key, limit, label] of checks) {
     const value = metrics[key]
     if (!Number.isFinite(value) || value < 0) failures.push(`${label}: metric unavailable or invalid`)
     else if (!Number.isFinite(limit) || limit <= 0) failures.push(`${label}: invalid threshold`)
@@ -54,7 +61,7 @@ export function evaluateThresholds(metrics, thresholds) {
   return { ok: failures.length === 0, failures }
 }
 
-/** Metrics use milliseconds and MiB (bytes / 1024²); thresholds apply only to ready time and used heap. */
+/** Metrics use milliseconds and MiB (bytes / 1024²); interactive thresholds are optional for older reports. */
 export function formatBenchmarkMarkdown(metrics) {
   const number = value => Number.isFinite(value) ? value.toFixed(2) : 'N/A'
   const status = metrics.thresholds ? evaluateThresholds(metrics, metrics.thresholds) : metrics.thresholdStatus
@@ -65,14 +72,17 @@ export function formatBenchmarkMarkdown(metrics) {
     `| First paint (ms, navigation-relative) | ${number(metrics.firstPaintMs)} |`,
     `| JS heap used (MiB) | ${number(metrics.jsHeapUsedMB)} |`,
     `| JS heap total (MiB) | ${number(metrics.jsHeapTotalMB)} |`,
-    `| Process tree RSS (MiB) | ${number(metrics.processTreeRssMB)} |`, '',
+    `| Process tree RSS (MiB) | ${number(metrics.processTreeRssMB)} |`,
+    ...('projectSwitchAvgMs' in metrics ? [`| Project switch avg (ms) | ${number(metrics.projectSwitchAvgMs)} |`] : []),
+    ...('projectSwitchMaxMs' in metrics ? [`| Project switch max (ms) | ${number(metrics.projectSwitchMaxMs)} |`] : []),
+    ...('ipcPingMaxMs' in metrics ? [`| IPC ping max under LSP load (ms) | ${number(metrics.ipcPingMaxMs)} |`] : []), '',
     `Threshold status: **${status ? status.ok ? 'PASS' : 'FAIL' : 'NOT EVALUATED'}**`,
     ...(status?.failures ?? []).map(failure => `- ${failure}`),
   ].join('\n')
 }
 
-function exec(command, args) {
-  return new Promise((resolve, reject) => execFile(command, args, { timeout: 5000, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout)))
+function exec(command, args, options = {}) {
+  return new Promise((resolve, reject) => execFile(command, args, { timeout: 5000, maxBuffer: 4 * 1024 * 1024, windowsHide: true, ...options }, (error, stdout) => error ? reject(error) : resolve(stdout)))
 }
 async function treeRss(pid) {
   try {
@@ -101,7 +111,9 @@ async function treeRss(pid) {
 }
 
 async function benchmark(options) {
-  const selected = resolveExecutable(options.executable ?? process.env.AME_IDE_PACKAGED_EXECUTABLE, repoRoot, process.platform)
+  const selected = options.dev
+    ? { mode: 'dev', executable: null, resourcesDir: path.join(repoRoot, 'resources') }
+    : resolveExecutable(options.executable ?? process.env.AME_IDE_PACKAGED_EXECUTABLE, repoRoot, process.platform)
   const executable = selected.executable ?? (await import('electron')).default
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-benchmark-'))
   let child, socket, spawnError, sequence = 0
@@ -110,7 +122,7 @@ async function benchmark(options) {
   const command = (method, params = {}) => new Promise((resolve, reject) => {
     const id = ++sequence
     const finish = (error, value) => { clearTimeout(timer); pending.delete(id); error ? reject(error) : resolve(value) }
-    const timer = setTimeout(() => finish(new Error(`CDP timeout: ${method}`)), 5000)
+    const timer = setTimeout(() => finish(new Error(`CDP timeout: ${method}`)), 30000)
     pending.set(id, finish)
     try { socket.send(JSON.stringify({ id, method, params })) } catch (error) { finish(error) }
   })
@@ -120,10 +132,24 @@ async function benchmark(options) {
     return value.result.value
   }
   try {
-    const userData = path.join(root, 'data'), project = path.join(root, 'project')
-    await mkdir(userData); await mkdir(project)
-    await writeFile(path.join(project, 'hello.ts'), 'export const greeting: string = "hello"\n')
-    await writeFile(path.join(userData, 'projects.json'), JSON.stringify([{ id: 'benchmark', directory: project }]))
+    const userData = path.join(root, 'data'), hooks = path.join(root, 'empty-hooks')
+    await mkdir(userData); await mkdir(hooks)
+    const projects = []
+    for (const id of ['alpha', 'beta', 'gamma']) {
+      const directory = path.join(root, id)
+      await mkdir(directory)
+      for (let i = 0; i < 50; i++) {
+        const source = i === 0 ? 'export const value0: number = 0\n'
+          : `import { value${i - 1} } from './file${i - 1}'\nexport const value${i}: number = value${i - 1} + 1\n`
+        await writeFile(path.join(directory, `file${i}.ts`), source)
+      }
+      await writeFile(path.join(directory, 'tsconfig.json'), JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'ESNext', strict: true, noEmit: true, skipLibCheck: true }, include: ['*.ts'] }))
+      await exec('git', ['init', '--quiet', `--template=${hooks}`, directory])
+      await exec('git', ['-c', 'core.fsmonitor=false', 'add', '.'], { cwd: directory })
+      await exec('git', ['-c', 'user.name=Benchmark', '-c', 'user.email=benchmark@localhost', '-c', `core.hooksPath=${hooks}`, '-c', 'core.fsmonitor=false', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'Local benchmark fixture'], { cwd: directory, timeout: 30000 })
+      projects.push({ id, directory })
+    }
+    await writeFile(path.join(userData, 'projects.json'), JSON.stringify(projects))
     const server = net.createServer()
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
     const port = server.address().port
@@ -131,7 +157,7 @@ async function benchmark(options) {
     const env = { ...process.env, AME_IDE_TEST_DATA: userData }
     delete env.ELECTRON_RUN_AS_NODE; delete env.ELECTRON_RENDERER_URL
     const t0 = performance.now()
-    child = spawn(executable, [...(selected.mode === 'dev' ? ['.'] : []), `--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', `--user-data-dir=${userData}`], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    child = spawn(executable, [...(selected.mode === 'dev' ? ['.'] : []), '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', `--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', `--user-data-dir=${userData}`], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] })
     child.on('error', error => { spawnError = error })
     for (const stream of [child.stdout, child.stderr]) stream.on('data', data => { logs = (logs + data).slice(-16000) })
     const deadline = t0 + Math.max(30000, options.thresholdStartupMs + 15000)
@@ -167,9 +193,74 @@ async function benchmark(options) {
     const timeToReadyMs = performance.now() - t0
     await command('Performance.enable')
     const firstPaintMs = await evaluate('performance.getEntriesByType("paint").find(entry => entry.name === "first-paint")?.startTime ?? null')
+    await evaluate(`(async () => {
+      const deadline = performance.now() + 15000
+      while (performance.now() < deadline) {
+        const names = [...document.querySelectorAll('.sidebar .project-select .proj-name')].map(node => node.textContent.trim())
+        if (['alpha', 'beta', 'gamma'].every(name => names.includes(name)) && document.querySelector('.proj-group.is-active-proj .proj-name')?.textContent.trim() === 'alpha') return
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      throw new Error('Benchmark project sidebar readiness timed out')
+    })()`)
+    await evaluate(`(async () => {
+      const deadline = performance.now() + 15000
+      while (performance.now() < deadline) {
+        let timer
+        const connection = await Promise.race([
+          window.ame.connection().catch(() => undefined),
+          new Promise(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - performance.now())) }),
+        ]).finally(() => clearTimeout(timer))
+        if (connection?.connected === true || Boolean(connection?.error)) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      await new Promise(resolve => setTimeout(resolve, 250))
+    })()`)
+    const switchTimes = []
+    for (const name of ['beta', 'gamma', 'alpha', 'gamma', 'beta', 'alpha']) {
+      switchTimes.push(await evaluate(`(async () => {
+        const name = ${JSON.stringify(name)}
+        const button = [...document.querySelectorAll('.sidebar .project-select')].find(node => node.querySelector('.proj-name')?.textContent.trim() === name)
+        if (!button) throw new Error('Project switch button unavailable: ' + name)
+        const start = performance.now()
+        button.click()
+        while (document.querySelector('.proj-group.is-active-proj .proj-name')?.textContent.trim() !== name) {
+          if (performance.now() - start > 10000) throw new Error('Project switch timed out: ' + name)
+          await new Promise(resolve => setTimeout(resolve, 0))
+        }
+        await window.ame.platform()
+        return performance.now() - start
+      })()`))
+    }
+    const { ipcPingMaxMs, lspLoadMs } = await evaluate(`(async () => {
+      const start = performance.now()
+      let complete = false, lspLoadMs = 0, ipcPingMaxMs = 0
+      const failures = []
+      const load = Promise.all([
+        window.ame.lspDiagnostics('alpha'), window.ame.lspDiagnostics('beta'), window.ame.lspDiagnostics('gamma'),
+      ].map(request => request.catch(error => { failures.push(String(error)) }))).then(() => {
+        lspLoadMs = performance.now() - start
+        complete = true
+      })
+      do {
+        const pingStart = performance.now()
+        await window.ame.platform()
+        ipcPingMaxMs = Math.max(ipcPingMaxMs, performance.now() - pingStart)
+        if (!complete) await new Promise(resolve => setTimeout(resolve, 20))
+      } while (!complete)
+      await load
+      if (failures.length) throw new Error('Benchmark LSP load failed: ' + failures.join('; '))
+      return { ipcPingMaxMs, lspLoadMs }
+    })()`)
     const { metrics } = await command('Performance.getMetrics')
     const values = Object.fromEntries(metrics.map(metric => [metric.name, metric.value]))
-    const result = { mode: selected.mode, executable, timeToReadyMs, firstPaintMs, jsHeapUsedMB: values.JSHeapUsedSize / 1024 ** 2, jsHeapTotalMB: values.JSHeapTotalSize / 1024 ** 2, processTreeRssMB: await treeRss(child.pid), thresholds: { thresholdStartupMs: options.thresholdStartupMs, thresholdHeapMb: options.thresholdHeapMb } }
+    const result = {
+      mode: selected.mode, executable, timeToReadyMs, firstPaintMs,
+      projectSwitchAvgMs: switchTimes.reduce((sum, value) => sum + value, 0) / switchTimes.length,
+      projectSwitchMaxMs: Math.max(...switchTimes), ipcPingMaxMs, lspLoadMs,
+      jsHeapUsedMB: values.JSHeapUsedSize / 1024 ** 2, jsHeapTotalMB: values.JSHeapTotalSize / 1024 ** 2,
+      processTreeRssMB: await treeRss(child.pid),
+      thresholds: { thresholdStartupMs: options.thresholdStartupMs, thresholdHeapMb: options.thresholdHeapMb, thresholdSwitchMs: options.thresholdSwitchMs, thresholdEventLoopLagMs: options.thresholdEventLoopLagMs },
+    }
     result.thresholdStatus = evaluateThresholds(result, result.thresholds)
     return result
   } catch (error) { throw new Error(`${error.message}\n${logs}`, { cause: error }) }

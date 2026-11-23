@@ -1,247 +1,134 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import ts from 'typescript'
-import { validateWorkspacePath } from './workspace-fs'
+import { createRequire } from 'node:module'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { Worker } from 'node:worker_threads'
+import type { TsLanguageService } from './ts-lsp-engine'
 
-export type LspSeverity = 'error' | 'warning' | 'info'
-export type LspRange = { line: number; column: number; endLine: number; endColumn: number }
-export type LspDiagnostic = LspRange & { path: string; severity: LspSeverity; code: number; message: string; source: 'ts' }
-export type LspCompletion = { label: string; kind: string; detail?: string; insertText?: string; sortText?: string }
-export type LspHover = { display: string; documentation?: string; range: LspRange }
-export type LspLocation = LspRange & { path: string }
-export type LspReference = LspLocation & { lineText: string; isDefinition?: boolean }
-export type LspTextEdit = LspRange & { newText: string }
-export type LspRenameResult = { canRename: boolean; reason?: string; edits: { path: string; edits: LspTextEdit[] }[] }
-export type TsLanguageService = {
-  updateDocument(relativePath: string, content: string, version?: number): Promise<void>
-  closeDocument(relativePath: string): Promise<void>
-  refreshFiles(): Promise<void>
-  diagnostics(relativePath?: string): Promise<LspDiagnostic[]>
-  completions(relativePath: string, line: number, column: number): Promise<LspCompletion[]>
-  hover(relativePath: string, line: number, column: number): Promise<LspHover | null>
-  definition(relativePath: string, line: number, column: number): Promise<LspLocation[]>
-  references(relativePath: string, line: number, column: number): Promise<LspReference[]>
-  renamePreview(relativePath: string, line: number, column: number, newName: string): Promise<LspRenameResult>
-  dispose(): void
+export type { LspSeverity, LspRange, LspDiagnostic, LspCompletion, LspHover, LspLocation, LspReference, LspTextEdit, LspRenameResult, TsLanguageService } from './ts-lsp-engine'
+
+function resolveWorkerTarget() {
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const built = path.join(here, 'ts-lsp-worker.js')
+  const unpacked = built.replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`)
+  if (fs.existsSync(unpacked)) return { file: unpacked, execArgv: [] as string[] }
+  if (fs.existsSync(built)) return { file: built, execArgv: [] as string[] }
+  const tsSource = path.join(here, 'ts-lsp-worker.ts')
+  const tsxLoader = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href
+  return { file: tsSource, execArgv: ['--import', tsxLoader] }
 }
 
-const excluded = new Set(['node_modules', '.git', 'dist', 'out', 'build', 'coverage'])
-const sourceExtension = /\.(?:[cm]?[jt]s|[jt]sx)$/i
+let nextServiceID = 1, nextRequestID = 1
+let sharedWorker: Worker | undefined
+let workerGeneration = 0
+const activeServices = new Set<number>()
+const pending = new Map<number, { serviceID: number; resolve: (result: unknown) => void; reject: (error: Error) => void }>()
 
-/** In-memory overlays and rename previews never write workspace files; refresh reloads disk/config state. */
+function rejectPending(error: Error) {
+  for (const request of pending.values()) request.reject(error)
+  pending.clear()
+}
+
+function spawn() {
+  const { file, execArgv } = resolveWorkerTarget()
+  // Node 24 may select its native TS loader before --import hooks for a worker entry.
+  const target = file.endsWith('.ts') ? new URL(`data:text/javascript,${encodeURIComponent(
+    `import { tsImport } from ${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm/api')).href)}; await tsImport(${JSON.stringify(pathToFileURL(file).href)}, ${JSON.stringify(import.meta.url)});`
+  )}`) : file
+  const current = new Worker(target, { execArgv })
+  sharedWorker = current
+  workerGeneration++
+  current.on('message', (message: { id: number; serviceID: number; ok: boolean; result?: unknown; message?: string; code?: string }) => {
+    if (sharedWorker !== current) return
+    const request = pending.get(message.id)
+    if (!request || request.serviceID !== message.serviceID) return
+    pending.delete(message.id)
+    if (message.ok) request.resolve(message.result)
+    else {
+      const error = new Error(message.message)
+      if (message.code) Object.assign(error, { code: message.code })
+      request.reject(error)
+    }
+  })
+  const failed = (error: Error) => {
+    if (sharedWorker !== current) return
+    sharedWorker = undefined
+    rejectPending(error)
+    void current.terminate()
+  }
+  current.on('error', failed)
+  current.on('exit', code => {
+    if (sharedWorker === current) failed(new Error(`LSP_WORKER_EXIT: ${code}`))
+  })
+  return current
+}
+
+/** Workspaces retain isolated engines inside one lazily created shared worker. */
 export function createTsLanguageService(workspaceRoot: string): TsLanguageService {
   const root = fs.realpathSync(workspaceRoot)
-  const overlays = new Map<string, { text: string; version: number }>()
-  let files: string[] = [], projectVersion = 0, initialized = false, disposed = false
-  let initializing: Promise<void> | undefined
-  const defaults: ts.CompilerOptions = {
-    target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
-    allowJs: true, checkJs: false, jsx: ts.JsxEmit.ReactJSX, strict: true, noEmit: true,
-  }
-  let options = { ...defaults }
-  const assertLive = () => { if (disposed) throw new Error('LSP_DISPOSED') }
-  async function checked(relative: string) {
-    assertLive()
-    if (typeof relative !== 'string' || relative.replace(/\\/g, '/').split('/').includes('..')) throw new Error('PATH_OUTSIDE_WORKSPACE')
-    return validateWorkspacePath(root, relative)
-  }
-  function sourceFile(file: string) {
-    return sourceExtension.test(file) && !/^lib\..*\.d\.ts$/i.test(path.basename(file))
-      && !path.relative(root, file).split(path.sep).some(part => excluded.has(part.toLowerCase()))
-  }
-  // The synchronous compiler host must also reject links introduced after discovery.
-  function safeWorkspaceFile(file: string) {
-    const relative = path.relative(root, file)
-    if (path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) return true
-    let current = root
-    for (const part of relative.split(path.sep)) {
-      if (part.toLowerCase() === '.git') return false
-      current = path.join(current, part)
-      try { if (fs.lstatSync(current).isSymbolicLink()) return false } catch { break }
-    }
-    return true
-  }
-  const read = (file: string) => safeWorkspaceFile(file) ? overlays.get(path.normalize(file))?.text ?? ts.sys.readFile(file) : undefined
-  const host: ts.LanguageServiceHost = {
-    getCompilationSettings: () => options,
-    getCurrentDirectory: () => root,
-    getDefaultLibFileName: settings => ts.getDefaultLibFilePath(settings),
-    getScriptFileNames: () => [...new Set([...files, ...overlays.keys()])],
-    getScriptVersion: file => `${projectVersion}:${overlays.get(path.normalize(file))?.version ?? 0}`,
-    getProjectVersion: () => String(projectVersion),
-    getScriptSnapshot: file => { const text = read(file); return text === undefined ? undefined : ts.ScriptSnapshot.fromString(text) },
-    fileExists: file => safeWorkspaceFile(file) && (overlays.has(path.normalize(file)) || ts.sys.fileExists(file)),
-    readFile: read,
-    readDirectory: ts.sys.readDirectory,
-    directoryExists: directory => safeWorkspaceFile(directory) && (ts.sys.directoryExists(directory)
-      || [...overlays.keys()].some(file => file.startsWith(`${path.normalize(directory)}${path.sep}`))),
-    getDirectories: ts.sys.getDirectories,
-    useCaseSensitiveFileNames: () => ts.sys.useCaseSensitiveFileNames,
-    realpath: ts.sys.realpath,
-  }
-  const service = ts.createLanguageService(host, ts.createDocumentRegistry())
-  async function refreshFiles() {
-    assertLive()
-    let discovered: string[] = []
-    async function walk(directory: string) {
-      for (const entry of await fs.promises.readdir(directory, { withFileTypes: true })) {
-        if (entry.isSymbolicLink() || excluded.has(entry.name.toLowerCase())) continue
-        const absolute = path.join(directory, entry.name)
-        const valid = await checked(path.relative(root, absolute))
-        if (entry.isDirectory()) await walk(valid.target)
-        else if (entry.isFile() && sourceFile(valid.target)) discovered.push(valid.target)
-      }
-    }
-    await walk(root)
-    options = { ...defaults }
-    for (const name of ['tsconfig.json', 'jsconfig.json']) {
-      const config = await checked(name)
-      if (!fs.existsSync(config.target)) continue
-      // TypeScript's JSON diagnostic attachment expects compiler-style separators on Windows.
+  const serviceID = nextServiceID++
+  activeServices.add(serviceID)
+  let disposed = false, initializedInWorker = false, sentGeneration = 0
+  let activeRefresh: Promise<void> | undefined, refreshQueued = false
+  function rpc<T>(method: keyof TsLanguageService, args: unknown[]): Promise<T> {
+    if (disposed) return Promise.reject(new Error('LSP_DISPOSED'))
+    return new Promise<T>((resolve, reject) => {
       try {
-        const loaded = ts.readConfigFile(config.target.split(path.sep).join('/'), read)
-        if (!loaded.error) {
-          const parsed = ts.parseJsonConfigFileContent(loaded.config, { ...ts.sys, readFile: read, fileExists: host.fileExists }, root)
-          if (!parsed.errors.length) {
-            options = { ...parsed.options, noEmit: true }
-            const allowed = new Set(discovered)
-            discovered = parsed.fileNames.map(file => path.normalize(file)).filter(file => allowed.has(file))
-          }
+        const current = sharedWorker ?? spawn()
+        if (sentGeneration !== workerGeneration) initializedInWorker = false
+        const id = nextRequestID++
+        pending.set(id, { serviceID, resolve: result => resolve(result as T), reject })
+        try {
+          current.postMessage({ id, serviceID, root: initializedInWorker ? undefined : root, method, args })
+          initializedInWorker = true
+          sentGeneration = workerGeneration
+        } catch (error) {
+          pending.delete(id)
+          reject(error)
         }
-      } catch {
-        options = { ...defaults }
-      }
-      break
-    }
-    assertLive()
-    files = discovered
-    projectVersion++
-    initialized = true
+      } catch (error) { reject(error) }
+    })
   }
-  async function ready() {
-    assertLive()
-    if (!initialized) {
-      initializing ??= refreshFiles().finally(() => { initializing = undefined })
-      await initializing
-    }
-  }
-  async function document(relative: string) {
-    const valid = await checked(relative)
-    await ready()
-    if (!sourceFile(valid.target)) throw new Error('LSP_UNSUPPORTED_FILE')
-    const text = read(valid.target)
-    if (text === undefined) throw new Error('LSP_FILE_NOT_FOUND')
-    if (!files.includes(valid.target) && !overlays.has(valid.target)) { files.push(valid.target); projectVersion++ }
-    const source = ts.createSourceFile(valid.target, text, ts.ScriptTarget.Latest, true)
-    return { ...valid, source, text }
-  }
-  function offset(source: ts.SourceFile, line: number, column: number) {
-    const starts = source.getLineStarts()
-    const boundedLine = Math.min(starts.length - 1, Math.max(0, Number.isFinite(line) ? Math.trunc(line) - 1 : 0))
-    const start = starts[boundedLine]
-    let end = starts[boundedLine + 1] ?? source.text.length
-    while (end > start && /[\r\n]/.test(source.text[end - 1])) end--
-    return Math.min(end, start + Math.max(0, Number.isFinite(column) ? Math.trunc(column) - 1 : 0))
-  }
-  function range(source: ts.SourceFile, span: ts.TextSpan): LspRange {
-    const start = source.getLineAndCharacterOfPosition(Math.min(source.text.length, span.start))
-    const end = source.getLineAndCharacterOfPosition(Math.min(source.text.length, span.start + span.length))
-    return { line: start.line + 1, column: start.character + 1, endLine: end.line + 1, endColumn: end.character + 1 }
-  }
-  async function location(file: string, span: ts.TextSpan): Promise<LspLocation | null> {
-    const relative = path.relative(root, file).split(path.sep).join('/')
-    if (relative.split('/').some(part => excluded.has(part.toLowerCase())) || !sourceExtension.test(relative)) return null
-    try {
-      const doc = await document(relative)
-      return { path: doc.normalized, ...range(doc.source, span) }
-    } catch { return null }
+  function refreshFiles(): Promise<void> {
+    if (disposed) return Promise.reject(new Error('LSP_DISPOSED'))
+    if (activeRefresh) { refreshQueued = true; return activeRefresh }
+    activeRefresh = (async () => {
+      await rpc<void>('refreshFiles', [])
+      if (refreshQueued) { refreshQueued = false; await rpc<void>('refreshFiles', []) }
+    })().finally(() => { activeRefresh = undefined; refreshQueued = false })
+    return activeRefresh
   }
   return {
-    async updateDocument(relative, content, version) {
-      const valid = await checked(relative)
-      await ready()
-      if (!sourceFile(valid.target)) throw new Error('LSP_UNSUPPORTED_FILE')
-      const previous = overlays.get(valid.target)?.version ?? 0
-      overlays.set(valid.target, { text: content, version: Math.max(previous + 1, Number.isFinite(version) ? version! : 0) })
-      projectVersion++
-    },
-    async closeDocument(relative) {
-      const valid = await checked(relative)
-      overlays.delete(valid.target)
-      projectVersion++
-    },
+    updateDocument: (...args) => rpc('updateDocument', args),
+    closeDocument: (...args) => rpc('closeDocument', args),
     refreshFiles,
-    async diagnostics(relative) {
-      await ready()
-      const targets = relative === undefined ? [...new Set([...files, ...overlays.keys()])] : [(await document(relative)).target]
-      const result: LspDiagnostic[] = []
-      for (const target of targets) {
-        const doc = await document(path.relative(root, target))
-        for (const diagnostic of [...service.getSyntacticDiagnostics(target), ...service.getSemanticDiagnostics(target)]) {
-          if (!diagnostic.file) continue
-          result.push({ path: doc.normalized, ...range(doc.source, { start: diagnostic.start ?? 0, length: diagnostic.length ?? 0 }),
-            severity: diagnostic.category === ts.DiagnosticCategory.Error ? 'error' : diagnostic.category === ts.DiagnosticCategory.Warning ? 'warning' : 'info',
-            code: diagnostic.code, message: ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'), source: 'ts' })
+    diagnostics: (...args) => rpc('diagnostics', args),
+    completions: (...args) => rpc('completions', args),
+    hover: (...args) => rpc('hover', args),
+    definition: (...args) => rpc('definition', args),
+    references: (...args) => rpc('references', args),
+    renamePreview: (...args) => rpc('renamePreview', args),
+    dispose() {
+      if (disposed) return
+      disposed = true
+      activeServices.delete(serviceID)
+      const error = new Error('LSP_DISPOSED')
+      for (const [id, request] of pending) {
+        if (request.serviceID !== serviceID) continue
+        request.reject(error)
+        pending.delete(id)
+      }
+      if (sharedWorker) {
+        if (activeServices.size === 0) {
+          const current = sharedWorker
+          sharedWorker = undefined
+          workerGeneration++
+          rejectPending(error)
+          void current.terminate()
+        } else {
+          sharedWorker.postMessage({ id: 0, serviceID, method: 'dispose', args: [] })
         }
       }
-      return result
     },
-    async completions(relative, line, column) {
-      const doc = await document(relative)
-      const position = offset(doc.source, line, column)
-      const entries = service.getCompletionsAtPosition(doc.target, position, {})?.entries ?? []
-      return entries.slice(0, 100).map(entry => ({ label: entry.name, kind: entry.kind, insertText: entry.insertText, sortText: entry.sortText }))
-    },
-    async hover(relative, line, column) {
-      const doc = await document(relative)
-      const info = service.getQuickInfoAtPosition(doc.target, offset(doc.source, line, column))
-      return info ? { display: ts.displayPartsToString(info.displayParts), documentation: ts.displayPartsToString(info.documentation), range: range(doc.source, info.textSpan) } : null
-    },
-    async definition(relative, line, column) {
-      const doc = await document(relative)
-      const definitions = service.getDefinitionAtPosition(doc.target, offset(doc.source, line, column)) ?? []
-      const locations = await Promise.all(definitions.map(item => location(item.fileName, item.textSpan)))
-      return locations.filter((item): item is LspLocation => item !== null)
-    },
-    async references(relative, line, column) {
-      const doc = await document(relative)
-      const symbols = service.findReferences(doc.target, offset(doc.source, line, column)) ?? []
-      const result: LspReference[] = []
-      const seen = new Set<string>()
-      for (const symbol of symbols) for (const ref of symbol.references) {
-        const hit = await location(ref.fileName, ref.textSpan)
-        if (!hit) continue
-        const key = `${hit.path}:${hit.line}:${hit.column}`
-        if (seen.has(key)) continue
-        seen.add(key)
-        const source = await document(hit.path)
-        result.push({ ...hit, lineText: source.text.split(/\r?\n/)[hit.line - 1] ?? '', isDefinition: ref.isDefinition })
-      }
-      return result
-    },
-    async renamePreview(relative, line, column, newName) {
-      const doc = await document(relative)
-      const position = offset(doc.source, line, column)
-      const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, newName)
-      const token = scanner.scan()
-      const identifier = token === ts.SyntaxKind.Identifier || (token >= ts.SyntaxKind.AbstractKeyword
-        && token <= ts.SyntaxKind.LastKeyword && token !== ts.SyntaxKind.AwaitKeyword)
-      if (!newName || !identifier || scanner.getTokenText() !== newName || scanner.scan() !== ts.SyntaxKind.EndOfFileToken)
-        return { canRename: false, reason: 'INVALID_IDENTIFIER', edits: [] }
-      const info = service.getRenameInfo(doc.target, position)
-      if (!info.canRename) return { canRename: false, reason: info.localizedErrorMessage, edits: [] }
-      const locations = service.findRenameLocations(doc.target, position, false, false, { providePrefixAndSuffixTextForRename: false }) ?? []
-      const groups = new Map<string, LspTextEdit[]>()
-      for (const item of locations) {
-        const hit = await location(item.fileName, item.textSpan)
-        if (!hit) continue
-        const { path: file, ...span } = hit
-        const edits = groups.get(file) ?? []
-        if (!edits.some(edit => edit.line === span.line && edit.column === span.column)) edits.push({ ...span, newText: newName })
-        groups.set(file, edits)
-      }
-      return { canRename: true, edits: [...groups].map(([file, edits]) => ({ path: file, edits: edits.sort((a, b) => a.line - b.line || a.column - b.column) })) }
-    },
-    dispose() { disposed = true; service.dispose(); overlays.clear(); files = [] },
   }
 }
