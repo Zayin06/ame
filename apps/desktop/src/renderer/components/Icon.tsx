@@ -38,6 +38,8 @@ const paths: Record<string, ReactNode> = {
   account: <><circle cx="12" cy="8" r="4" /><path d="M4 21v-2a8 8 0 0 1 16 0v2" /></>,
   more: <><circle cx="12" cy="5" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="12" cy="19" r="1" /></>,
   folder: <path d="M3 7V5h6l2 2h10v13H3Z" />,
+  folderOpen: <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />,
+  filter: <path d="M3 6h18M6 12h12M10 18h4" />,
   file: <><path d="M5 3h9l5 5v13H5Z M14 3v6h5" /></>,
   chevron: <path d="m9 5 7 7-7 7" />,
   left: <path d="m15 18-6-6 6-6" />,
