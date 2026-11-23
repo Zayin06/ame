@@ -3,6 +3,22 @@ import { Icon } from './Icon'
 import { clampWidth, defaultWidths, type Pane } from '../state'
 
 export const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/, '')
+export function humanizeIdeError(error: unknown): string {
+  const text = errorText(error).trim()
+  const messages: [RegExp, string][] = [
+    [/\b(?:IS_DIRECTORY|EISDIR)\b/, 'Không thể mở thư mục như tệp văn bản.'],
+    [/\bBINARY_FILE\b/, 'Không thể xem trước tệp nhị phân trong trình soạn thảo.'],
+    [/\bFILE_TOO_LARGE\b/, 'Tệp vượt quá giới hạn 4 MiB để mở trong trình soạn thảo.'],
+    [/\bENOENT\b/, 'Không tìm thấy tệp hoặc thư mục trong dự án.'],
+    [/\bALREADY_EXISTS\b/, 'Tệp hoặc thư mục cùng tên đã tồn tại.'],
+    [/\bFILE_CONFLICT\b/, 'Tệp trên đĩa đã thay đổi. Nạp lại tệp trước khi lưu đè.'],
+    [/\b(?:PATH_OUTSIDE_WORKSPACE|SYMLINK_NOT_ALLOWED)\b/, 'Đường dẫn nằm ngoài thư mục dự án hoặc qua liên kết không hợp lệ.'],
+    [/\bINVALID_PATH\b/, 'Đường dẫn tệp không hợp lệ.'],
+    [/\bGIT_ROOT_REQUIRED\b/, 'Thư mục dự án không phải gốc Git repository.'],
+    [/\bOPENCODE_DISCONNECTED\b/, 'Chưa kết nối máy chủ OpenCode.'],
+  ]
+  return messages.find(([pattern]) => pattern.test(text))?.[1] ?? (text || 'Đã xảy ra lỗi thao tác.')
+}
 export function Empty({ children }: { children: ReactNode }) { return <div className="empty">{children}</div> }
 export function IconButton({ label, children, onClick, active = false, disabled = false }: { label: string; children: ReactNode; onClick: () => void; active?: boolean; disabled?: boolean }) {
   return <button className={`icon-btn ${active ? 'is-active' : ''}`} title={label} aria-label={label} aria-pressed={active} onClick={onClick} disabled={disabled}>{children}</button>

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { parseFileRef } from '../markdown-parser'
+import { resolveWorkspaceFilePath } from '../workspace-paths'
 
 export type ToolCallView = {
   name: string
@@ -70,23 +70,23 @@ const statusLabels: Record<ToolCallView['status'], string> = {
   streaming: 'Đang chuẩn bị…', running: 'Đang chạy…', completed: 'Hoàn tất', error: 'Lỗi',
 }
 
-export function ToolCard({ call, onOpenFile }: { call: ToolCallView; onOpenFile?: (path: string, line?: number) => void }) {
+export function ToolCard({ call, onOpenFile, projectDirectory }: { call: ToolCallView; onOpenFile?: (path: string, line?: number) => void; projectDirectory?: string }) {
   const summary = summarizeToolCall(call.name, call.input)
   const target = call.target || summary.target
   const tool = call.name.trim().toLowerCase()
   const icon = shellTools.has(tool) ? '>_' : summary.isFile ? '▤' : searchTools.has(tool) ? '⌕' : agentTools.has(tool) ? '◇' : '⚙'
-  const file = summary.isFile && target ? parseFileRef(target) : null
+  const file = summary.isFile && target ? resolveWorkspaceFilePath(target, projectDirectory) : null
   return <section className="tool-card tool-card--rich" aria-label={`${summary.label}: ${statusLabels[call.status]}`}>
     <div className="tool-card__header">
       <div className="tool-card__left">
         <span className="tool-card__icon" aria-hidden="true">{icon}</span>
         <span className="tool-card__label">{summary.label}</span>
-        {target && <span className="tool-card__target" title={target}>{target}</span>}
+        {target && <span className="tool-card__target" title={target}>{file?.path ?? target}</span>}
       </div>
       <div className="tool-card__actions">
         <span className={`tool-status tool-status--${call.status}`}>{statusLabels[call.status]}</span>
         {call.durationMs !== undefined && Number.isFinite(call.durationMs) && call.durationMs >= 0 && <span className="tool-card__duration">{call.durationMs < 1000 ? `${Math.round(call.durationMs)} ms` : `${(call.durationMs / 1000).toFixed(1)} s`}</span>}
-        {summary.isFile && target && onOpenFile && <button type="button" className="file-chip" onClick={() => onOpenFile(file?.path ?? target, file?.line)}>Mở tệp</button>}
+        {file !== null && onOpenFile && <button type="button" className="file-chip" onClick={() => onOpenFile(file.path, file.line)}>Mở tệp</button>}
       </div>
     </div>
     <details className="tool-card-details">

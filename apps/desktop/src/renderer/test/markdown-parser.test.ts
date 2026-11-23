@@ -4,6 +4,32 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { parseFileRef, parseInline, parseMarkdown, type InlineNode } from '../markdown-parser'
 import { summarizeToolCall, ToolCard, type ToolCallView } from '../components/ToolCard'
+import { errorText, humanizeIdeError } from '../components/Primitives'
+
+test('ToolCard opens only workspace files and shows relative targets with the original hover path', () => {
+  const projectDirectory = 'E:\\Extensions\\chrome-MD-This-Page'
+  const filePath = projectDirectory + '\\build\\chrome-mv3-dev\\manifest.json'
+  const render = (path: string) => renderToStaticMarkup(createElement(ToolCard, { call: { name: 'read', status: 'completed', input: { filePath: path } }, projectDirectory, onOpenFile: () => {} }))
+  const html = render(filePath)
+  assert.match(html, /Mở tệp/)
+  assert.ok(html.includes(`title="${filePath}">build/chrome-mv3-dev/manifest.json</span>`))
+  for (const path of [projectDirectory, projectDirectory + '\\', projectDirectory + '-other\\README.md', 'C:\\outside\\file.ts', '../secret']) assert.doesNotMatch(render(path), /Mở tệp/)
+})
+test('IDE errors humanize IPC and OS codes without changing unknown messages or errorText', () => {
+  const cases = [
+    ['IS_DIRECTORY', 'Không thể mở thư mục như tệp văn bản.'], ['EISDIR: illegal operation on a directory', 'Không thể mở thư mục như tệp văn bản.'],
+    ['BINARY_FILE', 'Không thể xem trước tệp nhị phân trong trình soạn thảo.'], ['FILE_TOO_LARGE', 'Tệp vượt quá giới hạn 4 MiB để mở trong trình soạn thảo.'],
+    ['ENOENT: no such file or directory', 'Không tìm thấy tệp hoặc thư mục trong dự án.'], ['ALREADY_EXISTS', 'Tệp hoặc thư mục cùng tên đã tồn tại.'],
+    ['FILE_CONFLICT', 'Tệp trên đĩa đã thay đổi. Nạp lại tệp trước khi lưu đè.'], ['PATH_OUTSIDE_WORKSPACE', 'Đường dẫn nằm ngoài thư mục dự án hoặc qua liên kết không hợp lệ.'],
+    ['SYMLINK_NOT_ALLOWED', 'Đường dẫn nằm ngoài thư mục dự án hoặc qua liên kết không hợp lệ.'], ['INVALID_PATH', 'Đường dẫn tệp không hợp lệ.'],
+    ['GIT_ROOT_REQUIRED', 'Thư mục dự án không phải gốc Git repository.'], ['OPENCODE_DISCONNECTED', 'Chưa kết nối máy chủ OpenCode.'],
+  ]
+  for (const [code, message] of cases) assert.equal(humanizeIdeError(new Error(`Error invoking remote method 'ame:call': Error: ${code}`)), message)
+  assert.equal(humanizeIdeError('  Custom failure  '), 'Custom failure')
+  assert.equal(humanizeIdeError(' '), 'Đã xảy ra lỗi thao tác.')
+  assert.equal(humanizeIdeError('NOT_INVALID_PATH_SUFFIX'), 'NOT_INVALID_PATH_SUFFIX')
+  assert.equal(errorText(new Error('INVALID_PATH')), 'INVALID_PATH')
+})
 
 const text = (value: string): InlineNode => ({ type: 'text', text: value })
 

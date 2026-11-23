@@ -25,7 +25,7 @@ export type TsLanguageService = {
   dispose(): void
 }
 
-const excluded = new Set(['node_modules', '.git', 'dist', 'out', 'build', 'coverage', 'release', '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache', '.venv', 'venv', '__pycache__', 'target', 'vendor', '.pm'])
+const excluded = new Set(['node_modules', '.git', 'dist', 'out', 'build', 'coverage', 'release', '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache', '.plasmo', '.vite', '.parcel-cache', 'storybook-static', '.venv', 'venv', '__pycache__', 'target', 'vendor', '.pm'])
 const excludedFolder = (name: string) => excluded.has(name.toLowerCase()) || name.toLowerCase().startsWith('release-')
 const pathKey = (value: string) => process.platform === 'win32' ? path.normalize(value).toLowerCase() : path.normalize(value)
 const inside = (root: string, target: string) => {

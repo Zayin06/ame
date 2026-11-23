@@ -343,7 +343,11 @@
 .session-rename button[type="submit"]:hover:not(:disabled) { color: var(--accent); }
 .session-rename button svg { width: 14px; height: 14px; }
 .session-operation-status { padding: 3px; font-size: 11px; }
-.error-banner { position: absolute; left: 8px; right: 8px; top: 42px; z-index: 50; }
+.error-banner { position: fixed; right: 16px; bottom: 36px; left: auto; top: auto; z-index: 55; width: min(440px, calc(100vw - 32px)); margin: 0; padding: 10px 12px; gap: 10px; background: var(--bg-elevated); color: var(--text-primary); border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border-default)); border-left: 3px solid var(--danger); border-radius: var(--radius-md); box-shadow: var(--shadow-md); max-height: 140px; overflow: auto; }
+.error-banner > span { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.45; }
+.editor-load-error { display: grid; align-content: center; justify-items: center; text-align: center; min-height: 180px; height: 100%; padding: 24px; gap: 8px; color: var(--text-secondary); }
+.editor-load-error strong { color: var(--danger); font-size: 13px; }
+.editor-load-error p { margin: 0; max-width: 340px; font-size: 12px; line-height: 1.5; }
 @media (max-width: 960px) { .titlebar { grid-template-columns: 1fr auto; } }
 .modal:focus, .modal:focus-visible { outline: none; }
 .settings-navigation { display: flex; gap: 4px; padding: 10px 20px; border-bottom: 1px solid var(--border-subtle); }

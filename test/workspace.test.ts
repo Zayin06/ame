@@ -80,7 +80,7 @@ test('rejects escapes, Git metadata, alternate streams, binary and oversized fil
 })
 test('listFiles returns deterministic POSIX paths and skips generated directories, metadata and links', async t => {
   const { root, directory, workspaces, project } = await fixture(t)
-  for (const folder of ['src/nested', '.git', 'node_modules', 'dist', 'out', '.next', 'src/node_modules']) {
+  for (const folder of ['src/nested', '.git', 'node_modules', 'dist', 'out', '.next', '.plasmo', '.vite', '.parcel-cache', 'storybook-static', 'src/node_modules']) {
     await mkdir(path.join(directory, folder), { recursive: true })
     await writeFile(path.join(directory, folder, 'file.ts'), 'fixture')
   }
@@ -91,6 +91,7 @@ test('listFiles returns deterministic POSIX paths and skips generated directorie
   await symlink(path.join(root, 'outside'), path.join(directory, 'escape'), process.platform === 'win32' ? 'junction' : 'dir')
   await symlink(path.join(directory, 'src'), path.join(directory, 'alias'), process.platform === 'win32' ? 'junction' : 'dir')
   if (process.platform !== 'win32') await symlink(path.join(root, 'outside', 'secret.txt'), path.join(directory, 'secret.txt'))
+  await assert.rejects(workspaces.read(project.id, 'src'), /IS_DIRECTORY/)
   const expected = ['a.txt', 'src/nested/file.ts', 'z.txt']
   assert.deepEqual(await workspaces.listFiles(project.id), expected)
   assert.deepEqual(await workspaces.listFiles(project.id), expected)

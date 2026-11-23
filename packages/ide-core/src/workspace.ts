@@ -34,7 +34,7 @@ export class Workspaces {
     this.projects.set(id, project)
     try {
       const watcher = watch(resolved, { recursive: true }, (_event, file) => {
-        if (file && /(^|[\\/])(node_modules|\.git|dist|out|build|coverage|release|release-[^\\/]+|\.next|\.nuxt|\.turbo|\.cache|\.venv|venv|__pycache__|target|vendor|\.pm)([\\/]|$)/i.test(String(file))) return
+        if (file && /(^|[\\/])(node_modules|\.git|dist|out|build|coverage|release|release-[^\\/]+|\.next|\.nuxt|\.turbo|\.cache|\.plasmo|\.vite|\.parcel-cache|storybook-static|\.venv|venv|__pycache__|target|vendor|\.pm)([\\/]|$)/i.test(String(file))) return
         this.scheduleWatchChange(id)
       })
       watcher.on('error', () => this.scheduleWatchChange(id))
@@ -81,7 +81,7 @@ export class Workspaces {
   }
   async listFiles(id: string): Promise<string[]> {
     const root = this.get(id).directory
-    const ignored = new Set(['.git', 'node_modules', 'dist', 'out', '.next', 'build', 'coverage', 'release', '.nuxt', '.turbo', '.cache', '.venv', 'venv', '__pycache__', 'target', 'vendor', '.pm'])
+    const ignored = new Set(['.git', 'node_modules', 'dist', 'out', '.next', 'build', 'coverage', 'release', '.nuxt', '.turbo', '.cache', '.plasmo', '.vite', '.parcel-cache', 'storybook-static', '.venv', 'venv', '__pycache__', 'target', 'vendor', '.pm'])
     const files: string[] = [], pending = [root]
     while (pending.length && files.length < 20000) {
       const directory = pending.pop()!
@@ -110,7 +110,9 @@ export class Workspaces {
   }
   async read(id: string, relative: string): Promise<FileDocument> {
     const target = await this.resolve(id, relative)
-    if ((await stat(target)).size > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
+    const info = await stat(target)
+    if (info.isDirectory()) throw new Error('IS_DIRECTORY')
+    if (info.size > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
     const bytes = await readFile(target)
     if (bytes.includes(0)) throw new Error('BINARY_FILE')
     const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
