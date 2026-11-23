@@ -407,6 +407,20 @@ button:focus:not(:focus-visible) { outline: none; }
 .amekit-issues ul { margin: 0; padding: 0; list-style: none; }
 .amekit-issues li { display: flex; flex-direction: column; gap: 4px; padding: 9px 0; border-bottom: 1px solid var(--border-subtle); overflow-wrap: anywhere; }
 .amekit-issues code, .amekit-package-summary code { font-family: var(--font-mono); }
+.amekit-core .amekit-fix-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 14px; padding: 10px 12px; border: 1px solid var(--accent-border); border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text-primary); font-size: 12px; overflow-wrap: anywhere; }
+.amekit-core .amekit-fix-bar p { flex: 1 1 240px; min-width: 0; margin: 0; line-height: 1.6; }
+.amekit-core .amekit-fix-bar button { flex: 0 1 auto; max-width: 100%; }
+.amekit-core .amekit-issue-row { min-width: 0; overflow-wrap: anywhere; }
+.amekit-core .amekit-issue-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.amekit-core .amekit-issue-actions button { max-width: 100%; padding: 5px 9px; font-size: 11px; }
+.amekit-core .amekit-fix-notice { margin: 10px 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.amekit-core .amekit-fix-list { display: grid; gap: 8px; min-width: 0; margin-top: 12px; }
+.amekit-core .amekit-fix-list > p { margin: 0; font-size: 12px; line-height: 1.6; }
+.amekit-core .amekit-fix-card { min-width: 0; max-width: 100%; padding: 10px 12px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-canvas); color: var(--text-primary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.amekit-core .amekit-fix-card p { margin: 6px 0; }
+.amekit-core .amekit-fix-card code { min-width: 0; font-family: var(--font-mono); }
+.amekit-core .amekit-fix-card summary { cursor: pointer; color: var(--text-secondary); }
+.amekit-core .amekit-fix-diff { max-width: 100%; max-height: 260px; margin: 8px 0; padding: 10px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-code); color: var(--text-primary); font: 11px/1.6 var(--font-mono); }
 .amekit-package-summary { padding: 10px; border: 1px solid var(--border-subtle); border-radius: 8px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .amekit-release { padding: 10px 0; border-bottom: 1px solid var(--border-subtle); }
 .amekit-release p { margin-bottom: 4px; }

@@ -21,7 +21,7 @@ export function Settings({ preferences, setLayout, theme, setTheme, connection, 
       <button type="button" className={section === 'pairing' ? 'active' : ''} onClick={() => setSection('pairing')}>Pairing</button>
       <button type="button" className={section === 'pet' ? 'active' : ''} onClick={() => setSection('pet')}>Desktop Pet</button>
     </nav>
-    {section === 'pet' ? <PetSettings petState={pet} spriteUrl={sprite} selectedModel={selectedModel} onConfigure={async input => onPet(await window.ame.petConfigure(input))} onSpeech={async input => onPet(await window.ame.petSpeech(input))} onGenerateDialogue={async model => onPet(await window.ame.petGenerateDialogue(model))} onTestSpeech={async () => onPet(await window.ame.petTestSpeech())} /> : section === 'amekit' ? <Account key={preferences.project} embedded projectID={preferences.project} close={close} /> : section === 'pairing' ? <Pairing /> : <div className="settings-content settings-content--general">
+    {section === 'pet' ? <PetSettings petState={pet} spriteUrl={sprite} selectedModel={selectedModel} onConfigure={async input => onPet(await window.ame.petConfigure(input))} onSpeech={async input => onPet(await window.ame.petSpeech(input))} onGenerateDialogue={async model => onPet(await window.ame.petGenerateDialogue(model))} onTestSpeech={async () => onPet(await window.ame.petTestSpeech())} /> : section === 'amekit' ? <Account key={preferences.project} embedded projectID={preferences.project} selectedModel={selectedModel} close={close} /> : section === 'pairing' ? <Pairing /> : <div className="settings-content settings-content--general">
       <section>
         <h3 className="settings-section-title">Giao diện</h3>
         <div className="settings-group">

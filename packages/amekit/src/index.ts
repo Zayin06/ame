@@ -1,9 +1,12 @@
 import path from "node:path"
+import { lstat, open, realpath } from "node:fs/promises"
+import { constants } from "node:fs"
 import { AmeApi, isTransientError } from "./api"
 import { assertModel, managedProvider, modelPolicy, providerURL } from "./model-policy"
 import { openSessionVault, type Encryption } from "./session-vault"
-import { pack, type Preview } from "./bundle/package"
-import { scan } from "./bundle/scan"
+import { pack, preview, safePath, type ImportOptions, type InputFile, type Issue, type Preview } from "./bundle/package"
+import { scanWithSource } from "./bundle/scan"
+import { fixImportFileWithLlm, isFixableTextFile } from "./bundle/ai-fix"
 import * as installer from "./installer"
 import { runtimeDiscovery, type Discover } from "./runtime"
 import { readUsagePrices } from "./usage-pricing"
@@ -25,6 +28,17 @@ export type AmeKit = {
   generatePetDialogue(model: string, signal: AbortSignal): Promise<DialogueSet>
   dispose(): Promise<void>
 }
+type ImportSession = {
+  root: string
+  folderName: string
+  options: ImportOptions
+  adaptClaudeAgents: boolean
+  originalInheritedIssues: Issue[]
+  inheritedIssues: Issue[]
+  originalFiles: Map<string, Uint8Array>
+  workingFiles: Map<string, Uint8Array>
+  savedToDisk: Set<string>
+}
 type ElectronMain = { safeStorage: Encryption; dialog: Pick<typeof import("electron")["dialog"], "showMessageBox"> }
 /** Main-process test seams; never accept these dependencies over renderer IPC. */
 export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number }
@@ -40,7 +54,42 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   let inFlight: Promise<unknown> | undefined, disposal: Promise<void> | undefined
   let transientFailures = 0
   const code = (error: unknown) => error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "AMEKIT_OPERATION_FAILED"
-  const resetImport = () => { source = undefined; packed = undefined }
+  let importSession: ImportSession | undefined
+  const resetImport = () => { source = undefined; packed = undefined; importSession = undefined }
+  const importFiles = (session: ImportSession, replacement?: InputFile): InputFile[] => [...session.workingFiles]
+    .map(([filePath, data]) => ({ path: filePath, data: (replacement?.path === filePath ? replacement.data : data).slice() }))
+    .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+  const importView = () => {
+    if (!source || !importSession) throw new Error("IMPORT_REQUIRED")
+    const session = importSession
+    const fixablePaths = [...new Set(source.issues.filter(issue => issue.severity === "error" && issue.path && session.workingFiles.has(issue.path) && isFixableTextFile(issue.path, session.workingFiles.get(issue.path)!)).map(issue => issue.path))].sort()
+    return { folderName: session.folderName, issues: source.issues, agents: source.agents, skills: source.skills, compatibilityMode: source.compatibilityMode ?? "native", adaptClaudeAgents: session.adaptClaudeAgents, files: source.files.map(file => ({ path: file.path, size: file.data.length })), fixablePaths }
+  }
+  const recomputeImportPreview = () => {
+    if (!importSession) throw new Error("IMPORT_REQUIRED")
+    source = preview(importFiles(importSession), importSession.inheritedIssues, importSession.options)
+    packed = undefined
+    return importView()
+  }
+  const fixImportFile = async (targetPath: string, model?: string) => {
+    if (!importSession || !source) throw new Error("IMPORT_REQUIRED")
+    const session = importSession, fileBytes = session.workingFiles.get(targetPath)
+    if (!fileBytes) throw new Error("IMPORT_FILE_NOT_FOUND")
+    const fixed = await fixImportFileWithLlm({
+      api, requestedModel: model, filePath: targetPath, fileBytes,
+      issues: source.issues.filter(issue => issue.path === targetPath),
+      compatibilityMode: session.options.compatibilityMode ?? "native", adaptClaudeAgents: session.adaptClaudeAgents,
+      availablePaths: [...session.workingFiles.keys()], signal, fetcher,
+      validateCandidate: candidateBytes => {
+        const candidate = preview(importFiles(session, { path: targetPath, data: candidateBytes }), session.inheritedIssues, session.options)
+        return { preview: candidate, remainingErrors: candidate.issues.filter(issue => issue.severity === "error" && (issue.path === targetPath || !source!.issues.some(existing => existing.severity === "error" && existing.path === issue.path && existing.reason === issue.reason))) }
+      },
+    })
+    session.workingFiles.set(targetPath, fixed.contentBytes.slice())
+    session.savedToDisk.delete(targetPath)
+    const currentPreview = recomputeImportPreview()
+    return { preview: currentPreview, fix: { path: targetPath, summary: fixed.summary, diff: fixed.diff, model: fixed.model, redactionCount: fixed.redactionCount } }
+  }
   const rpc = async (input: unknown, cleanup = false) => {
     const endpoint = options.endpoint()
     if (!endpoint) throw new Error("MODEL_POLICY_PLUGIN_REQUIRED")
@@ -65,7 +114,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   const revoke = async (cleanup = false) => { policyReady = false; await rpc(null, cleanup).catch(() => {}) }
   const persist = async () => {
     try { if (!vault) throw new Error(); await vault.save(api?.credential) }
-    catch { storageError = "SESSION_STORAGE_UNAVAILABLE"; api?.suspend(); await revoke(); throw new Error(storageError) }
+    catch { storageError = "SESSION_STORAGE_UNAVAILABLE"; api?.suspend(); resetImport(); await revoke(); throw new Error(storageError) }
   }
   const synchronize = async () => {
     policyReady = false
@@ -83,7 +132,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     }
   }
   const view = () => {
-    if (api?.account && api.expires <= Date.now()) { api.suspend(); policyReady = false; blocker = "AMECODE_LOGIN_REQUIRED" }
+    if (api?.account && api.expires <= Date.now()) { api.suspend(); resetImport(); policyReady = false; blocker = "AMECODE_LOGIN_REQUIRED" }
     if (api?.account) {
       const models = modelPolicy(api.account.role, api.provider?.catalog)
       return { origin: api.origin, account: { ...api.account }, models: { ...models, small_model: api.account.role === "user" ? models.default_model : models.small_model }, ready: policyReady, ...(blocker ? { blocker } : {}) }
@@ -189,8 +238,85 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         const root = await options.pickImport()
         if (!root) return null
         await installer.safeDirectory(root)
-        source = await scan(root, signal, { compatibilityMode: payload.compatibilityMode === "raw" ? "raw" : "native", adaptClaudeAgents })
-        return { folderName: path.basename(path.resolve(root)) || root, issues: source.issues, agents: source.agents, skills: source.skills, compatibilityMode: source.compatibilityMode ?? "native", adaptClaudeAgents, files: source.files.map(file => ({ path: file.path, size: file.data.length })) }
+        const importOptions: ImportOptions = { compatibilityMode: payload.compatibilityMode === "raw" ? "raw" : "native", adaptClaudeAgents }
+        const scanned = await scanWithSource(root, signal, importOptions)
+        source = scanned.preview
+        importSession = {
+          root, folderName: path.basename(path.resolve(root)) || root, options: importOptions, adaptClaudeAgents,
+          originalInheritedIssues: scanned.inheritedIssues.map(issue => ({ ...issue })), inheritedIssues: scanned.inheritedIssues.map(issue => ({ ...issue })),
+          originalFiles: new Map(scanned.files.map(file => [file.path, file.data.slice()])),
+          workingFiles: new Map(scanned.files.map(file => [file.path, file.data.slice()])), savedToDisk: new Set(),
+        }
+        return importView()
+      }
+      case "fix-import":
+      case "fix-import-all":
+      case "exclude-import-file":
+      case "revert-import-fix":
+      case "save-import-fix": {
+        await api.guard(true, signal)
+        if (!importSession || !source) throw new Error("IMPORT_REQUIRED")
+        const session = importSession, targetPath = payload.path
+        if (operation === "fix-import") return fixImportFile(targetPath, payload.model)
+        if (operation === "fix-import-all") {
+          const targets = importView().fixablePaths.slice(0, 10)
+          if (!targets.length) throw new Error("AI_FIX_NO_FIXABLE_ERRORS")
+          const fixes: Awaited<ReturnType<typeof fixImportFile>>["fix"][] = [], failed: { path: string; code: string }[] = []
+          for (const target of targets) {
+            signal.throwIfAborted()
+            try { fixes.push((await fixImportFile(target, payload.model)).fix) }
+            catch (error) {
+              if (signal.aborted || !api?.account || api.account.role !== "admin") throw error
+              failed.push({ path: target, code: code(error) })
+            }
+          }
+          return { preview: recomputeImportPreview(), fixes, failed }
+        }
+        if (operation === "exclude-import-file") {
+          if (!session.workingFiles.has(targetPath) && !session.inheritedIssues.some(issue => issue.path === targetPath)) throw new Error("IMPORT_FILE_NOT_FOUND")
+          session.workingFiles.delete(targetPath)
+          session.inheritedIssues = session.inheritedIssues.filter(issue => issue.path !== targetPath)
+          session.savedToDisk.delete(targetPath)
+          return { preview: recomputeImportPreview(), excluded: targetPath }
+        }
+        if (operation === "revert-import-fix") {
+          if (!session.originalFiles.has(targetPath) && !session.originalInheritedIssues.some(issue => issue.path === targetPath)) throw new Error("IMPORT_FILE_NOT_FOUND")
+          const original = session.originalFiles.get(targetPath)
+          if (original) session.workingFiles.set(targetPath, original.slice())
+          session.inheritedIssues = [...session.inheritedIssues.filter(issue => issue.path !== targetPath), ...session.originalInheritedIssues.filter(issue => issue.path === targetPath).map(issue => ({ ...issue }))]
+          session.savedToDisk.delete(targetPath)
+          return { preview: recomputeImportPreview(), reverted: targetPath }
+        }
+        if (!session.workingFiles.has(targetPath) || !session.originalFiles.has(targetPath)) throw new Error("IMPORT_FILE_NOT_FOUND")
+        await confirm("Lưu tệp đã sửa về thư mục gốc?", `Ghi đè ${targetPath} trong ${session.root}. Hành động này sẽ cập nhật tệp nguồn trên đĩa.`)
+        try {
+          await installer.safeDirectory(session.root)
+          safePath(targetPath)
+          const root = path.resolve(session.root), segments = targetPath.split("/")
+          let current = root
+          const check = async () => {
+            current = root
+            for (let i = 0; i < segments.length; i++) {
+              current = path.join(current, segments[i])
+              const stat = await lstat(current), resolved = await realpath(current), relative = path.relative(root, resolved)
+              if (stat.isSymbolicLink() || resolved.toLowerCase() !== current.toLowerCase() || !relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative) || (i === segments.length - 1 ? !stat.isFile() || stat.nlink !== 1 : !stat.isDirectory())) throw new Error("SAVE_PATH_UNSAFE")
+            }
+            return lstat(current)
+          }
+          const before = await check()
+          const handle = await open(current, constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0))
+          try {
+            const opened = await handle.stat()
+            const checked = await check()
+            if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.dev !== checked.dev || opened.ino !== checked.ino) throw new Error("SAVE_PATH_UNSAFE")
+            signal.throwIfAborted()
+            await handle.truncate(0)
+            await handle.writeFile(session.workingFiles.get(targetPath)!)
+            await handle.sync()
+          } finally { await handle.close() }
+        } catch { throw new Error("SAVE_PATH_UNSAFE") }
+        session.savedToDisk.add(targetPath)
+        return { saved: targetPath }
       }
       case "package": {
         await api.guard(true, signal)

@@ -6,7 +6,11 @@ type AccountState = { origin?: string; account?: { name: string; username: strin
 type Features = { commitEnhanceSkill?: string }
 type Release = { releaseId?: string; id?: string; version?: string; channel?: string; size?: number; features?: Features; manifest?: { agents?: number; skills?: number; compatibility?: { mode?: string }; features?: Features } }
 type Bundle = { version?: string; releaseId?: string; verification?: string; compatibilityWarnings?: unknown[]; compatibilityMode?: string; agents?: string[]; skills?: string[]; fileCount?: number; features?: Features } | null
-type ImportPreview = { folderName: string; agents: string[]; skills: string[]; files: { path: string; size: number }[]; issues: unknown[]; compatibilityMode: string; adaptClaudeAgents?: boolean }
+type ImportPreview = { folderName: string; agents: string[]; skills: string[]; files: { path: string; size: number }[]; issues: unknown[]; compatibilityMode: string; adaptClaudeAgents?: boolean; fixablePaths?: string[] }
+type ImportFix = { path: string; summary: string; diff: string; model: string }
+type AppliedFix = { path: string; kind: 'ai' | 'excluded'; summary: string; diff?: string; model?: string; saved?: boolean }
+type ImportFixResult = { preview?: ImportPreview; fix?: ImportFix; fixes?: ImportFix[]; failed?: { path: string; code: string }[]; excluded?: string; reverted?: string; saved?: string }
+function canExcludeImportPath(path: string) { return !!path.trim() && !/^(?:[/\\]|[a-z]:)/i.test(path) && !path.split(/[/\\]/).some(part => part === '..') }
 type Packaged = { summary: { version: string; features?: Features }; size: number; entries: number; sha256: string }
 function object(value: unknown): Record<string, unknown> { return value && typeof value === 'object' ? value as Record<string, unknown> : {} }
 function noActiveRelease(error: unknown) { return /\bNO_ACTIVE_RELEASE\b/.test(errorText(error)) }
@@ -33,7 +37,7 @@ function EnhanceSummary({ features }: { features?: Features }) {
 function ReleaseSummary({ release }: { release: Release }) {
   return <p className="muted">{release.manifest?.agents ?? 0} agents · {release.manifest?.skills ?? 0} skills · {formatBundleSize(release.size ?? 0)} <EnhanceSummary features={release.manifest?.features ?? release.features} /></p>
 }
-export function Account({ projectID, close, embedded = false }: { projectID?: string; close: () => void; embedded?: boolean }) {
+export function Account({ projectID, close, embedded = false, selectedModel }: { projectID?: string; close: () => void; embedded?: boolean; selectedModel?: string }) {
   const [account, setAccount] = useState<AccountState>(null)
   const [tab, setTab] = useState('account')
   const [busy, setBusy] = useState(false)
@@ -57,10 +61,14 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   const [packaged, setPackaged] = useState<Packaged | null>(null)
   const [commitEnhanceSkill, setCommitEnhanceSkill] = useState('')
   const [publishNotice, setPublishNotice] = useState('')
+  const [appliedFixes, setAppliedFixes] = useState<Record<string, AppliedFix>>({})
+  const [fixNotice, setFixNotice] = useState('')
   const [issueTab, setIssueTab] = useState<IssueSeverity>('excluded')
   const [activeReleaseId, setActiveReleaseId] = useState('')
   const isAdmin = account?.account?.role === 'admin' || account?.account?.role === 'owner'
   const grouped = groupIssues(importPreview?.issues ?? [], importPreview?.compatibilityMode)
+  const fixableErrors = [...new Set(grouped.error.map(issue => issue.path).filter(path => importPreview?.fixablePaths?.includes(path)))]
+  const fixModel: Record<string, string> = selectedModel?.trim() ? { model: selectedModel.trim() } : {}
   const formatted = error ? formatAmeKitError(error) : undefined
   const blockerInfo = account?.blocker ? formatAmeKitError(account.blocker) : undefined
   const bundleGeneration = useRef(0)
@@ -125,16 +133,21 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     void request('status').then(value => { if (alive) setAccount(value as AccountState) }).catch(e => { if (alive) setError(errorText(e)) }).finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
   }, [request])
+  useEffect(() => {
+    setCommitEnhanceSkill(skill => importPreview?.skills.includes(skill) ? skill : '')
+  }, [importPreview])
   const execute = async (operation: string, payload?: Record<string, string>) => {
     setBusy(true); setError(''); setResult(undefined)
-    if (operation === 'import') { setImportPreview(null); setPackaged(null); setPublishNotice(''); setCommitEnhanceSkill('') }
+    const importOperation = ['fix-import', 'fix-import-all', 'exclude-import-file', 'revert-import-fix', 'save-import-fix'].includes(operation)
+    if (importOperation) setFixNotice('')
+    if (operation === 'import') { setImportPreview(null); setPackaged(null); setPublishNotice(''); setCommitEnhanceSkill(''); setAppliedFixes({}); setFixNotice('') }
     if (operation === 'package') setPackaged(null)
     try {
       const value = await request(operation, payload)
       if (['status', 'login', 'refresh', 'logout'].includes(operation)) {
         setAccount(value as AccountState); setPassword('')
         if (operation === 'logout') {
-          setImportPreview(null); setPackaged(null); setPublishNotice(''); setLatest(null); setInstalled(null); setCommitEnhanceSkill('')
+          setImportPreview(null); setPackaged(null); setPublishNotice(''); setLatest(null); setInstalled(null); setCommitEnhanceSkill(''); setAppliedFixes({}); setFixNotice('')
           setReleases([]); setCursor(''); setActiveReleaseId(''); setActivation(''); setRevision(''); setNoRelease(false); setTab('account')
         }
       } else {
@@ -152,6 +165,29 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           setImportPreview(preview)
           setCommitEnhanceSkill(preview?.skills.includes(latestSkill) ? latestSkill : '')
           setIssueTab(groupIssues(preview?.issues ?? [], preview?.compatibilityMode).defaultTab)
+        }
+        if (importOperation) {
+          const data = value as ImportFixResult
+          setPackaged(null); setPublishNotice('')
+          if (data.preview) {
+            setImportPreview(data.preview)
+            setIssueTab(groupIssues(data.preview.issues, data.preview.compatibilityMode).defaultTab)
+          }
+          setAppliedFixes(old => {
+            const next = { ...old }
+            for (const fix of data.fixes ?? (data.fix ? [data.fix] : [])) next[fix.path] = { ...fix, kind: 'ai', saved: false }
+            if (data.excluded) next[data.excluded] = { path: data.excluded, kind: 'excluded', summary: 'Tệp đã được bỏ khỏi gói tạm; tệp nguồn trên đĩa không bị xóa.' }
+            if (data.reverted) delete next[data.reverted]
+            if (data.saved && next[data.saved]) next[data.saved] = { ...next[data.saved], saved: true }
+            return next
+          })
+          if (operation === 'fix-import-all') {
+            const failed = data.failed ?? []
+            setFixNotice(`Đã sửa ${data.fixes?.length ?? 0} tệp bằng AI.${failed.length ? ` Không sửa được ${failed.length} tệp: ${failed.map(item => `${item.path} — ${formatAmeKitError(item.code).title}`).join('; ')}.` : ''}${fixableErrors.length > 10 ? ' Mỗi lần sửa tối đa 10 tệp; chạy lại để xử lý các lỗi còn lại.' : ''}`)
+          } else if (data.fix) setFixNotice(`Đã sửa ${data.fix.path} bằng AI và kiểm tra lại thành công.`)
+          else if (data.excluded) setFixNotice(`Đã bỏ ${data.excluded} khỏi gói tạm.`)
+          else if (data.reverted) setFixNotice(`Đã khôi phục ${data.reverted} về nội dung lúc nhập; tệp trên đĩa không thay đổi.`)
+          else if (data.saved) setFixNotice(`Đã lưu ${data.saved} vào thư mục gốc.`)
         }
         if (operation === 'package') setPackaged(value as Packaged)
         if (operation === 'latest' || operation === 'activate') {
@@ -224,8 +260,16 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           {grouped.suggestClaudeAdapt && mode === 'native' && <div className="amekit-alert amekit-alert--warning"><strong>Phát hiện frontmatter agent Claude không tương thích Native.</strong><p>Các trường tools, model: inherit, color cần được chuẩn hóa cho OpenCode. Chuyển chế độ rồi chọn nhập lại thư mục để kiểm tra.</p><button disabled={busy} onClick={() => setMode('raw-adapt')}>Chuyển sang "Raw + Chuẩn hóa agent Claude"</button></div>}
           {mode !== (importPreview.adaptClaudeAgents ? 'raw-adapt' : importPreview.compatibilityMode) && <p className="muted">Chế độ mới chỉ áp dụng lần nhập tiếp theo. Chọn thư mục &amp; nhập lại để cập nhật kết quả.</p>}
           <BundleInventory agents={importPreview.agents} skills={importPreview.skills} />
+          {grouped.error.length > 0 && <div className="amekit-fix-bar"><p>Sửa trực tiếp các tệp lỗi bằng tài khoản admin và model đang dùng; secret nhạy cảm được ẩn tự động trước khi gửi lên AI.</p>{fixableErrors.length > 0 && <button type="button" disabled={busy} onClick={() => void execute('fix-import-all', fixModel)}>{fixableErrors.length > 1 ? `Sửa tất cả lỗi bằng AI (${fixableErrors.length})` : 'Sửa lỗi bằng AI'}</button>}</div>}
+          {fixNotice && <p className="amekit-fix-notice" role="status">{fixNotice}</p>}
           <div className="amekit-issue-tabs" role="tablist" aria-label="Phân loại vấn đề">{(Object.keys(issueLabels) as IssueSeverity[]).map(severity => <button key={severity} id={`amekit-issue-${severity}`} role="tab" aria-selected={issueTab === severity} aria-controls="amekit-issue-panel" onClick={() => setIssueTab(severity)}>{issueLabels[severity]} ({grouped[severity].length})</button>)}</div>
-          <div id="amekit-issue-panel" className="amekit-issues" role="tabpanel" aria-labelledby={`amekit-issue-${issueTab}`} tabIndex={0}>{grouped[issueTab].length ? <ul>{grouped[issueTab].map((issue, index) => <li key={index}><code>{issue.path || 'Bundle'}</code><span>{issue.reason}</span></li>)}</ul> : <p className="muted">Không có mục nào trong nhóm này.</p>}</div>
+          <div id="amekit-issue-panel" className="amekit-issues" role="tabpanel" aria-labelledby={`amekit-issue-${issueTab}`} tabIndex={0}>{grouped[issueTab].length ? <ul>{grouped[issueTab].map((issue, index) => <li className="amekit-issue-row" key={index}><code>{issue.path || 'Bundle'}</code><span>{issue.reason}</span>{issueTab === 'error' && issue.path && <div className="amekit-issue-actions">{importPreview.fixablePaths?.includes(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('fix-import', { path: issue.path, ...fixModel })}>Sửa bằng AI</button>}{canExcludeImportPath(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('exclude-import-file', { path: issue.path })}>Bỏ tệp</button>}</div>}</li>)}</ul> : <p className="muted">Không có mục nào trong nhóm này.</p>}</div>
+          {Object.keys(appliedFixes).length > 0 && <div className="amekit-fix-list"><p className="muted">Các bản sửa đang áp dụng tạm để đóng gói (chưa ghi đè thư mục gốc nếu chưa bấm Lưu).</p>{Object.values(appliedFixes).map(fix => <article className="amekit-fix-card" key={fix.path}>
+            <div className="amekit-badges"><code>{fix.path}</code><span className="amekit-pill">{fix.kind === 'ai' ? `Đã sửa bởi AI · ${fix.model}` : 'Đã bỏ khỏi gói'}</span></div>
+            <p>{fix.summary}</p>
+            {fix.diff && <details><summary>Xem thay đổi (diff)</summary><pre className="amekit-fix-diff">{fix.diff}</pre></details>}
+            <div className="amekit-issue-actions">{fix.kind === 'ai' && <button type="button" disabled={busy || fix.saved} onClick={() => void execute('save-import-fix', { path: fix.path })}>{fix.saved ? 'Đã lưu vào đĩa' : 'Lưu về thư mục gốc'}</button>}<button type="button" disabled={busy} title="Khôi phục gói tạm; không thay đổi tệp đã lưu trên đĩa" onClick={() => void execute('revert-import-fix', { path: fix.path })}>Hoàn tác</button></div>
+          </article>)}</div>}
         </div>}
       </section>
       <section className="amekit-card"><h3>Bước 2 · Đóng gói ZIP &amp; Xuất bản lên máy chủ</h3>
@@ -234,7 +278,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           {importPreview && <><label>Skill cho Enhance (Commit message)<select aria-label="Skill cho Enhance (Commit message)" disabled={busy} value={commitEnhanceSkill} onChange={e => { setCommitEnhanceSkill(e.target.value); setPackaged(null) }}><option value="">Mặc định (Conventional Commits)</option>{importPreview.skills.map(skill => <option key={skill} value={skill}>/{skill}</option>)}</select></label><p className="muted">Cấu hình này được đóng gói vào bundle; sau khi kích hoạt và đồng bộ, nút Enhance của mọi thành viên tự dùng skill đã chọn.</p></>}
           <div className="button-row"><button disabled={busy || !version.trim() || !importPreview || grouped.error.length > 0}>Đóng gói</button><button type="button" className={packaged ? 'primary' : ''} disabled={busy || !packaged} onClick={() => void execute('publish')}>Xuất bản gói đã chuẩn bị</button></div>
         </form>
-        {importPreview && grouped.error.length > 0 && <p className="amekit-alert amekit-alert--warning">Đóng gói bị khóa. Hãy xử lý các lỗi ở Bước 1 rồi nhập lại thư mục.</p>}
+        {importPreview && grouped.error.length > 0 && <p className="amekit-alert amekit-alert--warning">Đóng gói bị khóa. Hãy sửa hoặc bỏ các tệp lỗi ở Bước 1; kết quả được kiểm tra lại ngay.</p>}
         {packaged && <p className="amekit-package-summary">Đã đóng gói v{packaged.summary.version} · {formatBundleSize(packaged.size)} · {packaged.entries} mục · SHA-256 <code>{packaged.sha256}</code> <EnhanceSummary features={packaged.summary.features} /></p>}
       </section>
       <section className="amekit-card"><div className="amekit-card-heading"><h3>Bước 3 · Bản phát hành &amp; Kích hoạt cho team</h3><div className="button-row"><button disabled={busy} onClick={() => void execute('history')}>Làm mới lịch sử</button>{cursor && <button disabled={busy} onClick={() => void execute('history', { cursor })}>Trang tiếp</button>}</div></div>

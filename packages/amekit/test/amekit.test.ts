@@ -1,6 +1,6 @@
 import test, { after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { link, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
@@ -9,7 +9,9 @@ import { openSessionVault, type Encryption } from "../src/session-vault"
 import { zipSync, unzipSync } from "fflate"
 import { pack, preview, safePath } from "../src/bundle/package"
 import { validate } from "../src/bundle/manifest"
-import { scan } from "../src/bundle/scan"
+import { scan, scanWithSource } from "../src/bundle/scan"
+import { buildCompactDiff, fixImportFileWithLlm, isFixableTextFile, redactSecretsForLlm } from "../src/bundle/ai-fix"
+import { AmeApi } from "../src/api"
 import { parse, stringify } from "yaml"
 import { installed, install, readCommitEnhanceSkill, uninstall } from "../src/installer"
 import type { Release } from "../src/api"
@@ -45,6 +47,8 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
   let rpcResponse: (() => Promise<Response | undefined>) | undefined
   let dialogueResponse: ((signal: AbortSignal) => Promise<Response>) | undefined
+  let fixResponse: ((body: Record<string, unknown>, init: RequestInit) => Promise<Response>) | undefined
+  const fixRequests: Record<string, unknown>[] = []
   const fetcher: typeof fetch = async (request, init) => {
     const url = new URL(String(request)); requests.push(url.pathname)
     if (url.origin === "http://127.0.0.1:3210") {
@@ -58,6 +62,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
       assert.equal(url.pathname, "/v1/chat/completions")
       assert.equal(new Headers(init?.headers).get("authorization"), "Bearer fixture-provider-key")
       const body = JSON.parse(String(init?.body))
+      if (fixResponse) { fixRequests.push(body); return fixResponse(body, init!) }
       assert.deepEqual(body.messages, [{ role: "user", content: dialoguePrompt }])
       assert.equal(body.stream, false)
       assert.equal(init?.redirect, "error")
@@ -91,6 +96,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
     sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
     rpcResponse: (value?: () => Promise<Response | undefined>) => { rpcResponse = value },
     dialogueResponse: (value: (signal: AbortSignal) => Promise<Response>) => { dialogueResponse = value },
+    fixRequests, fixResponse: (value: (body: Record<string, unknown>, init: RequestInit) => Promise<Response>) => { fixResponse = value },
     cleanup: async () => { await service.dispose(); await rm(folder, { recursive: true, force: true }) } }
 }
 const login = (service: AmeKit) => service.call("login", { server: "http://localhost:3211", username: "fixture", password: "fixture-password" })
@@ -805,6 +811,275 @@ test("background refresh and active IPC share the same operation mutex", async t
   } finally { release?.(); await f.cleanup() }
 })
 
+type FixPreview = { issues: { path: string; severity: string; reason: string }[]; fixablePaths: string[]; files: { path: string; size: number }[] }
+const fixReply = (content: string, summary = "Đã sửa tệp an toàn.") => Response.json({ choices: [{ message: { content: JSON.stringify({ summary, content }) } }] })
+const secretFixture = "fixtureSensitiveValue1234567890"
+const secretPath = "skills/turnstile-spin/references/sveltekit.md"
+async function addSecretFile(imported: string, name = secretPath) {
+  const entrypoint = path.join(imported, "skills", "turnstile-spin", "SKILL.md")
+  await mkdir(path.dirname(entrypoint), { recursive: true })
+  await writeFile(entrypoint, "---\nname: turnstile-spin\ndescription: Test skill\n---\nRun verification.\n")
+  const target = path.join(imported, ...name.split("/"))
+  await mkdir(path.dirname(target), { recursive: true })
+  await writeFile(target, `api_key="${secretFixture}"\n`)
+}
+
+test("AI fix redacts secret patterns while preserving assignment quotes and safe templates", () => {
+  const provider = "sk-" + "a".repeat(26), aws = "AKIA" + "Z".repeat(16)
+  const pem = "-----BEGIN RSA PRIVATE KEY-----\nfixture-key-material\n-----END RSA PRIVATE KEY-----"
+  const unclosed = "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-unclosed-material"
+  const text = `${pem}\n${provider}\n${aws}\npassword='${secretFixture}'\ntoken=${secretFixture}\nsecret=YOUR_SAFE_TEMPLATE\napi_key=INSERT_API_KEY_HERE\npassword=your_password_here\n${unclosed}`
+  const result = redactSecretsForLlm(text)
+  for (const secret of [provider, aws, secretFixture, "fixture-key-material", "fixture-unclosed-material"]) assert.equal(result.redactedText.includes(secret), false)
+  assert.equal(result.redactionCount, 6)
+  assert.match(result.redactedText, /password='\[REDACTED_SECRET_\d+\]'/)
+  assert.match(result.redactedText, /secret=YOUR_SAFE_TEMPLATE/)
+  assert.match(result.redactedText, /api_key=INSERT_API_KEY_HERE/)
+  assert.match(result.redactedText, /password=your_password_here/)
+  assert.equal(redactSecretsForLlm('token="YOUR_SAFE_TEMPLATE_extra').redactionCount, 1, "unterminated quote is not a safe template")
+  assert.equal(redactSecretsForLlm("sK-" + "x".repeat(24)).redactionCount, 1, "provider detection is case insensitive like secretFindings")
+})
+
+test("AI fix accepts only bounded UTF-8 supported-root files and compact contextual diffs", () => {
+  assert.equal(isFixableTextFile("agents/helper.md", encode("hello")), true)
+  for (const [name, bytes] of [["README.md", encode("hello")], ["skills/a/x", new Uint8Array([0])], ["agents/x.md", new Uint8Array([255])], ["agents/x.md", new Uint8Array(256 * 1024 + 1)]] as const) assert.equal(isFixableTextFile(name, bytes), false)
+  const diff = buildCompactDiff("a\nb\nc\nd\ne\nf\ng", "a\nb\nchanged\nd\ne\nf\ng")
+  assert.match(diff, /- c/); assert.match(diff, /\+ changed/)
+  const capped = buildCompactDiff(Array.from({ length: 140 }, (_, i) => `old-${i}`).join("\n"), "new", 12)
+  assert.ok(capped.split("\n").length <= 13)
+  assert.match(capped, /\.\.\. \(\+\d+ dòng\)/)
+})
+
+test("scanWithSource preserves raw Claude bytes independently from adapted previews", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    const raw = "---\nname: helper\ndescription: Helpful\nmodel: inherit\ntools: Read\ncolor: green\n---\nBody.\n"
+    await writeFile(path.join(f.imported, "agents", "helper.md"), raw)
+    const result = await scanWithSource(f.imported, undefined, { compatibilityMode: "raw", adaptClaudeAgents: true })
+    assert.equal(new TextDecoder().decode(result.files.find(file => file.path === "agents/helper.md")!.data), raw)
+    assert.notEqual(new TextDecoder().decode(result.preview.files.find(file => file.path === "agents/helper.md")!.data), raw)
+    assert.deepEqual(result.preview, await scan(f.imported, undefined, { compatibilityMode: "raw", adaptClaudeAgents: true }))
+  } finally { await f.cleanup() }
+})
+
+test("admin AI fix stages secret-safe edits, packages immediately, saves only after confirmation and reverts immutable originals", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    await addSecretFile(f.imported)
+    f.fixResponse(async (body, init) => {
+      assert.equal(JSON.stringify(body).includes(secretFixture), false)
+      assert.equal(body.model, "other"); assert.equal(body.stream, false); assert.equal(body.temperature, 0.1)
+      assert.equal(body.max_tokens, 8192); assert.equal(init.redirect, "error"); assert.ok(init.signal)
+      return fixReply('api_key="<YOUR_API_KEY>"\n')
+    })
+    await login(f.service)
+    const imported = await f.service.call("import", {}) as FixPreview
+    assert.ok(imported.issues.some(issue => issue.path === secretPath && issue.reason.includes("likely embedded secret")))
+    assert.deepEqual(imported.fixablePaths, [secretPath])
+    await assert.rejects(f.service.call("package", { version: "1.2.4" }), /IMPORT_BLOCKED/)
+    const fixed = await f.service.call("fix-import", { path: secretPath, model: "other" }) as { preview: FixPreview; fix: { diff: string; redactionCount: number; model: string } }
+    assert.deepEqual(fixed.preview.fixablePaths, [])
+    assert.equal(fixed.preview.issues.filter(issue => issue.severity === "error").length, 0)
+    assert.equal(fixed.fix.diff.includes(secretFixture), false); assert.equal(fixed.fix.redactionCount, 1); assert.equal(fixed.fix.model, "other")
+    const target = path.join(f.imported, ...secretPath.split("/"))
+    assert.ok((await readFile(target, "utf8")).includes(secretFixture), "AI edits are staged only")
+    await f.service.call("package", { version: "1.2.4" })
+    f.confirm(false)
+    await assert.rejects(f.service.call("save-import-fix", { path: secretPath }), /CANCELLED/)
+    assert.ok((await readFile(target, "utf8")).includes(secretFixture))
+    f.confirm(true)
+    assert.deepEqual(await f.service.call("save-import-fix", { path: secretPath }), { saved: secretPath })
+    assert.equal(await readFile(target, "utf8"), 'api_key="<YOUR_API_KEY>"\n')
+    const reverted = await f.service.call("revert-import-fix", { path: secretPath }) as { preview: FixPreview }
+    assert.ok(reverted.preview.fixablePaths.includes(secretPath))
+    await assert.rejects(f.service.call("package", { version: "1.2.5" }), /IMPORT_BLOCKED/)
+    const excluded = await f.service.call("exclude-import-file", { path: secretPath }) as { preview: FixPreview }
+    assert.equal(excluded.preview.files.some(file => file.path === secretPath), false)
+    await f.service.call("package", { version: "1.2.5" })
+    await f.service.call("revert-import-fix", { path: secretPath })
+    await assert.rejects(f.service.call("package", { version: "1.2.6" }), /IMPORT_BLOCKED/)
+    await f.service.call("import", {})
+    assert.equal((await f.service.call("package", { version: "1.2.6" }) as { size: number }).size > 0, true, "reimport uses explicitly saved disk content")
+    await f.service.call("logout", {}); await login(f.service)
+    await assert.rejects(f.service.call("fix-import", { path: secretPath }), /IMPORT_REQUIRED/)
+  } finally { await f.cleanup() }
+})
+
+test("AI fix retries exact validation feedback once and fails closed without altering staged originals", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    await addSecretFile(f.imported); await login(f.service); await f.service.call("import", {})
+    f.fixResponse(async () => f.fixRequests.length === 1 ? fixReply("[missing](absent.md)\n") : fixReply("Use an environment lookup.\n"))
+    await f.service.call("fix-import", { path: secretPath, model: "not-allowed" })
+    assert.equal(f.fixRequests.length, 2)
+    assert.equal(f.fixRequests[0].model, "default", "unknown requested model falls back")
+    assert.match(JSON.stringify(f.fixRequests[1]), /missing\/unsafe local reference: absent.md/)
+    await f.service.call("revert-import-fix", { path: secretPath })
+    f.fixResponse(async () => fixReply("[missing](absent.md)\n"))
+    await assert.rejects(f.service.call("fix-import", { path: secretPath }), /AI_FIX_VALIDATION_FAILED/)
+    assert.equal(f.fixRequests.length, 4)
+    await assert.rejects(f.service.call("package", { version: "1.2.4" }), /IMPORT_BLOCKED/)
+    assert.ok((await readFile(path.join(f.imported, ...secretPath.split("/")), "utf8")).includes(secretFixture))
+  } finally { await f.cleanup() }
+})
+
+test("AI fix-all applies evolving validated files and reports per-file failures without aborting", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    const second = "skills/turnstile-spin/references/z.md"
+    await addSecretFile(f.imported); await addSecretFile(f.imported, second)
+    await login(f.service); await f.service.call("import", {})
+    f.fixResponse(async () => f.fixRequests.length === 1 ? new Response("provider unavailable", { status: 503 }) : fixReply("Safe reference.\n"))
+    const result = await f.service.call("fix-import-all", {}) as { preview: FixPreview; fixes: { path: string }[]; failed: { path: string; code: string }[] }
+    assert.deepEqual(result.failed, [{ path: secretPath, code: "AI_FIX_PROVIDER_ERROR" }])
+    assert.deepEqual(result.fixes.map(fix => fix.path), [second]); assert.deepEqual(result.preview.fixablePaths, [secretPath])
+    await f.service.call("exclude-import-file", { path: secretPath })
+    await f.service.call("package", { version: "1.2.4" })
+    await assert.rejects(f.service.call("fix-import-all", {}), /AI_FIX_NO_FIXABLE_ERRORS/)
+  } finally { await f.cleanup() }
+})
+
+test("import exclusions restore scan-only issues and reject absent paths and unsupported content", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    await writeFile(path.join(f.imported, "README.md"), "stray content")
+    await writeFile(path.join(f.imported, "agents", "binary.bin"), new Uint8Array([0, 255]))
+    await writeFile(path.join(f.imported, "agents", "oversized.md"), "x".repeat(256 * 1024 + 1))
+    await login(f.service); await f.service.call("import", {})
+    await assert.rejects(f.service.call("fix-import", { path: "README.md" }), /AI_FIX_UNSUPPORTED_FILE/)
+    await assert.rejects(f.service.call("fix-import", { path: "agents/binary.bin" }), /AI_FIX_UNSUPPORTED_FILE/)
+    await assert.rejects(f.service.call("fix-import", { path: "agents/oversized.md" }), /AI_FIX_FILE_TOO_LARGE/)
+    for (const operation of ["fix-import", "exclude-import-file", "revert-import-fix", "save-import-fix"]) await assert.rejects(f.service.call(operation, { path: "agents/absent.md" }), /IMPORT_FILE_NOT_FOUND/)
+    await f.service.call("exclude-import-file", { path: "README.md" })
+    const reverted = await f.service.call("revert-import-fix", { path: "README.md" }) as { preview: FixPreview }
+    assert.ok(reverted.preview.issues.some(issue => issue.path === "README.md" && issue.severity === "error"))
+    assert.equal(f.fixRequests.length, 0)
+  } finally { await f.cleanup() }
+})
+
+test("save-import-fix rejects substituted directory junctions and file symlinks without changing outside data", async t => {
+  for (const substitution of ["directory", "file"] as const) await t.test(substitution, async t => {
+    const f = await fixture({ role: "admin" })
+    try {
+      await addSecretFile(f.imported); await login(f.service); await f.service.call("import", {})
+      f.fixResponse(async () => fixReply("Safe replacement.\n"))
+      await f.service.call("fix-import", { path: secretPath })
+      const outside = path.join(f.folder, "outside"); await mkdir(outside)
+      const outsideFile = path.join(outside, "sveltekit.md"); await writeFile(outsideFile, "outside unchanged")
+      const directory = path.join(f.imported, "skills", "turnstile-spin", "references"), target = path.join(directory, "sveltekit.md")
+      await rename(substitution === "directory" ? directory : target, (substitution === "directory" ? directory : target) + ".original")
+      try { await symlink(substitution === "directory" ? outside : outsideFile, substitution === "directory" ? directory : target, substitution === "directory" && process.platform === "win32" ? "junction" : substitution === "directory" ? "dir" : "file") }
+      catch (error) {
+        if (substitution === "file" && ["EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) await link(outsideFile, target)
+        else throw error
+      }
+      await assert.rejects(f.service.call("save-import-fix", { path: secretPath }), /SAVE_PATH_UNSAFE/)
+      assert.equal(await readFile(outsideFile, "utf8"), "outside unchanged")
+      if (substitution === "directory") {
+        await f.service.call("import", {})
+        const excluded = await f.service.call("exclude-import-file", { path: "skills/turnstile-spin/references" }) as { preview: FixPreview }
+        assert.equal(excluded.preview.issues.some(issue => issue.path === "skills/turnstile-spin/references"), false)
+        const reverted = await f.service.call("revert-import-fix", { path: "skills/turnstile-spin/references" }) as { preview: FixPreview }
+        assert.ok(reverted.preview.issues.some(issue => issue.path === "skills/turnstile-spin/references" && issue.reason.includes("symlink")))
+      }
+    } finally { await f.cleanup() }
+  })
+})
+
+test("large AI fixes use unique targeted patches with bounded safe context", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    const source = `${"Unchanged reference documentation.\n".repeat(1000)}api_key="${secretFixture}"\n`
+    await addSecretFile(f.imported)
+    await writeFile(path.join(f.imported, ...secretPath.split("/")), source)
+    await login(f.service); await f.service.call("import", {})
+    f.fixResponse(async body => {
+      assert.equal(body.max_tokens, 4096)
+      const payload = JSON.parse((body.messages as { content: string }[]).at(-1)!.content)
+      assert.ok(payload.text.length < source.length / 2)
+      assert.equal(JSON.stringify(body).includes(secretFixture), false)
+      const oldText = /api_key="\[REDACTED_SECRET_\d+\]"/.exec(payload.text)![0]
+      return Response.json({ choices: [{ message: { content: "```json\n" + JSON.stringify({ summary: "Đã thay bằng biến môi trường.", edits: [{ oldText, newText: 'api_key="<API_KEY>"' }] }) + "\n```" } }] })
+    })
+    const result = await f.service.call("fix-import", { path: secretPath }) as { preview: FixPreview; fix: { diff: string } }
+    assert.equal(result.preview.issues.filter(issue => issue.severity === "error").length, 0)
+    assert.equal(result.fix.diff.includes(secretFixture), false)
+    await f.service.call("save-import-fix", { path: secretPath })
+    assert.equal(await readFile(path.join(f.imported, ...secretPath.split("/")), "utf8"), source.replace(secretFixture, "<API_KEY>"))
+    await f.service.call("revert-import-fix", { path: secretPath })
+    f.fixResponse(async () => Response.json({ choices: [{ message: { content: JSON.stringify({ summary: "Invalid duplicate replacement", edits: [{ oldText: "Unchanged reference documentation.", newText: "changed" }] }) } }] }))
+    await assert.rejects(f.service.call("fix-import", { path: secretPath }), /AI_FIX_INVALID_RESPONSE/)
+    await assert.rejects(f.service.call("package", { version: "1.2.4" }), /IMPORT_BLOCKED/)
+  } finally { await f.cleanup() }
+})
+
+test("AI fix sanitizes JSON-escaped metadata, repeated raw literals, retry feedback and provider summary", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    const api = new AmeApi("http://localhost:3211", f.dependencies.fetch)
+    await api.login("fixture", "fixture-password")
+    let attempts = 0
+    f.fixResponse(async body => {
+      attempts++
+      assert.equal(JSON.stringify(body).includes(secretFixture), false)
+      assert.equal(JSON.stringify(body).includes("private-material"), false)
+      return fixReply("Use <KEY> instead.\n", `Đã sửa ${secretFixture}`)
+    })
+    const bytes = encode(`password="${secretFixture}"\nRepeated: ${secretFixture}\n-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n`)
+    const fixed = await fixImportFileWithLlm({ api, filePath: `skills/fixture/${secretFixture}.md`, fileBytes: bytes,
+      issues: [{ path: secretPath, severity: "error", reason: `bad password="${secretFixture}"\n-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----` }],
+      compatibilityMode: "native", adaptClaudeAgents: false, availablePaths: [`skills/${secretFixture}/SKILL.md`], signal: new AbortController().signal, fetcher: f.dependencies.fetch,
+      validateCandidate: () => ({ preview: preview(input()), remainingErrors: attempts === 1 ? [{ path: secretPath, severity: "error", reason: `retry ${secretFixture}` }] : [] }),
+    })
+    assert.equal(attempts, 2)
+    assert.equal(fixed.summary.includes(secretFixture), false); assert.equal(fixed.diff.includes(secretFixture), false)
+  } finally { await f.cleanup() }
+})
+
+test("malformed, oversized and secret-echoing provider responses fail closed with sanitized codes", async t => {
+  for (const kind of ["json", "empty", "marker", "echo", "oversized", "network"] as const) await t.test(kind, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      await addSecretFile(f.imported); await login(f.service); await f.service.call("import", {})
+      f.fixResponse(async () => {
+        if (kind === "network") throw new Error(secretFixture)
+        if (kind === "json") return new Response("not json " + secretFixture)
+        if (kind === "oversized") return new Response("x".repeat(512 * 1024 + 1))
+        return fixReply(kind === "empty" ? "" : kind === "marker" ? "[REDACTED_SECRET_1]" : secretFixture)
+      })
+      await assert.rejects(f.service.call("fix-import", { path: secretPath }), new RegExp(kind === "network" ? "^Error: AI_FIX_PROVIDER_ERROR$" : "^Error: AI_FIX_INVALID_RESPONSE$"))
+      await assert.rejects(f.service.call("package", { version: "1.2.4" }), /IMPORT_BLOCKED/)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("fix-all limits work to ten sequential files and can resume remaining errors", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    for (let i = 0; i < 11; i++) await addSecretFile(f.imported, `skills/turnstile-spin/references/file-${i}.md`)
+    await login(f.service); await f.service.call("import", {})
+    f.fixResponse(async () => fixReply("Safe documentation.\n"))
+    const first = await f.service.call("fix-import-all", {}) as { fixes: unknown[]; preview: FixPreview }
+    assert.equal(first.fixes.length, 10); assert.equal(first.preview.fixablePaths.length, 1); assert.equal(f.fixRequests.length, 10)
+    const second = await f.service.call("fix-import-all", {}) as { fixes: unknown[]; preview: FixPreview }
+    assert.equal(second.fixes.length, 1); assert.equal(second.preview.fixablePaths.length, 0)
+    await f.service.call("package", { version: "1.2.4" })
+  } finally { await f.cleanup() }
+})
+
+test("all import fix operations freshly enforce admin role and clear session after auth loss", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    await addSecretFile(f.imported); await login(f.service); await f.service.call("import", {})
+    f.role("user")
+    for (const operation of ["fix-import", "fix-import-all", "exclude-import-file", "revert-import-fix", "save-import-fix"]) await assert.rejects(f.service.call(operation, { path: secretPath }), /FORBIDDEN/)
+    assert.equal(f.requests.includes("/v1/chat/completions"), false)
+    f.role("admin"); f.disable()
+    await assert.rejects(f.service.call("fix-import", { path: secretPath }), /USER_DISABLED/)
+    await assert.rejects(f.service.call("fix-import", { path: secretPath }), /SIGNED_OUT/)
+  } finally { await f.cleanup() }
+})
+
 test("Linux basic_text storage backend is rejected even when encryption reports available", async () => {
   const folder = await area()
   try {
@@ -812,4 +1087,225 @@ test("Linux basic_text storage backend is rejected even when encryption reports 
     await assert.rejects(vault.save({ origin: "http://localhost:3211", token: "fixture" }), /SESSION_STORAGE_UNAVAILABLE/)
     assert.deepEqual(await readdir(folder), [])
   } finally { await rm(folder, { recursive: true, force: true }) }
+})
+
+const syntheticSecret = "synthetic_fixture_value_0123456789"
+const originalReference = `# SvelteKit fixture\napi_key="${syntheticSecret}"\n`
+const fixedReference = "# SvelteKit fixture\napi_key=process.env.TURNSTILE_SECRET\n"
+const aiResponse = (value: unknown) => Response.json({ choices: [{ message: { content: JSON.stringify(value) } }] })
+async function engineParams(f: Awaited<ReturnType<typeof fixture>>, text = originalReference) {
+  const api = new AmeApi("http://localhost:3211", f.dependencies.fetch)
+  await api.login("fixture", "fixture-password")
+  const files = [...input(), { path: "skills/fixture/reference.md", data: encode(text) }]
+  const filePath = files.at(-1)!.path
+  return {
+    api, filePath, fileBytes: encode(text), issues: preview(files).issues.filter(issue => issue.path === filePath),
+    compatibilityMode: "native" as const, adaptClaudeAgents: false, availablePaths: files.map(file => file.path),
+    signal: new AbortController().signal, fetcher: f.dependencies.fetch,
+    validateCandidate: (candidateBytes: Uint8Array) => {
+      const candidate = preview(files.map(file => file.path === filePath ? { ...file, data: candidateBytes } : file))
+      return { preview: candidate, remainingErrors: candidate.issues.filter(issue => issue.severity === "error" && issue.path === filePath) }
+    },
+  }
+}
+
+test("AI fix redaction covers case-insensitive provider keys, PEM blocks and unclosed PEM payloads", () => {
+  for (const label of ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY", "rSa pRiVaTe KeY"]) {
+    const payload = "U1lOVEhFVElDX0ZJWFRVUkVfUEFZTE9BRA=="
+    for (const closed of [true, false]) {
+      const text = `Context before\n-----BEGIN ${label}-----\n${payload}\n${closed ? `-----END ${label}-----\nContext after` : "U1lOVEhFVElDX1NFTkRfTkVWRVI="}`
+      const result = redactSecretsForLlm(text)
+      assert.equal(result.redactionCount, 1, `${label}, closed=${closed}`)
+      assert.match(result.redactedText, /\[REDACTED_PRIVATE_KEY_\d+\]/)
+      assert.equal(result.redactedText.includes(payload), false)
+      assert.doesNotMatch(result.redactedText, /U1lOVEhFVElDX1NFTkRfTkVWRVI=/)
+      assert.match(result.redactedText, /Context before/)
+      if (closed) assert.match(result.redactedText, /Context after/)
+    }
+  }
+  const keys = ["sk-" + "s".repeat(24), "SK-" + "t".repeat(24), "AKIA" + "A1".repeat(8), "akia" + "b2".repeat(8)]
+  const result = redactSecretsForLlm(keys.join("\n"))
+  assert.equal(result.redactionCount, keys.length)
+  assert.equal((result.redactedText.match(/\[REDACTED_PROVIDER_KEY_\d+\]/g) ?? []).length, keys.length)
+  for (const key of keys) assert.equal(result.redactedText.includes(key), false)
+})
+
+test("AI fix redaction preserves assignment keys and quotes but honors exact safe-template boundaries", () => {
+  for (const key of ["api_key", "api-key", "apikey", "password", "secret", "token", "API_KEY", "PaSsWoRd", "ToKeN"]) {
+    for (const quote of ["", "'", '"']) {
+      const result = redactSecretsForLlm(`prefix ${key}: ${quote}${syntheticSecret}${quote}\nsuffix`)
+      assert.equal(result.redactionCount, 1)
+      assert.match(result.redactedText, /\[REDACTED_SECRET_\d+\]/)
+      assert.equal(result.redactedText.includes(`${key}: ${quote}[REDACTED_SECRET_`), true)
+      assert.equal(result.redactedText.endsWith(`${quote}\nsuffix`), true)
+      assert.equal(result.redactedText.includes(syntheticSecret), false)
+    }
+  }
+  for (const value of ["YOUR_SYNTHETIC_SECRET", "INSERT_SYNTHETIC_SECRET_HERE", "your_synthetic_secret"]) {
+    for (const quote of ["", "'", '"']) {
+      const text = `token=${quote}${value}${quote}`
+      assert.deepEqual(redactSecretsForLlm(text), { redactedText: text, redactionCount: 0 })
+    }
+  }
+  for (const text of ['token="YOUR_SYNTHETIC_SECRET\'', "token=YOUR_SYNTHETIC_SECRET.extra", 'token="YOUR_SYNTHETIC_SECRET']) {
+    const result = redactSecretsForLlm(text)
+    assert.equal(result.redactionCount, 1, text)
+    assert.doesNotMatch(result.redactedText, /YOUR_SYNTHETIC_SECRET/)
+  }
+  const repeated = redactSecretsForLlm(`password=${syntheticSecret}\ntoken=${syntheticSecret}`)
+  assert.equal(repeated.redactionCount, 2)
+  assert.equal(new Set(repeated.redactedText.match(/\[REDACTED_SECRET_\d+\]/g)).size, 2)
+})
+
+test("AI fix text eligibility accepts the exact byte boundary and rejects lookalike roots", () => {
+  for (const filePath of ["agents/helper.md", "skills/fixture/reference.txt"]) {
+    assert.equal(isFixableTextFile(filePath, encode("Valid tiếng Việt 🤖")), true)
+    assert.equal(isFixableTextFile(filePath, new Uint8Array(256 * 1024).fill(0x61)), true)
+    assert.equal(isFixableTextFile(filePath, new Uint8Array(256 * 1024 + 1).fill(0x61)), false)
+  }
+  for (const filePath of ["Agents/helper.md", "skills-extra/fixture.md"]) assert.equal(isFixableTextFile(filePath, encode("text")), false)
+})
+
+test("AI fix compact diff keeps local context, additions/deletions and bounded truncation", () => {
+  const before = Array.from({ length: 200 }, (_, i) => `unchanged line ${i}`)
+  const after = [...before]; after[100] = "replacement line"
+  const diff = buildCompactDiff(before.join("\n"), after.join("\n"))
+  assert.match(diff, /^-\s+unchanged line 100$/m)
+  assert.match(diff, /^\+\s+replacement line$/m)
+  assert.match(diff, /unchanged line 99/)
+  assert.match(diff, /unchanged line 101/)
+  assert.doesNotMatch(diff, /unchanged line 0\b|unchanged line 199\b/)
+  assert.ok(diff.split("\n").length < 20)
+  assert.match(buildCompactDiff("", "added"), /^\+\s+added$/m)
+  assert.match(buildCompactDiff("removed", ""), /^-\s+removed$/m)
+  assert.doesNotMatch(buildCompactDiff("same", "same"), /^[+-]\s/m)
+  const capped = buildCompactDiff(before.join("\n"), before.map((_, i) => `changed ${i}`).join("\n"), 12)
+  assert.ok(capped.split("\n").length <= 12)
+  assert.match(capped, /\.\.\. \(\+\d+ dòng\)/)
+})
+
+test("AI fix engine uses redacted full-file requests, constrained HTTP settings and allowed model fallback", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    const params = await engineParams(f)
+    f.fixResponse(async (body, init) => {
+      assert.equal(init.method, "POST"); assert.equal(init.redirect, "error"); assert.ok(init.signal)
+      assert.equal(body.stream, false); assert.equal(body.temperature, 0.1); assert.equal(body.max_tokens, 8192)
+      const serialized = JSON.stringify(body)
+      assert.equal(serialized.includes(syntheticSecret), false)
+      assert.match(serialized, /REDACTED_SECRET_/)
+      assert.match(serialized, /likely embedded secret/)
+      return Response.json({ choices: [{ message: { content: "```json\n" + JSON.stringify({ summary: "Đã thay bằng biến môi trường", content: fixedReference }) + "\n```" } }] })
+    })
+    for (const [requestedModel, expected] of [[" other ", "other"], ["not-allowed", "default"], [" ", "default"]]) {
+      const result = await fixImportFileWithLlm({ ...params, requestedModel })
+      assert.equal(result.model, expected)
+      assert.equal(f.fixRequests.at(-1)!.model, expected)
+      assert.equal(new TextDecoder().decode(result.contentBytes), fixedReference)
+      assert.equal(result.redactionCount, 1)
+      assert.equal(result.diff.includes(syntheticSecret), false)
+    }
+  } finally { await f.cleanup() }
+})
+
+test("AI fix engine requires fresh admin authorization and validates file support before provider access", async t => {
+  for (const reason of ["signed out", "demoted", "invalid UTF-8"] as const) await t.test(reason, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      const params = await engineParams(f)
+      f.fixResponse(async () => { assert.fail("denied request must never reach the provider") })
+      const candidate = { ...params }
+      let expected = /^Error: AI_FIX_UNSUPPORTED_FILE$/
+      if (reason === "signed out") { candidate.api.clear(); expected = /^Error: AMECODE_LOGIN_REQUIRED$/ }
+      if (reason === "demoted") { f.role("user"); expected = /^Error: FORBIDDEN$/ }
+      if (reason === "invalid UTF-8") candidate.fileBytes = new Uint8Array([0xff])
+      await assert.rejects(fixImportFileWithLlm(candidate), expected)
+      assert.equal(f.fixRequests.length, 0)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("AI fix response reader enforces cumulative byte limits, cancels overflow and sanitizes stream failures", async t => {
+  for (const kind of ["exact limit", "chunked overflow", "read failure", "invalid UTF-8", "missing body"] as const) await t.test(kind, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      const params = await engineParams(f)
+      let cancelled = false, validated = 0
+      const valid = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "Đã sửa", content: fixedReference }) } }] })
+      f.fixResponse(async () => {
+        if (kind === "exact limit") return new Response(valid + " ".repeat(512 * 1024 - encode(valid).length))
+        if (kind === "missing body") return new Response(null)
+        if (kind === "invalid UTF-8") return new Response(new Uint8Array([0xff, 0xfe]))
+        let chunk = 0
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (kind === "read failure") { controller.error(new Error(syntheticSecret)); return }
+            controller.enqueue(new Uint8Array(chunk++ === 0 ? 512 * 1024 : 1).fill(0x20))
+          },
+          cancel() { cancelled = true },
+        }))
+      })
+      const fixing = fixImportFileWithLlm({ ...params, validateCandidate: bytes => { validated++; return params.validateCandidate(bytes) } })
+      if (kind === "exact limit") {
+        assert.equal(new TextDecoder().decode((await fixing).contentBytes), fixedReference)
+        assert.equal(validated, 1)
+      } else {
+        await assert.rejects(fixing, /^Error: AI_FIX_INVALID_RESPONSE$/)
+        assert.equal(validated, 0, "invalid transport bytes must never reach candidate validation")
+        if (kind === "chunked overflow") assert.equal(cancelled, true)
+      }
+      assert.equal(f.fixRequests.length, 1, "transport/shape errors are not candidate-validation retries")
+    } finally { await f.cleanup() }
+  })
+})
+
+test("AI fix targeted edits use evolving unique matches and reject overlaps without partial staging", async t => {
+  for (const overlap of [false, true]) await t.test(overlap ? "overlapping edits rejected" : "evolving unique edits accepted", async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      const text = "Unchanged large fixture text.\n".repeat(1100) + originalReference
+      const params = await engineParams(f, text)
+      let validated = 0
+      f.fixResponse(async body => {
+        const request = JSON.stringify(body), placeholder = request.match(/\[REDACTED_SECRET_\d+\]/)?.[0]
+        assert.ok(placeholder)
+        const first = { oldText: `api_key="${placeholder}"`, newText: "api_key=<INTERMEDIATE>" }
+        const second = { oldText: overlap ? first.oldText : first.newText, newText: "api_key=$SYNTHETIC_KEY" }
+        return aiResponse({ summary: "Sửa tuần tự", edits: [first, second] })
+      })
+      const fixing = fixImportFileWithLlm({ ...params, validateCandidate: bytes => { validated++; return params.validateCandidate(bytes) } })
+      if (overlap) {
+        await assert.rejects(fixing, /^Error: AI_FIX_INVALID_RESPONSE$/)
+        assert.equal(validated, 0)
+      } else {
+        assert.equal(new TextDecoder().decode((await fixing).contentBytes), text.replace(`api_key="${syntheticSecret}"`, "api_key=$SYNTHETIC_KEY"))
+        assert.equal(validated, 1)
+      }
+      assert.equal(new TextDecoder().decode(params.fileBytes), text)
+      assert.equal(f.fixRequests.length, 1)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("AI fix rejects provider echoes even outside assignment syntax and strips echoed summaries", async t => {
+  for (const kind of ["plain echo", "summary echo", "PEM payload echo"] as const) await t.test(kind, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      const params = await engineParams(f)
+      let validated = 0
+      const pemPayload = "fixture-pem-payload-1234567890"
+      f.fixResponse(async () => aiResponse({ summary: `Đã thay ${syntheticSecret}`, content: kind === "PEM payload echo" ? `Plain documentation echo: ${pemPayload}` : kind === "plain echo" ? `Plain documentation echo: ${syntheticSecret}` : fixedReference }))
+      const fixing = fixImportFileWithLlm({ ...params, ...(kind === "PEM payload echo" ? { fileBytes: encode(`-----BEGIN PRIVATE KEY-----\n${pemPayload}\n-----END PRIVATE KEY-----\n`) } : {}), validateCandidate: bytes => { validated++; return params.validateCandidate(bytes) } })
+      if (kind !== "summary echo") {
+        await assert.rejects(fixing, /^Error: AI_FIX_INVALID_RESPONSE$/)
+        assert.equal(validated, 0, "a syntactically harmless echo is still a forbidden secret literal")
+      } else {
+        const result = await fixing
+        assert.equal(JSON.stringify(result).includes(syntheticSecret), false)
+        assert.match(result.summary, /REDACTED_/)
+        assert.equal(validated, 1)
+      }
+      assert.equal(JSON.stringify(f.fixRequests).includes(syntheticSecret), false)
+    } finally { await f.cleanup() }
+  })
 })

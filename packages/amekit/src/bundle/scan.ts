@@ -4,7 +4,7 @@ import path from "node:path"
 import { exclusion, preview, safePath, type ImportOptions, type InputFile, type Issue } from "./package"
 import { MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES } from "./limits"
 
-export async function scan(root: string, signal?: AbortSignal, options: ImportOptions = {}) {
+export async function scanWithSource(root: string, signal?: AbortSignal, options: ImportOptions = {}): Promise<{ files: InputFile[]; inheritedIssues: Issue[]; preview: ReturnType<typeof preview> }> {
   if (options.compatibilityMode !== undefined && options.compatibilityMode !== "native" && options.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
   if (options.adaptClaudeAgents === true && options.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
   if (!path.isAbsolute(root)) throw new Error("SELECT_ABSOLUTE_FOLDER")
@@ -37,5 +37,9 @@ export async function scan(root: string, signal?: AbortSignal, options: ImportOp
     }
   }
   await walk(absolute, "")
-  return preview(files, issues, options)
+  return { files, inheritedIssues: issues, preview: preview(files.map(file => ({ path: file.path, data: file.data.slice() })), issues, options) }
+}
+
+export async function scan(root: string, signal?: AbortSignal, options: ImportOptions = {}) {
+  return (await scanWithSource(root, signal, options)).preview
 }
