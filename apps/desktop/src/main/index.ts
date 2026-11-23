@@ -7,16 +7,18 @@ import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
 import { Workspaces } from '../../../../packages/ide-core/src/workspace'
 import { validateWorkspacePath } from '../../../../packages/ide-core/src/workspace-fs'
+import { resolveDroppedPaths } from '../../../../packages/ide-core/src/dropped-attachments'
 import { Terminals } from '../../../../packages/ide-core/src/terminal'
 import { createTsLanguageService, type TsLanguageService } from '../../../../packages/ide-core/src/ts-lsp'
 import { createNodeDebugger, type NodeDebugger } from '../../../../packages/ide-core/src/debugger'
 import { OpenCodeAdapter } from '../../../../packages/opencode-adapter/src/index'
 import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtime'
 import { createAmeKit } from '../../../../packages/amekit/src/index'
+import { detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore } from '../../../../packages/amekit/src/android-translation'
 import { createPetHost } from '../../../../packages/amekit/src/pet-host'
 import { loadPetSprite } from '../../../../packages/amekit/src/pet'
 import type { UsagePrices } from '../../../../packages/amekit/src/usage-pricing'
-import type { IdeEvent, Model } from '../../../../packages/protocol/src/index'
+import type { AndroidTranslationInfo, AndroidTranslationPromptResult, IdeEvent, Model, SessionLockState } from '../../../../packages/protocol/src/index'
 
 if (!app.isPackaged && process.env.AME_IDE_TEST_DATA) app.setPath('userData', path.resolve(process.env.AME_IDE_TEST_DATA))
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -25,6 +27,7 @@ let workspace: Workspaces
 let terminals: Terminals
 let adapter: OpenCodeAdapter
 let account: ReturnType<typeof createAmeKit>
+let translationLocks: ReturnType<typeof createTranslationLockStore> | undefined
 let petHost: ReturnType<typeof createPetHost> | undefined
 let sprite = ''
 let runtime: PrivateRuntime
@@ -67,6 +70,16 @@ const workspacePath = relative.min(1).refine(value => !value.includes('\0'))
 const branchName = z.string().min(1).max(512).refine(value => !value.includes('\0'))
 const sessionTitle = z.string().min(1).max(500).refine(value => !!value.trim() && !value.includes('\0'))
 const modelSchema = z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).strict()
+const promptFileSchema = z.object({
+  uri: z.string().min(1).max(15 * 1024 * 1024).refine(value => !value.includes('\0') && (/^data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}$/i.test(value) || /^file:\/\/\//i.test(value))),
+  name: z.string().min(1).max(255).refine(value => !value.includes('\0')).optional(),
+  mime: z.string().min(1).max(120).refine(value => !value.includes('\0')).optional(),
+  source: z.union([
+    z.object({ type: z.literal('inline') }).strict(),
+    z.object({ type: z.literal('uri'), uri: z.string().min(1).max(4096).refine(value => !value.includes('\0')) }).strict(),
+  ]).optional(),
+}).strict()
+const promptFilesSchema = z.array(promptFileSchema).max(8)
 const boundedID = id.refine(value => !!value.trim() && !value.includes('\0'))
 const artifactID = text.min(1).max(200).refine(value => value === value.trim() && !value.includes('\0'))
 const question = text.min(1).max(20000).refine(value => !!value.trim() && !value.includes('\0'))
@@ -144,7 +157,12 @@ const schema = {
   sessions: z.tuple([id]), createSession: z.tuple([id]), messages: z.tuple([id, id]), sessionDiff: z.tuple([id, id, id.optional()]), models: z.tuple([id]), agents: z.tuple([id]),
   renameSession: z.tuple([id, id, sessionTitle]), archiveSession: z.tuple([id, id, z.boolean()]), deleteSession: z.tuple([id, id]),
   commands: z.tuple([id]), skills: z.tuple([id]), generateCommitMessage: z.tuple([id, modelSchema.optional()]),
-  prompt: z.tuple([id, id, text, z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).optional(), id.optional()]),
+  androidTranslationInfo: z.tuple([boundedID]),
+  androidTranslationPrompt: z.tuple([boundedID, boundedID.optional(), text.min(1).refine(value => !!value.trim() && !value.includes('\0')), z.enum(['update', 'full', 'scan', 'custom']).optional()]),
+  androidTranslationLock: z.tuple([boundedID, boundedID]),
+  prompt: z.tuple([id, id, text, z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).optional(), id.optional(), promptFilesSchema.optional()]),
+  resolveDroppedPaths: z.tuple([boundedID, z.array(z.string().max(4096)).max(32)]),
+  pickAttachmentFiles: z.tuple([boundedID]),
   cancel: z.tuple([id, id]), permissions: z.tuple([id, id]), replyPermission: z.tuple([id, id, z.enum(['once', 'always', 'reject'])]),
   pairingStatus: z.tuple([]), pairingConfigure: z.tuple([pairingSchema]), pairingCode: z.tuple([]),
   account: z.tuple([z.string().max(64), z.record(z.string(), z.string().max(8192))]), pickImport: z.tuple([]), window: z.tuple([z.enum(['minimize', 'maximize', 'close'])])
@@ -191,11 +209,48 @@ async function resolveModel(projectID: string, requested?: Model | string, requi
   if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
   return selected
 }
+async function resolveFeatureModel(projectID: string, selected: Model, configured?: string): Promise<Model> {
+  if (!configured || configured === (selected.modelID ?? selected.id)) return selected
+  const authorized = await account.authorizeFeatureModel?.(configured)
+  if (shuttingDown) throw new Error('APP_SHUTTING_DOWN')
+  if (!authorized) return selected
+  const models = await adapter.models(projectID)
+  if (shuttingDown) throw new Error('APP_SHUTTING_DOWN')
+  return models.find(model => model.providerID === 'amecode' && (model.modelID === authorized || model.id === authorized)) ?? selected
+}
+const translationModels = new Map<string, string>()
+function translationKey(projectID: string, sessionID: string) { return JSON.stringify([projectID, sessionID]) }
+async function resolveTranslationModel(projectID: string, sessionID: string, selected: Model): Promise<Model> {
+  const key = translationKey(projectID, sessionID)
+  let pinned = translationModels.get(key)
+  if (!pinned) {
+    const map = await adapter.agentMap(projectID, sessionID)
+    const session = map.nodes.find(node => node.id === sessionID)
+    if (session?.providerID !== 'amecode' || !session.model) throw new Error('TRANSLATION_MODEL_UNAVAILABLE')
+    const models = await adapter.models(projectID)
+    const model = models.find(model => model.providerID === 'amecode' && (model.id === session.model || model.modelID === session.model))
+    pinned = model?.modelID ?? session.model
+    translationModels.set(key, pinned)
+  }
+  const model = await resolveFeatureModel(projectID, selected, pinned)
+  if ((model.modelID ?? model.id) !== pinned) throw new Error('TRANSLATION_MODEL_UNAVAILABLE')
+  return model
+}
+function assertRegularSession(projectID: string, sessionID: string) {
+  if (translationLocks?.isLocked(projectID, sessionID)) throw new Error('TRANSLATION_SESSION_LOCKED')
+  if (translationLocks?.isTranslationSession(projectID, sessionID)) throw new Error('ANDROID_TRANSLATION_SESSION_REQUIRED')
+}
+function translationLockState(projectID: string): SessionLockState {
+  return {
+    translationSessionIDs: translationLocks?.translationSessionIDs(projectID) ?? [],
+    lockedSessionIDs: translationLocks?.lockedSessionIDs(projectID) ?? []
+  }
+}
 async function call(method: keyof typeof schema, args: unknown[]) {
   schema[method].parse(args)
   if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
   // Dispatch remains explicit: renderer never chooses arbitrary Node functions or IPC channels.
-  const [a, b, c, d, e] = args as any[]
+  const [a, b, c, d, e, f] = args as any[]
   switch (method) {
     case 'platform': return process.platform
     case 'artifacts': return adapter.artifacts(a, b)
@@ -203,7 +258,9 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'deleteArtifact':
       await confirmation('Xóa artifact này?', 'Hành động này không thể hoàn tác.')
       return adapter.deleteArtifact(a, b)
-    case 'btwAsk': return adapter.btwAsk(a, b, c, await resolveModel(a, d))
+    case 'btwAsk':
+      assertRegularSession(a, b)
+      return adapter.btwAsk(a, b, c, await resolveModel(a, d))
     case 'forkSession': return adapter.forkSession(a, b)
     case 'petState': return petHost!.state()
     case 'petSprite': return sprite
@@ -329,8 +386,61 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       const selected = await resolveModel(a, b)
       const summary = await workspace.stagedDiffSummary(a, 24576)
       if (summary.files.length === 0) throw new Error('NO_STAGED_CHANGES')
-      const skill = (await account.readCommitEnhanceSkill?.(a).catch(() => null)) ?? null
-      return skill ? adapter.generateCommitMessage(summary, selected, skill) : adapter.generateCommitMessage(summary, selected)
+      const feature = account.readCommitEnhanceFeature
+        ? await account.readCommitEnhanceFeature(a).catch(() => null)
+        : { skill: (await account.readCommitEnhanceSkill?.(a).catch(() => null)) ?? null, model: undefined }
+      const model = await resolveFeatureModel(a, selected, feature?.model)
+      const skill = feature?.skill ? { name: feature.skill.name, instructions: feature.skill.instructions } : null
+      return skill ? adapter.generateCommitMessage(summary, model, skill) : adapter.generateCommitMessage(summary, model)
+    }
+    case 'androidTranslationInfo': {
+      const { directory } = workspace.get(a)
+      const [detected, feature, status] = await Promise.all([
+        detectAndroidProject(directory),
+        account.readAndroidTranslationFeature?.(a),
+        account.call('status', {}).catch(() => null)
+      ])
+      const catalog = (status as { models?: { default_model?: string; active_models?: { id: string; name?: string }[]; models?: { id: string; name?: string }[] } } | null)?.models
+      const active = catalog?.active_models ?? catalog?.models ?? []
+      const configured = feature?.model && active.find(model => model.id === feature.model)
+      const effective = configured || active.find(model => model.id === catalog?.default_model)
+      return {
+        configured: !!(feature?.rawSkillName || feature?.skill), isAndroid: detected.isAndroid,
+        skill: feature?.skill?.name ?? feature?.rawSkillName, configuredModelID: feature?.model,
+        effectiveModelID: effective?.id, effectiveModelName: effective?.name ?? effective?.id,
+        fallbackToDefault: !configured, stringsFiles: detected.stringsFiles, ...translationLockState(a)
+      } satisfies AndroidTranslationInfo
+    }
+    case 'androidTranslationPrompt': {
+      const { directory } = workspace.get(a)
+      if (!translationLocks) throw new Error('TRANSLATION_LOCK_STORE_UNAVAILABLE')
+      if (b && translationLocks.isLocked(a, b)) throw new Error('TRANSLATION_SESSION_LOCKED')
+      if (b && !translationLocks.isTranslationSession(a, b)) throw new Error('ANDROID_TRANSLATION_SESSION_REQUIRED')
+      const feature = await account.readAndroidTranslationFeature?.(a)
+      if (!feature?.skill) throw new Error('ANDROID_TRANSLATION_NOT_CONFIGURED')
+      const selected = await resolveModel(a)
+      const model = b ? await resolveTranslationModel(a, b, selected) : await resolveFeatureModel(a, selected, feature.model)
+      const detected = await detectAndroidProject(directory)
+      const session = b ? (await adapter.sessions(a)).find(session => session.id === b) : await adapter.createSession(a)
+      if (!session) throw new Error('SESSION_NOT_FOUND')
+      const isFirstTurn = !b || (await adapter.messages(a, b)).length === 0
+      await translationLocks.recordSession(a, session.id)
+      translationModels.set(translationKey(a, session.id), model.modelID ?? model.id)
+      const prompt = buildAndroidTranslationPrompt({
+        userText: d && d !== 'custom' ? `[Translation mode: ${d}]\n${c}` : c,
+        isFirstTurn, skill: feature.skill, stringsFiles: detected.stringsFiles
+      })
+      await adapter.prompt(a, session.id, prompt, model)
+      return { session, model, locked: false } satisfies AndroidTranslationPromptResult
+    }
+    case 'androidTranslationLock': {
+      workspace.get(a)
+      if (!translationLocks?.isTranslationSession(a, b)) throw new Error('ANDROID_TRANSLATION_SESSION_REQUIRED')
+      await translationLocks.lockSession(a, b)
+      // prompt() acknowledges submission, not model completion; interrupt any remaining turn.
+      try { await adapter.cancel(a, b) }
+      finally { notify({ type: 'opencode', projectID: a, sessionID: b }) }
+      return translationLockState(a)
     }
     case 'messages': return adapter.messages(a, b)
     case 'agentMap': return adapter.agentMap(a, b)
@@ -341,9 +451,23 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     }
     case 'models': return adapter.models(a)
     case 'agents': return adapter.agents(a)
+    case 'resolveDroppedPaths': return resolveDroppedPaths(workspace.get(a).directory, b)
+    case 'pickAttachmentFiles': {
+      const directory = workspace.get(a).directory
+      const picked = await dialog.showOpenDialog(window!, {
+        title: 'Chọn tệp hoặc ảnh để đính kèm',
+        properties: ['openFile', 'multiSelections'],
+        filters: [
+          { name: 'Ảnh, PDF & Tệp mã/văn bản', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'pdf', 'txt', 'md', 'mdx', 'json', 'yaml', 'yml', 'xml', 'ts', 'tsx', 'js', 'jsx', 'kt', 'java', 'py', 'css', 'html', 'log', 'csv'] },
+          { name: 'Tất cả tệp', extensions: ['*'] },
+        ],
+      })
+      return picked.canceled || !picked.filePaths.length ? [] : resolveDroppedPaths(directory, picked.filePaths)
+    }
     case 'prompt': {
+      assertRegularSession(a, b)
       const selected = await resolveModel(a, d, true)
-      return adapter.prompt(a, b, c, selected, e)
+      return adapter.prompt(a, b, c, selected, e, f)
     }
     case 'cancel': return adapter.cancel(a, b)
     case 'permissions': return adapter.permissions(a, b)
@@ -360,7 +484,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
 }
 let authority: Promise<unknown> = Promise.resolve()
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
+  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'androidTranslationPrompt', 'androidTranslationLock', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
   // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
@@ -398,6 +522,8 @@ void app.whenReady().then(async () => {
     notify({ type: 'files', projectID })
   })
   await workspace.load()
+  translationLocks = createTranslationLockStore(path.join(app.getPath('userData'), 'translation-locks.json'))
+  await translationLocks.load()
   terminals = new Terminals(projectID => workspace.get(projectID).directory, notify)
   adapter = new OpenCodeAdapter(notify)
   for (const project of workspace.list()) adapter.attach(project.id, project.directory)

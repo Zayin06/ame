@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react'
-import type { Agent, ChatItem, Model, Permission, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
+import type { Agent, AndroidTranslationInfo, ChatItem, Model, Permission, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
 import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
 import { type Preferences, type Tab, type TimelineDetailMode } from '../state'
@@ -14,12 +14,17 @@ import { formatModelOptionLabel, modelKey, resolvePreferredModel, type ModelLeve
 import { TurnChanges } from './SessionChanges'
 import { ToolCard } from './ToolCard'
 import { ArtifactViewer } from './ArtifactViewer'
-import { applyComposerCompletion, composePromptWithAttachments, detectComposerTrigger, filterFileMentions, filterSlashEntries, type ComposerAttachment, type ComposerTrigger } from '../composer-mentions'
+import { applyComposerCompletion, detectComposerTrigger, filterFileMentions, filterSlashEntries, WORKSPACE_DRAG_MIME, readBrowserFileAttachment, splitComposerAttachments, MAX_PROMPT_FILES, type ComposerAttachment, type ComposerTrigger } from '../composer-mentions'
+import { ComposerAttachmentStrip, ComposerDropOverlay, MessageAttachmentList } from './ComposerAttachments'
 
 type ProjectCatalog = { key: string; fetchedAt: number; models: Model[]; agents: Agent[]; commands: SlashCommand[]; skills: SkillSummary[] }
 const projectCatalogCache = new Map<string, ProjectCatalog>()
 let catalogRevision = 0
 const clearProjectCatalogs = () => { projectCatalogCache.clear(); catalogRevision++ }
+
+export function chatModelsForPolicy(models: readonly Model[], role?: string, defaultModel?: string): Model[] {
+  return models.filter(model => model.providerID === 'amecode' && (role !== 'user' || !!defaultModel && (model.modelID === defaultModel || model.id === defaultModel)))
+}
 
 function sameValue(a: unknown, b: unknown): boolean {
   if (a === b) return true
@@ -35,16 +40,16 @@ function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
     const next = b[index]
     return item.id === next.id && item.role === next.role && item.text === next.text && item.kind === next.kind
       && item.createdAt === next.createdAt && item.completedAt === next.completedAt && item.phase === next.phase && item.workedMs === next.workedMs
-      && sameValue(item.tool, next.tool) && sameValue(item.turn, next.turn)
+      && sameValue(item.tool, next.tool) && sameValue(item.turn, next.turn) && sameValue(item.attachments, next.attachments)
   })
 }
 
-export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, ready, files = [], activeFile, onRequestFiles }: { timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, ready, files = [], activeFile, onRequestFiles }: { timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
   const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
   const initialCatalog = cached?.key === connectionUrl ? cached : undefined
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
-  const [models, setModels] = useState<Model[]>(() => initialCatalog?.models ?? [])
+  const [catalogModels, setModels] = useState<Model[]>(() => initialCatalog?.models ?? [])
   const [modelProject, setModelProject] = useState<string | undefined>(() => initialCatalog ? projectID : undefined)
   const [agents, setAgents] = useState<Agent[]>(() => initialCatalog?.agents ?? [])
   const [fallbackRole, setFallbackRole] = useState<string>()
@@ -53,8 +58,34 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   const role = accountRole !== undefined ? accountRole : fallbackRole
   const effectiveDefaultModel = defaultModelID !== undefined ? defaultModelID : fallbackDefaultModel
   const effectiveModelLevels = modelLevels !== undefined ? modelLevels : fallbackModelLevels
+  const models = chatModelsForPolicy(catalogModels, role, effectiveDefaultModel)
+  const [androidInfo, setAndroidInfo] = useState<AndroidTranslationInfo>()
+  const lockedTranslationIDs = androidInfo?.lockedSessionIDs ?? []
+  const translationSessionIDs = androidInfo?.translationSessionIDs ?? []
+  const lockedTranslation = !!sessionID && lockedTranslationIDs.includes(sessionID)
+  const translationSession = !!sessionID && translationSessionIDs.includes(sessionID)
+  useEffect(() => {
+    let alive = true, generation = 0
+    let timer: ReturnType<typeof setTimeout> | undefined
+    setAndroidInfo(undefined)
+    const load = async () => {
+      if (!projectID || !connected || !window.ame.androidTranslationInfo) return
+      const request = ++generation
+      try {
+        const info = await window.ame.androidTranslationInfo(projectID)
+        if (alive && request === generation) setAndroidInfo(info)
+      } catch (e) { if (alive && request === generation) report(e) }
+    }
+    void load()
+    window.addEventListener('ame-account-changed', load)
+    window.addEventListener('ame-translation-changed', load)
+    const unsubscribe = window.ame.onEvent(event => {
+      if (event.type === 'opencode' && event.projectID === projectID && (!event.sessionID || event.sessionID === sessionID)) { clearTimeout(timer); timer = setTimeout(() => void load(), 300) }
+    })
+    return () => { alive = false; clearTimeout(timer); unsubscribe(); window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-translation-changed', load) }
+  }, [projectID, connected, sessionID, report])
   const userPickedModel = useRef(false)
-  const [model, setModel] = useState(() => resolvePreferredModel({ models: initialCatalog?.models ?? [], currentValue: '', defaultModelID: effectiveDefaultModel, role }))
+  const [model, setModel] = useState(() => resolvePreferredModel({ models: chatModelsForPolicy(initialCatalog?.models ?? [], role, effectiveDefaultModel), currentValue: '', defaultModelID: effectiveDefaultModel, role }))
   const modelPolicy = useRef({ role, defaultModelID: effectiveDefaultModel })
   modelPolicy.current = { role, defaultModelID: effectiveDefaultModel }
   const [agent, setAgent] = useState('')
@@ -62,6 +93,10 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   const [commands, setCommands] = useState<SlashCommand[]>(() => initialCatalog?.commands ?? [])
   const [skills, setSkills] = useState<SkillSummary[]>(() => initialCatalog?.skills ?? [])
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
+  const dragDepth = useRef(0)
+  const [dragActive, setDragActive] = useState(false)
+  const canAttach = !lockedTranslation && !translationSession && !!projectID && connected
+  useEffect(() => { dragDepth.current = 0; setDragActive(false) }, [projectID, sessionID, canAttach])
   const [trigger, setTrigger] = useState<ComposerTrigger | null>(null)
   const [attachmentPicker, setAttachmentPicker] = useState(false)
   const [attachmentQuery, setAttachmentQuery] = useState('')
@@ -145,8 +180,8 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   useEffect(() => {
     let alive = true, generation = 0
     const hydrate = (catalog?: ProjectCatalog) => {
-      const allowed = catalog?.models ?? []
-      setModels(allowed); setAgents(catalog?.agents ?? [])
+      const allowed = chatModelsForPolicy(catalog?.models ?? [], modelPolicy.current.role, modelPolicy.current.defaultModelID)
+      setModels(catalog?.models ?? []); setAgents(catalog?.agents ?? [])
       setCommands(catalog?.commands ?? []); setSkills(catalog?.skills ?? [])
       setModelProject(catalog ? projectID : undefined)
       if (!allowed.length) userPickedModel.current = false
@@ -186,7 +221,7 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   useEffect(() => {
     if (!role || !models.length) userPickedModel.current = false
     setModel(currentValue => resolvePreferredModel({ models, currentValue, defaultModelID: effectiveDefaultModel, role, userPicked: userPickedModel.current }))
-  }, [role, models, effectiveDefaultModel])
+  }, [role, catalogModels, effectiveDefaultModel])
   const activeModel = projectID && connected && modelProject === projectID ? models.find(item => modelKey(item) === model) : undefined
   const activeAgent = agents.find(a => a.id === agent)
   useEffect(() => { onModelChange?.(ready ? activeModel : undefined) }, [activeModel, onModelChange, connected, ready, projectID])
@@ -268,6 +303,38 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
     setAttachments(current => current.some(item => item.kind === 'file' && item.path === path) ? current : [...current, { id: `file-${++attachmentSequence.current}`, kind: 'file', path }])
     setAttachmentPicker(false); setTrigger(null); input.current?.focus()
   }
+  const addResolvedAttachments = (resolved: readonly ResolvedDroppedFile[]) => {
+    const errors = resolved.filter(item => !item.ok).map(item => `${item.name}: ${item.reason}`)
+    setError(errors.join('\n'))
+    setAttachments(current => {
+      const next = [...current]
+      for (const item of resolved) {
+        if (!item.ok) continue
+        if (item.kind === 'workspace-file') {
+          if (!next.some(attachment => attachment.kind === 'file' && attachment.path === item.path)) next.push({ id: `file-${++attachmentSequence.current}`, kind: 'file', path: item.path })
+        } else {
+          if (next.some(attachment => 'dataUrl' in attachment && attachment.dataUrl === item.dataUrl && attachment.name === item.name)) continue
+          if (next.filter(attachment => attachment.kind === 'media' || attachment.kind === 'external-text').length >= MAX_PROMPT_FILES) {
+            setError([...errors, `Chỉ có thể đính kèm tối đa ${MAX_PROMPT_FILES} tệp ảnh/PDF hoặc văn bản bên ngoài.`].join('\n'))
+            continue
+          }
+          next.push({ id: `attachment-${++attachmentSequence.current}`, kind: item.kind, name: item.name, mime: item.mime, dataUrl: item.dataUrl, size: item.size, ...('workspacePath' in item && item.workspacePath ? { workspacePath: item.workspacePath } : {}) })
+        }
+      }
+      return next
+    })
+    setAttachmentPicker(false); setTrigger(null)
+  }
+  const receiveAttachments = async (load: () => Promise<ResolvedDroppedFile[]>) => {
+    const project = projectID, session = sessionID
+    try {
+      const resolved = await load()
+      if (currentProject.current === project && currentSession.current === session) addResolvedAttachments(resolved)
+    } catch (e) {
+      if (currentProject.current === project && currentSession.current === session) setError(errorText(e))
+    }
+  }
+  const isSupportedDrag = (dt: DataTransfer) => dt.types.includes(WORKSPACE_DRAG_MIME) || dt.types.includes('Files')
   const complete = (index: number) => {
     const choice = choices[index]
     if (!choice) return
@@ -298,13 +365,13 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   }
   const send = async () => {
     const selectedModel = activeModel
-    const prompt = composePromptWithAttachments(text, attachments)
-    if (!projectID || !prompt.trim() || busy || !connected || !ready || !selectedModel || composing.current) return
+    const { text: prompt, files } = splitComposerAttachments(text, attachments)
+    if (!projectID || (!prompt.trim() && !files.length) || busy || !connected || !ready || !selectedModel || translationSession || lockedTranslation || composing.current) return
     const submitted = text, submittedSession = sessionID, submittedProject = projectID, submittedAttachments = attachments
     const submittedIDs = new Set(submittedAttachments.map(item => item.id))
     setBusy(true)
     try {
-      if (!await submit.current!(projectID, sessionID, prompt, selectedModel, agent || undefined)) return
+      if (!await submit.current!(projectID, sessionID, prompt, selectedModel, agent || undefined, files.length ? files : undefined)) return
       if (currentProject.current === submittedProject && (currentSession.current === submittedSession || (!submittedSession && currentSession.current === createdSession.current))) {
         setText(current => current === submitted ? '' : current)
         setAttachments(current => current.filter(item => !submittedIDs.has(item.id)))
@@ -322,15 +389,46 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
     setReplying(true)
     try { await window.ame.replyPermission(projectID, permission.id, response); refresh.current() } catch (e) { report(e) } finally { setReplying(false) }
   }
-  return <main data-testid="chat" className="chat-pane" data-region="Chat Canvas">
-    <header className="chat-pane__header"><div className="chat-title-group"><span className="status-dot status-dot--active" /><span className="chat-title-text truncate">{title || 'Cuộc trò chuyện'}</span></div><div className="chat-header-actions">{(['artifacts', 'agents', 'btw'] as const).map(tab => <button key={tab} data-chat-drawer={tab} className={`pill-btn ${drawer === tab ? 'is-active' : ''}`} title={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} aria-label={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} onClick={() => { if (drawer !== tab) { setTrigger(null); setAttachmentPicker(false) } setDrawer(value => value === tab ? null : tab) }}><Icon name={tab === 'artifacts' ? 'layers' : tab === 'agents' ? 'agents' : 'message'} /><span className="pill-btn__label">{tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'}</span></button>)}<IconButton label="Tùy chọn hội thoại" active={menu} onClick={() => setMenu(value => !value)}><Icon name="more" /></IconButton></div></header>
+  return <main data-testid="chat" className="chat-pane" data-region="Chat Canvas" data-translation-session={sessionID && translationSessionIDs.includes(sessionID) || undefined}
+    onDragEnter={event => {
+      if (!canAttach || !isSupportedDrag(event.dataTransfer)) return
+      event.preventDefault(); dragDepth.current++; setDragActive(true)
+    }}
+    onDragOver={event => {
+      if (!canAttach || !isSupportedDrag(event.dataTransfer)) return
+      event.preventDefault(); event.dataTransfer.dropEffect = 'copy'
+    }}
+    onDragLeave={event => {
+      if (!dragDepth.current) return
+      event.preventDefault()
+      dragDepth.current = Math.max(0, dragDepth.current - 1)
+      if (!dragDepth.current) setDragActive(false)
+    }}
+    onDrop={event => {
+      dragDepth.current = 0; setDragActive(false)
+      if (!canAttach || !projectID || !isSupportedDrag(event.dataTransfer)) return
+      event.preventDefault()
+      const workspacePath = event.dataTransfer.getData(WORKSPACE_DRAG_MIME)
+      if (workspacePath) addAttachment(workspacePath)
+      const osPaths: string[] = [], browserFiles: File[] = []
+      for (const file of Array.from(event.dataTransfer.files)) {
+        const path = window.ame?.filePath?.(file) || ''
+        if (path) osPaths.push(path)
+        else browserFiles.push(file)
+      }
+      void receiveAttachments(async () => (await Promise.all([
+        osPaths.length ? window.ame.resolveDroppedPaths(projectID, osPaths) : Promise.resolve([]),
+        Promise.all(browserFiles.map(readBrowserFileAttachment)),
+      ])).flat())
+    }}>
+    <header className="chat-pane__header"><div className="chat-title-group"><span className="status-dot status-dot--active" /><span className="chat-title-text truncate">{title || 'Cuộc trò chuyện'}</span></div><div className="chat-header-actions">{(androidInfo?.configured || androidInfo?.isAndroid) && <button type="button" className="pill-btn android-translate-trigger" data-testid="android-translate-trigger" aria-label="Dịch Android" onClick={() => onOpenAndroidTranslation?.()}><Icon name="globe" /><span>Dịch Android</span></button>}{(['artifacts', 'agents', 'btw'] as const).map(tab => <button key={tab} data-chat-drawer={tab} className={`pill-btn ${drawer === tab ? 'is-active' : ''}`} title={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} aria-label={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} onClick={() => { if (drawer !== tab) { setTrigger(null); setAttachmentPicker(false) } setDrawer(value => value === tab ? null : tab) }}><Icon name={tab === 'artifacts' ? 'layers' : tab === 'agents' ? 'agents' : 'message'} /><span className="pill-btn__label">{tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'}</span></button>)}<IconButton label="Tùy chọn hội thoại" active={menu} onClick={() => setMenu(value => !value)}><Icon name="more" /></IconButton></div></header>
     {!connected && <div className="warning">Đang kết nối OpenCode. Có thể thử lại trong Cài đặt.</div>}
     {error && <div className="inline-error" role="status">{error}</div>}
     <div className="chat-pane__body">{menu && <div className="chat-corner-drawer is-open" role="menu"><button className="chat-drawer__row" role="menuitem" onClick={() => { onCreate(); setMenu(false) }}>Cuộc trò chuyện mới</button><button className="chat-drawer__row" role="menuitem" onClick={() => { void navigator.clipboard.writeText(messages.map(item => `${item.role}: ${item.text}`).join('\n\n')).catch(report); setMenu(false) }}>Copy conversation</button></div>}
-      <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><div className="chat-drawer__head-actions">{drawer === 'agents' && projectID && sessionID && <button type="button" className="chat-drawer__action" onClick={() => { setDrawer(null); setAgentMapOpen(true) }}>Agent map</button>}<IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? projectID && sessionID ? <BtwPanel key={JSON.stringify([projectID, sessionID])} projectID={projectID} sessionID={sessionID} connected={connected} ready={ready} model={activeModel} onCreated={onCreated} onSelectSession={onSelectSession} onActivity={onActivity} /> : <Empty>Chọn một phiên để mở luồng phụ /btw.</Empty> : <>{drawer === 'artifacts' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={sessionID} /> : <Empty>Mở dự án để xem artifacts.</Empty>)}<button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Mở bảng Artifacts</button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
+      <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><div className="chat-drawer__head-actions">{drawer === 'agents' && projectID && sessionID && <button type="button" className="chat-drawer__action" onClick={() => { setDrawer(null); setAgentMapOpen(true) }}>Agent map</button>}<IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? lockedTranslation || translationSession ? <Empty>Dùng Chat chính mới cho /btw; phiên dịch Android chỉ dành cho bản địa hóa.</Empty> : projectID && sessionID ? <BtwPanel key={JSON.stringify([projectID, sessionID])} projectID={projectID} sessionID={sessionID} connected={connected} ready={ready} model={activeModel} onCreated={onCreated} onSelectSession={onSelectSession} onActivity={onActivity} /> : <Empty>Chọn một phiên để mở luồng phụ /btw.</Empty> : <>{drawer === 'artifacts' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={sessionID} /> : <Empty>Mở dự án để xem artifacts.</Empty>)}<button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Mở bảng Artifacts</button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
       <div ref={timeline} className="chat-stream" onScroll={e => { const el = e.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
         {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty>         : projectChatTimeline(messages, { running, mode: timelineDetail }).map(turn => <section key={turn.id} className="chat-turn">
-                 {turn.user && <article className="msg-user"><MessageContent text={turn.user.text || '…'} onOpenFile={onOpenFile} /></article>}
+                 {turn.user && <article className="msg-user"><MessageContent text={turn.user.text || '…'} onOpenFile={onOpenFile} /><MessageAttachmentList attachments={turn.user.attachments} /></article>}
                  <div className="msg-turn-body">{turn.blocks.map(block => {
                    const actions = { projectDirectory, onOpenFile, onOpenAgentMap: () => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) } }
                    if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
@@ -342,13 +440,20 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
                </section>)}
         {permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
-      <div className="composer-dock"><div className="composer-dock__inner">{(projectName || sessionID) && <div className="composer-context-strip">{sessionID ? <button className="ctx-strip-chip" onClick={() => onOpenPanel('changes')} title="Thay đổi của toàn bộ session, từ OpenCode snapshots"><Icon name="diff" /><span>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files changed`}</span>{changesStatus === 'ready' && projectName && <span className="ctx-strip-chip__meta">· {projectName}</span>}</button> : <span>Project: <strong>{projectName}</strong>{branch ? ` (${branch})` : ''}</span>}{sessionID && <button type="button" className="agent-map-trigger" data-testid="agent-map-trigger" title="Mở Agent map (sơ đồ subagents, skill, prompt và output)" onClick={() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }}><span className={`agent-map-dot ${agentFamily.runningCount > 0 ? 'agent-map-dot--running' : agentFamily.subagentCount > 0 ? 'agent-map-dot--succeeded' : 'agent-map-dot--idle'}`} aria-hidden="true" /><span>{agentFamily.subagentCount > 0 ? `${agentFamily.subagentCount} subagent` : 'Agent map'}</span></button>}</div>}      <form className="composer-card" onSubmit={e => { e.preventDefault(); void send() }} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) { setTrigger(null); setAttachmentPicker(false) } }}>
-              {attachments.length > 0 && <div className="composer-attachments" aria-label="Tệp đính kèm">{attachments.map(item => <span className="attachment-chip" key={item.id} title={item.path}><Icon name="file" /><span className="truncate">{item.path}</span><button type="button" aria-label={`Bỏ đính kèm ${item.path}`} onClick={() => setAttachments(current => current.filter(attachment => attachment.id !== item.id))}>×</button></span>)}</div>}
+      {lockedTranslation || translationSession ? <div className="translation-locked-banner" role="status" data-testid="translation-locked-banner"><Icon name="lock" /><p>{lockedTranslation ? 'Phiên dịch Android này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Dịch Android riêng. Mở Dịch Android để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p>{!lockedTranslation && <button type="button" onClick={() => onOpenAndroidTranslation?.()}>Dịch Android</button>}<button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <div className="composer-dock"><div className="composer-dock__inner">{(projectName || sessionID) && <div className="composer-context-strip">{sessionID ? <button className="ctx-strip-chip" onClick={() => onOpenPanel('changes')} title="Thay đổi của toàn bộ session, từ OpenCode snapshots"><Icon name="diff" /><span>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files changed`}</span>{changesStatus === 'ready' && projectName && <span className="ctx-strip-chip__meta">· {projectName}</span>}</button> : <span>Project: <strong>{projectName}</strong>{branch ? ` (${branch})` : ''}</span>}{sessionID && <button type="button" className="agent-map-trigger" data-testid="agent-map-trigger" title="Mở Agent map (sơ đồ subagents, skill, prompt và output)" onClick={() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }}><span className={`agent-map-dot ${agentFamily.runningCount > 0 ? 'agent-map-dot--running' : agentFamily.subagentCount > 0 ? 'agent-map-dot--succeeded' : 'agent-map-dot--idle'}`} aria-hidden="true" /><span>{agentFamily.subagentCount > 0 ? `${agentFamily.subagentCount} subagent` : 'Agent map'}</span></button>}</div>}      <form className="composer-card" onSubmit={e => { e.preventDefault(); void send() }} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) { setTrigger(null); setAttachmentPicker(false) } }}>
+              <ComposerAttachmentStrip attachments={attachments} onRemove={id => setAttachments(current => current.filter(attachment => attachment.id !== id))} />
+              <ComposerDropOverlay active={dragActive} />
               {popoverOpen && <div className="composer-popover is-open">
-                {attachmentPicker && <><div className="composer-popover__header">Đính kèm ngữ cảnh</div>{activeFile && <button type="button" className="composer-popover__active-file" onClick={() => addAttachment(activeFile)}>Đính kèm tệp đang mở: {activeFile}</button>}<input autoFocus className="composer-attachment-search" placeholder="Tìm tệp trong dự án..." aria-label="Tìm tệp đính kèm" role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls={popoverID} aria-activedescendant={choices.length ? `${popoverID}-${selectedCompletion}` : undefined} value={attachmentQuery} onChange={e => { setAttachmentQuery(e.target.value); setCompletionIndex(0) }} onKeyDown={handlePopoverKey} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} /></>}
+                {attachmentPicker && <><div className="composer-popover__header">Đính kèm ngữ cảnh</div><button type="button" className="composer-popover__pick-file" disabled={!canAttach} onClick={() => { if (projectID && canAttach) { setAttachmentPicker(false); void receiveAttachments(() => window.ame.pickAttachmentFiles(projectID)) } }}>Chọn tệp / ảnh từ máy…</button>{activeFile && <button type="button" className="composer-popover__active-file" onClick={() => addAttachment(activeFile)}>Đính kèm tệp đang mở: {activeFile}</button>}<input autoFocus className="composer-attachment-search" placeholder="Tìm tệp trong dự án..." aria-label="Tìm tệp đính kèm" role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls={popoverID} aria-activedescendant={choices.length ? `${popoverID}-${selectedCompletion}` : undefined} value={attachmentQuery} onChange={e => { setAttachmentQuery(e.target.value); setCompletionIndex(0) }} onKeyDown={handlePopoverKey} onCompositionStart={() => { composing.current = true }} onCompositionEnd={() => { composing.current = false }} /></>}
                 <div className="composer-popover__list" role="listbox" id={popoverID} aria-label={attachmentPicker ? 'Tệp đính kèm' : trigger?.kind === '@' ? 'File mentions' : 'Slash commands & skills'}>{choices.map((choice, index) => <button type="button" role="option" id={`${popoverID}-${index}`} aria-selected={index === selectedCompletion} tabIndex={-1} className={`composer-popover__option ${index === selectedCompletion ? 'is-active' : ''}`} key={choice.insertText} onMouseDown={e => e.preventDefault()} onMouseEnter={() => setCompletionIndex(index)} onClick={() => complete(index)}><span className="truncate">{choice.label}</span><span className="muted truncate">{choice.description}</span></button>)}{!choices.length && <div className="composer-popover__empty" role="status">Không có kết quả.</div>}</div>
               </div>}
-              <textarea ref={input} className="composer-input" aria-label="Yêu cầu cho agent" aria-autocomplete="list" aria-expanded={!!trigger} aria-controls={trigger ? popoverID : undefined} aria-activedescendant={trigger && choices.length ? `${popoverID}-${selectedCompletion}` : undefined} placeholder="Hỏi bất cứ điều gì — gõ yêu cầu cho agent…" value={text} disabled={!projectID || !connected} onChange={e => { setText(e.target.value); updateTrigger(e.target.value, e.target.selectionStart) }} onClick={e => updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart)} onKeyUp={e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onCompositionStart={() => { composing.current = true; setTrigger(null) }} onCompositionEnd={e => { composing.current = false; updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onKeyDown={e => { if (composing.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || handlePopoverKey(e)) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} rows={1} />
+              <textarea ref={input} className="composer-input" onPaste={event => {
+                if (!canAttach) return
+                const images = Array.from(event.clipboardData.items).filter(item => item.kind === 'file' && item.type.startsWith('image/')).map(item => item.getAsFile()).filter((file): file is File => !!file)
+                if (!images.length) return
+                if (!event.clipboardData.getData('text/plain')) event.preventDefault()
+                void receiveAttachments(() => Promise.all(images.map(readBrowserFileAttachment)))
+              }} aria-label="Yêu cầu cho agent" aria-autocomplete="list" aria-expanded={!!trigger} aria-controls={trigger ? popoverID : undefined} aria-activedescendant={trigger && choices.length ? `${popoverID}-${selectedCompletion}` : undefined} placeholder="Hỏi bất cứ điều gì — gõ yêu cầu cho agent…" value={text} disabled={!projectID || !connected} onChange={e => { setText(e.target.value); updateTrigger(e.target.value, e.target.selectionStart) }} onClick={e => updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart)} onKeyUp={e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onCompositionStart={() => { composing.current = true; setTrigger(null) }} onCompositionEnd={e => { composing.current = false; updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onKeyDown={e => { if (composing.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || handlePopoverKey(e)) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} rows={1} />
         <div className="composer-toolbar"><div className="composer-toolbar__left"><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Đính kèm ngữ cảnh" aria-label="Đính kèm ngữ cảnh" aria-expanded={attachmentPicker} aria-controls={attachmentPicker ? popoverID : undefined} onClick={() => { const open = !attachmentPicker; setAttachmentPicker(open); setAttachmentQuery(''); setCompletionIndex(0); setTrigger(null); if (open) onRequestFiles?.() }}><Icon name="plus" /></button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Slash commands & skills" aria-label="Slash commands & skills" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('/')}>/</button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="File mentions" aria-label="File mentions" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('@')}>@</button>{role === 'user' ? <span className="composer-picker composer-picker--model composer-picker--locked" role="status" aria-label="Mô hình cố định theo chính sách máy chủ" title={`Tài khoản user dùng model cố định từ máy chủ: ${activeModel?.name || model}`}>
           <span className="composer-picker__face"><Icon name="lock" /><span className="composer-picker__label">{activeModel?.name || model}</span></span>
         </span> : <label className="composer-picker composer-picker--model" title={activeModel ? `Model: ${formatModelOptionLabel(activeModel, effectiveModelLevels)}` : 'Chọn model'}>
@@ -358,7 +463,7 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
           <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{activeAgent?.name || 'Default'}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Agent" value={agent} onChange={e => setAgent(e.target.value)} disabled={!connected || busy}><option value="">Default</option>{agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select>
         </label>{running && <button className="icon-btn" type="button" disabled={!sessionID || !connected} title="Dừng phản hồi" onClick={() => { if (projectID && sessionID) void window.ame.cancel(projectID, sessionID).then(() => refresh.current()).catch(report) }}><Icon name="stop" /></button>}<button className="send-btn" aria-label="Gửi yêu cầu" disabled={!projectID || !connected || !ready || busy || (!text.trim() && !attachments.length) || !activeModel}><Icon name="send" /></button></div></div>
-      </form></div></div>
+      </form></div></div>}
     </div>
     </div>
     {agentMapOpen && projectID && sessionID && <AgentMap projectID={projectID} sessionID={sessionID} connected={connected} onSelectSession={id => { onSelectSession(id); setAgentMapOpen(false) }} onOpenFile={(path, line) => { onOpenFile(path, line); setAgentMapOpen(false) }} onClose={() => setAgentMapOpen(false)} />}

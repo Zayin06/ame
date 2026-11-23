@@ -5,7 +5,7 @@ import { z } from "zod"
 import { assertModel, managedProvider, modelPolicy, parseModelLevel, providerURL, resolveModelLevel, type ModelLevels } from "../../amekit/src/model-policy"
 import { modelGateway } from "./model-gateway"
 
-type RuntimePolicy = { models: ReturnType<typeof modelPolicy>["models"]; default_model: string; model_levels: ModelLevels }
+type RuntimePolicy = { models: ReturnType<typeof modelPolicy>["models"]; default_model: string; model_levels: ModelLevels; chat_models?: ReturnType<typeof modelPolicy>["chat_models"]; feature_models?: readonly string[] }
 type AgentModel = { id: string; model?: Model.Ref }
 type AgentModelEditor = {
   list(): readonly AgentModel[]
@@ -32,16 +32,25 @@ export function applyAgentModelTransform(editor: AgentModelEditor, policy: Runti
 
 export function resolveHookModel(input: { kind: string; model: Model.Ref }, policy: RuntimePolicy | undefined) {
   if (!policy || input.model.providerID !== managedProvider) return
+  const singleChatModel = (policy.chat_models?.length ?? policy.models.length) === 1
+  const isAuthorizedFeatureModel = !!policy.feature_models?.includes(input.model.id)
   const level = parseModelLevel(input.model.id)
-  if (level) input.model = { providerID: managedProvider as Model.Info["providerID"], id: policy.model_levels[level] as Model.ID }
-  else if (input.kind === "title" && policy.models.some(model => model.id === policy.model_levels.haiku)) {
-    input.model = { providerID: managedProvider as Model.Info["providerID"], id: policy.model_levels.haiku as Model.ID }
+  if (level) {
+    input.model = { providerID: managedProvider as Model.Info["providerID"], id: policy.model_levels[level] as Model.ID }
+  } else if (input.kind === "title") {
+    if (singleChatModel) input.model = { providerID: managedProvider as Model.Info["providerID"], id: policy.default_model as Model.ID }
+    else if (policy.models.some(model => model.id === policy.model_levels.haiku)) {
+      input.model = { providerID: managedProvider as Model.Info["providerID"], id: policy.model_levels.haiku as Model.ID }
+    }
   }
-  if (policy.models.length === 1) input.model = { providerID: input.model.providerID, id: policy.default_model as Model.ID }
+  if (singleChatModel && !(input.kind !== "title" && isAuthorizedFeatureModel)) {
+    input.model = { providerID: input.model.providerID, id: policy.default_model as Model.ID }
+  }
 }
 
 const updateSchema = z.object({
   role: z.enum(["admin", "user"]), catalog: z.unknown(),
+  featureModels: z.array(z.string().min(1).max(200)).max(20).optional(),
   provider: z.object({ base_url: z.string(), api_key: z.string().min(1) }),
   expires: z.number().finite(),
 }).nullable()
@@ -115,7 +124,7 @@ export default Plugin.define({
         state.policy = undefined; state.provider = undefined; state.expires = 0
         try {
           if (value) {
-            const policy = modelPolicy(value.role, value.catalog), base_url = providerURL(value.provider.base_url)
+            const policy = modelPolicy(value.role, value.catalog, { featureModels: value.featureModels }), base_url = providerURL(value.provider.base_url)
             if (value.expires <= Date.now()) throw new Error("AMECODE_LOGIN_REQUIRED")
             state.policy = policy; state.provider = { ...value.provider, base_url }; state.expires = Math.min(value.expires, Date.now() + 90_000)
           }

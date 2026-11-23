@@ -27,7 +27,7 @@ test('real SDK requests use location, main-only auth, session binding, prompt an
     if (url.pathname === '/api/session/foreign') return json({ data: { id: 'foreign', location: { directory: 'C:\\other-project' } } })
     if (url.pathname === '/api/model') return json({ data: [{ id: 'server-model-id', modelID: 'catalog-id', providerID: 'amecode', name: 'Model' }] })
     if (url.pathname === '/api/session') return json({ data: [{ id: 's1', title: 'Hello' }], cursor: {} })
-    if (url.pathname.endsWith('/model')) return new Response(null, { status: 204 })
+    if (url.pathname.endsWith('/model') || url.pathname.endsWith('/agent')) return new Response(null, { status: 204 })
     if (url.pathname.endsWith('/prompt')) return json({ data: { id: 'inbox1' } })
     if (url.pathname.endsWith('/interrupt')) return json({ data: {} })
     if (url.pathname.endsWith('/message')) return json({ data: [{ id: 'u1', type: 'user', text: 'Hello' }], cursor: {} })
@@ -45,6 +45,22 @@ test('real SDK requests use location, main-only auth, session binding, prompt an
     assert.equal(model.modelID, 'catalog-id')
     await adapter.prompt('project', 's1', 'test', model)
     assert.deepEqual(JSON.parse(String(calls.find(c => c.url.pathname === '/api/session/s1/model')!.init.body)).model, { id: 'server-model-id', providerID: 'amecode' })
+    const promptBodies = () => calls.filter(call => call.url.pathname === '/api/session/s1/prompt').map(call => JSON.parse(String(call.init.body)))
+    assert.deepEqual(promptBodies().at(-1), { text: 'test' })
+    const file = { uri: 'data:image/png;base64,iVBOR', name: 'shot.png', mime: 'image/png', source: { type: 'inline' as const } }
+    await adapter.prompt('project', 's1', '', model, undefined, [file])
+    assert.deepEqual(promptBodies().at(-1), { text: '(Đính kèm tệp)', files: [{ uri: file.uri, name: file.name, source: file.source }] })
+    await adapter.prompt('project', 's1', '  describe  ', model, 'agent', Array.from({ length: 10 }, (_, index) => ({ ...file, name: `${index}.png` })))
+    assert.equal(promptBodies().at(-1).text, '  describe  ')
+    assert.equal(promptBodies().at(-1).files.length, 8)
+    assert.equal(promptBodies().at(-1).files[7].name, '7.png')
+    assert.ok(calls.some(call => call.url.pathname === '/api/session/s1/agent'))
+    await adapter.prompt('project', 's1', 'reference', model, undefined, [{ uri: 'file:///C:/notes.txt' }])
+    assert.deepEqual(promptBodies().at(-1).files, [{ uri: 'file:///C:/notes.txt' }])
+    const promptCount = promptBodies().length
+    await assert.rejects(adapter.prompt('project', 's1', ' \n ', model, undefined, []), /INVALID_PROMPT/)
+    await assert.rejects(adapter.prompt('project', 's1', 'x'.repeat(200001), model, undefined, [file]), /INVALID_PROMPT/)
+    assert.equal(promptBodies().length, promptCount)
     assert.equal((await adapter.permissions('project', 's1'))[0].title, 'edit: a.ts')
     await adapter.replyPermission('project', 'p1', 'once')
     assert.equal(new Headers(calls[0].init.headers).get('authorization'), 'Basic ' + Buffer.from('opencode:private-password').toString('base64'))
@@ -149,6 +165,27 @@ test('session changes use snapshot ranges, not the latest-turn default or Git', 
     empty = false; rejected = true
     await assert.rejects(adapter.sessionDiff('p', 's1'))
   } finally { adapter.dispose() }
+})
+
+test('user file parts preserve inline base64 and URI references without changing text-only history', () => {
+  const items = normalizeMessages([
+    { id: 'inline', type: 'user', text: '', files: [
+      { name: 'shot.png', mime: 'image/png', data: ' Y Q==\n\t' },
+      { name: 'report.pdf', mime: 'application/pdf', data: 'cGRm', uri: 'ignored' },
+      { name: 'notes.txt', mime: 'text/plain', data: '  ', uri: 'file:///C:/notes.txt', bytes: 12 },
+      { uri: 'file:///C:/unknown.bin', bytes: 0 },
+    ] },
+    { id: 'plain', type: 'user', text: 'unchanged', files: [] },
+  ] as unknown as SessionMessageInfo[])
+  assert.deepEqual(items, [
+    { id: 'inline', role: 'user', text: '', attachments: [
+      { name: 'shot.png', mime: 'image/png', dataUrl: 'data:image/png;base64,YQ==' },
+      { name: 'report.pdf', mime: 'application/pdf', dataUrl: 'data:application/pdf;base64,cGRm' },
+      { name: 'notes.txt', mime: 'text/plain', uri: 'file:///C:/notes.txt', size: 12 },
+      { name: 'attachment', mime: 'application/octet-stream', uri: 'file:///C:/unknown.bin', size: 0 },
+    ] },
+    { id: 'plain', role: 'user', text: 'unchanged' },
+  ])
 })
 
 test('completed turns follow native idle/snapshot boundaries, including steered prompts', () => {

@@ -102,8 +102,9 @@ function harness(component: 'Account' | 'Settings', initialProps: object, accoun
   return { render, find, button, click, change, AccountMarker, async flush() { await tick(); return render() }, unmount() { effects.forEach(effect => effect.cleanup?.()) } }
 }
 
-function admin(options: { initial?: ReturnType<typeof preview>; role?: string; models?: { default_model?: string; small_model?: string; model_levels?: Partial<typeof modelLevels> } | null } = {}) {
-  let imported = options.initial ?? preview(), current = imported, batchFailures: { path: string; code: string }[] = [], failure = '', nextFix: Promise<unknown> | undefined
+function admin(options: { initial?: ReturnType<typeof preview>; role?: string; features?: { commitEnhanceSkill?: string; commitEnhanceModel?: string; androidTranslationSkill?: string; androidTranslationModel?: string }; models?: { default_model?: string; small_model?: string; model_levels?: Partial<typeof modelLevels>; active_models?: { id: string; name: string; vision?: boolean; reasoning?: boolean }[] } | null } = {}) {
+  let imported = options.initial ?? preview(), current = imported, batchFailures: { path: string; code: string; detail?: string }[] = [], failure = '', nextFix: Promise<unknown> | undefined
+  let nextImport: Promise<unknown> | undefined, nextBatch: Promise<unknown> | undefined
   const calls: { operation: string; payload?: Record<string, string> }[] = []
   const loggedIn = { account: { name: 'Admin', username: 'admin', role: options.role ?? 'admin' }, ready: true, models: options.models === null ? undefined : options.models ?? accountModels }
   const h = harness('Account', { embedded: true, close() {} }, async (operation, payload) => {
@@ -111,9 +112,13 @@ function admin(options: { initial?: ReturnType<typeof preview>; role?: string; m
     if (operation === 'status' || operation === 'login') return loggedIn
     if (operation === 'logout') return null
     if (operation === 'history') return { releases: [], active: { revision: 1 } }
-    if (operation === 'latest') return { release: { features: { commitEnhanceSkill: 'review' } } }
-    if (operation === 'import') { current = imported; return current }
-    if (operation === 'package') return { summary: { version: payload?.version }, size: 100, entries: 2, sha256: 'abc' }
+    if (operation === 'latest') return { release: { features: options.features ?? { commitEnhanceSkill: 'review' } } }
+    if (operation === 'import') {
+      if (nextImport) { const value = nextImport; nextImport = undefined; return value }
+      if (failure) throw new Error(failure)
+      current = imported; return current
+    }
+    if (operation === 'package') return { summary: { version: payload?.version, features: Object.fromEntries(Object.entries(payload ?? {}).filter(([key]) => key !== 'version')) }, size: 100, entries: 2, sha256: 'abc' }
     if (operation === 'publish') return { releaseId: 'release', version: '1.0.0' }
     if (failure) throw new Error(failure)
     const path = payload?.path ?? ''
@@ -123,6 +128,7 @@ function admin(options: { initial?: ReturnType<typeof preview>; role?: string; m
       return { preview: current, fix: fixed(path) }
     }
     if (operation === 'fix-import-all') {
+      if (nextBatch) { const value = nextBatch; nextBatch = undefined; return value }
       const paths = current.fixablePaths.filter(path => !batchFailures.some(item => item.path === path)).slice(0, 10)
       current = { ...current, issues: current.issues.filter(item => !paths.includes(item.path)), fixablePaths: current.fixablePaths.filter(path => !paths.includes(path)) }
       return { preview: current, fixes: paths.map(fixed), failed: batchFailures }
@@ -145,6 +151,8 @@ function admin(options: { initial?: ReturnType<typeof preview>; role?: string; m
     failBatch(value: typeof batchFailures) { batchFailures = value },
     fail(value: string) { failure = value },
     delayFix(value: Promise<unknown>) { nextFix = value },
+    delayImport(value: Promise<unknown>) { nextImport = value },
+    delayBatch(value: Promise<unknown>) { nextBatch = value },
   }
 }
 async function openAdmin(h: ReturnType<typeof admin>) {
@@ -172,7 +180,11 @@ test('Admin single fix uses API default, gates busy actions, shows safe diff and
   assert.ok(h.button('Sửa lỗi bằng AI'))
   const response = deferred()
   h.delayFix(response.promise); h.click('Sửa bằng AI', agent); h.render()
-  for (const label of ['Sửa bằng AI', 'Bỏ tệp', 'Sửa lỗi bằng AI', 'Chọn thư mục & nhập']) assert.equal(h.button(label).props.disabled, true)
+  for (const label of ['Đang sửa…', 'Bỏ tệp', 'Sửa lỗi bằng AI', 'Chọn thư mục & nhập']) assert.equal(h.button(label).props.disabled, true)
+  const bar = h.find(node => node.props.className === 'amekit-fix-bar')
+  assert.ok((bar.props.children as ReactNode[]).some(child => isValidElement<{ className?: string }>(child) && child.props.className === 'amekit-busy-inline'))
+  assert.match(h.render(), /amekit-spinner.*Đang sửa agents\/helper.md.*model default.*resolved-model/s)
+  assert.doesNotMatch(h.render(), />Đang xử lý…</)
   response.resolve({ preview: preview([agent], []), fix: fixed(agent) })
   html = await h.flush()
   assert.deepEqual(payload(h, 'fix-import'), { path: agent })
@@ -202,11 +214,13 @@ test('batch fixing deduplicates file errors, reports partial failures and preser
   const h = admin({ initial: preview([agent, skill], [issue(agent), issue(agent, 'broken local link'), issue(skill)]) })
   let html = await openAdmin(h)
   assert.ok(h.button('Sửa tất cả lỗi bằng AI (2)'))
-  h.failBatch([{ path: skill, code: 'AI_FIX_VALIDATION_FAILED' }])
+  h.failBatch([{ path: skill, code: 'AI_FIX_VALIDATION_FAILED', detail: 'missing/unsafe local reference: guide.md' }])
   h.click('Sửa tất cả lỗi bằng AI (2)'); html = await h.flush()
   assert.deepEqual(payload(h, 'fix-import-all'), {})
   assert.match(html, /Đã sửa 1 tệp bằng AI\. Không sửa được 1 tệp:/)
-  assert.ok(html.includes(`${skill} — Bản sửa AI vẫn còn lỗi`))
+  assert.ok(html.includes(`${skill} — Bản sửa AI vẫn còn lỗi sau khi kiểm tra lại: missing/unsafe local reference: guide.md`))
+  assert.match(html, /<\/div><p class="amekit-alert amekit-alert--error" role="alert">Đã sửa 1 tệp/)
+  assert.ok(html.indexOf('Không sửa được 1 tệp') < html.indexOf('amekit-issue-tabs'))
   assert.match(html, /Bị chặn · 1 lỗi/)
   assert.ok(h.button('Hoàn tác', agent))
   assert.ok(h.button('Sửa lỗi bằng AI'))
@@ -284,6 +298,52 @@ test('reimport and logout reset applied fixes/notices, saved state, and packaged
   ;(login.props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
   await h.flush(); h.click('Quản trị'); h.render(); html = await h.flush()
   assert.doesNotMatch(html, /amekit-inspector|amekit-fix-card|amekit-fix-notice/)
+  h.unmount()
+})
+
+test('pending, canceled and failed reimports retain preview, staged fixes, features and package', async () => {
+  const h = admin({ initial: preview() })
+  await openAdmin(h)
+  h.click('Sửa tất cả lỗi bằng AI (2)'); await h.flush()
+  packageBundle(h); await h.flush()
+  const pending = deferred()
+  h.delayImport(pending.promise); h.click('Chọn thư mục & nhập')
+  let html = h.render()
+  assert.equal(h.button('Đang quét thư mục…').props.disabled, true)
+  for (const text of ['amekit-inspector', 'amekit-fix-card', 'Đã đóng gói v1.0.0', 'Đã sửa 2 tệp bằng AI']) assert.ok(html.includes(text), text)
+  assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Enhance (Commit message)').props.value, 'review')
+  pending.resolve(null); html = await h.flush()
+  assert.match(html, /amekit-fix-card|Đã đóng gói v1\.0\.0/)
+  assert.equal(h.button('Xuất bản gói đã chuẩn bị').props.disabled, false)
+  h.fail('AI_FIX_PROVIDER_ERROR: HTTP 400: unsupported model setting')
+  h.click('Chọn thư mục & nhập'); html = await h.flush()
+  assert.match(html, /amekit-inspector/)
+  assert.match(html, /Đã đóng gói v1\.0\.0/)
+  assert.equal((html.match(/unsupported model setting/g) ?? []).length, 1)
+  assert.ok(html.indexOf('role="alert"') < html.indexOf('Bước 1'))
+  assert.match(html, /settings-content"><div class="amekit-alert amekit-alert--error" role="alert"/)
+  h.fail(''); h.setImport(preview([agent])); h.click('Chọn thư mục & nhập'); html = await h.flush()
+  assert.match(html, /Bị chặn · 1 lỗi/)
+  assert.doesNotMatch(html, /amekit-fix-card|Đã đóng gói v|unsupported model setting/)
+  assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Enhance (Commit message)').props.value, '')
+  h.unmount()
+})
+
+test('batch progress is inline and restores actions after provider diagnostics', async () => {
+  const h = admin()
+  await openAdmin(h)
+  const pending = deferred()
+  h.delayBatch(pending.promise); h.click('Sửa tất cả lỗi bằng AI (2)')
+  let html = h.render()
+  assert.equal(h.button('Đang sửa bằng AI…').props.disabled, true)
+  assert.match(html, /amekit-busy-inline" role="status"/)
+  assert.match(html, /amekit-spinner/)
+  assert.doesNotMatch(html, />Đang xử lý…</)
+  pending.resolve({ preview: preview(), fixes: [], failed: [{ path: agent, code: 'AI_FIX_PROVIDER_ERROR', detail: 'HTTP 400: unsupported parameter' }] })
+  html = await h.flush()
+  assert.match(html, /role="alert">Đã sửa 0 tệp.*HTTP 400: unsupported parameter/)
+  assert.doesNotMatch(html, /amekit-busy-inline|amekit-spinner/)
+  assert.equal(h.button('Sửa tất cả lỗi bằng AI (2)').props.disabled, false)
   h.unmount()
 })
 
@@ -368,11 +428,98 @@ test('Account displays legacy API tier fallbacks and uses default_model for the 
 
 test('Account without catalog metadata keeps the default fix explanation and omits the tier card', async () => {
   const h = admin({ models: null })
-  h.render(); assert.doesNotMatch(await h.flush(), /Phân cấp Model từ API/)
+  h.render(); assert.doesNotMatch(await h.flush(), /Phân cấp Model từ API|amekit-active-models/)
   const html = await openAdmin(h)
   assert.match(html, /Model sửa lỗi \(agent &amp; skill\): default<\/span>/)
   assert.match(html, /API \(<code>default<\/code>\); secret/)
   assert.doesNotMatch(html, /undefined|null/)
+  h.unmount()
+})
+
+test('Android feature failures provide actionable Vietnamese account messages', () => {
+  for (const code of ['UNKNOWN_ANDROID_TRANSLATION_SKILL', 'ANDROID_TRANSLATION_NOT_CONFIGURED', 'TRANSLATION_SESSION_LOCKED', 'TRANSLATION_MODEL_UNAVAILABLE', 'ANDROID_TRANSLATION_SESSION_REQUIRED']) {
+    const result = amekitUI.formatAmeKitError(new Error(code))
+    assert.equal(result.code, code)
+    assert.notEqual(result.title, code)
+    assert.ok(result.detail)
+  }
+})
+
+test('Account lists every active API model with capabilities for user accounts', async () => {
+  const h = admin({ role: 'user', models: { ...accountModels, active_models: [
+    { id: modelLevels.default, name: 'Default' },
+    { id: 'gemini-active', name: 'Gemini Active', vision: true, reasoning: true },
+  ] } })
+  h.render(); const html = await h.flush()
+  assert.match(html, /data-testid="amekit-active-models"/)
+  assert.ok(html.includes('Tất cả Model đang hoạt động từ API (2)'))
+  assert.match(html, /Gemini Active/)
+  assert.match(html, /gemini-active/)
+  assert.match(html, />Vision</)
+  assert.match(html, />Reasoning</)
+  assert.doesNotMatch(html, />Quản trị</)
+  h.unmount()
+})
+
+test('Admin prefills all feature fields, selects direct active models and packages four options', async () => {
+  const features = { commitEnhanceSkill: 'review', commitEnhanceModel: 'inactive-model', androidTranslationSkill: 'review', androidTranslationModel: 'gemini-active' }
+  const h = admin({ initial: preview([agent, skill], []), features, models: { ...accountModels, active_models: [{ id: 'gemini-active', name: 'Gemini' }, { id: 'commit-active', name: 'Commit' }] } })
+  let html = await openAdmin(h)
+  for (const [label, value] of [
+    ['Skill cho Enhance (Commit message)', features.commitEnhanceSkill], ['Model cho Enhance (Commit message)', features.commitEnhanceModel],
+    ['Skill cho Dịch Android', features.androidTranslationSkill], ['Model cho Dịch Android', features.androidTranslationModel],
+  ]) assert.equal(h.find(node => node.props['aria-label'] === label).props.value, value)
+  assert.match(html, /inactive-model · Không còn hoạt động/)
+  h.change('Model cho Enhance (Commit message)', 'commit-active'); h.render()
+  packageBundle(h); html = await h.flush()
+  assert.ok(html.includes('Enhance: /review · commit-active'))
+  assert.ok(html.includes('Dịch Android: /review · gemini-active'))
+  assert.deepEqual(payload(h, 'package'), { version: '1.0.0', ...features, commitEnhanceModel: 'commit-active' })
+  h.change('Skill cho Dịch Android', ''); h.render()
+  assert.equal(h.find(node => node.props['aria-label'] === 'Model cho Dịch Android').props.disabled, true)
+  assert.equal(h.button('Xuất bản gói đã chuẩn bị').props.disabled, true)
+  h.unmount()
+})
+
+test('Bundle installed and release history summaries retain both feature models', async () => {
+  const features = { commitEnhanceSkill: 'review', commitEnhanceModel: 'commit-active', androidTranslationSkill: 'android-strings-translation', androidTranslationModel: 'gemini-active' }
+  const h = harness('Account', { embedded: true, projectID: 'project', close() {} }, async operation => {
+    if (operation === 'status') return { account: { name: 'Admin', username: 'admin', role: 'admin' }, models: accountModels, ready: true }
+    if (operation === 'installed') return { version: '1.0.0', releaseId: 'installed', features }
+    if (operation === 'latest') return { release: { releaseId: 'latest', version: '2.0.0', manifest: { features } } }
+    if (operation === 'history') return { releases: [{ releaseId: 'latest', version: '2.0.0', manifest: { features } }], active: { revision: 1 } }
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Bundle'); h.render()
+  let html = await h.flush()
+  assert.equal((html.match(/Enhance: \/review · commit-active/g) ?? []).length, 2)
+  assert.equal((html.match(/Dịch Android: \/android-strings-translation · gemini-active/g) ?? []).length, 2)
+  h.click('Quản trị'); h.render(); html = await h.flush()
+  assert.ok(html.includes('Enhance: /review · commit-active'))
+  assert.ok(html.includes('Dịch Android: /android-strings-translation · gemini-active'))
+  h.unmount()
+})
+
+test('Admin can package a commit model without a skill and omit cleared feature overrides', async () => {
+  const h = admin({ initial: preview([agent, skill], []), features: {}, models: { ...accountModels, active_models: [{ id: 'commit-active', name: 'Commit' }] } })
+  await openAdmin(h)
+  assert.equal(h.find(node => node.props['aria-label'] === 'Model cho Dịch Android').props.disabled, true)
+  h.change('Model cho Enhance (Commit message)', 'commit-active'); h.render()
+  packageBundle(h); await h.flush()
+  assert.deepEqual(payload(h, 'package'), { version: '1.0.0', commitEnhanceModel: 'commit-active' })
+  h.change('Model cho Enhance (Commit message)', ''); h.render()
+  packageBundle(h); await h.flush()
+  assert.deepEqual(payload(h, 'package'), { version: '1.0.0' })
+  h.unmount()
+})
+
+test('Android feature selection clears when its imported skill is excluded', async () => {
+  const h = admin({ initial: preview([agent, skill], []), features: { androidTranslationSkill: 'review', androidTranslationModel: 'gemini' } })
+  await openAdmin(h)
+  h.setImport(preview([agent], []))
+  h.click('Chọn thư mục & nhập'); await h.flush()
+  assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Dịch Android').props.value, '')
+  assert.equal(h.find(node => node.props['aria-label'] === 'Model cho Dịch Android').props.disabled, true)
   h.unmount()
 })
 

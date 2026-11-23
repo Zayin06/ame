@@ -1,5 +1,7 @@
 export type { LspSeverity, LspRange, LspDiagnostic, LspCompletion, LspHover, LspLocation, LspReference, LspTextEdit, LspRenameResult } from '../../ide-core/src/ts-lsp'
 export type { DebugStatus, DebugBreakpoint, DebugCallFrame, DebugVariable, DebugSessionSnapshot, DebugEvent, DebugStartConfig } from '../../ide-core/src/debugger'
+export type { PromptFileAttachment, ChatAttachment, ResolvedDroppedFile } from '../../ide-core/src/dropped-attachments'
+import type { PromptFileAttachment, ChatAttachment, ResolvedDroppedFile } from '../../ide-core/src/dropped-attachments'
 import type { LspDiagnostic, LspCompletion, LspHover, LspLocation, LspReference, LspRenameResult } from '../../ide-core/src/ts-lsp'
 import type { DebugBreakpoint, DebugSessionSnapshot, DebugEvent, DebugStartConfig } from '../../ide-core/src/debugger'
 export type { PetHostState } from '../../amekit/src/pet-host'
@@ -57,6 +59,7 @@ export type ChatItem = {
   id: string
   role: string
   text: string
+  attachments?: ChatAttachment[]
   kind?: string
   tool?: ToolCallInfo
   turn?: { from: string; files: string[] }
@@ -66,6 +69,18 @@ export type ChatItem = {
   workedMs?: number
 }
 export type Model = { id: string; modelID?: string; name: string; providerID: string }
+export type SessionLockState = { lockedSessionIDs: string[]; translationSessionIDs: string[] }
+export type AndroidTranslationInfo = SessionLockState & {
+  configured: boolean
+  isAndroid: boolean
+  skill?: string
+  configuredModelID?: string
+  effectiveModelID?: string
+  effectiveModelName?: string
+  fallbackToDefault: boolean
+  stringsFiles: string[]
+}
+export type AndroidTranslationPromptResult = { session: Session; model: Model; locked: boolean }
 export type Agent = { id: string; name: string }
 export type Permission = { id: string; sessionID: string; title: string }
 export type Connection = { connected: boolean; url: string; version?: string; error?: string }
@@ -208,13 +223,19 @@ export interface DesktopApi {
   commands(projectID: string): Promise<SlashCommand[]>
   skills(projectID: string): Promise<SkillSummary[]>
   generateCommitMessage(projectID: string, model?: Model): Promise<{ message: string; truncated: boolean }>
+  androidTranslationInfo(projectID: string): Promise<AndroidTranslationInfo>
+  androidTranslationPrompt(projectID: string, sessionID: string | undefined, text: string, mode?: 'update' | 'full' | 'scan' | 'custom'): Promise<AndroidTranslationPromptResult>
+  androidTranslationLock(projectID: string, sessionID: string): Promise<SessionLockState>
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
   sessionUsage(projectID: string, sessionID: string): Promise<SessionUsageView>
   agentMap(projectID: string, sessionID: string): Promise<AgentMapView>
   models(projectID: string): Promise<Model[]>
   agents(projectID: string): Promise<Agent[]>
-  prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string): Promise<void>
+  prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string, files?: PromptFileAttachment[]): Promise<void>
+  resolveDroppedPaths(projectID: string, paths: string[]): Promise<ResolvedDroppedFile[]>
+  pickAttachmentFiles(projectID: string): Promise<ResolvedDroppedFile[]>
+  filePath(file: File): string
   cancel(projectID: string, sessionID: string): Promise<void>
   permissions(projectID: string, sessionID: string): Promise<Permission[]>
   replyPermission(projectID: string, permissionID: string, reply: 'once' | 'always' | 'reject'): Promise<void>

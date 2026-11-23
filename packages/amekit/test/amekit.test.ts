@@ -7,14 +7,15 @@ import { setTimeout as delay } from "node:timers/promises"
 import { createAmeKit, type AmeKitDependencies, type AmeKit } from "../src/index"
 import { openSessionVault, type Encryption } from "../src/session-vault"
 import { zipSync, unzipSync } from "fflate"
-import { pack, preview, safePath } from "../src/bundle/package"
+import { pack, preview, safePath, secretFindings } from "../src/bundle/package"
 import { validate } from "../src/bundle/manifest"
 import { scan, scanWithSource } from "../src/bundle/scan"
-import { buildCompactDiff, fixImportFileWithLlm, isFixableTextFile, redactSecretsForLlm } from "../src/bundle/ai-fix"
+import { AiFixError, buildCompactDiff, fixImportFileWithLlm, isFixableTextFile, redactSecretsForLlm } from "../src/bundle/ai-fix"
 import { AmeApi } from "../src/api"
 import { assertModel, catalogSchema, MODEL_LEVELS, modelPolicy, parseModelLevel, resolveModelLevel, type ModelLevels } from "../src/model-policy"
 import { parse, stringify } from "yaml"
-import { installed, install, readCommitEnhanceSkill, uninstall } from "../src/installer"
+import { installed, install, readAndroidTranslationFeature, readBundleFeatures, readCommitEnhanceSkill, uninstall } from "../src/installer"
+import { buildAndroidTranslationPrompt, createTranslationLockStore, detectAndroidProject } from "../src/android-translation"
 import type { Release } from "../src/api"
 import { dialoguePrompt, localDialogue } from "../src/pet-dialogue"
 import type { PetHostOptions } from "../src/pet-host"
@@ -46,6 +47,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   const rpc: unknown[] = [], requests: string[] = [], dialogs: string[] = []
   let role: unknown = settings.role ?? "user", plugin = settings.plugin !== false, accepted = settings.confirm !== false, failAuth = false, failStorage = false, pickerCount = 0
   let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
+  let pickResponse: (() => Promise<string | null>) | undefined
   let rpcResponse: (() => Promise<Response | undefined>) | undefined
   let dialogueResponse: ((signal: AbortSignal) => Promise<Response>) | undefined
   let fixResponse: ((body: Record<string, unknown>, init: RequestInit) => Promise<Response>) | undefined
@@ -90,12 +92,13 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
       return { agents: [{ id: "helper" }], skills: [{ id: "fixture", name: "fixture", path: path.join(directory, ".opencode", "skills", "fixture", "SKILL.md") }] }
     }),
   }
-  const options = { userData: data, endpoint: () => ({ url: "http://127.0.0.1:3210", headers: { authorization: "Basic fixture-owner" } }), project: async (id: string) => { assert.equal(id, "project-id"); return project }, pickImport: async () => { pickerCount++; return imported } }
+  const options = { userData: data, endpoint: () => ({ url: "http://127.0.0.1:3210", headers: { authorization: "Basic fixture-owner" } }), project: async (id: string) => { assert.equal(id, "project-id"); return project }, pickImport: async () => { pickerCount++; return pickResponse ? pickResponse() : imported } }
   const service = createAmeKit(options, dependencies)
   return { service, folder, project, imported, data, rpc, requests, dialogs, options, dependencies, artifact,
     role: (value: unknown) => { role = value }, plugin: (value: boolean) => { plugin = value }, confirm: (value: boolean) => { accepted = value }, disable: () => { failAuth = true }, breakStorage: () => { failStorage = true }, pickerCount: () => pickerCount,
     sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
     rpcResponse: (value?: () => Promise<Response | undefined>) => { rpcResponse = value },
+    pickResponse: (value?: () => Promise<string | null>) => { pickResponse = value },
     dialogueResponse: (value: (signal: AbortSignal) => Promise<Response>) => { dialogueResponse = value },
     fixRequests, fixResponse: (value: (body: Record<string, unknown>, init: RequestInit) => Promise<Response>) => { fixResponse = value },
     cleanup: async () => { await service.dispose(); await rm(folder, { recursive: true, force: true }) } }
@@ -122,6 +125,47 @@ test("model policy maps explicit tiers for admins and locks every user tier to t
   assert.throws(() => assertModel(admin, { providerID: "other", id: levels.default }), /AMECODE_MODEL_NOT_ALLOWED/)
   assert.deepEqual(modelPolicy("admin", catalog).model_levels, { default: "default", haiku: "other", sonnet: "default", opus: "default" })
   assert.deepEqual(modelPolicy("user", catalog).model_levels, { default: "default", haiku: "default", sonnet: "default", opus: "default" })
+})
+
+test("active model catalog is complete while chat and explicitly authorized feature models stay separate", () => {
+  const value = { ...catalog, models: [...catalog.models, { ...catalog.models[0], id: "gemini-active", name: "Gemini" }] }
+  const user = modelPolicy("user", value, { featureModels: ["other", "missing", "other", "default"] })
+  assert.deepEqual(user.active_models.map(model => model.id), ["default", "other", "gemini-active"])
+  assert.deepEqual(user.chat_models.map(model => model.id), ["default"])
+  assert.deepEqual(user.feature_models, ["other"])
+  assert.deepEqual(user.models.map(model => model.id), ["default", "other"])
+  assertModel(user, { providerID: "amecode", id: "other" })
+  assert.throws(() => assertModel(user, { providerID: "amecode", id: "gemini-active" }), /AMECODE_MODEL_NOT_ALLOWED/)
+  const admin = modelPolicy("admin", value)
+  assert.deepEqual(admin.active_models, admin.chat_models)
+  assert.deepEqual(admin.models, admin.active_models)
+})
+
+test("feature authorization reloads runtime policy without unlocking regular prompts or pet models", async () => {
+  const f = await fixture()
+  try {
+    assert.equal(await f.service.authorizeFeatureModel!("other"), null)
+    await login(f.service)
+    assert.equal(await f.service.authorizeFeatureModel!("missing"), null)
+    assert.equal(await f.service.authorizeFeatureModel!("default"), "default")
+    const before = f.rpc.length
+    assert.deepEqual(await Promise.all([f.service.authorizeFeatureModel!("other"), f.service.authorizeFeatureModel!("other")]), ["other", "other"])
+    assert.equal(f.rpc.length, before + 1)
+    assert.deepEqual((f.rpc.at(-1) as { featureModels: string[] }).featureModels, ["other"])
+    const status = await f.service.call("status", {}) as { models: ReturnType<typeof modelPolicy> }
+    assert.deepEqual(status.models.active_models.map(model => model.id), ["default", "other"])
+    assert.deepEqual(status.models.chat_models.map(model => model.id), ["default"])
+    assert.deepEqual(status.models.feature_models, ["other"])
+    assert.deepEqual(status.models.models.map(model => model.id), ["default", "other"])
+    await assert.rejects(f.service.generatePetDialogue("other", new AbortController().signal), /AMECODE_MODEL_NOT_ALLOWED/)
+    await assert.rejects(f.service.call("assert-model", { modelID: "other" }), /AMECODE_MODEL_NOT_ALLOWED/)
+    await f.service.call("logout", {})
+    await login(f.service)
+    assert.deepEqual((f.rpc.at(-1) as { featureModels: string[] }).featureModels, [])
+    assert.equal(await f.service.authorizeFeatureModel!("other"), "other")
+    await login(f.service)
+    assert.deepEqual((f.rpc.at(-1) as { featureModels: string[] }).featureModels, [])
+  } finally { await f.cleanup() }
 })
 
 test("model policy rejects invalid roles and incomplete or inconsistent tier catalogs", () => {
@@ -441,7 +485,7 @@ test("commit Enhance packaging is opt-in, deterministic and validates manifest f
     ...["", ".", "..", "e\u0301", "a".repeat(121), "a/b", "a\\b", "a:b", "a*b", "a?b", 'a"b', "a<b", "a>b", "a|b", "a\x00b", "a\x1fb", "a\x7fb", 1].map(commitEnhanceSkill => ({ commitEnhanceSkill }))]) {
     await assert.rejects(validate(rewrite(features), "1.2.3"), { name: "ZodError" }, JSON.stringify(features))
   }
-  assert.deepEqual((await validate(rewrite({}), "1.2.3")).features, {})
+  assert.equal(Object.hasOwn(await validate(rewrite({}), "1.2.3"), "features"), false)
   const unicode = input().map(file => ({ ...file, path: file.path.replace("fixture", "kỹ-năng") }))
   const raw = await pack(preview(unicode, [], { compatibilityMode: "raw" }), "1.2.3", undefined, { commitEnhanceSkill: "kỹ-năng" })
   assert.deepEqual(raw.summary.features, { commitEnhanceSkill: "kỹ-năng" })
@@ -553,6 +597,141 @@ test("commit Enhance reader rejects malformed ownership, tampering and linked di
     await assert.rejects(readCommitEnhanceSkill(f.project), /REPARSE_CONFIG_REJECTED/)
     await assert.rejects(readCommitEnhanceSkill("relative-project"), /ABSOLUTE_PROJECT_REQUIRED/)
   } finally { await f.cleanup() }
+})
+
+test("four bundle features round-trip through API, packaging, install and verified readers", async () => {
+  const f = await fixture({ role: "admin" })
+  const features = { commitEnhanceSkill: "fixture", commitEnhanceModel: "other", androidTranslationSkill: "fixture", androidTranslationModel: "gemini-active" }
+  try {
+    await login(f.service)
+    await f.service.call("import", {})
+    const packaged = await f.service.call("package", { version: "1.2.3", ...Object.fromEntries(Object.entries(features).map(([key, value]) => [key, ` ${value} `])) }) as { summary: Release["manifest"] }
+    assert.deepEqual(packaged.summary.features, features)
+    const packed = await pack(preview(input()), "1.2.3", undefined, features)
+    assert.deepEqual((await validate(packed.bytes, "1.2.3")).features, features)
+    const release = { ...f.artifact.release, sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"] }
+    const authPayload = { session: { token: "token", expires_at: new Date(Date.now() + 60000).toISOString() }, user: { id: "1", username: "admin", name: "Admin", role: "admin" }, provider: { base_url: "http://localhost:3212", api_key: "key" }, catalog, registry: {} }
+    let apiFeatures: unknown = features
+    const api = new AmeApi("http://localhost:3211", async url => String(url).includes("/latest")
+      ? Response.json({ release: { ...release, manifest: { ...release.manifest, features: apiFeatures } }, revision: 1, activatedAt: 1 })
+      : Response.json(authPayload))
+    await api.login("admin", "password")
+    assert.deepEqual((await api.latest()).release.manifest.features, features)
+    apiFeatures = { ...features, unexpected: "value" }
+    await assert.rejects(api.latest(), /INVALID_API_RESPONSE/)
+    const result = await install(f.project, "http://localhost:3211", release, packed.bytes, f.dependencies.discover!)
+    assert.deepEqual(result.state.features, features)
+    assert.deepEqual(await readBundleFeatures(f.project), features)
+    assert.deepEqual(await f.service.readCommitEnhanceFeature!("project-id"), { skill: { name: "fixture", instructions: "Run checks." }, model: "other" })
+    const expected = { skill: { name: "fixture", instructions: "Run checks.", directory: path.join(f.project, ".opencode", "skills", "fixture") }, model: "gemini-active", rawSkillName: "fixture" }
+    assert.deepEqual(await readAndroidTranslationFeature(f.project), expected)
+    assert.deepEqual(await f.service.readAndroidTranslationFeature!("project-id"), expected)
+    const entries = unzipSync(packed.bytes), manifest = JSON.parse(new TextDecoder().decode(entries["manifest.json"]))
+    const rewrite = (value: unknown) => zipSync({ ...entries, "manifest.json": encode(JSON.stringify({ ...manifest, features: value })) })
+    await assert.rejects(pack(preview(input()), "1.2.3", undefined, { androidTranslationSkill: "missing" }), /UNKNOWN_ANDROID_TRANSLATION_SKILL/)
+    await assert.rejects(validate(rewrite({ androidTranslationSkill: "missing" }), "1.2.3"), /UNKNOWN_ANDROID_TRANSLATION_SKILL/)
+    for (const key of ["commitEnhanceModel", "androidTranslationModel"] as const) {
+      for (const value of ["", "a b", "a/b", "a\n", "a\x00b", "e\u0301", "a".repeat(201), 42])
+        await assert.rejects(validate(rewrite({ [key]: value }), "1.2.3"), { name: "ZodError" })
+    }
+    const statePath = path.join(f.project, ".opencode", ".amekit-release.json"), original = JSON.parse(await readFile(statePath, "utf8"))
+    for (const invalid of [{ unexpected: "fixture" }, { androidTranslationSkill: "missing" }, { androidTranslationModel: 1 }, { commitEnhanceModel: "a/b" }]) {
+      await writeFile(statePath, JSON.stringify({ ...original, features: invalid }))
+      await assert.rejects(readBundleFeatures(f.project), /INVALID_OWNERSHIP_STATE/)
+    }
+    await writeFile(statePath, JSON.stringify(original))
+    await writeFile(path.join(f.project, ".opencode", "skills", "fixture", "SKILL.md"), "tampered")
+    await assert.rejects(readAndroidTranslationFeature(f.project), /OWNED_FILE_CHANGED/)
+  } finally { await f.cleanup() }
+})
+
+test("Android reader bounds verified instructions separately from commit Enhance", async () => {
+  const f = await fixture()
+  try {
+    const files = input(); files[1].data = encode("---\nname: fixture\ndescription: Fixture\n---\n" + "x".repeat(33_000))
+    const packed = await pack(preview(files), "1.2.3", undefined, { commitEnhanceSkill: "fixture", androidTranslationSkill: "fixture" })
+    await install(f.project, "http://localhost:3211", { ...f.artifact.release, sha256: packed.sha256, size: packed.bytes.length }, packed.bytes, f.dependencies.discover!)
+    assert.equal((await readCommitEnhanceSkill(f.project))!.instructions.length, 16_000)
+    assert.equal((await readAndroidTranslationFeature(f.project)).skill!.instructions.length, 32_000)
+  } finally { await f.cleanup() }
+})
+
+test("Android detection is sorted, bounded, abortable and skips cache trees and junctions", async () => {
+  const folder = await area(), project = path.join(folder, "project"), outside = path.join(folder, "outside")
+  try {
+    await mkdir(project); await mkdir(outside)
+    assert.deepEqual(await detectAndroidProject(project), { isAndroid: false, stringsFiles: [] })
+    for (const relative of ["app/src/main/res/values/strings.xml", "app/src/main/res/values-ja/strings.xml", "node_modules/res/values/strings.xml", "build/res/values/strings.xml", ".opencode/res/values/strings.xml", "one/two/three/four/five/six/res/values/strings.xml"]) {
+      const file = path.join(project, ...relative.split("/")); await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, "<resources/>")
+    }
+    await mkdir(path.join(outside, "res", "values"), { recursive: true }); await writeFile(path.join(outside, "res", "values", "strings.xml"), "<resources/>")
+    await symlink(outside, path.join(project, "linked"), "junction")
+    assert.deepEqual(await detectAndroidProject(project), { isAndroid: true, stringsFiles: ["app/src/main/res/values-ja/strings.xml", "app/src/main/res/values/strings.xml"] })
+    await rm(path.join(project, "app"), { recursive: true })
+    assert.equal((await detectAndroidProject(project)).isAndroid, false)
+    await writeFile(path.join(project, "settings.gradle.kts"), "")
+    assert.deepEqual(await detectAndroidProject(project), { isAndroid: true, stringsFiles: [] })
+    for (let i = 0; i < 55; i++) {
+      const file = path.join(project, "res", `values-${String(i).padStart(2, "0")}`, "strings.xml")
+      await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, "<resources/>")
+    }
+    const detected = await detectAndroidProject(project)
+    assert.equal(detected.stringsFiles.length, 50)
+    assert.equal(detected.stringsFiles.at(-1), "res/values-49/strings.xml")
+    const controller = new AbortController(); controller.abort()
+    await assert.rejects(detectAndroidProject(project, controller.signal), { name: "AbortError" })
+  } finally { await rm(folder, { recursive: true, force: true }) }
+})
+
+test("Android prompt embeds verified skill assets and scope on initial and follow-up turns", () => {
+  const skill = { name: "android-strings-translation", instructions: "Keep placeholders intact.", directory: "C:\\project\\.opencode\\skills\\android-strings-translation" }
+  const initial = buildAndroidTranslationPrompt({ userText: "Translate to ja", isFirstTurn: true, skill, stringsFiles: ["app/res/values/strings.xml"] })
+  for (const value of ["[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]", "/android-strings-translation", skill.instructions, skill.directory, "scripts/strings_tool.py", "references/", "assets/", "app/res/values/strings.xml", "i18n/translation-context.md", ".kt", ".java", ".ts", "Gradle", "Hoàn tất & đóng", "main Chat", "Translate to ja"]) assert.ok(initial.includes(value), value)
+  const followup = buildAndroidTranslationPrompt({ userText: "Now scan", isFirstTurn: false, skill, stringsFiles: [] })
+  assert.ok(followup.startsWith("[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]"))
+  assert.ok(followup.endsWith("Now scan"))
+  assert.ok(!followup.includes(skill.instructions))
+})
+
+test("translation lock store atomically persists isolated sessions and permanent locks", async () => {
+  const folder = await area(), file = path.join(folder, "locks", "translation-locks.json")
+  try {
+    const store = createTranslationLockStore(file)
+    assert.throws(() => store.isLocked("p", "s"), /TRANSLATION_LOCKS_NOT_LOADED/)
+    await store.load()
+    assert.equal(store.isLocked("p", "s"), false)
+    await Promise.all([store.recordSession("p", "one"), store.recordSession("p", "two"), store.lockSession("p", "one"), store.recordSession("q", "one")])
+    assert.equal(store.isTranslationSession("p", "one"), true)
+    assert.equal(store.isLocked("q", "one"), false)
+    assert.deepEqual(store.lockedSessionIDs("p"), ["one"])
+    assert.deepEqual(store.translationSessionIDs("p"), ["one", "two"])
+    const detached = store.lockedSessionIDs("p"); detached.length = 0
+    assert.equal(store.isLocked("p", "one"), true)
+    const reopened = createTranslationLockStore(file); await reopened.load()
+    assert.equal(reopened.isLocked("p", "one"), true)
+    await reopened.recordSession("p", "one")
+    assert.equal(reopened.isLocked("p", "one"), true)
+    await reopened.lockSession("p", "new")
+    assert.equal(reopened.isTranslationSession("p", "new"), true)
+    await reopened.lockSession("__proto__", "constructor")
+    assert.equal(reopened.isLocked("__proto__", "constructor"), true)
+    await rename(file, file + ".backup")
+    await mkdir(file)
+    await assert.rejects(reopened.lockSession("p", "failed"), /UNSAFE_TRANSLATION_LOCKS/)
+    assert.equal(reopened.isLocked("p", "failed"), false, "failed persistence must not publish an in-memory lock")
+    await rm(file, { recursive: true }); await rename(file + ".backup", file)
+    await reopened.recordSession("p", "after-failure")
+    assert.equal(reopened.isTranslationSession("p", "after-failure"), true, "failed writes must not poison the mutation queue")
+    assert.deepEqual(await readdir(path.dirname(file)), ["translation-locks.json"])
+    await assert.rejects(reopened.recordSession("", "bad"), /INVALID_TRANSLATION_SESSION/)
+    await writeFile(file, JSON.stringify({ sessions: { p: ["one"] }, locked: { p: "one" } }))
+    await assert.rejects(createTranslationLockStore(file).load(), /INVALID_TRANSLATION_LOCKS/)
+    await rm(file)
+    const outside = path.join(folder, "outside.json"); await writeFile(outside, "{}")
+    await link(outside, file)
+    await assert.rejects(createTranslationLockStore(file).load(), /UNSAFE_TRANSLATION_LOCKS/)
+    assert.equal(await readFile(outside, "utf8"), "{}")
+  } finally { await rm(folder, { recursive: true, force: true }) }
 })
 
 test("raw Claude adaptation preserves body bytes through scan, pack and consented install", async () => {
@@ -883,9 +1062,9 @@ test("active assert-model rejects transient failures and revokes policy immediat
   })
 })
 
-test("background refresh and active IPC share the same operation mutex", async t => {
+test("background refresh queues user imports without rejecting them and skips active user operations", async t => {
   t.mock.timers.enable({ apis: ["setInterval"] })
-  const f = await fixture({ refreshIntervalMs: 100 })
+  const f = await fixture({ role: "admin", refreshIntervalMs: 100 })
   let release: (() => void) | undefined
   const waitForRelease = async (): Promise<() => void> => {
     while (!release) await delay(1)
@@ -896,16 +1075,22 @@ test("background refresh and active IPC share the same operation mutex", async t
     const before = f.requests.filter(request => request === "/v1/session").length
     f.sessionResponse(() => new Promise(resolve => { release = () => resolve(undefined) }))
     t.mock.timers.tick(100)
-    await assert.rejects(f.service.call("assert-model", { modelID: "default" }), /OPERATION_BUSY/)
+    const importing = f.service.call("import", {})
+    await assert.rejects(f.service.call("status", {}), /OPERATION_BUSY/)
     t.mock.timers.tick(300)
     const releaseBackground = await waitForRelease()
     assert.equal(f.requests.filter(request => request === "/v1/session").length, before + 1)
+    assert.equal(f.pickerCount(), 0, "import waits for the background refresh")
+    f.sessionResponse()
     releaseBackground(); release = undefined
+    assert.ok(await importing)
+    assert.equal(f.pickerCount(), 1)
     assert.equal((await settledStatus(f.service)).ready, true)
+    f.sessionResponse(() => new Promise(resolve => { release = () => resolve(undefined) }))
     const active = f.service.call("assert-model", { modelID: "default" })
     const releaseActive = await waitForRelease()
     t.mock.timers.tick(300)
-    assert.equal(f.requests.filter(request => request === "/v1/session").length, before + 2)
+    assert.equal(f.requests.filter(request => request === "/v1/session").length, before + 3)
     releaseActive()
     await active
   } finally { release?.(); await f.cleanup() }
@@ -968,8 +1153,8 @@ test("admin AI fix stages secret-safe edits, packages immediately, saves only af
     await addSecretFile(f.imported)
     f.fixResponse(async (body, init) => {
       assert.equal(JSON.stringify(body).includes(secretFixture), false)
-      assert.equal(body.model, "default"); assert.equal(body.stream, false); assert.equal(body.temperature, 0.1)
-      assert.equal(body.max_tokens, 8192); assert.equal(init.redirect, "error"); assert.ok(init.signal)
+      assert.equal(body.model, "default"); assert.equal(body.stream, false); assert.equal(Object.hasOwn(body, "temperature"), false)
+      assert.equal(Object.hasOwn(body, "max_tokens"), false); assert.equal(init.redirect, "error"); assert.ok(init.signal)
       return fixReply('api_key="<YOUR_API_KEY>"\n')
     })
     await login(f.service)
@@ -1061,7 +1246,7 @@ test("AI fix-all applies evolving validated files and reports per-file failures 
     })
     const result = await f.service.call("fix-import-all", { model: "other" }) as { preview: FixPreview; fixes: { path: string; model: string }[]; failed: { path: string; code: string }[] }
     assert.ok(result.fixes.every(fix => fix.model === "default"))
-    assert.deepEqual(result.failed, [{ path: secretPath, code: "AI_FIX_PROVIDER_ERROR" }])
+    assert.deepEqual(result.failed, [{ path: secretPath, code: "AI_FIX_PROVIDER_ERROR", detail: "HTTP 503: provider unavailable" }])
     assert.deepEqual(result.fixes.map(fix => fix.path), [second]); assert.deepEqual(result.preview.fixablePaths, [secretPath])
     await f.service.call("exclude-import-file", { path: secretPath })
     await f.service.call("package", { version: "1.2.4" })
@@ -1124,7 +1309,7 @@ test("large AI fixes use unique targeted patches with bounded safe context", asy
     await writeFile(path.join(f.imported, ...secretPath.split("/")), source)
     await login(f.service); await f.service.call("import", {})
     f.fixResponse(async body => {
-      assert.equal(body.max_tokens, 4096)
+      assert.equal(Object.hasOwn(body, "max_tokens"), false)
       const payload = JSON.parse((body.messages as { content: string }[]).at(-1)!.content)
       assert.ok(payload.text.length < source.length / 2)
       assert.equal(JSON.stringify(body).includes(secretFixture), false)
@@ -1177,7 +1362,11 @@ test("malformed, oversized and secret-echoing provider responses fail closed wit
         if (kind === "oversized") return new Response("x".repeat(512 * 1024 + 1))
         return fixReply(kind === "empty" ? "" : kind === "marker" ? "[REDACTED_SECRET_1]" : secretFixture)
       })
-      await assert.rejects(f.service.call("fix-import", { path: secretPath }), new RegExp(kind === "network" ? "^Error: AI_FIX_PROVIDER_ERROR$" : "^Error: AI_FIX_INVALID_RESPONSE$"))
+      await assert.rejects(f.service.call("fix-import", { path: secretPath }), error => {
+        assert.match((error as Error).message, kind === "network" ? /^AI_FIX_PROVIDER_ERROR: / : /^AI_FIX_INVALID_RESPONSE: /)
+        assert.equal((error as Error).message.includes(secretFixture), false)
+        return true
+      })
       await assert.rejects(f.service.call("package", { version: "1.2.4" }), /IMPORT_BLOCKED/)
     } finally { await f.cleanup() }
   })
@@ -1238,6 +1427,128 @@ async function engineParams(f: Awaited<ReturnType<typeof fixture>>, text = origi
     },
   }
 }
+
+const svelteReference = '# SvelteKit\n```ts title="src/routes/signup/+page.server.ts"\nimport { TURNSTILE_SECRET } from \'$env/static/private\'\nconst options = { secret: TURNSTILE_SECRET }\n```\n'
+
+test("language-tagged env expressions are warning-only in raw modes while literal credentials stay blocked", () => {
+  for (const lang of ['ts', 'typescript', 'js', 'javascript', 'tsx', 'jsx', 'svelte', 'kotlin', 'java', 'py', 'python', 'go', 'rust', 'swift', 'dart', 'c', 'cpp', 'csharp', 'cs', 'php', 'ruby', 'rb', 'scala']) {
+    const text = svelteReference.replace('```ts ', `\`\`\`${lang.toUpperCase()} `)
+    assert.deepEqual(secretFindings(text), [{ rule: 'assignment', classification: 'code-expression' }])
+    for (const options of [{ compatibilityMode: 'native' as const }, { compatibilityMode: 'raw' as const }, { compatibilityMode: 'raw' as const, adaptClaudeAgents: true }]) {
+      const issues = preview([...input(), { path: secretPath, data: encode(text) }], [], options).issues.filter(issue => issue.path === secretPath && /secret/.test(issue.reason))
+      assert.equal(issues.length, 1)
+      assert.equal(issues[0].severity, options.compatibilityMode === 'native' ? 'error' : 'warning')
+    }
+  }
+  for (const text of ['secret: TURNSTILE_SECRET', '```env\nsecret=TURNSTILE_SECRET\n```', '```ts\nsecret: "TURNSTILE_SECRET"\n```', `\`\`\`ts\nsecret: "${syntheticSecret}"\n\`\`\``, '```ts\nsk-' + 'x'.repeat(24) + '\nAKIA' + 'A'.repeat(16) + '\n-----BEGIN PRIVATE KEY-----\n```']) {
+    assert.ok(secretFindings(text).every(item => item.classification === 'blocked'), text)
+    assert.ok(preview([...input(), { path: secretPath, data: encode(text) }], [], { compatibilityMode: 'raw' }).issues.some(issue => issue.path === secretPath && issue.severity === 'error'))
+  }
+  assert.deepEqual(redactSecretsForLlm(svelteReference), { redactedText: svelteReference, redactionCount: 0 })
+  assert.equal(redactSecretsForLlm('secret: "TURNSTILE_SECRET"').redactionCount, 1)
+})
+
+test("reasoning-model fixes preserve env imports, omit unrelated context and accept array/prose JSON", async () => {
+  const model = 'gpt-6.1-sol(medium)'
+  const f = await fixture({ role: 'admin', catalog: { ...catalog, default_model: model, small_model: model, models: [{ ...catalog.models[0], id: model, name: model }] } })
+  try {
+    const params = await engineParams(f, svelteReference)
+    const fixedText = svelteReference.replace('secret: TURNSTILE_SECRET', 'secret: env.TURNSTILE_SECRET')
+    const json = JSON.stringify({ summary: 'Đã dùng biến môi trường', content: fixedText })
+    for (const content of ['Here is the repair:\n```json\n' + json + '\n```\nDone.', 'Result follows: ' + json + '\nDone.', [{ type: 'reasoning', text: 'ignored' }, { type: 'text', text: 'Repair follows:' }, { type: 'text', text: '```json\n' + json + '\n```' }]]) {
+      f.fixResponse(async body => {
+        assert.equal(body.model, model)
+        assert.equal(Object.hasOwn(body, 'temperature'), false)
+        assert.equal(Object.hasOwn(body, 'max_tokens'), false)
+        const context = JSON.parse((body.messages as { content: string }[])[1].content)
+        assert.equal(Object.hasOwn(context, 'availablePaths'), false)
+        assert.match(context.text, /import \{ TURNSTILE_SECRET \}/)
+        assert.doesNotMatch(context.text, /REDACTED/)
+        return Response.json({ choices: [{ message: { content } }] })
+      })
+      const result = await fixImportFileWithLlm({ ...params, availablePaths: Array.from({ length: 1200 }, (_, i) => `skills/unrelated-${i}/SKILL.md`) })
+      assert.equal(new TextDecoder().decode(result.contentBytes), fixedText)
+      assert.equal(result.redactionCount, 0)
+    }
+  } finally { await f.cleanup() }
+})
+
+test("missing-reference context is capped, same-skill only, sibling-first and available on validation retry", async () => {
+  const f = await fixture({ role: 'admin' })
+  try {
+    const params = await engineParams(f)
+    const siblings = Array.from({ length: 100 }, (_, i) => `skills/fixture/references/ref-${i}.md`)
+    const paths = [...Array.from({ length: 1200 }, (_, i) => `skills/unrelated-${i}/SKILL.md`), 'skills/fixture/SKILL.md', ...siblings]
+    let attempt = 0
+    f.fixResponse(async body => {
+      const context = JSON.parse((body.messages as { content: string }[])[1].content)
+      if (++attempt === 1) assert.equal(Object.hasOwn(context, 'availablePaths'), false)
+      else assert.deepEqual(context.availablePaths, siblings.slice(0, 80))
+      return aiResponse({ summary: 'Đã sửa', content: fixedReference })
+    })
+    await fixImportFileWithLlm({ ...params, filePath: 'skills/fixture/references/sveltekit.md', availablePaths: paths,
+      validateCandidate: bytes => ({ preview: params.validateCandidate(bytes).preview, remainingErrors: attempt === 1 ? [{ path: params.filePath, severity: 'error', reason: 'missing/unsafe local reference: guide.md' }] : [] }) })
+    assert.equal(attempt, 2)
+  } finally { await f.cleanup() }
+})
+
+test("provider and validation diagnostics preserve codes and sanitize credentials in engine and IPC", async () => {
+  const f = await fixture({ role: 'admin' })
+  try {
+    const params = await engineParams(f)
+    const providerError = async () => Response.json({ error: { message: `unsupported parameter ${syntheticSecret} fixture-provider-key` } }, { status: 400 })
+    f.fixResponse(providerError)
+    await assert.rejects(fixImportFileWithLlm(params), error => {
+      assert.ok(error instanceof AiFixError)
+      assert.equal(error.message, 'AI_FIX_PROVIDER_ERROR')
+      assert.match(error.detail!, /^HTTP 400: unsupported parameter/)
+      assert.doesNotMatch(error.detail!, new RegExp(`${syntheticSecret}|fixture-provider-key`))
+      return true
+    })
+    await addSecretFile(f.imported); await login(f.service); await f.service.call('import', {})
+    f.fixResponse(async () => Response.json({ error: { message: `unsupported parameter ${secretFixture} fixture-provider-key` } }, { status: 400 }))
+    await assert.rejects(f.service.call('fix-import', { path: secretPath }), error => {
+      assert.match((error as Error).message, /^AI_FIX_PROVIDER_ERROR: HTTP 400: unsupported parameter/)
+      assert.doesNotMatch((error as Error).message, new RegExp(`${secretFixture}|fixture-provider-key`))
+      return true
+    })
+    const batch = await f.service.call('fix-import-all', {}) as { failed: { code: string; detail: string }[] }
+    assert.equal(batch.failed[0].code, 'AI_FIX_PROVIDER_ERROR')
+    assert.match(batch.failed[0].detail, /^HTTP 400: unsupported parameter/)
+    assert.doesNotMatch(batch.failed[0].detail, new RegExp(`${secretFixture}|fixture-provider-key`))
+    f.fixResponse(async () => aiResponse({ summary: 'Đã sửa', content: fixedReference }))
+    await assert.rejects(fixImportFileWithLlm({ ...params, validateCandidate: () => ({ preview: preview(input()), remainingErrors: ['first ' + syntheticSecret, 'second', 'third'].map(reason => ({ path: params.filePath, severity: 'error', reason })) }) }), error => {
+      assert.ok(error instanceof AiFixError)
+      assert.equal(error.message, 'AI_FIX_VALIDATION_FAILED')
+      assert.match(error.detail!, /^first \[REDACTED_SECRET\]; second$/)
+      return true
+    })
+    const controller = new AbortController()
+    f.fixResponse(async () => { controller.abort(); throw new Error('aborted') })
+    await assert.rejects(fixImportFileWithLlm({ ...params, signal: controller.signal }), { name: 'AiFixError', message: 'CANCELLED' })
+  } finally { await f.cleanup() }
+})
+
+test("canceling or failing reimport preserves staged edits and packaged output until a successful scan", async () => {
+  const f = await fixture({ role: 'admin' })
+  try {
+    await addSecretFile(f.imported); await login(f.service); await f.service.call('import', {})
+    f.fixResponse(async () => fixReply('api_key=process.env.TURNSTILE_SECRET\n'))
+    await f.service.call('fix-import', { path: secretPath })
+    await f.service.call('package', { version: '1.2.4' })
+    f.pickResponse(async () => null)
+    assert.equal(await f.service.call('import', {}), null)
+    f.pickResponse(async () => path.join(f.folder, 'missing'))
+    await assert.rejects(f.service.call('import', {}))
+    await assert.rejects(f.service.call('import', { compatibilityMode: 'invalid' }), /INVALID_COMPATIBILITY_MODE/)
+    assert.equal((await f.service.call('package', { version: '1.2.5' }) as { size: number }).size > 0, true)
+    f.pickResponse()
+    const imported = await f.service.call('import', {}) as FixPreview
+    assert.ok(imported.fixablePaths.includes(secretPath))
+    await assert.rejects(f.service.call('package', { version: '1.2.6' }), /IMPORT_BLOCKED/)
+    assert.ok((await readFile(path.join(f.imported, ...secretPath.split('/')), 'utf8')).includes(secretFixture))
+  } finally { await f.cleanup() }
+})
 
 test("AI fix redaction covers case-insensitive provider keys, PEM blocks and unclosed PEM payloads", () => {
   for (const label of ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY", "rSa pRiVaTe KeY"]) {
@@ -1320,7 +1631,7 @@ test("AI fix engine uses redacted full-file requests, constrained HTTP settings 
     const params = await engineParams(f)
     f.fixResponse(async (body, init) => {
       assert.equal(init.method, "POST"); assert.equal(init.redirect, "error"); assert.ok(init.signal)
-      assert.equal(body.stream, false); assert.equal(body.temperature, 0.1); assert.equal(body.max_tokens, 8192)
+      assert.equal(body.stream, false); assert.equal(Object.hasOwn(body, "temperature"), false); assert.equal(Object.hasOwn(body, "max_tokens"), false)
       const serialized = JSON.stringify(body)
       assert.equal(serialized.includes(syntheticSecret), false)
       assert.match(serialized, /REDACTED_SECRET_/)
@@ -1380,7 +1691,7 @@ test("AI fix response reader enforces cumulative byte limits, cancels overflow a
         assert.equal(new TextDecoder().decode((await fixing).contentBytes), fixedReference)
         assert.equal(validated, 1)
       } else {
-        await assert.rejects(fixing, /^Error: AI_FIX_INVALID_RESPONSE$/)
+        await assert.rejects(fixing, { name: "AiFixError", message: "AI_FIX_INVALID_RESPONSE" })
         assert.equal(validated, 0, "invalid transport bytes must never reach candidate validation")
         if (kind === "chunked overflow") assert.equal(cancelled, true)
       }
@@ -1405,7 +1716,7 @@ test("AI fix targeted edits use evolving unique matches and reject overlaps with
       })
       const fixing = fixImportFileWithLlm({ ...params, validateCandidate: bytes => { validated++; return params.validateCandidate(bytes) } })
       if (overlap) {
-        await assert.rejects(fixing, /^Error: AI_FIX_INVALID_RESPONSE$/)
+        await assert.rejects(fixing, { name: "AiFixError", message: "AI_FIX_INVALID_RESPONSE" })
         assert.equal(validated, 0)
       } else {
         assert.equal(new TextDecoder().decode((await fixing).contentBytes), text.replace(`api_key="${syntheticSecret}"`, "api_key=$SYNTHETIC_KEY"))
@@ -1427,7 +1738,7 @@ test("AI fix rejects provider echoes even outside assignment syntax and strips e
       f.fixResponse(async () => aiResponse({ summary: `Đã thay ${syntheticSecret}`, content: kind === "PEM payload echo" ? `Plain documentation echo: ${pemPayload}` : kind === "plain echo" ? `Plain documentation echo: ${syntheticSecret}` : fixedReference }))
       const fixing = fixImportFileWithLlm({ ...params, ...(kind === "PEM payload echo" ? { fileBytes: encode(`-----BEGIN PRIVATE KEY-----\n${pemPayload}\n-----END PRIVATE KEY-----\n`) } : {}), validateCandidate: bytes => { validated++; return params.validateCandidate(bytes) } })
       if (kind !== "summary echo") {
-        await assert.rejects(fixing, /^Error: AI_FIX_INVALID_RESPONSE$/)
+        await assert.rejects(fixing, { name: "AiFixError", message: "AI_FIX_INVALID_RESPONSE" })
         assert.equal(validated, 0, "a syntactically harmless echo is still a forbidden secret literal")
       } else {
         const result = await fixing

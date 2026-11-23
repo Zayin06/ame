@@ -1,4 +1,50 @@
 #root { height: 100%; }
+.amekit-feature-config { display: grid; gap: 10px; min-width: 0; margin: 14px 0; padding: 14px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-canvas); }
+.amekit-feature-config legend { padding: 0 6px; color: var(--text-primary); font-weight: 600; }
+.amekit-feature-config label, .amekit-feature-config select { min-width: 0; width: 100%; }
+.amekit-feature-config select { box-sizing: border-box; text-overflow: ellipsis; }
+.amekit-feature-config p { margin: 0; font-size: 12px; line-height: 1.6; }
+.amekit-active-models { min-width: 0; }
+.amekit-active-models h4 { margin-top: 0; }
+.amekit-active-models ul, .amekit-active-models__list { list-style: none; display: grid; gap: 8px; padding: 0; margin: 0; }
+.amekit-active-models li, .amekit-active-models__item { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-canvas); }
+.amekit-active-models code { display: block; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+.amekit-active-models .amekit-pill { margin: 2px; color: var(--accent); background: var(--accent-soft); }
+.translation-modal-backdrop { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; background: #0009; padding: 12px; }
+.translation-modal { --chat-max-w: 100%; display: flex; flex-direction: column; width: min(1280px, 95vw); height: min(880px, 92vh); min-width: 0; overflow: hidden; border: 1px solid var(--border-default); border-radius: 14px; background: var(--bg-canvas); color: var(--text-primary); box-shadow: 0 24px 80px #0005; outline: none; }
+.translation-modal__header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 18px 22px 12px; border-bottom: 1px solid var(--border-subtle); }
+.translation-modal__header h2 { display: flex; align-items: center; gap: 8px; font-size: 17px; margin: 0; }
+.translation-modal__header p { margin: 6px 0 0; color: var(--text-muted); font-size: 12px; }
+.translation-modal .button-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.translation-modal button, .translation-locked-banner button { border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-primary); font: inherit; padding: 8px 12px; cursor: pointer; }
+.translation-modal button:hover:not(:disabled), .translation-locked-banner button:hover { border-color: var(--accent); background: var(--bg-hover); }
+.translation-modal button:disabled { opacity: .5; cursor: not-allowed; }
+.translation-modal button:focus-visible, .translation-modal textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.translation-modal .translation-primary { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.translation-modal__metadata { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 22px; }
+.translation-modal__metadata .amekit-pill { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; }
+.translation-modal .warning, .translation-modal .inline-error { flex-shrink: 0; margin: 0 22px 10px; padding: 10px 12px; }
+.translation-modal .chat-stream, .translation-modal .chat-stream__inner, .translation-modal .composer-dock, .translation-modal .composer-dock__inner, .translation-modal .composer-card { width: 100%; max-width: none; min-width: 0; box-sizing: border-box; }
+.translation-modal__timeline { flex: 1; min-height: 0; overflow: auto; }
+.translation-modal .chat-stream__inner { padding: 16px 24px; }
+.translation-modal .chat-turn { max-width: none; }
+.translation-presets { margin: 12px 0; }
+.translation-presets h3 { margin: 0 0 8px; }
+.translation-presets > p { color: var(--text-muted); font-size: 13px; line-height: 1.6; }
+.translation-presets__grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }
+.translation-presets__grid button { display: flex; flex-direction: column; gap: 10px; padding: 18px; text-align: left; line-height: 1.5; }
+.translation-presets__grid span { color: var(--text-muted); font-size: 12px; }
+.translation-modal .translation-composer { flex-shrink: 0; padding: 12px 22px 18px; }
+.translation-modal .translation-composer__input { display: block; width: 100%; max-width: none; min-height: 76px; max-height: 220px; box-sizing: border-box; resize: vertical; background: transparent; color: var(--text-primary); font: inherit; line-height: 1.6; }
+.translation-composer__toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
+.translation-composer__toolbar > span { color: var(--text-muted); font-size: 11px; }
+.translation-finish-banner, .translation-locked-banner { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 12px 16px; border: 1px solid var(--accent-border, var(--border-default)); border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text-primary); font-size: 12px; line-height: 1.6; }
+.translation-finish-banner { margin-bottom: 12px; }
+.translation-finish-banner p, .translation-locked-banner p { flex: 1; min-width: 180px; margin: 0; }
+.translation-locked-banner { margin: 12px 22px 18px; flex-shrink: 0; }
+.android-translate-trigger { white-space: nowrap; }
+@media (max-width: 720px) { .translation-presets__grid { grid-template-columns: minmax(0, 1fr); } .translation-modal__header, .translation-modal__metadata { padding-left: 14px; padding-right: 14px; } .translation-modal .chat-stream__inner { padding: 12px 14px; } .translation-modal .translation-composer { padding: 10px 14px; } }
+
 .app-shell.is-macos .titlebar__left { padding-left: 74px; }
 .app-shell.is-macos .win-controls { display: none; }
 .artifact-viewer, .btw-panel { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
@@ -361,6 +407,20 @@
 .composer-attachments { min-width: 0; }
 .attachment-chip { max-width: 100%; overflow-wrap: anywhere; }
 .attachment-chip button { flex-shrink: 0; }
+.composer-drop-overlay { position: absolute; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center; padding: 16px; border: 2px dashed var(--accent-border, var(--accent)); border-radius: inherit; background: color-mix(in srgb, var(--accent-soft) 88%, var(--bg-elevated)); color: var(--text-primary); text-align: center; pointer-events: none; }
+.attachment-chip--media { gap: 6px; padding: 4px 6px; }
+.attachment-thumb { width: 36px; height: 36px; flex-shrink: 0; border-radius: 5px; object-fit: cover; }
+.msg-user-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.msg-user-attachments > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: 140px; font-size: 11px; overflow-wrap: anywhere; }
+.msg-user-thumb { display: block; max-width: 140px; max-height: 100px; object-fit: contain; border: 1px solid var(--border-default); border-radius: 6px; }
+.composer-popover__pick-file { display: block; width: 100%; padding: 8px 10px; border: 0; border-bottom: 1px solid var(--border-subtle); background: transparent; color: var(--text-primary); text-align: left; font: inherit; cursor: pointer; }
+.composer-popover__pick-file:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+.composer-popover__pick-file:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.composer-popover__pick-file:disabled { opacity: 0.5; cursor: not-allowed; }
+.amekit-busy-inline { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
+.amekit-spinner { display: inline-block; width: 14px; height: 14px; flex-shrink: 0; box-sizing: border-box; border: 2px solid var(--border-default); border-top-color: var(--accent); border-radius: 50%; animation: amekit-spin 0.8s linear infinite; }
+@keyframes amekit-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .amekit-spinner { animation-duration: 2s; } }
 .composer-popover__header, .composer-popover__empty { padding: 6px 8px; font-size: 12px; color: var(--text-muted); }
 .composer-popover__list { max-height: 180px; overflow: auto; }
 .composer-popover__option { justify-content: space-between; align-items: baseline; }

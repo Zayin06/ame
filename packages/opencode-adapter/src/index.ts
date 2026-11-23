@@ -5,6 +5,7 @@ import { summarizeUsage, usageFamily, type UsageNode } from '../../amekit/src/us
 import type { UsagePrices } from '../../amekit/src/usage-pricing'
 import type { Agent, AgentMapView, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
 import { buildAgentMap, resolveAgentMapFamily } from './agent-map'
+import { MAX_PROMPT_FILES, type ChatAttachment, type PromptFileAttachment } from '../../ide-core/src/dropped-attachments'
 
 export function localURL(value: string) {
   const url = new URL(value)
@@ -16,7 +17,20 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
   return messages.flatMap<ChatItem>(message => {
     if (message.type === 'user') {
       execution ??= { opener: message.id, files: new Set(), startedAt: message.time?.created }
-      return [{ id: message.id, role: 'user', text: message.text, ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }]
+      const attachments: ChatAttachment[] = 'files' in message && Array.isArray(message.files) && message.files.length
+        ? message.files.map(file => {
+          const mime = typeof file.mime === 'string' ? file.mime : 'application/octet-stream'
+          const attachment: ChatAttachment = { name: file.name || 'attachment', mime }
+          if (typeof file.data === 'string' && file.data.trim()) {
+            const base64 = file.data.replace(/\s+/g, '')
+            attachment.dataUrl = `data:${mime};base64,${base64}`
+          } else if ('uri' in file && typeof file.uri === 'string') {
+            attachment.uri = file.uri
+            if ('bytes' in file && typeof file.bytes === 'number') attachment.size = file.bytes
+          }
+          return attachment
+        }) : []
+      return [{ id: message.id, role: 'user', text: message.text, ...(attachments.length ? { attachments } : {}), ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }]
     }
     if (message.type === 'idle') {
       if (execution?.lastAssistant && execution.startedAt !== undefined && message.time?.created !== undefined && message.time.created >= execution.startedAt) {
@@ -299,13 +313,14 @@ export class OpenCodeAdapter {
     const list = await this.api().agent.list({ location: { directory: this.directory(projectID) } })
     return list.data.filter(a => !a.hidden && a.mode !== 'subagent').map(a => ({ id: a.id, name: a.name }))
   }
-  async prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string) {
+  async prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string, files?: PromptFileAttachment[]) {
     await this.owned(projectID, sessionID)
-    if (!text.trim() || text.length > 200000) throw new Error('INVALID_PROMPT')
+    if (!(text.trim().length > 0 || (Array.isArray(files) && files.length > 0)) || text.length > 200000) throw new Error('INVALID_PROMPT')
     if (!model) throw new Error('SELECT_MODEL_REQUIRED')
+    const mappedFiles = (files ?? []).slice(0, MAX_PROMPT_FILES).map(file => ({ uri: file.uri, ...(file.name ? { name: file.name } : {}), ...(file.source ? { source: file.source } : {}) }))
     await this.api().session.switchModel({ sessionID, model: { id: model.id, providerID: model.providerID } })
     if (agent) await this.api().session.switchAgent({ sessionID, agent })
-    await this.api().session.prompt({ sessionID, text })
+    await this.api().session.prompt({ sessionID, text: text.trim() ? text : '(Đính kèm tệp)', ...(mappedFiles.length ? { files: mappedFiles } : {}) })
   }
   async cancel(projectID: string, sessionID: string) { await this.owned(projectID, sessionID); await this.api().session.interrupt({ sessionID }) }
   async permissions(projectID: string, sessionID: string) {

@@ -1,4 +1,10 @@
 import { rankQuickOpenFiles } from './quick-open'
+import type { PromptFileAttachment, ResolvedDroppedFile } from '../../../../packages/ide-core/src/dropped-attachments'
+
+export const WORKSPACE_DRAG_MIME = 'application/x-ame-workspace-path'
+export const MAX_PROMPT_FILES = 8
+export const MAX_MEDIA_BYTES = 10 * 1024 * 1024
+export const MAX_EXTERNAL_TEXT_BYTES = 512 * 1024
 
 export type ComposerTrigger = { kind: '@' | '/'; start: number; end: number; query: string }
 
@@ -41,12 +47,15 @@ export function filterFileMentions(query: string, files: readonly string[], rece
   return rankQuickOpenFiles(query, files, recentPaths, limit)
 }
 
-export type ComposerAttachment = { id: string; kind: 'file' | 'selection'; path: string; lineStart?: number; lineEnd?: number; excerpt?: string }
+export type ComposerAttachment =
+  | { id: string; kind: 'file' | 'selection'; path: string; lineStart?: number; lineEnd?: number; excerpt?: string }
+  | { id: string; kind: 'media' | 'external-text'; name: string; mime: string; dataUrl: string; size: number; workspacePath?: string }
 
 export function composePromptWithAttachments(text: string, attachments: readonly ComposerAttachment[]): string {
   const seen = new Set<string>()
   const blocks: string[] = []
   for (const attachment of attachments) {
+    if (attachment.kind !== 'file' && attachment.kind !== 'selection') continue
     if (!attachment.path.trim()) continue
     const { kind, path, lineStart, lineEnd, excerpt } = attachment
     const key = JSON.stringify([kind, path, lineStart, lineEnd, excerpt])
@@ -63,4 +72,64 @@ export function composePromptWithAttachments(text: string, attachments: readonly
     blocks.push(block)
   }
   return blocks.length ? blocks.join('\n\n') + (text ? `\n\n${text}` : '') : text
+}
+
+export function splitComposerAttachments(text: string, attachments: readonly ComposerAttachment[]): { text: string; files: PromptFileAttachment[]; truncatedCount: number } {
+  const seen = new Set<string>()
+  const files: PromptFileAttachment[] = []
+  let truncatedCount = 0
+  for (const item of attachments) {
+    if (item.kind !== 'media' && item.kind !== 'external-text') continue
+    const key = JSON.stringify([item.dataUrl, item.name])
+    if (seen.has(key)) continue
+    seen.add(key)
+    if (files.length === MAX_PROMPT_FILES) { truncatedCount++; continue }
+    files.push({ uri: item.dataUrl, name: item.name, mime: item.mime, source: { type: 'inline' } })
+  }
+  return { text: composePromptWithAttachments(text, attachments), files, truncatedCount }
+}
+
+const mediaMimes: Readonly<Record<string, string>> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', pdf: 'application/pdf'
+}
+const textExtensions = new Set('txt md mdx json jsonc yaml yml xml gradle kts kt java ts tsx js jsx mjs cjs css scss html py sh bat ps1 sql toml ini cfg conf csv log properties svg go rs c cpp h hpp swift rb php dart'.split(' '))
+
+export function classifyBrowserFile(file: { name: string; type?: string; size: number }): { ok: true; kind: 'media' | 'external-text'; mime: string } | { ok: false; reason: string } {
+  if (!Number.isFinite(file.size) || file.size <= 0) return { ok: false, reason: 'Tệp rỗng không thể đính kèm.' }
+  const extension = /\.([^.\\/]+)$/.exec(file.name)?.[1].toLowerCase() || ''
+  const type = file.type?.toLowerCase() || ''
+  const mime = Object.values(mediaMimes).includes(type) ? type : Object.hasOwn(mediaMimes, extension) ? mediaMimes[extension] : undefined
+  if (mime) {
+    return file.size > MAX_MEDIA_BYTES ? { ok: false, reason: 'Tệp ảnh/PDF vượt quá giới hạn 10 MiB.' } : { ok: true, kind: 'media', mime }
+  }
+  if (textExtensions.has(extension) || file.name.toLowerCase().endsWith('.env.example')) {
+    return file.size > MAX_EXTERNAL_TEXT_BYTES ? { ok: false, reason: 'Tệp văn bản bên ngoài vượt quá giới hạn 512 KiB.' } : { ok: true, kind: 'external-text', mime: 'text/plain' }
+  }
+  return { ok: false, reason: 'Không hỗ trợ loại tệp này (chỉ hỗ trợ ảnh, PDF và văn bản UTF-8).' }
+}
+
+export async function readBrowserFileAttachment(file: File): Promise<ResolvedDroppedFile> {
+  const classification = classifyBrowserFile(file)
+  if (!classification.ok) return { ...classification, name: file.name }
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const checked = classifyBrowserFile({ name: file.name, type: file.type, size: bytes.length })
+    if (!checked.ok) return { ...checked, name: file.name }
+    const { kind, mime } = classification
+    if (kind === 'external-text') {
+      try {
+        if (bytes.includes(0)) throw new Error('NUL')
+        new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+      } catch {
+        return { ok: false, name: file.name, reason: 'Không hỗ trợ tệp nhị phân bên ngoài (chỉ hỗ trợ ảnh, PDF và văn bản UTF-8).' }
+      }
+    }
+    let binary = ''
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+    }
+    return { ok: true, kind, name: file.name, mime, dataUrl: `data:${mime};base64,${btoa(binary)}`, size: bytes.length }
+  } catch {
+    return { ok: false, name: file.name, reason: 'Không thể đọc tệp đính kèm.' }
+  }
 }

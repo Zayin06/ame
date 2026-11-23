@@ -6,12 +6,14 @@ import { assertModel, managedProvider, modelPolicy, providerURL } from "./model-
 import { openSessionVault, type Encryption } from "./session-vault"
 import { pack, preview, safePath, type ImportOptions, type InputFile, type Issue, type Preview } from "./bundle/package"
 import { scanWithSource } from "./bundle/scan"
-import { fixImportFileWithLlm, isFixableTextFile } from "./bundle/ai-fix"
+import { AiFixError, fixImportFileWithLlm, isFixableTextFile } from "./bundle/ai-fix"
 import * as installer from "./installer"
 import { runtimeDiscovery, type Discover } from "./runtime"
 import { readUsagePrices } from "./usage-pricing"
 import { generatePetDialogue as generateDialogue } from "./pet-generation"
 import type { DialogueSet } from "./pet-dialogue"
+export type { BundleFeatures } from "./api"
+export { detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore } from "./android-translation"
 
 export type AmeKitOptions = {
   userData: string
@@ -24,6 +26,11 @@ export type AmeKit = {
   call(operation: string, payload: Record<string, string>): Promise<unknown>
   /** Main-process only; reads verified installed instructions without taking the account mutex. */
   readCommitEnhanceSkill?(projectID: string): Promise<{ name: string; instructions: string } | null>
+  /** Main-process only; reads verified feature configuration independently of account locking. */
+  readCommitEnhanceFeature?(projectID: string): Promise<{ skill: { name: string; instructions: string } | null; model?: string }>
+  readAndroidTranslationFeature?(projectID: string): Promise<{ skill: { name: string; instructions: string; directory: string } | null; model?: string; rawSkillName?: string }>
+  /** Main-process only; enables an active concrete model for an explicit feature, never regular Chat or Pet. */
+  authorizeFeatureModel?(modelID: string): Promise<string | null>
   /** Main-process only; retain categorized dialogue for createPetHost. */
   generatePetDialogue(model: string, signal: AbortSignal): Promise<DialogueSet>
   dispose(): Promise<void>
@@ -51,8 +58,9 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   let api: AmeApi | undefined, source: Preview | undefined, packed: Awaited<ReturnType<typeof pack>> | undefined
   let vault: Awaited<ReturnType<typeof openSessionVault>> | undefined
   let storageError: string | undefined, blocker: string | undefined, policyReady = false, disposed = false, busy = false
-  let inFlight: Promise<unknown> | undefined, disposal: Promise<void> | undefined
+  let inFlight: Promise<unknown> | undefined, backgroundInFlight: Promise<void> | undefined, disposal: Promise<void> | undefined
   let transientFailures = 0
+  const authorizedFeatureModels = new Set<string>()
   const code = (error: unknown) => error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "AMEKIT_OPERATION_FAILED"
   let importSession: ImportSession | undefined
   const resetImport = () => { source = undefined; packed = undefined; importSession = undefined }
@@ -111,20 +119,20 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     const result = await response.json().catch(() => null) as { output?: unknown } | null
     if (result?.output !== true) throw new Error("MODEL_POLICY_UNAVAILABLE")
   }
-  const revoke = async (cleanup = false) => { policyReady = false; await rpc(null, cleanup).catch(() => {}) }
+  const revoke = async (cleanup = false) => { policyReady = false; if (!api?.credential) authorizedFeatureModels.clear(); await rpc(null, cleanup).catch(() => {}) }
   const persist = async () => {
-    try { if (!vault) throw new Error(); await vault.save(api?.credential) }
+    try { if (!api?.credential) authorizedFeatureModels.clear(); if (!vault) throw new Error(); await vault.save(api?.credential) }
     catch { storageError = "SESSION_STORAGE_UNAVAILABLE"; api?.suspend(); resetImport(); await revoke(); throw new Error(storageError) }
   }
   const synchronize = async () => {
     policyReady = false
     try {
       if (!api?.account) { await rpc(null); return }
-      modelPolicy(api.account.role, api.provider?.catalog)
+      modelPolicy(api.account.role, api.provider?.catalog, { featureModels: [...authorizedFeatureModels] })
       providerURL(api.provider!.provider.base_url)
       if (api.expires <= Date.now()) throw new Error("AMECODE_LOGIN_REQUIRED")
       await persist()
-      await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires })
+      await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires, featureModels: [...authorizedFeatureModels] })
       policyReady = true; blocker = undefined; transientFailures = 0
     } catch (error) {
       blocker = code(error); api?.suspend(); resetImport(); await revoke()
@@ -134,7 +142,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   const view = () => {
     if (api?.account && api.expires <= Date.now()) { api.suspend(); resetImport(); policyReady = false; blocker = "AMECODE_LOGIN_REQUIRED" }
     if (api?.account) {
-      const models = modelPolicy(api.account.role, api.provider?.catalog)
+      const models = modelPolicy(api.account.role, api.provider?.catalog, { featureModels: [...authorizedFeatureModels] })
       return { origin: api.origin, account: { ...api.account }, models: { ...models, small_model: api.account.role === "user" ? models.default_model : models.small_model }, ready: policyReady, ...(blocker ? { blocker } : {}) }
     }
     return api?.credential ? { origin: api.origin, reconnecting: true, ready: false, blocker: storageError ?? blocker ?? "ACCOUNT_REFRESH_REQUIRED" } : null
@@ -186,6 +194,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     if (operation === "status") return { ...viewOrEmpty(), ...(storageError ? { ready: false, blocker: storageError } : {}) }
     if (operation === "usage-prices") return { origin: api?.account ? api.origin : null, prices: readUsagePrices(api?.provider?.catalog) }
     if (operation === "logout") {
+      authorizedFeatureModels.clear()
       api?.suspend(); resetImport(); await revoke()
       try { if (!vault) throw new Error(); await vault.save(undefined); storageError = undefined }
       catch { api?.clear(); api = undefined; storageError = "SESSION_STORAGE_UNAVAILABLE"; throw new Error(storageError) }
@@ -203,6 +212,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     }
     if (storageError) throw new Error(storageError)
     if (operation === "login") {
+      authorizedFeatureModels.clear()
       api?.clear(); resetImport(); await persist(); await rpc(null)
       api = new AmeApi(payload.server || undefined, fetcher)
       await api.login(payload.username, payload.password, signal)
@@ -229,24 +239,24 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         return api.activate(payload.id, Number(payload.revision), signal)
       }
       case "import": {
-        await api.guard(true, signal)
-        resetImport()
         if (payload.compatibilityMode && !["native", "raw"].includes(payload.compatibilityMode)) throw new Error("INVALID_COMPATIBILITY_MODE")
         if (payload.adaptClaudeAgents !== undefined && !["true", "false"].includes(payload.adaptClaudeAgents)) throw new Error("INVALID_PAYLOAD")
         if (payload.adaptClaudeAgents === "true" && payload.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
         const adaptClaudeAgents = payload.compatibilityMode === "raw" && payload.adaptClaudeAgents === "true"
+        await api.guard(true, signal)
         const root = await options.pickImport()
         if (!root) return null
         await installer.safeDirectory(root)
         const importOptions: ImportOptions = { compatibilityMode: payload.compatibilityMode === "raw" ? "raw" : "native", adaptClaudeAgents }
-        const scanned = await scanWithSource(root, signal, importOptions)
-        source = scanned.preview
-        importSession = {
+        const nextScanned = await scanWithSource(root, signal, importOptions)
+        const nextSession: ImportSession = {
           root, folderName: path.basename(path.resolve(root)) || root, options: importOptions, adaptClaudeAgents,
-          originalInheritedIssues: scanned.inheritedIssues.map(issue => ({ ...issue })), inheritedIssues: scanned.inheritedIssues.map(issue => ({ ...issue })),
-          originalFiles: new Map(scanned.files.map(file => [file.path, file.data.slice()])),
-          workingFiles: new Map(scanned.files.map(file => [file.path, file.data.slice()])), savedToDisk: new Set(),
+          originalInheritedIssues: nextScanned.inheritedIssues.map(issue => ({ ...issue })), inheritedIssues: nextScanned.inheritedIssues.map(issue => ({ ...issue })),
+          originalFiles: new Map(nextScanned.files.map(file => [file.path, file.data.slice()])),
+          workingFiles: new Map(nextScanned.files.map(file => [file.path, file.data.slice()])), savedToDisk: new Set(),
         }
+        signal.throwIfAborted()
+        resetImport(); source = nextScanned.preview; importSession = nextSession
         return importView()
       }
       case "fix-import":
@@ -261,13 +271,13 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         if (operation === "fix-import-all") {
           const targets = importView().fixablePaths.slice(0, 10)
           if (!targets.length) throw new Error("AI_FIX_NO_FIXABLE_ERRORS")
-          const fixes: Awaited<ReturnType<typeof fixImportFile>>["fix"][] = [], failed: { path: string; code: string }[] = []
+          const fixes: Awaited<ReturnType<typeof fixImportFile>>["fix"][] = [], failed: { path: string; code: string; detail?: string }[] = []
           for (const target of targets) {
             signal.throwIfAborted()
             try { fixes.push((await fixImportFile(target)).fix) }
             catch (error) {
               if (signal.aborted || !api?.account || api.account.role !== "admin") throw error
-              failed.push({ path: target, code: code(error) })
+              failed.push({ path: target, code: code(error), ...(error instanceof AiFixError && error.detail ? { detail: error.detail } : {}) })
             }
           }
           return { preview: recomputeImportPreview(), fixes, failed }
@@ -322,8 +332,10 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         await api.guard(true, signal)
         if (!source) throw new Error("IMPORT_REQUIRED")
         packed = undefined
-        const commitEnhanceSkill = typeof payload.commitEnhanceSkill === "string" ? payload.commitEnhanceSkill.trim() : ""
-        packed = await pack(source, payload.version, signal, { ...(commitEnhanceSkill ? { commitEnhanceSkill } : {}) })
+        const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel"]
+          .filter(key => typeof payload[key] === "string" && payload[key].trim())
+          .map(key => [key, payload[key]]))
+        packed = await pack(source, payload.version, signal, features)
         const { bytes, ...summary } = packed
         return { ...summary, size: bytes.length }
       }
@@ -353,7 +365,10 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     busy = true
     const task = (async () => {
       let result: unknown, failure: unknown
-      try { result = await execute(operation, payload) }
+      try {
+        if (backgroundInFlight) await backgroundInFlight.catch(() => {})
+        result = await execute(operation, payload)
+      }
       catch (error) { failure = error }
       if (!["status", "usage-prices", "installed", "offline", "uninstall", "logout"].includes(operation)) {
         if (failure && (["login", "refresh", "assert-ready", "assert-model"].includes(operation) || !api?.account)) {
@@ -363,15 +378,14 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         }
         try { await persist() } catch (error) { failure ??= error }
       }
-      if (failure) throw new Error(code(failure))
+      if (failure) throw new Error(`${code(failure)}${failure instanceof AiFixError && failure.detail ? `: ${failure.detail}` : ""}`)
       return result
     })().finally(() => { busy = false; if (inFlight === task) inFlight = undefined })
     inFlight = task
     return task
   }
   const backgroundRefresh = () => {
-    if (disposed || busy || storageError || !api?.credential) return
-    busy = true
+    if (disposed || busy || backgroundInFlight || storageError || !api?.credential) return
     const task = (async () => {
       await ready
       if (disposed) return
@@ -388,8 +402,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         }
         api?.suspend(); resetImport(); transientFailures = 0; await revoke()
       }
-    })().finally(() => { busy = false; if (inFlight === task) inFlight = undefined })
-    inFlight = task
+    })().finally(() => { if (backgroundInFlight === task) backgroundInFlight = undefined })
+    backgroundInFlight = task
     void task.catch(() => {})
   }
   const timer = setInterval(backgroundRefresh, dependencies.refreshIntervalMs ?? 30_000)
@@ -400,6 +414,38 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       if (disposed) throw new Error("AMEKIT_DISPOSED")
       try { return await installer.readCommitEnhanceSkill(await project(projectID)) }
       catch (error) { throw new Error(code(error)) }
+    },
+    async readCommitEnhanceFeature(projectID) {
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      try {
+        const directory = await project(projectID)
+        const features = await installer.readBundleFeatures(directory)
+        const skill = await installer.readCommitEnhanceSkill(directory)
+        return { skill, ...(features?.commitEnhanceModel ? { model: features.commitEnhanceModel } : {}) }
+      } catch (error) { throw new Error(code(error)) }
+    },
+    async readAndroidTranslationFeature(projectID) {
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      try { return await installer.readAndroidTranslationFeature(await project(projectID)) }
+      catch (error) { throw new Error(code(error)) }
+    },
+    async authorizeFeatureModel(modelID) {
+      await ready
+      while (busy) await inFlight?.catch(() => {})
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      if (!api?.account || !api.provider || api.expires <= Date.now() || !policyReady) return null
+      const policy = modelPolicy(api.account.role, api.provider.catalog)
+      if (!policy.active_models.some(model => model.id === modelID)) return null
+      if (api.account.role !== "user" || modelID === policy.default_model || authorizedFeatureModels.has(modelID)) return modelID
+      if (authorizedFeatureModels.size >= 20) return null
+      busy = true
+      const task = (async () => {
+        authorizedFeatureModels.add(modelID)
+        try { await synchronize(); return modelID }
+        catch { authorizedFeatureModels.delete(modelID); return null }
+      })().finally(() => { busy = false; if (inFlight === task) inFlight = undefined })
+      inFlight = task
+      return task
     },
     async generatePetDialogue(model, callerSignal) {
       await ready
@@ -415,8 +461,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     dispose() {
       return disposal ??= (async () => {
         disposed = true; clearInterval(timer); lifetime.abort()
-        await ready; await inFlight?.catch(() => {})
-        api?.clear(); resetImport(); await revoke(true)
+        await ready; await Promise.all([inFlight?.catch(() => {}), backgroundInFlight?.catch(() => {})])
+        authorizedFeatureModels.clear(); api?.clear(); resetImport(); await revoke(true)
       })()
     },
   }

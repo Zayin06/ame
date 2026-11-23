@@ -14,7 +14,12 @@ const SkillId = z
     (s) => s === s.normalize("NFC") && !/[\\/:*?"<>|\x00-\x1f\x7f]/.test(s) && s !== "." && s !== "..",
     "Invalid skill ID"
   )
-const Features = z.object({ commitEnhanceSkill: SkillId.optional() }).strict()
+export const ModelId = z.string().min(1).max(200).refine(s => s === s.normalize("NFC") && /^[^\s/\x00-\x1f\x7f]+$/.test(s), "Invalid model ID")
+export const Features = z.object({
+  commitEnhanceSkill: SkillId.optional(), commitEnhanceModel: ModelId.optional(),
+  androidTranslationSkill: SkillId.optional(), androidTranslationModel: ModelId.optional(),
+}).strict()
+export type BundleFeatures = z.infer<typeof Features>
 const File = z.object({ path: z.string().min(1).max(240), size: z.number().int().min(0).max(MAX_FILE), sha256: Hash }).strict()
 const Manifest = z.object({
   schemaVersion: z.literal(1), target: z.literal("opencode"), version: Version, channel: z.literal("stable"),
@@ -67,9 +72,10 @@ export async function validate(bytes: Uint8Array, version: string) {
   }
   const features = manifest.features
   if (features?.commitEnhanceSkill && !skills.has(features.commitEnhanceSkill)) throw new Error("UNKNOWN_COMMIT_ENHANCE_SKILL")
+  if (features?.androidTranslationSkill && !skills.has(features.androidTranslationSkill)) throw new Error("UNKNOWN_ANDROID_TRANSLATION_SKILL")
   return {
     schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: manifest.compatibility,
-    ...(features ? { features } : {}),
+    ...(features && Object.values(features).some(value => value !== undefined) ? { features: Object.fromEntries(Object.entries(features).filter(([, value]) => value !== undefined)) as BundleFeatures } : {}),
     agents, skills: skills.size, fileCount: manifest.files.length,
     expandedSize: manifest.files.reduce((sum, file) => sum + file.size, 0),
   }

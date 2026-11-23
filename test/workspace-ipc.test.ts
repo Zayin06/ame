@@ -12,9 +12,16 @@ import * as editorSplit from '../apps/desktop/src/renderer/editor-split'
 import * as workspacePaths from '../apps/desktop/src/renderer/workspace-paths'
 import * as terminalControls from '../apps/desktop/src/renderer/terminal-controls'
 import * as platform from '../apps/desktop/src/renderer/platform'
+import * as composerMentions from '../apps/desktop/src/renderer/composer-mentions'
+import { chatSubmit } from '../apps/desktop/src/renderer/chat-submit'
+import * as modelSelection from '../apps/desktop/src/renderer/model-selection'
+import { projectChatTimeline } from '../apps/desktop/src/renderer/chat-timeline'
+import { familySummaryFromSessions } from '../apps/desktop/src/renderer/agent-map-model'
 import { z } from 'zod'
 import { validateWorkspacePath } from '../packages/ide-core/src/workspace-fs'
 import type { DesktopApi } from '../packages/protocol/src/index'
+import type { AmeKit } from '../packages/amekit/src/index'
+import { buildAndroidTranslationPrompt, createTranslationLockStore } from '../packages/amekit/src/android-translation'
 
 type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
@@ -40,6 +47,12 @@ const examples: Invocation[] = [
   { method: 'commands', args: ['p'] },
   { method: 'skills', args: ['p'] },
   { method: 'generateCommitMessage', args: ['p', { id: 'model', name: 'Model', providerID: 'amecode' }] }
+]
+
+const translationExamples: Invocation[] = [
+  { method: 'androidTranslationInfo', args: ['p'] },
+  { method: 'androidTranslationPrompt', args: ['p', undefined, 'Translate strings', 'update'] },
+  { method: 'androidTranslationLock', args: ['p', 'translation-1'] }
 ]
 
 const smartExamples: Invocation[] = [
@@ -91,6 +104,8 @@ async function harness(directory = 'workspace') {
   const calls: Invocation[] = []
   const messages: string[] = []
   let response = 1
+  let picked = { canceled: true, filePaths: [] as string[] }
+  const resolved = [{ ok: true, kind: 'workspace-file', path: 'src/app.ts', name: 'app.ts' }]
   let preview = { filesChanged: 2, replacements: 3, previews: [] }
   const result = { filesChanged: 2, replacements: 3, previews: [] }
   const workspace: Record<string, (...args: any[]) => any> = Object.fromEntries([...examples.map(({ method }) => method), 'stage', 'commit', 'remove'].map(method => [method, async (...args: unknown[]) => {
@@ -108,7 +123,7 @@ async function harness(directory = 'workspace') {
   let policyError = ''
   let policyGate: Promise<void> | undefined
   workspace.stagedDiffSummary = async (...args: unknown[]) => { calls.push({ method: 'stagedDiffSummary', args }); return summary }
-  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt'].map(method => [method, async (...args: unknown[]) => {
+  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt', 'cancel'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args })
     if (operationGate) await operationGate
     return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
@@ -126,7 +141,7 @@ async function harness(directory = 'workspace') {
     }]))
   }
   adapter.models = async (...args: unknown[]) => { calls.push({ method: 'models', args }); return models }
-  const account: { readCommitEnhanceSkill?: (projectID: string) => Promise<{ name: string; instructions: string } | null>; call: (...args: unknown[]) => Promise<unknown> } = { call: async (...args: unknown[]) => {
+  const account: Pick<AmeKit, 'readCommitEnhanceSkill' | 'readCommitEnhanceFeature' | 'readAndroidTranslationFeature' | 'authorizeFeatureModel'> & { call: (...args: unknown[]) => Promise<unknown> } = { call: async (...args: unknown[]) => {
     calls.push({ method: 'account', args })
     if (policyGate && args[0] !== 'status') await policyGate
     if (policyError && args[0] !== 'status') throw new Error(policyError)
@@ -145,8 +160,31 @@ async function harness(directory = 'workspace') {
     return methods
   }
   const parent = { isDestroyed: () => false, webContents: { send: (channel: string, event: unknown) => { calls.push({ method: channel, args: [event] }) } } }
+  const translationSessions = new Map<string, Set<string>>(), lockedSessions = new Map<string, Set<string>>()
+  const translationLocks = {
+    recordSession: async (projectID: string, sessionID: string) => { const ids = translationSessions.get(projectID) ?? new Set(); ids.add(sessionID); translationSessions.set(projectID, ids) },
+    lockSession: async (projectID: string, sessionID: string) => { const ids = lockedSessions.get(projectID) ?? new Set(); ids.add(sessionID); lockedSessions.set(projectID, ids) },
+    isTranslationSession: (projectID: string, sessionID: string) => translationSessions.get(projectID)?.has(sessionID) ?? false,
+    isLocked: (projectID: string, sessionID: string) => lockedSessions.get(projectID)?.has(sessionID) ?? false,
+    translationSessionIDs: (projectID: string) => [...(translationSessions.get(projectID) ?? [])],
+    lockedSessionIDs: (projectID: string) => [...(lockedSessions.get(projectID) ?? [])]
+  }
+  let detected = { isAndroid: true, stringsFiles: ['app/src/main/res/values/strings.xml'] }
+  let sessions = [{ id: 'translation-1', title: 'Translation' }]
+  let sessionMessages: unknown[] = []
+  let sessionModel: string | undefined
+  adapter.agentMap = async (...args: unknown[]) => {
+    calls.push({ method: 'agentMap', args })
+    return sessionModel ? { nodes: [{ id: args[1], model: sessionModel, providerID: 'amecode' }] } : 'agentMap'
+  }
+  adapter.createSession = async (...args: unknown[]) => { calls.push({ method: 'createSession', args }); return sessions[0] }
+  adapter.sessions = async (...args: unknown[]) => { calls.push({ method: 'sessions', args }); return sessions }
+  adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
     z, Buffer, process, window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
+    translationLocks, buildAndroidTranslationPrompt,
+    resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
+    detectAndroidProject: async (...args: unknown[]) => { calls.push({ method: 'detectAndroidProject', args }); return detected },
     pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
     managed: true,
     createTsLanguageService: (directory: string) => serviceFactory('lsp', directory),
@@ -155,7 +193,11 @@ async function harness(directory = 'workspace') {
     pairing: { status: () => ({ enabled: false }) },
     configurePairing: async (settings: unknown) => { calls.push({ method: 'configurePairing', args: [settings] }); return settings },
     shell: { showItemInFolder: (target: string) => calls.push({ method: 'shell', args: [target] }) },
-    dialog: { showMessageBox: async (window: unknown, options: any) => {
+    dialog: { showOpenDialog: async (window: unknown, options: unknown) => {
+      assert.equal(window, parent)
+      calls.push({ method: 'showOpenDialog', args: [options] })
+      return picked
+    }, showMessageBox: async (window: unknown, options: any) => {
       assert.equal(window, parent)
       assert.deepEqual(Array.from(options.buttons), ['Hủy', 'Xác nhận'])
       assert.equal(options.defaultId, 0); assert.equal(options.cancelId, 0)
@@ -170,8 +212,19 @@ async function harness(directory = 'workspace') {
     lspServices: Map<string, any>; debuggers: Map<string, any>
   }
   return {
-    dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState,
+    dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState, resolved,
+    setPicked: (value: typeof picked) => { picked = value },
     setCommitEnhanceReader: (reader: NonNullable<typeof account.readCommitEnhanceSkill>) => { account.readCommitEnhanceSkill = reader },
+    setCommitEnhanceFeatureReader: (reader: NonNullable<typeof account.readCommitEnhanceFeature>) => { account.readCommitEnhanceFeature = reader },
+    setAndroidTranslationReader: (reader: NonNullable<typeof account.readAndroidTranslationFeature>) => { account.readAndroidTranslationFeature = reader },
+    setFeatureAuthorizer: (authorize: NonNullable<typeof account.authorizeFeatureModel>) => { account.authorizeFeatureModel = authorize },
+    setDetected: (value: typeof detected) => { detected = value },
+    setSessionMessages: (value: unknown[]) => { sessionMessages = value },
+    setSessionModel: (value: string) => { sessionModel = value },
+    failInterrupt: () => { adapter.cancel = async () => { throw new Error('INTERRUPT_FAILED') } },
+    setSessions: (value: typeof sessions) => { sessions = value },
+    translationLocks,
+    useLockStore: (store: ReturnType<typeof createTranslationLockStore>) => { context.translationLocks = store },
     failRemove: () => { workspace.remove = async (...args: unknown[]) => { calls.push({ method: 'remove', args }); throw new Error('REMOVE_FAILED') } },
     setProjectDirectory: (id: string, value: string) => { const previous = workspace.get; workspace.get = key => key === id ? { directory: value } : previous(key) },
     invalidateProject: () => { workspace.get = () => { throw new Error('UNKNOWN_PROJECT') } }, setPricing: (value: typeof pricing) => { pricing = value },
@@ -207,6 +260,7 @@ function rendererHooks() {
       const index = cursor++
       return slots[index] ??= { current: initial }
     },
+    useId() { return `test-id-${cursor++}` },
     useCallback(callback: any, deps: readonly unknown[]) {
       const index = cursor++, previous = slots[index]
       if (!previous || !same(previous.deps, deps)) slots[index] = { deps, callback }
@@ -235,7 +289,9 @@ async function rendererModule(file: string, hooks: ReturnType<typeof rendererHoo
   const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'renderer', file), 'utf8')
   const modules: Record<string, unknown> = {
     react: hooks.react, 'react/jsx-runtime': jsxRuntime, './state': rendererState, './editor-split': editorSplit,
-    './workspace-paths': workspacePaths, './terminal-controls': terminalControls, './platform': platform
+    './workspace-paths': workspacePaths, './terminal-controls': terminalControls, './platform': platform,
+    '../composer-mentions': composerMentions, '../chat-submit': { chatSubmit }, '../model-selection': modelSelection,
+    '../chat-timeline': { projectChatTimeline }, '../agent-map-model': { familySummaryFromSessions }
   }
   const components = new Map<string, React.ComponentType<any>>()
   const exports: Record<string, any> = {}
@@ -319,6 +375,7 @@ test('TerminalPanel defaults to terminal and tab switches retain the same Shell 
 
 async function appRenderer(overrides: Record<string, (...args: any[]) => any> = {}) {
   const hooks = rendererHooks(), calls: Invocation[] = [], listeners = new Set<(event: any) => void>()
+  const windowListeners = new Map<string, (event: any) => void>()
   const timers = new Map<number, { delay: number; callback: () => void }>(); let timerID = 0
   const preferences = { ...rendererState.defaults(), project: 'p', inspector: true }
   const projectItems = [{ id: 'p', name: 'Primary', directory: 'workspace' }, { id: 'q', name: 'Other', directory: 'other' }]
@@ -338,7 +395,7 @@ async function appRenderer(overrides: Record<string, (...args: any[]) => any> = 
     }
   } })
   const { exports } = await rendererModule('App.tsx', hooks, {
-    window: { ame: api, addEventListener() {}, removeEventListener() {}, dispatchEvent() {}, confirm: () => true },
+    window: { ame: api, addEventListener: (type: string, listener: (event: any) => void) => windowListeners.set(type, listener), removeEventListener: (type: string) => windowListeners.delete(type), dispatchEvent() {}, confirm: () => true },
     document: { documentElement: { dataset: {}, style: { setProperty() {} } } },
     localStorage: { getItem: () => JSON.stringify(preferences), setItem() {} },
     setTimeout: (callback: () => void, delay: number) => { const id = ++timerID; timers.set(id, { callback, delay }); return id },
@@ -351,7 +408,7 @@ async function appRenderer(overrides: Record<string, (...args: any[]) => any> = 
     assert.ok(element, `${name} should be rendered`); return element.props
   }
   await settle()
-  return { calls, props, settle, dispose: () => hooks.dispose(),
+  return { calls, props, settle, windowListeners, dispose: () => hooks.dispose(),
     emit: (event: any) => {
       if (event.type === 'debug' && event.event.snapshot) debugStates.set(event.projectID, event.event.snapshot)
       listeners.forEach(listener => listener(event))
@@ -359,6 +416,145 @@ async function appRenderer(overrides: Record<string, (...args: any[]) => any> = 
     tick: async (delay: number) => { for (const [id, timer] of [...timers]) if (timer.delay === delay) { timers.delete(id); timer.callback() }; await flushRendererPromises(); await settle() }
   }
 }
+
+test('file-only submission retains the pending guard and reuses a draft after a failed prompt', async () => {
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let creates = 0, attempts = 0
+  const calls: Invocation[] = []
+  const files = [{ uri: 'data:image/png;base64,YQ==', name: 'shot.png', source: { type: 'inline' as const } }]
+  const submit = chatSubmit({
+    createSession: async () => { creates++; await gate; return { id: 'draft', title: 'Draft' } },
+    prompt: async (...args) => { calls.push({ method: 'prompt', args }); if (++attempts === 1) throw new Error('offline') }
+  }, () => {})
+  assert.equal(await submit('p', undefined, ' ', selectedModel, undefined, []), false)
+  const first = submit('p', undefined, '', selectedModel, 'build', files)
+  assert.equal(await submit('p', undefined, '', selectedModel, 'build', files), false)
+  release()
+  await assert.rejects(first, /offline/)
+  assert.equal(await submit('p', undefined, '', selectedModel, 'build', files), true)
+  assert.equal(creates, 1)
+  assert.equal(calls.length, 2)
+  for (const call of calls) assert.deepEqual(call.args, ['p', 'draft', '', selectedModel, 'build', files])
+})
+
+test('Chat wires nested drops, browser paste, native picker, deduplication, limits and attachment-only submission', async () => {
+  const hooks = rendererHooks(), calls: Invocation[] = []
+  const image = { ok: true, kind: 'media', name: 'shot.png', mime: 'image/png', dataUrl: 'data:image/png;base64,YQ==', size: 1 }
+  let picked = [image], translation = false
+  const browser = { name: 'paste.png', type: 'image/png', size: 1, arrayBuffer: async () => Uint8Array.of(98).buffer } as File
+  const api = {
+    account: async () => ({ account: { role: 'admin' } }),
+    androidTranslationInfo: async () => ({ lockedSessionIDs: [], translationSessionIDs: translation ? ['s'] : [] }),
+    models: async () => [selectedModel], agents: async () => [], commands: async () => [], skills: async () => [],
+    messages: async () => [], permissions: async () => [], onEvent: () => () => {},
+    filePath: (file: { path?: string }) => file.path ?? '',
+    resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return [image] },
+    pickAttachmentFiles: async (...args: unknown[]) => { calls.push({ method: 'pickAttachmentFiles', args }); return picked },
+    createSession: async () => ({ id: 'created', title: 'Chat', projectID: 'p' }),
+    prompt: async (...args: unknown[]) => { calls.push({ method: 'prompt', args }) }
+  }
+  const { exports } = await rendererModule('components\\Chat.tsx', hooks, {
+    window: { ame: api, addEventListener() {}, removeEventListener() {} },
+    document: { getElementById: () => null }, requestAnimationFrame: (callback: () => void) => callback(),
+    setTimeout, clearTimeout
+  })
+  let props: any = { projectID: 'p', sessionID: 's', connected: true, ready: true, sessions: [], tabs: [], changes: 0, changesStatus: 'ready', theme: 'dark',
+    report(error: unknown) { throw error }, onCreated() {}, onActivity() {}, onCreate() {}, onOpenPanel() {}, onOpenFile() {}, onSelectSession() {} }
+  let tree: React.ReactNode
+  const render = () => { tree = hooks.render(exports.Chat, props) }
+  const settle = async () => { for (let i = 0; i < 3; i++) { render(); hooks.effects(); await flushRendererPromises() }; render() }
+  const element = (match: (node: React.ReactElement<any>) => boolean) => {
+    const found = rendererElements(tree, match)[0]; assert.ok(found); return found
+  }
+  const pane = () => element(node => node.type === 'main').props
+  const component = (name: string) => element(node => (node.type as any).displayName === name).props
+  const input = () => element(node => node.type === 'textarea' && node.props.className === 'composer-input').props
+  const event = (types: string[], files: File[] = [], workspacePath = '') => ({
+    dataTransfer: { types, files, getData: (type: string) => type === composerMentions.WORKSPACE_DRAG_MIME ? workspacePath : '', dropEffect: '' },
+    prevented: false, preventDefault() { this.prevented = true }
+  })
+  await settle()
+  try {
+    const drag = event(['Files'])
+    pane().onDragEnter(drag); pane().onDragEnter(drag); render()
+    assert.equal(component('ComposerDropOverlay').active, true)
+    pane().onDragLeave(drag); render()
+    assert.equal(component('ComposerDropOverlay').active, true)
+    pane().onDragLeave(drag); render()
+    assert.equal(component('ComposerDropOverlay').active, false)
+    pane().onDragOver(drag)
+    assert.equal(drag.dataTransfer.dropEffect, 'copy')
+    const unsupported = event(['text/plain'])
+    pane().onDragEnter(unsupported); assert.equal(unsupported.prevented, false)
+    pane().onDrop(event([composerMentions.WORKSPACE_DRAG_MIME], [], 'src/app.ts'))
+    pane().onDrop(event([composerMentions.WORKSPACE_DRAG_MIME], [], 'src/app.ts'))
+    render(); assert.equal(component('ComposerAttachmentStrip').attachments.length, 1)
+    const drop = event(['Files'], [{ path: 'C:\\images\\shot.png' } as unknown as File, browser])
+    pane().onDrop(drop); await settle()
+    assert.equal(drop.prevented, true)
+    assert.equal(component('ComposerDropOverlay').active, false)
+    assert.deepEqual(plain(calls[0]), { method: 'resolveDroppedPaths', args: ['p', ['C:\\images\\shot.png']] })
+    assert.equal(component('ComposerAttachmentStrip').attachments.length, 3)
+    const paste = (plainText: string) => ({ clipboardData: {
+      items: [{ kind: 'file', type: 'image/png', getAsFile: () => browser }, { kind: 'string', type: 'text/plain', getAsFile: () => null }],
+      getData: () => plainText
+    }, prevented: false, preventDefault() { this.prevented = true } })
+    const mixed = paste('keep text'); input().onPaste(mixed); await settle()
+    assert.equal(mixed.prevented, false)
+    const imageOnly = paste(''); input().onPaste(imageOnly); await settle()
+    assert.equal(imageOnly.prevented, true)
+    assert.equal(component('ComposerAttachmentStrip').attachments.length, 3)
+    const pick = async () => {
+      element(node => node.type === 'button' && node.props.title === 'Đính kèm ngữ cảnh').props.onClick()
+      render()
+      element(node => node.props.className === 'composer-popover__pick-file').props.onClick()
+      await settle()
+    }
+    picked = Array.from({ length: 8 }, (_, index) => ({ ...image, name: `${index}.png` }))
+    await pick()
+    assert.equal(calls.at(-1)!.method, 'pickAttachmentFiles')
+    assert.equal(component('ComposerAttachmentStrip').attachments.length, 9)
+    assert.match(String(element(node => node.props.className === 'inline-error').props.children), /tối đa 8/)
+    const workspace = component('ComposerAttachmentStrip').attachments.find((item: any) => item.kind === 'file')
+    component('ComposerAttachmentStrip').onRemove(workspace.id); render()
+    await element(node => node.type === 'form' && node.props.className === 'composer-card').props.onSubmit({ preventDefault() {} })
+    await settle()
+    const submitted = calls.find(call => call.method === 'prompt')!
+    assert.ok(submitted)
+    assert.equal(submitted.args[2], '')
+    assert.equal((submitted.args[5] as unknown[]).length, 8)
+    assert.equal(component('ComposerAttachmentStrip').attachments.length, 0)
+    picked = [{ ok: false, name: 'bad.zip', reason: 'Unsupported' }, { ok: true, kind: 'workspace-file', path: 'src/other.ts', name: 'other.ts' }] as any
+    await pick()
+    assert.match(String(element(node => node.props.className === 'inline-error').props.children), /bad.zip: Unsupported/)
+    assert.equal(component('ComposerAttachmentStrip').attachments.length, 1)
+    props = { ...props, connected: false }; await settle()
+    const disconnected = event(['Files'], [browser]); pane().onDrop(disconnected)
+    assert.equal(disconnected.prevented, false)
+    const blockedPaste = paste(''); input().onPaste(blockedPaste); assert.equal(blockedPaste.prevented, false)
+    translation = true; props = { ...props, connected: true }; await settle()
+    const locked = event(['Files'], [browser]); pane().onDrop(locked)
+    assert.equal(locked.prevented, false)
+    assert.equal(rendererElements(tree, node => node.type === 'textarea').length, 0)
+  } finally { hooks.dispose() }
+})
+
+test('App prevents OS-file drag navigation outside Chat and removes both global listeners', async () => {
+  const h = await appRenderer()
+  for (const type of ['dragover', 'drop']) {
+    const handler = h.windowListeners.get(type)
+    assert.ok(handler)
+    for (const types of [['Files'], ['text/plain'], undefined]) {
+      let prevented = false
+      handler({ dataTransfer: types ? { types } : null, preventDefault() { prevented = true } })
+      assert.equal(prevented, types?.includes('Files') ?? false)
+    }
+  }
+  h.dispose()
+  assert.equal(h.windowListeners.has('dragover'), false)
+  assert.equal(h.windowListeners.has('drop'), false)
+})
 
 test('App routes project debug output, pause navigation and exit without treating debug events as file changes', async () => {
   const h = await appRenderer()
@@ -772,6 +968,11 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
       process: { platform, env: {}, resourcesPath: 'resources' }, path, here: 'main', window: undefined,
       workspace: undefined, terminals: undefined, adapter: undefined, runtime: undefined, account: undefined, pairing: undefined,
       petHost: undefined, sprite: '', managed: true, shuttingDown: false, authority: Promise.resolve(), lspServices, debuggers,
+      translationLocks: undefined,
+      createTranslationLockStore: (file: string) => {
+        assert.equal(file, path.join('userData', 'translation-locks.json'))
+        return { load: async () => { sequence.push('translation-locks:load') } }
+      },
       app: { requestSingleInstanceLock: () => true, on: (name: string, callback: (...args: any[]) => any) => { events.set(name, callback) },
         whenReady: () => ({ then: (callback: () => Promise<void>) => { boot = callback(); return boot } }),
         isPackaged: false, getAppPath: () => process.cwd(), getPath: () => 'userData', quit: () => { sequence.push('quit') } },
@@ -802,6 +1003,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     assert.equal(options.hasMainWindow(), true)
     assert.equal(spritePath, path.join(process.cwd(), 'packages/amekit/src/assets/ame-chibi.png'))
     assert.ok(sequence.indexOf('pet:create') < sequence.indexOf('runtime:create'))
+    assert.ok(sequence.indexOf('translation-locks:load') < sequence.indexOf('window'))
     assert.ok(sequence.indexOf('pet:init') < sequence.indexOf('window'))
     assert.ok(sequence.indexOf('pet:init') < sequence.indexOf('backend:start'))
     const signal = new AbortController().signal
@@ -1001,6 +1203,279 @@ test('AI commit forwards the synced skill and silently falls back to the two-arg
   await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /NO_STAGED_CHANGES/)
 })
 
+test('AI commit authorizes a configured feature model after the staged summary and preserves the skill contract', async () => {
+  const h = await harness()
+  const featureModel = { id: 'gemini-ui', modelID: 'gemini', name: 'Gemini', providerID: 'amecode' }
+  const defaultModel = { id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }
+  h.setStatus({ account: { role: 'user' }, models: { default_model: 'server-model', models: [{ id: 'server-model' }] } })
+  h.setCommitEnhanceFeatureReader(async projectID => {
+    h.calls.push({ method: 'readFeature', args: [projectID] })
+    return { model: 'gemini', skill: { name: 'team-commit', instructions: 'Team format' } }
+  })
+  h.setFeatureAuthorizer(async modelID => {
+    h.calls.push({ method: 'authorizeFeatureModel', args: [modelID] })
+    h.setModels([defaultModel, { ...featureModel, providerID: 'external' }, featureModel])
+    h.setStatus({ account: { role: 'user' }, models: { default_model: 'server-model', models: [{ id: 'server-model' }, { id: 'gemini' }] } })
+    return modelID
+  })
+  await h.dispatch('generateCommitMessage', ['p', featureModel])
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'stagedDiffSummary', 'readFeature', 'authorizeFeatureModel', 'models', 'generateCommitMessage'])
+  assert.deepEqual(plain(h.calls.at(-1)!.args), [
+    { diff: '+change', files: ['new.txt'], truncated: false }, featureModel,
+    { name: 'team-commit', instructions: 'Team format' }
+  ])
+  await h.dispatch('prompt', ['p', 'main-chat', 'Regular chat', featureModel])
+  assert.deepEqual(plain(h.calls.at(-1)!.args[3]), defaultModel)
+  h.setSummary({ diff: '', files: [], truncated: false }); h.calls.length = 0
+  await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /NO_STAGED_CHANGES/)
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'stagedDiffSummary'])
+})
+
+test('AI commit falls back when feature models are inactive, unavailable, or already default', async () => {
+  for (const mode of ['inactive', 'missing-runtime', 'missing-authorizer', 'default'] as const) {
+    const h = await harness()
+    h.setCommitEnhanceFeatureReader(async () => ({ model: mode === 'default' ? 'server-model' : 'gemini', skill: null }))
+    if (mode !== 'missing-authorizer') h.setFeatureAuthorizer(async modelID => {
+      h.calls.push({ method: 'authorizeFeatureModel', args: [modelID] })
+      return mode === 'inactive' ? null : modelID
+    })
+    await h.dispatch('generateCommitMessage', ['p'])
+    assert.deepEqual(plain(h.calls.at(-1)!.args[1]), { id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' })
+    assert.equal(h.calls.at(-1)!.args.length, 2)
+    assert.equal(h.calls.some(call => call.method === 'authorizeFeatureModel'), mode === 'inactive' || mode === 'missing-runtime')
+  }
+})
+
+test('feature authorization retains authority and fails closed on authorization errors or shutdown', async () => {
+  for (const shutdown of [false, true]) {
+    const h = await harness()
+    h.setCommitEnhanceFeatureReader(async () => ({ skill: null, model: 'gemini' }))
+    let release!: (model: string) => void
+    h.setFeatureAuthorizer(() => new Promise<string>(resolve => { release = resolve }))
+    const generation = h.dispatch('generateCommitMessage', ['p'])
+    await new Promise(resolve => setImmediate(resolve))
+    const following = h.dispatch('account', ['logout', {}])
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(h.calls.some(call => call.method === 'generateCommitMessage' || call.args[0] === 'logout'), false)
+    if (shutdown) h.shutdown()
+    release('gemini')
+    if (shutdown) {
+      await assert.rejects(generation, /APP_SHUTTING_DOWN/)
+      await assert.rejects(following, /APP_SHUTTING_DOWN/)
+      assert.equal(h.calls.some(call => call.method === 'generateCommitMessage'), false)
+    } else {
+      await Promise.all([generation, following])
+      assert.deepEqual(plain(h.calls.at(-1)), { method: 'account', args: ['logout', {}] })
+    }
+  }
+  const h = await harness()
+  h.setCommitEnhanceFeatureReader(async () => ({ skill: null, model: 'gemini' }))
+  h.setFeatureAuthorizer(async () => { throw new Error('POLICY_RELOAD_FAILED') })
+  await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /POLICY_RELOAD_FAILED/)
+  assert.equal(h.calls.some(call => call.method === 'generateCommitMessage'), false)
+})
+
+test('Android translation info reports active feature models, project detection, fallback, and lock state', async () => {
+  const h = await harness()
+  h.setAndroidTranslationReader(async () => ({ rawSkillName: 'android-strings-translation', skill: null, model: 'gemini' }))
+  h.setStatus({ account: { role: 'user' }, models: {
+    default_model: 'server-model', models: [{ id: 'server-model', name: 'Default' }],
+    active_models: [{ id: 'server-model', name: 'Default' }, { id: 'gemini', name: 'Gemini' }]
+  } })
+  await h.translationLocks.recordSession('p', 'translation-1')
+  await h.translationLocks.lockSession('p', 'translation-1')
+  assert.deepEqual(plain(await h.dispatch('androidTranslationInfo', ['p'])), {
+    configured: true, isAndroid: true, skill: 'android-strings-translation', configuredModelID: 'gemini',
+    effectiveModelID: 'gemini', effectiveModelName: 'Gemini', fallbackToDefault: false,
+    stringsFiles: ['app/src/main/res/values/strings.xml'], translationSessionIDs: ['translation-1'], lockedSessionIDs: ['translation-1']
+  })
+  h.setStatus({ models: { default_model: 'server-model', active_models: [{ id: 'server-model', name: 'Default' }] } })
+  assert.equal((await h.dispatch('androidTranslationInfo', ['p']) as any).fallbackToDefault, true)
+  assert.equal((await h.dispatch('androidTranslationInfo', ['p']) as any).effectiveModelID, 'server-model')
+  h.setAndroidTranslationReader(async () => ({ skill: null }))
+  h.setDetected({ isAndroid: false, stringsFiles: [] })
+  const unset = await h.dispatch('androidTranslationInfo', ['p']) as any
+  assert.equal(unset.configured, false); assert.equal(unset.isAndroid, false)
+  assert.deepEqual(plain(unset.stringsFiles), [])
+  assert.equal(h.calls.some(call => call.method === 'authorizeFeatureModel'), false)
+  h.invalidateProject()
+  await assert.rejects(h.dispatch('androidTranslationInfo', ['p']), /UNKNOWN_PROJECT/)
+})
+
+const translationSkill = { name: 'android-strings-translation', instructions: 'Run bundled scripts/strings_tool.py.', directory: 'workspace/.opencode/skills/android-strings-translation' }
+
+test('Android translation creates an isolated session, authorizes the pinned model, and wraps first and follow-up prompts', async () => {
+  const h = await harness()
+  const model = { id: 'gemini-runtime', modelID: 'gemini', name: 'Gemini', providerID: 'amecode' }
+  h.setAndroidTranslationReader(async () => ({ skill: translationSkill, model: 'gemini' }))
+  h.setFeatureAuthorizer(async modelID => {
+    h.setModels([{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }, model])
+    return modelID
+  })
+  const result = await h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate into Japanese', 'full'])
+  assert.deepEqual(plain(result), { session: { id: 'translation-1', title: 'Translation' }, model, locked: false })
+  const first = h.calls.find(call => call.method === 'prompt')!
+  assert.deepEqual(plain(first.args.slice(0, 2)), ['p', 'translation-1'])
+  assert.deepEqual(plain(first.args[3]), model)
+  for (const fragment of ['[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]', translationSkill.instructions, translationSkill.directory, 'app/src/main/res/values/strings.xml', 'Translate into Japanese', 'full']) assert.ok(String(first.args[2]).includes(fragment), fragment)
+  assert.equal(h.translationLocks.isTranslationSession('p', 'translation-1'), true)
+  assert.equal(h.translationLocks.isTranslationSession('p', 'main-chat'), false)
+  h.calls.length = 0; h.setSessionMessages([{ role: 'user', text: 'previous' }])
+  await h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Now French', 'custom'])
+  const next = h.calls.find(call => call.method === 'prompt')!
+  assert.match(String(next.args[2]), /\[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY\]/)
+  assert.match(String(next.args[2]), /Now French/)
+  assert.equal(String(next.args[2]).includes(translationSkill.instructions), false)
+  assert.equal(h.calls.some(call => call.method === 'createSession'), false)
+})
+
+test('translation followups keep their initial model despite configuration/default changes and never leak it to regular Chat', async () => {
+  const h = await harness()
+  const defaultModel = { id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }
+  const featureModel = { id: 'gemini-runtime', modelID: 'gemini', name: 'Gemini', providerID: 'amecode' }
+  h.setModels([defaultModel, featureModel])
+  h.setAndroidTranslationReader(async () => ({ skill: translationSkill, model: 'gemini' }))
+  h.setFeatureAuthorizer(async id => id)
+  await h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate'])
+  h.setAndroidTranslationReader(async () => ({ skill: translationSkill, model: 'changed-model' }))
+  h.setStatus({ account: { role: 'user' }, models: { default_model: 'server-model', models: [{ id: 'server-model' }, { id: 'gemini' }] } })
+  h.calls.length = 0
+  const followup = await h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue']) as any
+  assert.equal(followup.model.modelID, 'gemini')
+  assert.deepEqual(plain(h.calls.find(call => call.method === 'prompt')!.args[3]), featureModel)
+  await h.dispatch('prompt', ['p', 'normal-chat', 'Code', featureModel])
+  assert.deepEqual(plain(h.calls.at(-1)!.args[3]), defaultModel)
+  await h.dispatch('btwAsk', ['p', 'normal-chat', 'Question', featureModel])
+  assert.deepEqual(plain(h.calls.at(-1)!.args[3]), defaultModel)
+  h.calls.length = 0
+  await assert.rejects(h.dispatch('prompt', ['p', 'translation-1', 'Code', featureModel]), /ANDROID_TRANSLATION_SESSION_REQUIRED/)
+  await assert.rejects(h.dispatch('btwAsk', ['p', 'translation-1', 'Code', featureModel]), /ANDROID_TRANSLATION_SESSION_REQUIRED/)
+  assert.equal(h.calls.length, 0)
+  h.setFeatureAuthorizer(async () => null)
+  await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue']), /TRANSLATION_MODEL_UNAVAILABLE/)
+  assert.equal((h.calls as Invocation[]).some(call => call.method === 'prompt'), false)
+})
+
+test('a translation started on API default stays on that model after the default changes', async () => {
+  const h = await harness()
+  const original = { id: 'model', modelID: 'server-model', name: 'Original', providerID: 'amecode' }
+  const replacement = { id: 'new-default', modelID: 'new-default', name: 'New default', providerID: 'amecode' }
+  h.setModels([original, replacement])
+  h.setAndroidTranslationReader(async () => ({ skill: translationSkill }))
+  await h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate'])
+  h.setStatus({ account: { role: 'user' }, models: { default_model: 'new-default', models: [{ id: 'server-model' }, { id: 'new-default' }] } })
+  h.setFeatureAuthorizer(async id => id)
+  const followup = await h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue']) as any
+  assert.equal(followup.model.modelID, 'server-model')
+  await h.dispatch('prompt', ['p', 'normal-chat', 'Code', original])
+  assert.deepEqual(plain(h.calls.at(-1)!.args[3]), replacement)
+})
+
+test('translation pins are recovered from owned session metadata after restart rather than current configuration', async () => {
+  const h = await harness()
+  await h.translationLocks.recordSession('p', 'translation-1')
+  h.setSessionModel('gemini-runtime')
+  const pinned = { id: 'gemini-runtime', modelID: 'gemini', name: 'Gemini', providerID: 'amecode' }
+  h.setModels([{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }, pinned])
+  h.setAndroidTranslationReader(async () => ({ skill: translationSkill, model: 'new-config' }))
+  h.setFeatureAuthorizer(async id => id)
+  const result = await h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue']) as any
+  assert.deepEqual(plain(result.model), pinned)
+  assert.ok(h.calls.some(call => call.method === 'agentMap'))
+  h.setProjectDirectory('other', 'another-workspace')
+  h.calls.length = 0
+  await assert.rejects(h.dispatch('androidTranslationPrompt', ['other', 'translation-1', 'Translate']), /ANDROID_TRANSLATION_SESSION_REQUIRED/)
+  await assert.rejects(h.dispatch('androidTranslationLock', ['other', 'translation-1']), /ANDROID_TRANSLATION_SESSION_REQUIRED/)
+  assert.deepEqual(h.calls, [])
+})
+
+test('translation lock interrupts accepted asynchronous generation and rejects every queued subsequent prompt', async () => {
+  const h = await harness()
+  h.setAndroidTranslationReader(async () => ({ skill: translationSkill }))
+  // Submission resolves without waiting for server-side generation.
+  await h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate'])
+  const lock = h.dispatch('androidTranslationLock', ['p', 'translation-1'])
+  const regular = h.dispatch('prompt', ['p', 'translation-1', 'Code', selectedModel])
+  const translation = h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue'])
+  await lock
+  await assert.rejects(regular, /TRANSLATION_SESSION_LOCKED/)
+  await assert.rejects(translation, /TRANSLATION_SESSION_LOCKED/)
+  assert.deepEqual(plain(h.calls.filter(call => call.method === 'cancel')), [{ method: 'cancel', args: ['p', 'translation-1'] }])
+  assert.equal(h.calls.filter(call => call.method === 'prompt').length, 1)
+})
+
+test('translation sessions remain durably locked and notify the renderer even if interrupt fails', async () => {
+  const h = await harness()
+  await h.translationLocks.recordSession('p', 'translation-1')
+  h.failInterrupt()
+  await assert.rejects(h.dispatch('androidTranslationLock', ['p', 'translation-1']), /INTERRUPT_FAILED/)
+  assert.equal(h.translationLocks.isLocked('p', 'translation-1'), true)
+  assert.deepEqual(plain(h.calls.at(-1)), { method: 'ame:event', args: [{ type: 'opencode', projectID: 'p', sessionID: 'translation-1' }] })
+  await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue']), /TRANSLATION_SESSION_LOCKED/)
+  await assert.rejects(h.dispatch('btwAsk', ['p', 'translation-1', 'Continue']), /TRANSLATION_SESSION_LOCKED/)
+})
+
+test('Android translation requires verified configuration, rejects main sessions, and falls back to the default model', async () => {
+  const h = await harness()
+  await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate']), /ANDROID_TRANSLATION_NOT_CONFIGURED/)
+  h.setAndroidTranslationReader(async () => ({ rawSkillName: translationSkill.name, skill: null }))
+  await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate']), /ANDROID_TRANSLATION_NOT_CONFIGURED/)
+  h.setAndroidTranslationReader(async () => ({ skill: translationSkill, model: 'inactive' }))
+  h.setFeatureAuthorizer(async () => null)
+  await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', 'main-chat', 'Translate']), /ANDROID_TRANSLATION_SESSION_REQUIRED/)
+  await assert.rejects(h.dispatch('androidTranslationLock', ['p', 'main-chat']), /ANDROID_TRANSLATION_SESSION_REQUIRED/)
+  assert.equal(h.calls.some(call => call.method === 'prompt' || call.method === 'createSession'), false)
+  const result = await h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate']) as any
+  assert.equal(result.model.modelID, 'server-model')
+  h.setSessions([])
+  await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Translate']), /SESSION_NOT_FOUND/)
+})
+
+test('Android translation IPC validates bounds, modes and extra arguments before any side effect', async () => {
+  const h = await harness()
+  const invalid: Invocation[] = [
+    ...translationExamples.flatMap(({ method, args }) => [[], ['', ...args.slice(1)], ['bad\0id', ...args.slice(1)], [' '.repeat(3), ...args.slice(1)], ['x'.repeat(513), ...args.slice(1)], [...args, 'extra']].map(args => ({ method, args }))),
+    ...['', '   ', '\0', 42, 'x'.repeat(200001)].map(value => ({ method: 'androidTranslationPrompt', args: ['p', undefined, value] })),
+    ...['', null, 42, 'bad\0id', '  '].flatMap(value => [
+      { method: 'androidTranslationPrompt', args: ['p', value, 'Translate'] },
+      { method: 'androidTranslationLock', args: ['p', value] }
+    ]),
+    { method: 'androidTranslationPrompt', args: ['p', undefined, 'Translate', 'invalid'] }
+  ]
+  for (const { method, args } of invalid) await assert.rejects(h.dispatch(method, args), method)
+  assert.deepEqual(h.calls, [])
+})
+
+test('translation lock serializes after pending prompts and permanently rejects both translation and normal Chat writes', async () => {
+  const root = await mkdtemp(path.join(process.cwd(), '.ame-translation-ipc-'))
+  try {
+    const file = path.join(root, 'translation-locks.json')
+    const store = createTranslationLockStore(file); await store.load()
+    const h = await harness(); h.useLockStore(store)
+    h.setAndroidTranslationReader(async () => ({ skill: translationSkill }))
+    let release!: () => void
+    h.gateOperation(new Promise<void>(resolve => { release = resolve }))
+    const pending = h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate'])
+    await new Promise(resolve => setImmediate(resolve))
+    const lock = h.dispatch('androidTranslationLock', ['p', 'translation-1'])
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(store.isLocked('p', 'translation-1'), false)
+    release(); await pending
+    assert.deepEqual(plain(await lock), { translationSessionIDs: ['translation-1'], lockedSessionIDs: ['translation-1'] })
+    h.calls.length = 0
+    await assert.rejects(h.dispatch('prompt', ['p', 'translation-1', 'Code now', selectedModel]), /TRANSLATION_SESSION_LOCKED/)
+    await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Translate again']), /TRANSLATION_SESSION_LOCKED/)
+    assert.deepEqual(h.calls, [])
+    const reloaded = createTranslationLockStore(file); await reloaded.load()
+    const restarted = await harness(); restarted.useLockStore(reloaded)
+    await assert.rejects(restarted.dispatch('prompt', ['p', 'translation-1', 'Code now', selectedModel]), /TRANSLATION_SESSION_LOCKED/)
+    await restarted.dispatch('prompt', ['p', 'main-chat', 'Normal chat', selectedModel])
+    assert.equal(reloaded.isLocked('another-project', 'translation-1'), false)
+    await restarted.dispatch('androidTranslationLock', ['p', 'translation-1'])
+    assert.deepEqual(reloaded.lockedSessionIDs('p'), ['translation-1'])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('AI commit fails closed for unavailable models, rejected policy, or no staged changes', async () => {
   const h = await harness()
   for (const models of [[], [{ id: 'model', modelID: 'model', name: 'Model', providerID: 'external' }]]) {
@@ -1125,6 +1600,49 @@ test('shell reveal validates the actual workspace path including root, metadata,
   assert.deepEqual(h.messages, [])
 })
 
+test('dropped paths and native picker resolve against the registered workspace and preserve cancellation', async () => {
+  const h = await harness('C:\\workspace')
+  const paths = ['C:\\workspace\\src\\app.ts', 'C:\\images\\shot.png']
+  assert.equal(await h.dispatch('resolveDroppedPaths', ['p', paths]), h.resolved)
+  assert.deepEqual(plain(h.calls.pop()), { method: 'resolveDroppedPaths', args: ['C:\\workspace', paths] })
+  assert.deepEqual(plain(await h.dispatch('pickAttachmentFiles', ['p'])), [])
+  assert.equal(h.calls.at(-1)!.method, 'showOpenDialog')
+  h.setPicked({ canceled: false, filePaths: [] })
+  assert.deepEqual(plain(await h.dispatch('pickAttachmentFiles', ['p'])), [])
+  h.setPicked({ canceled: false, filePaths: paths })
+  assert.equal(await h.dispatch('pickAttachmentFiles', ['p']), h.resolved)
+  assert.deepEqual(plain(h.calls.pop()), { method: 'resolveDroppedPaths', args: ['C:\\workspace', paths] })
+  const options = h.calls.at(-1)!.args[0] as any
+  assert.deepEqual(Array.from(options.properties), ['openFile', 'multiSelections'])
+  assert.ok(options.filters[0].extensions.includes('png'))
+  h.calls.length = 0
+  await assert.rejects(h.dispatch('resolveDroppedPaths', ['unknown', paths]), /UNKNOWN_PROJECT/)
+  await assert.rejects(h.dispatch('pickAttachmentFiles', ['unknown']), /UNKNOWN_PROJECT/)
+  for (const args of [['p', Array(33).fill('x')], ['p', ['x'.repeat(4097)]], ['\0', paths]]) await assert.rejects(h.dispatch('resolveDroppedPaths', args))
+  assert.equal(h.calls.length, 0)
+})
+
+test('prompt IPC forwards bounded file parts and rejects malformed parts before invoking the adapter', async () => {
+  const h = await harness()
+  const file = { uri: 'data:image/png;base64,YQ==', name: 'shot.png', mime: 'image/png', source: { type: 'inline' } }
+  const files = [file, { uri: 'file:///C:/notes.txt', source: { type: 'uri', uri: 'file:///C:/notes.txt' } }]
+  await h.dispatch('prompt', ['p', 's', '', selectedModel, 'agent', files])
+  assert.deepEqual(plain(h.calls.at(-1)), { method: 'prompt', args: ['p', 's', '', { ...selectedModel, modelID: 'server-model' }, 'agent', files] })
+  await h.dispatch('prompt', ['p', 's', '', selectedModel, undefined, Array(8).fill(file)])
+  h.calls.length = 0
+  for (const invalid of [
+    Array(9).fill(file), [{ ...file, uri: 'data:image/png;base64,' + 'A'.repeat(15 * 1024 * 1024) }],
+    [{ ...file, uri: file.uri + '\0' }], [{ ...file, name: 'bad\0.png' }], [{ ...file, mime: 'image/\0png' }],
+    [{ ...file, name: 'x'.repeat(256) }], [{ ...file, mime: 'x'.repeat(121) }],
+    [{ ...file, uri: 'https://example.com/image.png' }], [{ ...file, uri: 'data:image/png;base64,Y Q==' }],
+    [{ ...file, extra: true }], [{ ...file, source: { type: 'inline', extra: true } }],
+    [{ ...file, source: { type: 'uri', uri: 'bad\0' } }], [{ ...file, source: { type: 'uri', uri: 'x'.repeat(4097) } }],
+  ]) await assert.rejects(h.dispatch('prompt', ['p', 's', '', selectedModel, undefined, invalid]))
+  assert.equal(h.calls.length, 0)
+  await h.translationLocks.recordSession('p', 'translation')
+  await assert.rejects(h.dispatch('prompt', ['p', 'translation', '', selectedModel, undefined, [file]]), /TRANSLATION/)
+})
+
 test('preload forwards all new methods, optional arguments, return values and rejections', async () => {
   const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'preload', 'index.ts'), 'utf8')
   let api: DesktopApi | undefined, rejected = false
@@ -1136,6 +1654,7 @@ test('preload forwards all new methods, optional arguments, return values and re
       assert.equal(name, 'electron')
       return {
         contextBridge: { exposeInMainWorld: (name: string, value: DesktopApi) => { assert.equal(name, 'ame'); api = value } },
+        webUtils: { getPathForFile: (file: { path?: string }) => file.path ?? '' },
         ipcRenderer: { invoke: async (channel: string, method: string, args: unknown[]) => {
           assert.equal(channel, 'ame:call'); calls.push({ method, args: Array.from(args) })
           if (rejected) throw new Error('CANCELLED')
@@ -1147,19 +1666,30 @@ test('preload forwards all new methods, optional arguments, return values and re
   runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, context)
   assert.ok(api)
   const methods = api as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
-  for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples]) {
+  for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples,
+    { method: 'resolveDroppedPaths', args: ['p', ['C:\\images\\shot.png']] },
+    { method: 'pickAttachmentFiles', args: ['p'] },
+    { method: 'prompt', args: ['p', 's', '', selectedModel, undefined, [{ uri: 'data:image/png;base64,YQ==', name: 'shot.png', source: { type: 'inline' } }]] }
+  ]) {
     assert.equal(await methods[method](...args), result)
     assert.deepEqual(calls.pop(), { method, args })
     rejected = true
     await assert.rejects(methods[method](...args), /CANCELLED/)
     calls.length = 0; rejected = false
   }
+  assert.equal(api.filePath({ path: 'C:\\images\\shot.png' } as unknown as File), 'C:\\images\\shot.png')
+  assert.equal(api.filePath({} as File), '')
+  assert.equal(api.filePath(null as unknown as File), '')
+  await api.prompt('p', 's', 'text')
+  assert.deepEqual(calls.pop(), { method: 'prompt', args: ['p', 's', 'text', undefined, undefined, undefined] })
   await api.createFile('p', 'empty.txt')
   assert.deepEqual(calls.pop(), { method: 'createFile', args: ['p', 'empty.txt', undefined] })
   await api.createBranch('p', 'feature')
   assert.deepEqual(calls.pop(), { method: 'createBranch', args: ['p', 'feature', undefined] })
   await api.generateCommitMessage('p')
   assert.deepEqual(calls.pop(), { method: 'generateCommitMessage', args: ['p', undefined] })
+  await api.androidTranslationPrompt('p', undefined, 'Translate strings')
+  assert.deepEqual(calls.pop(), { method: 'androidTranslationPrompt', args: ['p', undefined, 'Translate strings', undefined] })
   await api.artifacts('p')
   assert.deepEqual(calls.pop(), { method: 'artifacts', args: ['p', undefined] })
   await api.btwAsk('p', 's', 'question')

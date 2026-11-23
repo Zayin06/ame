@@ -16,6 +16,7 @@ export function groupIssues(rawIssues: unknown[], mode?: string) {
 }
 
 const errors: Record<string, { title: string; detail?: string }> = {
+  OPERATION_BUSY: { title: 'Hệ thống đang xử lý tác vụ đồng bộ tài khoản', detail: 'Vui lòng chờ giây lát rồi thử lại.' },
   MODEL_POLICY_PLUGIN_REQUIRED: { title: 'Cần đăng nhập để kích hoạt chính sách model', detail: 'Đăng nhập tài khoản AmeCode bên dưới để đồng bộ cấu hình model và bundle.' },
   MODEL_POLICY_UNAVAILABLE: { title: 'Chưa tải được chính sách model từ máy chủ', detail: 'Kiểm tra kết nối mạng hoặc bấm Kiểm tra lại.' },
   ACCOUNT_REFRESH_REQUIRED: { title: 'Phiên đăng nhập cần được làm mới', detail: 'Bấm Làm mới phiên hoặc đăng nhập lại.' },
@@ -44,6 +45,11 @@ const errors: Record<string, { title: string; detail?: string }> = {
   IMPORT_FILE_NOT_FOUND: { title: 'Không tìm thấy tệp trong phiên nhập hiện tại', detail: 'Chọn nhập lại thư mục để cập nhật danh sách tệp.' },
   SAVE_PATH_UNSAFE: { title: 'Không thể lưu vì đường dẫn nguồn không an toàn', detail: 'Kiểm tra liên kết tượng trưng và vị trí thư mục nguồn rồi nhập lại.' },
   UNKNOWN_COMMIT_ENHANCE_SKILL: { title: 'Skill Enhance không nằm trong gói đã nhập', detail: 'Hãy chọn lại skill có trong danh sách skills/ ở Bước 1 rồi đóng gói lại.' },
+  UNKNOWN_ANDROID_TRANSLATION_SKILL: { title: 'Skill Dịch Android không nằm trong gói đã nhập', detail: 'Hãy chọn lại skill trong danh sách ở Bước 1 rồi đóng gói lại.' },
+  ANDROID_TRANSLATION_NOT_CONFIGURED: { title: 'Chưa cấu hình Dịch Android', detail: 'Nhờ quản trị viên chọn skill Dịch Android trong Cài đặt → AmeKit, xuất bản và đồng bộ bundle.' },
+  TRANSLATION_SESSION_LOCKED: { title: 'Phiên dịch Android đã hoàn tất và được khóa', detail: 'Chọn Phiên dịch mới để tiếp tục dịch hoặc dùng Chat chính cho công việc lập trình.' },
+  TRANSLATION_MODEL_UNAVAILABLE: { title: 'Model đã ghim của phiên dịch không còn khả dụng', detail: 'Kiểm tra kết nối và tài khoản hoặc chọn Phiên dịch mới để dùng cấu hình model hiện tại.' },
+  ANDROID_TRANSLATION_SESSION_REQUIRED: { title: 'Phiên này chỉ dùng trong cửa sổ Dịch Android', detail: 'Mở Dịch Android để tiếp tục dịch hoặc chọn Cuộc trò chuyện mới trong Chat chính.' },
   PACKAGE_REQUIRED: { title: 'Chưa có gói ZIP sẵn sàng xuất bản', detail: 'Nhập phiên bản và bấm Đóng gói ZIP ở Bước 2 trước.' },
   ZIP_EXCEEDS_8_MIB: { title: 'Gói ZIP vượt quá giới hạn 8 MiB', detail: 'Giảm dung lượng tài nguyên trong skills/ hoặc tách bớt tệp lớn.' },
   OWNED_FILE_CHANGED: { title: 'Tệp do AmeKit quản lý trong .opencode/ đã bị chỉnh sửa tay', detail: 'Khôi phục tệp về nguyên bản hoặc gỡ thủ công rồi đồng bộ lại.' },
@@ -63,7 +69,8 @@ export function formatAmeKitError(error: unknown): { code?: string; title: strin
   const text = errorText(error).trim()
   const code = text.match(/\b([A-Z][A-Z0-9_]{2,79})\b/)?.[1]
   const message = code && Object.hasOwn(errors, code) ? errors[code] : undefined
-  return { ...(code ? { code } : {}), ...(message ?? { title: text }) }
+  const providerDetail = code?.startsWith('AI_FIX_') ? text.slice(text.indexOf(code) + code.length).replace(/^:\s*/, '').trim() : ''
+  return { ...(code ? { code } : {}), ...(message ?? { title: text }), ...(providerDetail ? { detail: providerDetail } : {}) }
 }
 
 export function formatBundleSize(bytes: number): string {

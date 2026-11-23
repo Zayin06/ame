@@ -19,6 +19,7 @@ const paths: Record<string, ReactNode> = {
   sparkles: <path d="m12 3 1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8ZM19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9Z" />,
   wand: <><path d="m15 4 5 5L7 22l-5-5ZM12 7l5 5M5 2v4M3 4h4M21 14v4M19 16h4" /></>,
   lock: <><rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></>,
+  globe: <><circle cx="12" cy="12" r="9" /><ellipse cx="12" cy="12" rx="4" ry="9" /><path d="M3 12h18M5 6.5h14M5 17.5h14" /></>,
   stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
   filePlus: <><path d="M5 3h9l5 5v13H5Z M14 3v6h5" /><path d="M12 12v6M9 15h6" /></>,
   folderPlus: <><path d="M3 7V5h6l2 2h10v13H3Z" /><path d="M12 11v5M9.5 13.5h5" /></>,

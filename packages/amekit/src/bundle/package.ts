@@ -1,7 +1,7 @@
 // Adapted from opencode-amekit/src/bundle/package.ts; see ../docs/amekit.md for provenance.
 import { zipSync, type Zippable } from "fflate"
 import { parseDocument, stringify } from "yaml"
-import { MAX_ZIP, Version, sha256, validate } from "./manifest"
+import { Features, MAX_ZIP, Version, sha256, validate, type BundleFeatures } from "./manifest"
 import { readArchive } from "./archive"
 import { BUNDLE_ARCHIVE_LIMITS, MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES } from "./limits"
 import { z } from "zod"
@@ -66,6 +66,11 @@ export function exclusion(name: string, options: ImportOptions = {}) {
     (options.compatibilityMode !== "raw" && parts.some(p => /^(dist|build)$/i.test(p)))) return "metadata/cache/build/credential path"
   if (/\.(pem|key|pfx|p12)$/i.test(name) || /(^|\/)(credentials|id_rsa|id_ed25519|auth\.json)$/i.test(name)) return "credential file"
 }
+const CODE_FENCE_LANGS = new Set([
+  "ts", "typescript", "js", "javascript", "tsx", "jsx", "svelte",
+  "kotlin", "java", "py", "python", "go", "rust", "swift", "dart",
+  "c", "cpp", "csharp", "cs", "php", "ruby", "rb", "scala",
+])
 export function secretFindings(text: string) {
   const findings: { rule: "private-key" | "provider-key" | "assignment"; classification: "blocked" | "template" | "code-expression" }[] = []
   if (/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i.test(text)) findings.push({ rule: "private-key", classification: "blocked" })
@@ -76,8 +81,10 @@ export function secretFindings(text: string) {
     const template = boundary && (/^YOUR_[A-Z0-9_]+$/.test(value) || /^INSERT_[A-Z0-9_]+_HERE$/.test(value) || /^your_[a-z_]+$/.test(value))
     // Restrict code-expression exceptions to language-tagged examples, never quoted literals.
     const fences = [...text.slice(0, match.index).matchAll(/^```([^\r\n]*)/gm)]
-    const inKotlinExample = fences.length % 2 === 1 && fences.at(-1)?.[1].trim() === "kotlin"
-    const expression = inKotlinExample && !match[1] && /^[A-Za-z_]\w*$/.test(value) && /^(?:\.[A-Za-z_]\w*)*\s*\(/.test(rest)
+    const fenceLang = fences.length % 2 === 1 ? (fences.at(-1)?.[1].trim().split(/\s+/)[0]?.toLowerCase() ?? "") : ""
+    const inCodeFence = CODE_FENCE_LANGS.has(fenceLang)
+    const envIdentifier = !match[1] && boundary && /^[A-Z][A-Z0-9]*_[A-Z0-9_]+$/.test(value)
+    const expression = inCodeFence && !match[1] && ((fenceLang === "kotlin" && /^[A-Za-z_]\w*$/.test(value) && /^(?:\.[A-Za-z_]\w*)*\s*\(/.test(rest)) || envIdentifier)
     findings.push({ rule: "assignment", classification: template ? "template" : expression ? "code-expression" : "blocked" })
   }
   return findings
@@ -187,15 +194,16 @@ export function preview(input: InputFile[], inherited: Issue[] = [], options: Im
   if (total > MAX_EXPANDED) issues.push({ path: "", severity: "error", reason: "expanded payload exceeds 24 MiB" })
   return { files, issues, agents, skills, ...(raw ? { compatibilityMode: "raw" as const } : {}) }
 }
-export async function pack(source: Preview, version: string, signal?: AbortSignal, options: { commitEnhanceSkill?: string } = {}) {
+export async function pack(source: Preview, version: string, signal?: AbortSignal, options: BundleFeatures = {}) {
   signal?.throwIfAborted()
   Version.parse(version)
   if (source.issues.some(i => i.severity === "error")) throw new Error("IMPORT_BLOCKED")
-  const commitEnhanceSkill = options.commitEnhanceSkill?.trim()
-  if (commitEnhanceSkill && !source.skills.includes(commitEnhanceSkill)) throw new Error("UNKNOWN_COMMIT_ENHANCE_SKILL")
+  const features = Features.parse(Object.fromEntries(Object.entries(options).map(([key, value]) => [key, typeof value === "string" ? value.trim() || undefined : value]).filter(([, value]) => value !== undefined)))
+  if (features.commitEnhanceSkill && !source.skills.includes(features.commitEnhanceSkill)) throw new Error("UNKNOWN_COMMIT_ENHANCE_SKILL")
+  if (features.androidTranslationSkill && !source.skills.includes(features.androidTranslationSkill)) throw new Error("UNKNOWN_ANDROID_TRANSLATION_SKILL")
   const files = [...source.files].sort((a,b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   const inventory = await Promise.all(files.map(async f => ({ path: f.path, size: f.data.length, sha256: await sha256(f.data) })))
-  const manifest = { schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: source.compatibilityMode === "raw" ? { mode: "raw", testedOpenCode: [] } : { testedOpenCode: ["2.3.2"] }, agents: source.agents.length, skills: source.skills.length, files: inventory, ...(commitEnhanceSkill ? { features: { commitEnhanceSkill } } : {}) }
+  const manifest = { schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: source.compatibilityMode === "raw" ? { mode: "raw", testedOpenCode: [] } : { testedOpenCode: ["2.3.2"] }, agents: source.agents.length, skills: source.skills.length, files: inventory, ...(Object.keys(features).length ? { features } : {}) }
   const entries: Zippable = Object.create(null)
   // Fixed DOS timestamp and no directory entries keep output deterministic and strict.
   for (const f of [...files, { path: "manifest.json", data: encode.encode(JSON.stringify(manifest)) }]) {

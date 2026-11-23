@@ -76,6 +76,32 @@ test('model resolution maps tiers before title routing and enforces the single-m
   }
 })
 
+test('authorized feature models pass through concrete requests but never unlock user titles or tiers', () => {
+  const policy = modelPolicy('user', catalog, { featureModels: [levels.opus] })
+  for (const kind of ['primary', 'commit', 'translation']) {
+    const feature = { kind, model: ref(levels.opus) }
+    resolveHookModel(feature, policy)
+    assert.deepEqual(feature.model, ref(levels.opus))
+    const regular = { kind, model: ref(levels.sonnet) }
+    resolveHookModel(regular, policy)
+    assert.deepEqual(regular.model, ref(levels.default))
+    for (const tier of ['opus', 'amecode/haiku', 'default']) {
+      const input = { kind, model: ref(tier) }
+      resolveHookModel(input, policy)
+      assert.deepEqual(input.model, ref(levels.default))
+    }
+  }
+  for (const id of [levels.opus, levels.haiku, 'opus']) {
+    const title = { kind: 'title', model: ref(id) }
+    resolveHookModel(title, policy)
+    assert.deepEqual(title.model, ref(levels.default))
+  }
+  const legacyPolicy = { models: [{ ...catalog.models[1], reasoning: false }], default_model: levels.default, model_levels: policy.model_levels }
+  const legacy = { kind: 'primary', model: ref(levels.opus) }
+  resolveHookModel(legacy, legacyPolicy)
+  assert.deepEqual(legacy.model, ref(levels.default))
+})
+
 test('hook resolution leaves inactive and foreign models unchanged and skips unavailable title models', () => {
   const admin = modelPolicy('admin', catalog)
   const foreign = { kind: 'title', model: ref('opus', 'other') }
@@ -154,8 +180,17 @@ test('plugin reloads agents after providers/models and adds one policy context n
     assert.deepEqual(input.model, ref(levels.opus))
     await assert.rejects(hooks.get('experimental.model.resolve')!({ ...input, model: ref('not-allowed') }), /AMECODE_/)
     await assert.rejects(hooks.get('experimental.model.resolve')!({ ...input, model: ref('haiku', 'other') }), /AMECODE_MODEL_NOT_ALLOWED/)
+    await update({ role: 'user', catalog, featureModels: [levels.opus, 'inactive'], provider: { base_url: 'https://api.example.com/v1', api_key: 'test-key' }, expires: Date.now() + 60000 })
+    providerTransform({ list: () => [], remove() {}, add(record: { models: readonly Model.Info[] }) { offered = record.models } } as unknown as Parameters<ProviderTransform>[0])
+    assert.deepEqual(offered.map(model => model.id), [levels.default, levels.opus])
+    const feature = { ...input, model: ref(levels.opus) }
+    await hooks.get('experimental.model.resolve')!(feature)
+    assert.deepEqual(feature.model, ref(levels.opus))
+    const title = { ...feature, kind: 'title' }
+    await hooks.get('experimental.model.resolve')!(title)
+    assert.deepEqual(title.model, ref(levels.default))
     await update(null)
-    assert.deepEqual(reloads, ['provider', 'model', 'agent', 'provider', 'model', 'agent'])
+    assert.deepEqual(reloads, ['provider', 'model', 'agent', 'provider', 'model', 'agent', 'provider', 'model', 'agent'])
     await assert.rejects(hooks.get('experimental.model.resolve')!(input), /AMECODE_LOGIN_REQUIRED/)
   } finally { await cleanup?.() }
 })
@@ -201,12 +236,21 @@ test('gateway rewrites managed tier request bodies and rejects disallowed or una
       assert.equal(body.error.code, 'AMECODE_MODEL_NOT_ALLOWED')
       assert.equal(forwarded.length, allowedCount)
     }
+    policy = modelPolicy('user', catalog, { featureModels: [levels.opus] })
+    const featureResponse = await send(levels.opus)
+    assert.equal(featureResponse.status, 200)
+    await featureResponse.json()
+    assert.equal(forwarded.at(-1)!.model, levels.opus)
+    const tierResponse = await send('opus')
+    assert.equal(tierResponse.status, 200)
+    await tierResponse.json()
+    assert.equal(forwarded.at(-1)!.model, levels.default)
     policy = undefined
     const response = await send('default')
     assert.equal(response.status, 403)
     const body = await response.json() as { error: { code: string } }
     assert.equal(body.error.code, 'AMECODE_LOGIN_REQUIRED')
-    assert.equal(forwarded.length, allowedCount)
+    assert.equal(forwarded.length, allowedCount + 2)
   } finally {
     await gateway.close()
     upstream.closeAllConnections()

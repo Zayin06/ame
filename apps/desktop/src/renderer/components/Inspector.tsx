@@ -6,6 +6,7 @@ import { ProjectSearch } from './ProjectSearch'
 import { canCommit, commitShortcut } from '../scm-commit'
 import { gitStatusMeta, splitFilePath } from '../scm-display'
 import { FileTypeIcon } from '../components/FileTypeIcon'
+import { WORKSPACE_DRAG_MIME } from '../composer-mentions'
 
 type Mutate = <T>(action: () => Promise<T>, success?: (result: T) => void, refreshAfter?: boolean) => Promise<void>
 type Naming = { kind: 'file' | 'directory' | 'rename'; parent: string; entry?: FileEntry }
@@ -56,7 +57,12 @@ function Directory(props: DirectoryProps) {
     const editing = naming && (naming.kind === 'rename' ? naming.entry?.path === entry.path : naming.parent === entry.path)
     return <li key={entry.path}>
       <div className="insp-tree-entry">
-        <button className="tree-row insp-row" title={entry.path} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined} onClick={() => entry.directory ? setExpanded(value => ({ ...value, [entry.path]: !value[entry.path] })) : onOpen(entry.path)}><span className="file-symbol">{entry.directory ? <Icon name={expanded[entry.path] ? 'down' : 'chevron'} /> : <FileTypeIcon path={entry.path} />}</span><span className="truncate">{entry.name}</span></button>
+        <button className="tree-row insp-row" title={entry.path} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined} draggable={!entry.directory && !busy} onDragStart={event => {
+          if (entry.directory || busy) { event.preventDefault(); return }
+          event.dataTransfer.setData(WORKSPACE_DRAG_MIME, entry.path)
+          event.dataTransfer.setData('text/plain', `@${entry.path}`)
+          event.dataTransfer.effectAllowed = 'copy'
+        }} onClick={() => entry.directory ? setExpanded(value => ({ ...value, [entry.path]: !value[entry.path] })) : onOpen(entry.path)}><span className="file-symbol">{entry.directory ? <Icon name={expanded[entry.path] ? 'down' : 'chevron'} /> : <FileTypeIcon path={entry.path} />}</span><span className="truncate">{entry.name}</span></button>
         <button className="insp-tree-more" title={`Thao tác ${entry.path}`} aria-label={`Thao tác ${entry.path}`} aria-haspopup="menu" aria-expanded={menu === entry.path} disabled={busy} onClick={() => setMenu(menu === entry.path ? null : entry.path)}><Icon name="more" /></button>
       </div>
       {menu === entry.path && !busy && <div className="insp-tree-popover" role="menu" aria-label={`Thao tác ${entry.path}`}>

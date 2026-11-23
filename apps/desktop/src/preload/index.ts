@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { DesktopApi, IdeEvent } from '../../../../packages/protocol/src/index'
 
 const invoke = (method: string, ...args: unknown[]) => ipcRenderer.invoke('ame:call', method, args)
@@ -64,11 +64,17 @@ const api: DesktopApi = {
   deleteSession: (id, session) => invoke('deleteSession', id, session),
   commands: id => invoke('commands', id), skills: id => invoke('skills', id),
   generateCommitMessage: (id, model) => invoke('generateCommitMessage', id, model),
+  androidTranslationInfo: id => invoke('androidTranslationInfo', id),
+  androidTranslationPrompt: (id, session, text, mode) => invoke('androidTranslationPrompt', id, session, text, mode),
+  androidTranslationLock: (id, session) => invoke('androidTranslationLock', id, session),
   sessionDiff: (id, session, from) => invoke('sessionDiff', id, session, from),
   sessionUsage: (id, session) => invoke('sessionUsage', id, session),
   agentMap: (id, session) => invoke('agentMap', id, session),
   models: id => invoke('models', id), agents: id => invoke('agents', id),
-  prompt: (id, session, text, model, agent) => invoke('prompt', id, session, text, model, agent),
+  prompt: (id, session, text, model, agent, files) => invoke('prompt', id, session, text, model, agent, files),
+  resolveDroppedPaths: (id, paths) => invoke('resolveDroppedPaths', id, paths),
+  pickAttachmentFiles: id => invoke('pickAttachmentFiles', id),
+  filePath: (file: File) => { try { return webUtils?.getPathForFile?.(file) || '' } catch { return '' } },
   cancel: (id, session) => invoke('cancel', id, session), permissions: (id, session) => invoke('permissions', id, session),
   replyPermission: (id, permission, reply) => invoke('replyPermission', id, permission, reply),
   account: (operation, payload = {}) => invoke('account', operation, payload), pickImport: () => invoke('pickImport'),
