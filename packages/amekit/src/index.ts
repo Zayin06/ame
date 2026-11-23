@@ -117,7 +117,16 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     return directory
   }
   const discover = dependencies.discover ?? runtimeDiscovery(options.cli, path.join(options.userData, "amekit-runtime"))
-  const installView = (state: NonNullable<Awaited<ReturnType<typeof installer.installed>>>) => ({ version: state.version, releaseId: state.releaseId, compatibilityMode: state.compatibilityMode, verification: state.verification, compatibilityWarnings: state.compatibilityWarnings })
+  const installView = (state: NonNullable<Awaited<ReturnType<typeof installer.installed>>>) => ({
+    version: state.version,
+    releaseId: state.releaseId,
+    compatibilityMode: state.compatibilityMode,
+    verification: state.verification,
+    compatibilityWarnings: state.compatibilityWarnings,
+    agents: state.agents,
+    skills: state.skills,
+    fileCount: state.files.length,
+  })
   const execute = async (operation: string, payload: Record<string, string>): Promise<unknown> => {
     await ready
     if (disposed) throw new Error("AMEKIT_DISPOSED")
@@ -178,7 +187,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         if (!root) return null
         await installer.safeDirectory(root)
         source = await scan(root, signal, { compatibilityMode: payload.compatibilityMode === "raw" ? "raw" : "native", adaptClaudeAgents })
-        return { issues: source.issues, agents: source.agents, skills: source.skills, compatibilityMode: source.compatibilityMode ?? "native", adaptClaudeAgents, files: source.files.map(file => ({ path: file.path, size: file.data.length })) }
+        return { folderName: path.basename(path.resolve(root)) || root, issues: source.issues, agents: source.agents, skills: source.skills, compatibilityMode: source.compatibilityMode ?? "native", adaptClaudeAgents, files: source.files.map(file => ({ path: file.path, size: file.data.length })) }
       }
       case "package": {
         await api.guard(true, signal)

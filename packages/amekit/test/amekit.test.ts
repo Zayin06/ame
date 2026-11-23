@@ -324,8 +324,10 @@ test("admin import/package/publish/activate require roles and native main confir
     await assert.rejects(f.service.call("import", { root: "C:\\untrusted-renderer-path" }), /FORBIDDEN/)
     assert.equal(f.pickerCount(), 0)
     f.role("admin"); await f.service.call("refresh", {})
-    const imported = await f.service.call("import", { root: "C:\\ignored" }) as { files: { path: string; size: number }[] }
+    const imported = await f.service.call("import", { root: "C:\\ignored" }) as { folderName: string; files: { path: string; size: number }[] }
     assert.equal(f.pickerCount(), 1); assert.equal(imported.files.length, 2)
+    assert.equal(imported.folderName, path.basename(f.imported))
+    assert.equal(imported.folderName.includes(path.dirname(f.imported)), false)
     const packaged = await f.service.call("package", { version: "1.2.3" }) as { size: number; bytes?: unknown }
     assert.ok(packaged.size > 0); assert.equal(packaged.bytes, undefined)
     f.confirm(false)
@@ -438,13 +440,22 @@ test("native sync preserves personal config, verifies runtime, supports offline 
     await assert.rejects(f.service.call("sync", { project: "project-id" }), /CANCELLED/)
     assert.equal(f.requests.some(request => request.endsWith("/download")), false)
     f.confirm(true)
-    const result = await f.service.call("sync", { project: "project-id" }) as { changed: boolean; verification: string }
+    type Inventory = { agents: string[]; skills: string[]; fileCount: number; verification: string }
+    const checkInventory = (value: Inventory) => {
+      assert.deepEqual(value.agents, ["helper"])
+      assert.deepEqual(value.skills, ["fixture"])
+      assert.equal(value.fileCount, input().length)
+    }
+    const result = await f.service.call("sync", { project: "project-id" }) as Inventory & { changed: boolean }
     assert.equal(result.changed, true); assert.equal(result.verification, "runtime-ready")
+    checkInventory(result)
     assert.equal(await readFile(path.join(f.project, ".opencode", "personal.json"), "utf8"), "personal")
-    assert.ok(await f.service.call("installed", { project: "project-id" }))
+    checkInventory(await f.service.call("installed", { project: "project-id" }) as Inventory)
     await f.service.call("logout", {})
     const before = f.requests.length
-    assert.equal((await f.service.call("offline", { project: "project-id" }) as { verification: string }).verification, "runtime-ready")
+    const offline = await f.service.call("offline", { project: "project-id" }) as Inventory
+    assert.equal(offline.verification, "runtime-ready")
+    checkInventory(offline)
     assert.equal(f.requests.length, before)
     f.confirm(false); await assert.rejects(f.service.call("uninstall", { project: "project-id" }), /CANCELLED/)
     f.confirm(true)
