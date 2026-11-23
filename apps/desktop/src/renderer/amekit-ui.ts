@@ -15,6 +15,17 @@ export function groupIssues(rawIssues: unknown[], mode?: string) {
   return { ...groups, defaultTab, suggestClaudeAdapt }
 }
 
+export function suggestNextVersion(versions: readonly (string | undefined)[]): string {
+  let highest: bigint[] | undefined
+  for (const version of versions) {
+    const match = version?.match(/^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/)
+    if (!match) continue
+    const tuple = match.slice(1, 4).map(value => BigInt(value))
+    if (!highest || tuple[0] > highest[0] || (tuple[0] === highest[0] && (tuple[1] > highest[1] || (tuple[1] === highest[1] && tuple[2] > highest[2])))) highest = tuple
+  }
+  return highest ? `${highest[0]}.${highest[1]}.${highest[2] + 1n}` : '1.0.0'
+}
+
 const errors: Record<string, { title: string; detail?: string }> = {
   OPERATION_BUSY: { title: 'Hệ thống đang xử lý tác vụ đồng bộ tài khoản', detail: 'Vui lòng chờ giây lát rồi thử lại.' },
   MODEL_POLICY_PLUGIN_REQUIRED: { title: 'Cần đăng nhập để kích hoạt chính sách model', detail: 'Đăng nhập tài khoản AmeCode bên dưới để đồng bộ cấu hình model và bundle.' },
@@ -30,12 +41,12 @@ const errors: Record<string, { title: string; detail?: string }> = {
   INVALID_CREDENTIALS: { title: 'Sai tên đăng nhập hoặc mật khẩu', detail: 'Kiểm tra lại thông tin tài khoản và thử lại.' },
   UNAUTHORIZED: { title: 'Sai tên đăng nhập hoặc mật khẩu', detail: 'Kiểm tra lại thông tin tài khoản và thử lại.' },
   IMPORT_BLOCKED: { title: 'Không thể đóng gói vì còn lỗi trong thư mục nguồn', detail: 'Hãy xem tab Lỗi ở Bước 1 hoặc chuyển sang chế độ Raw + Chuẩn hóa agent Claude -> OpenCode nếu dùng gói Claude.' },
-  INVALID_BUNDLE: { title: 'Máy chủ từ chối gói ZIP/manifest', detail: 'Kiểm tra phiên bản SemVer, giới hạn ≤ 1023 tệp và kích thước ZIP ≤ 8 MiB.' },
+  INVALID_BUNDLE: { title: 'Máy chủ từ chối gói ZIP/manifest', detail: 'Kiểm tra phiên bản SemVer, giới hạn ≤ 10.000 tệp và kích thước ZIP ≤ 32 MiB.' },
   RAW_INSTALL_CONFIRMATION_REQUIRED: { title: 'Cần xác nhận chế độ Raw trước khi đồng bộ', detail: "Bật tùy chọn 'Cho phép raw compatibility khi đồng bộ' rồi bấm Đồng bộ lại." },
   UPLOAD_LIMIT: { title: 'Đạt giới hạn tối đa 5 upload đang chờ', detail: 'Đợi các upload pending hết hạn hoặc hoàn tất xuất bản release trước khi đẩy mới.' },
   RELEASE_CONFLICT: { title: 'Phiên bản này đã tồn tại trên máy chủ', detail: 'Hãy đặt số phiên bản mới (ví dụ 1.0.1) và đóng gói lại.' },
   ACTIVATION_CONFLICT: { title: 'Revision kích hoạt đã thay đổi trên máy chủ', detail: 'Lịch sử đã được làm mới hoặc hãy bấm Cập nhật lịch sử rồi kích hoạt lại.' },
-  IMPORT_REQUIRED: { title: 'Chưa có dữ liệu nhập hợp lệ', detail: 'Hãy chọn thư mục chứa agents/ và skills/ ở Bước 1 trước.' },
+  IMPORT_REQUIRED: { title: 'Chưa có dữ liệu nhập hợp lệ', detail: 'Hãy chọn và nhập thư mục chứa agents/ và skills/ trước.' },
   AI_FIX_PROVIDER_ERROR: { title: 'Không thể sửa tệp qua máy chủ AI', detail: 'Kiểm tra kết nối và model đang dùng rồi thử lại.' },
   AI_FIX_INVALID_RESPONSE: { title: 'AI trả về bản sửa không hợp lệ', detail: 'Tệp tạm chưa thay đổi. Thử lại với model khác.' },
   AI_FIX_VALIDATION_FAILED: { title: 'Bản sửa AI vẫn còn lỗi sau khi kiểm tra lại', detail: 'Tệp tạm chưa thay đổi. Thử model khác hoặc bỏ tệp khỏi gói.' },
@@ -50,7 +61,8 @@ const errors: Record<string, { title: string; detail?: string }> = {
   TRANSLATION_SESSION_LOCKED: { title: 'Phiên dịch Android đã hoàn tất và được khóa', detail: 'Chọn Phiên dịch mới để tiếp tục dịch hoặc dùng Chat chính cho công việc lập trình.' },
   TRANSLATION_MODEL_UNAVAILABLE: { title: 'Model đã ghim của phiên dịch không còn khả dụng', detail: 'Kiểm tra kết nối và tài khoản hoặc chọn Phiên dịch mới để dùng cấu hình model hiện tại.' },
   ANDROID_TRANSLATION_SESSION_REQUIRED: { title: 'Phiên này chỉ dùng trong cửa sổ Dịch Android', detail: 'Mở Dịch Android để tiếp tục dịch hoặc chọn Cuộc trò chuyện mới trong Chat chính.' },
-  PACKAGE_REQUIRED: { title: 'Chưa có gói ZIP sẵn sàng xuất bản', detail: 'Nhập phiên bản và bấm Đóng gói ZIP ở Bước 2 trước.' },
+  PACKAGE_REQUIRED: { title: 'Chưa có gói ZIP sẵn sàng xuất bản', detail: 'Chọn thư mục nguồn và bấm Chỉ đóng gói thử trước khi xuất bản gói đã nén.' },
+  ZIP_EXCEEDS_32_MIB: { title: 'Gói ZIP sau nén vượt quá giới hạn 32 MiB', detail: 'Giảm dung lượng tài nguyên trong skills/ hoặc tách bớt tệp lớn.' },
   ZIP_EXCEEDS_8_MIB: { title: 'Gói ZIP vượt quá giới hạn 8 MiB', detail: 'Giảm dung lượng tài nguyên trong skills/ hoặc tách bớt tệp lớn.' },
   OWNED_FILE_CHANGED: { title: 'Tệp do AmeKit quản lý trong .opencode/ đã bị chỉnh sửa tay', detail: 'Khôi phục tệp về nguyên bản hoặc gỡ thủ công rồi đồng bộ lại.' },
   DISCOVERY_MISMATCH: { title: 'OpenCode 2.3.2 không nạp được đủ agent/skill trong gói Native', detail: 'Kiểm tra lại metadata agent/skill trước khi kích hoạt cho team.' },
@@ -59,7 +71,7 @@ const errors: Record<string, { title: string; detail?: string }> = {
   CANCELLED: { title: 'Bạn đã hủy hộp thoại xác nhận.' },
   AMECODE_LOGIN_REQUIRED: { title: 'Phiên đăng nhập AmeCode đã hết hạn hoặc chưa đăng nhập', detail: 'Vào tab Tài khoản để đăng nhập hoặc làm mới phiên.' },
 }
-errors.ZIP_EXCEEDS = errors.ZIP_EXCEEDS_8_MIB
+errors.ZIP_EXCEEDS = errors.ZIP_EXCEEDS_32_MIB
 errors.SIGNED_OUT = errors.AMECODE_LOGIN_REQUIRED
 for (const code of ['PERSONAL_FILE_COLLISION', 'PERSONAL_AGENT_COLLISION', 'PERSONAL_SKILL_COLLISION', 'PERSONAL_DIRECTORY_COLLISION']) {
   errors[code] = { title: 'Xung đột với cấu hình OpenCode cá nhân trong .opencode/', detail: 'Dự án đang có tệp/agent/skill trùng tên với bundle của team; hãy dọn hoặc sao lưu tệp trùng trước khi đồng bộ.' }

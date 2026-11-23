@@ -47,7 +47,7 @@ export async function validate(bytes: Uint8Array, version: string) {
   })) {
     if (file.path !== file.path.normalize("NFC")) throw new Error("Đường dẫn phải là Unicode NFC")
     if (file.path === "manifest.json") {
-      if (file.data.length > MAX_MANIFEST) throw new Error("Manifest vượt 512 KiB")
+      if (file.data.length > MAX_MANIFEST) throw new Error(`Manifest vượt ${Math.round(MAX_MANIFEST / 1048576)} MiB`)
       manifest = Manifest.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(file.data)))
       continue
     }

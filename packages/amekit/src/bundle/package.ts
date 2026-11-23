@@ -191,7 +191,7 @@ export function preview(input: InputFile[], inherited: Issue[] = [], options: Im
   }
   if (!agents.length || !skills.length) issues.push({ path: "", severity: "error", reason: "bundle requires at least one agent and one skill" })
   if (files.length > MAX_PAYLOAD_FILES) issues.push({ path: "", severity: "error", reason: `more than ${MAX_PAYLOAD_FILES} payload entries` })
-  if (total > MAX_EXPANDED) issues.push({ path: "", severity: "error", reason: "expanded payload exceeds 24 MiB" })
+  if (total > MAX_EXPANDED) issues.push({ path: "", severity: "error", reason: `expanded payload exceeds ${Math.round(MAX_EXPANDED / 1048576)} MiB` })
   return { files, issues, agents, skills, ...(raw ? { compatibilityMode: "raw" as const } : {}) }
 }
 export async function pack(source: Preview, version: string, signal?: AbortSignal, options: BundleFeatures = {}) {
@@ -208,10 +208,10 @@ export async function pack(source: Preview, version: string, signal?: AbortSigna
   // Fixed DOS timestamp and no directory entries keep output deterministic and strict.
   for (const f of [...files, { path: "manifest.json", data: encode.encode(JSON.stringify(manifest)) }]) {
     signal?.throwIfAborted()
-    entries[f.path] = [f.data, { level: 0, mtime: new Date(1980, 0, 1) }]
+    entries[f.path] = [f.data, { level: 6, mtime: new Date(1980, 0, 1) }]
   }
   const bytes = zipSync(entries)
-  if (bytes.length > MAX_ZIP) throw new Error("ZIP_EXCEEDS_8_MIB")
+  if (bytes.length > MAX_ZIP) throw new Error("ZIP_EXCEEDS_32_MIB")
   const summary = await validate(bytes, version)
   return { bytes, sha256: await sha256(bytes), summary, entries: inventory.length + 1, expanded: summary.expandedSize + encode.encode(JSON.stringify(manifest)).length }
 }

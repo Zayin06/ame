@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { formatAmeKitError, formatBundleSize, groupIssues } from '../amekit-ui'
+import { formatAmeKitError, formatBundleSize, groupIssues, suggestNextVersion } from '../amekit-ui'
 
 test('import inspector prioritizes blocking Archive (5) errors over leading excluded files', () => {
   const grouped = groupIssues([
@@ -43,12 +43,12 @@ test('Claude adaptation is suggested only for matching blocking errors outside r
 test('AmeKit errors unwrap Electron IPC wrappers and provide practical Vietnamese guidance', () => {
   const cases: [string, RegExp, RegExp | undefined][] = [
     ['IMPORT_BLOCKED', /lỗi trong thư mục nguồn/, /tab Lỗi.*Raw \+ Chuẩn hóa/],
-    ['INVALID_BUNDLE', /ZIP\/manifest/, /SemVer.*1023.*8 MiB/],
+    ['INVALID_BUNDLE', /ZIP\/manifest/, /SemVer.*10\.000.*32 MiB/],
     ['RAW_INSTALL_CONFIRMATION_REQUIRED', /xác nhận chế độ Raw/, /Cho phép raw compatibility.*Đồng bộ/],
     ['UPLOAD_LIMIT', /tối đa 5 upload/, /pending.*release/],
     ['RELEASE_CONFLICT', /đã tồn tại/, /1\.0\.1/],
     ['ACTIVATION_CONFLICT', /Revision kích hoạt/, /lịch sử.*kích hoạt lại/i],
-    ['IMPORT_REQUIRED', /Chưa có dữ liệu nhập/, /agents\/.*skills\/.*Bước 1/],
+    ['IMPORT_REQUIRED', /Chưa có dữ liệu nhập/, /agents\/.*skills\//],
     ['AI_FIX_PROVIDER_ERROR', /máy chủ AI/, /kết nối.*model.*thử lại/],
     ['AI_FIX_INVALID_RESPONSE', /bản sửa không hợp lệ/, /chưa thay đổi.*model khác/],
     ['AI_FIX_VALIDATION_FAILED', /vẫn còn lỗi.*kiểm tra lại/, /chưa thay đổi.*bỏ tệp/],
@@ -58,9 +58,10 @@ test('AmeKit errors unwrap Electron IPC wrappers and provide practical Vietnames
     ['IMPORT_FILE_NOT_FOUND', /Không tìm thấy tệp.*phiên nhập/, /nhập lại.*danh sách/],
     ['SAVE_PATH_UNSAFE', /đường dẫn nguồn không an toàn/, /liên kết tượng trưng.*nhập lại/],
     ['UNKNOWN_COMMIT_ENHANCE_SKILL', /Skill Enhance không nằm trong gói đã nhập/, /chọn lại skill.*skills\/.*Bước 1.*đóng gói lại/],
-    ['PACKAGE_REQUIRED', /Chưa có gói ZIP/, /Bước 2/],
+    ['PACKAGE_REQUIRED', /Chưa có gói ZIP/, /Chỉ đóng gói thử/],
     ['ZIP_EXCEEDS_8_MIB', /vượt quá giới hạn 8 MiB/, /tệp lớn/],
-    ['ZIP_EXCEEDS', /vượt quá giới hạn 8 MiB/, /tệp lớn/],
+    ['ZIP_EXCEEDS_32_MIB', /sau nén vượt quá giới hạn 32 MiB/, /tệp lớn/],
+    ['ZIP_EXCEEDS', /vượt quá giới hạn 32 MiB/, /tệp lớn/],
     ...['PERSONAL_FILE_COLLISION', 'PERSONAL_AGENT_COLLISION', 'PERSONAL_SKILL_COLLISION', 'PERSONAL_DIRECTORY_COLLISION'].map(code => [code, /cấu hình OpenCode cá nhân/, /sao lưu.*đồng bộ/] as [string, RegExp, RegExp]),
     ['OWNED_FILE_CHANGED', /chỉnh sửa tay/, /nguyên bản.*đồng bộ/],
     ['DISCOVERY_MISMATCH', /OpenCode 2\.3\.2/, /metadata agent\/skill/],
@@ -120,4 +121,17 @@ test('unknown errors preserve cleaned text and the first uppercase code without 
 test('bundle sizes use readable binary units at boundaries and handle invalid inputs', () => {
   const cases: [number, string][] = [[0, '0 B'], [1, '1 B'], [1023, '1023 B'], [1024, '1.0 KiB'], [1536, '1.5 KiB'], [1024 * 1024 - 1, '1024.0 KiB'], [1024 * 1024, '1.00 MiB'], [1.25 * 1024 * 1024, '1.25 MiB'], [8 * 1024 * 1024, '8.00 MiB'], [-1, '0 B'], [NaN, '0 B'], [Infinity, '0 B']]
   for (const [bytes, expected] of cases) assert.equal(formatBundleSize(bytes), expected)
+})
+
+test('suggestNextVersion compares numeric tuples, ignores invalid values and bumps prereleases', () => {
+  const cases: [readonly (string | undefined)[], string][] = [
+    [[], '1.0.0'], [['1.0.0', '1.0.9', '1.0.10'], '1.0.11'],
+    [[undefined, '', 'bad', 'v1.2.3', '1.2', '1.2.3+build', '-1.0.0'], '1.0.0'],
+    [['bad', '2.3.4-rc.1', '2.3.3'], '2.3.5'],
+    [['1.99.99', '2.0.0', '1.100.100'], '2.0.1'],
+    [['3.2.100', '3.10.0', '3.9.999'], '3.10.1'],
+    [['0.0.0-alpha', undefined], '0.0.1'],
+    [['9007199254740993.0.9007199254740993'], '9007199254740993.0.9007199254740994'],
+  ]
+  for (const [versions, expected] of cases) assert.equal(suggestNextVersion(versions), expected)
 })

@@ -1,7 +1,7 @@
 import path from "node:path"
 import { lstat, open, realpath } from "node:fs/promises"
 import { constants } from "node:fs"
-import { AmeApi, isTransientError } from "./api"
+import { AmeApi, ClientError, isTransientError } from "./api"
 import { assertModel, managedProvider, modelPolicy, providerURL } from "./model-policy"
 import { openSessionVault, type Encryption } from "./session-vault"
 import { pack, preview, safePath, type ImportOptions, type InputFile, type Issue, type Preview } from "./bundle/package"
@@ -344,6 +344,39 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         if (!packed) throw new Error("PACKAGE_REQUIRED")
         await confirm("Publish AmeKit bundle?", `Upload version ${packed.summary.version}, ${packed.bytes.length} bytes, SHA-256 ${packed.sha256}. Publishing does not activate the release.`)
         return api.publish(packed.bytes, packed.summary.version, packed.sha256, () => {}, signal)
+      }
+      case "release": {
+        await api.guard(true, signal); await synchronize()
+        if (!source) throw new Error("IMPORT_REQUIRED")
+        if (payload.activate !== undefined && !["true", "false"].includes(payload.activate)) throw new Error("INVALID_PAYLOAD")
+        const activateNow = payload.activate !== "false"
+        const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel"]
+          .filter(key => typeof payload[key] === "string" && payload[key].trim())
+          .map(key => [key, payload[key]]))
+        const nextPacked = await pack(source, payload.version, signal, features)
+        if (activateNow) {
+          await confirm("Phát hành & kích hoạt AmeKit?", `Đóng gói v${nextPacked.summary.version} (${nextPacked.bytes.length} bytes, ${nextPacked.summary.fileCount} tệp, SHA-256 ${nextPacked.sha256.slice(0, 12)}…), xuất bản lên máy chủ và kích hoạt ngay cho toàn bộ team.`)
+        } else {
+          await confirm("Xuất bản bản nháp AmeKit?", `Đóng gói v${nextPacked.summary.version} (${nextPacked.bytes.length} bytes, ${nextPacked.summary.fileCount} tệp, SHA-256 ${nextPacked.sha256.slice(0, 12)}…) và xuất bản lên máy chủ (chưa kích hoạt cho team).`)
+        }
+        const release = await api.publish(nextPacked.bytes, nextPacked.summary.version, nextPacked.sha256, () => {}, signal)
+        packed = undefined
+        const packaged = { summary: nextPacked.summary, size: nextPacked.bytes.length, entries: nextPacked.entries, sha256: nextPacked.sha256 }
+        if (!activateNow) return { packaged, release, activated: null }
+        try {
+          let history = await api.history(undefined, signal)
+          let activated
+          try { activated = await api.activate(release.releaseId, history.active.revision, signal) }
+          catch (error) {
+            if (!(error instanceof ClientError) || error.code !== "ACTIVATION_CONFLICT") throw error
+            history = await api.history(undefined, signal)
+            activated = await api.activate(release.releaseId, history.active.revision, signal)
+          }
+          return { packaged, release, activated, revision: activated.revision }
+        } catch (error) {
+          if (signal.aborted || !api?.account || error instanceof ClientError && (error.status === 401 || error.status === 403)) throw error
+          return { packaged, release, activated: null, activationError: code(error) }
+        }
       }
       case "sync": {
         const directory = await project(payload.project)

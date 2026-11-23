@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { errorText, Modal } from './Primitives'
-import { formatAmeKitError, formatBundleSize, groupIssues, type IssueSeverity } from '../amekit-ui'
+import { formatAmeKitError, formatBundleSize, groupIssues, suggestNextVersion, type IssueSeverity } from '../amekit-ui'
 
 import type { BundleFeatures } from '../../../../../packages/amekit/src/api'
 
@@ -42,24 +42,38 @@ function ReleaseSummary({ release }: { release: Release }) {
 }
 export function Account({ projectID, close, embedded = false }: { projectID?: string; close: () => void; embedded?: boolean }) {
   const [account, setAccount] = useState<AccountState>(null)
-  const [tab, setTab] = useState('account')
+  const [tab, updateTab] = useState('account')
+  const [adminTab, updateAdminTab] = useState<'publish' | 'history'>('publish')
+  const [errorState, setErrorState] = useState<{ scope: 'global' | 'source' | 'release' | 'history'; message: string } | null>(null)
+  const setTab = (value: string) => { setErrorState(null); updateTab(value) }
+  const setAdminTab = (value: 'publish' | 'history') => { setErrorState(null); updateAdminTab(value) }
   const [busy, setBusy] = useState(false)
   const [busyOp, setBusyOp] = useState<{ operation: string; path?: string } | null>(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [result, setResult] = useState<unknown>(undefined)
   const [server, setServer] = useState('')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [latest, setLatest] = useState<Release | null>(null)
   const [revision, setRevision] = useState('')
   const [installed, setInstalled] = useState<Bundle>(null)
-  const [version, setVersion] = useState('')
-  const [mode, setMode] = useState('native')
+  const [editingVersion, setEditingVersion] = useState(false)
+  const [customVersion, setCustomVersion] = useState('')
+  const [activateNow, setActivateNow] = useState(true)
+  const [mode, updateMode] = useState(() => {
+    try {
+      const saved = window.localStorage?.getItem('ame.amekit.importMode')
+      if (saved === 'native' || saved === 'raw-adapt' || saved === 'raw') return saved
+    } catch { /* Storage may be unavailable in restricted environments. */ }
+    return 'raw-adapt'
+  })
+  const setMode = (value: string) => {
+    updateMode(value)
+    try { window.localStorage?.setItem('ame.amekit.importMode', value) } catch { /* Keep the selection even without storage. */ }
+  }
   const [raw, setRaw] = useState(false)
   const [releases, setReleases] = useState<Release[]>([])
   const [cursor, setCursor] = useState('')
-  const [activation, setActivation] = useState('')
+  const [, setActivation] = useState('')
   const [noRelease, setNoRelease] = useState(false)
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null)
   const [packaged, setPackaged] = useState<Packaged | null>(null)
@@ -86,7 +100,11 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   const selectableModels = account?.models?.active_models ?? [...new Set(Object.values(modelLevels).filter(Boolean))].map(id => ({ id, name: id }))
   const modelOptions = (selected: string) => <><option value="">Mặc định theo API (default · {defaultModelID || '—'})</option>{selected && !selectableModels.some(model => model.id === selected) && <option value={selected}>{selected} · Không còn hoạt động</option>}{selectableModels.map(model => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}</>
   const resetFeatures = () => { setCommitEnhanceSkill(''); setCommitEnhanceModel(''); setAndroidTranslationSkill(''); setAndroidTranslationModel('') }
-  const formatted = error ? formatAmeKitError(error) : undefined
+  const autoVersion = suggestNextVersion([latest?.version, ...releases.map(release => release.version)])
+  const effectiveVersion = editingVersion ? customVersion.trim() : autoVersion
+  const featurePayload = { ...(commitEnhanceSkill ? { commitEnhanceSkill } : {}), ...(commitEnhanceModel ? { commitEnhanceModel } : {}), ...(androidTranslationSkill ? { androidTranslationSkill } : {}), ...(androidTranslationModel ? { androidTranslationModel } : {}) }
+  const formatted = errorState ? formatAmeKitError(errorState.message) : undefined
+  const renderInlineError = (targetScope: NonNullable<typeof errorState>['scope']) => errorState?.scope === targetScope && formatted ? <div className="amekit-alert amekit-alert--error" role="alert"><strong>{formatted.title}</strong>{formatted.detail && <p>{formatted.detail}</p>}{formatted.code && <small>Mã: {formatted.code}</small>}</div> : null
   const blockerInfo = account?.blocker ? formatAmeKitError(account.blocker) : undefined
   const bundleGeneration = useRef(0)
   const historyGeneration = useRef(0)
@@ -114,9 +132,9 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     let alive = true
     const generation = ++historyGeneration.current
     const current = () => alive && generation === historyGeneration.current
-    setBusy(true); setError('')
+    setBusy(true); setErrorState(null)
     void request('history').then(value => { if (current()) applyHistory(value) })
-      .catch(e => { if (current()) setError(errorText(e)) })
+      .catch(e => { if (current()) setErrorState({ scope: 'history', message: errorText(e) }) })
       .finally(() => { if (current()) setBusy(false) })
     return () => { alive = false; if (generation === historyGeneration.current) { historyGeneration.current++; setBusy(false) } }
   }, [tab, isAdmin, request, applyHistory])
@@ -125,11 +143,11 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     let alive = true
     const generation = ++bundleGeneration.current
     const current = () => alive && generation === bundleGeneration.current
-    setBusy(true); setError(''); setLatest(null); setInstalled(null); setNoRelease(false)
+    setBusy(true); setErrorState(null); setLatest(null); setInstalled(null); setNoRelease(false)
     void (async () => {
       if (projectID) {
         try { const value = await request('installed', { project: projectID }); if (current()) setInstalled(value as Bundle) }
-        catch (e) { if (current()) setError(errorText(e)) }
+        catch (e) { if (current()) setErrorState({ scope: 'global', message: errorText(e) }) }
       }
       if (!current()) return
       try {
@@ -139,7 +157,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
         if (current()) {
           setLatest(null)
           if (noActiveRelease(e)) { setActiveReleaseId(''); setNoRelease(true) }
-          else setError(errorText(e))
+          else setErrorState({ scope: 'global', message: errorText(e) })
         }
       }
     })().finally(() => { if (current()) setBusy(false) })
@@ -147,7 +165,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   }, [tab, account?.account, projectID, request])
   useEffect(() => {
     let alive = true
-    void request('status').then(value => { if (alive) setAccount(value as AccountState) }).catch(e => { if (alive) setError(errorText(e)) }).finally(() => { if (alive) setLoading(false) })
+    void request('status').then(value => { if (alive) setAccount(value as AccountState) }).catch(e => { if (alive) setErrorState({ scope: 'global', message: errorText(e) }) }).finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
   }, [request])
   useEffect(() => {
@@ -155,7 +173,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     setAndroidTranslationSkill(skill => importPreview?.skills.includes(skill) ? skill : '')
   }, [importPreview])
   const execute = async (operation: string, payload?: Record<string, string>) => {
-    setBusy(true); setBusyOp({ operation, path: payload?.path }); setError(''); setResult(undefined)
+    setBusy(true); setBusyOp({ operation, path: payload?.path }); setErrorState(null)
     const importOperation = ['fix-import', 'fix-import-all', 'exclude-import-file', 'revert-import-fix', 'save-import-fix'].includes(operation)
     if (importOperation) setFixNotice('')
     if (operation === 'package') setPackaged(null)
@@ -168,7 +186,6 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           setReleases([]); setCursor(''); setActiveReleaseId(''); setActivation(''); setRevision(''); setNoRelease(false); setTab('account')
         }
       } else {
-        setResult(value)
         if (operation === 'import' && value) {
           const preview = value as ImportPreview
           setPackaged(null); setPublishNotice(''); setAppliedFixes({}); setFixNotice('')
@@ -216,14 +233,25 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           setLatest(release); setActiveReleaseId(releaseID(release)); setNoRelease(false); setRevision(String(data.revision ?? ''))
           if (operation === 'activate') { setActivation(releaseID(release)); setPublishNotice(`Đã kích hoạt v${release.version || releaseID(release)} cho team.`) }
         }
-        if (operation === 'publish') {
-          const published = value as Release, id = releaseID(published)
-          setPackaged(null); setPublishNotice(`Đã xuất bản v${published.version || id}. Chọn Kích hoạt ở Bước 3 để áp dụng cho team.`)
-          setActivation(id)
-          setReleases(old => [published, ...old.filter(release => releaseID(release) !== id)])
-          const history = await request('history')
-          applyHistory(history)
-          setReleases(old => old.some(release => releaseID(release) === id) ? old : [published, ...old])
+        if (operation === 'release' || operation === 'publish') {
+          const data = operation === 'release' ? value as { packaged?: Packaged; release?: Release; activated?: { release?: Release; revision?: number } | null; activationError?: string } : { release: value as Release }
+          const published = data.release
+          setPackaged(null); setEditingVersion(false); setCustomVersion('')
+          if (published) {
+            const id = releaseID(published)
+            setPublishNotice(`Đã xuất bản v${published.version || id}.${data.activated ? ' Đã kích hoạt cho team.' : data.activationError ? ` Chưa kích hoạt: ${formatAmeKitError(data.activationError).title}. Mở lịch sử để thử Kích hoạt lại.` : ' Mở lịch sử để kích hoạt cho team khi sẵn sàng.'}`)
+            setActivation(id)
+            setReleases(old => [published, ...old.filter(release => releaseID(release) !== id)])
+            if (data.activated) {
+              const active = data.activated.release ?? published
+              setLatest(active); setActiveReleaseId(releaseID(active)); setNoRelease(false)
+              setRevision(String(data.activated.revision ?? '')); setActivation(releaseID(active))
+            }
+            try {
+              applyHistory(await request('history'))
+              setReleases(old => old.some(release => releaseID(release) === id) ? old : [published, ...old])
+            } catch (e) { setErrorState({ scope: 'history', message: errorText(e) }) }
+          }
         }
         if (operation === 'installed') setInstalled(value as Bundle)
         if (operation === 'sync' || operation === 'offline') setInstalled(value as Bundle)
@@ -233,15 +261,18 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     } catch (e) {
       if (operation === 'latest' && noActiveRelease(e)) { setLatest(null); setActiveReleaseId(''); setNoRelease(true) }
       else {
-        setError(errorText(e))
+        const scope = operation === 'import' || importOperation ? 'source' : ['release', 'package', 'publish'].includes(operation) ? 'release' : ['history', 'activate'].includes(operation) ? 'history' : 'global'
+        setErrorState({ scope, message: errorText(e) })
         if (operation === 'activate' && /\bACTIVATION_CONFLICT\b/.test(errorText(e))) {
           try { applyHistory(await request('history')) } catch { /* Keep the original actionable activation error. */ }
         }
       }
     } finally { setBusy(false); setBusyOp(null) }
   }
+  const renderIssues = () => <><div className="amekit-issue-tabs" role="tablist" aria-label="Phân loại vấn đề">{(Object.keys(issueLabels) as IssueSeverity[]).map(severity => <button key={severity} id={`amekit-issue-${severity}`} role="tab" aria-selected={issueTab === severity} aria-controls="amekit-issue-panel" onClick={() => setIssueTab(severity)}>{issueLabels[severity]} ({grouped[severity].length})</button>)}</div>
+          <div id="amekit-issue-panel" className="amekit-issues" role="tabpanel" aria-labelledby={`amekit-issue-${issueTab}`} tabIndex={0}>{grouped[issueTab].length ? <ul>{grouped[issueTab].map((issue, index) => <li className="amekit-issue-row" key={index}><code>{issue.path || 'Bundle'}</code><span>{issue.reason}</span>{issueTab === 'error' && issue.path && <div className="amekit-issue-actions">{importPreview?.fixablePaths?.includes(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('fix-import', { path: issue.path })}>{busyOp?.operation === 'fix-import' && busyOp.path === issue.path ? 'Đang sửa…' : 'Sửa bằng AI'}</button>}{canExcludeImportPath(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('exclude-import-file', { path: issue.path })}>Bỏ tệp</button>}</div>}</li>)}</ul> : <p className="muted">Không có mục nào trong nhóm này.</p>}</div></>
   const content = <><div className="segmented account-tabs"><button className={tab === 'account' ? 'active' : ''} onClick={() => setTab('account')}>Tài khoản</button><button className={tab === 'bundle' ? 'active' : ''} onClick={() => setTab('bundle')}>Bundle</button>{isAdmin && <button className={tab === 'admin' ? 'active' : ''} onClick={() => setTab('admin')}>Quản trị</button>}</div><div className="settings-content">
-    {formatted && <div className="amekit-alert amekit-alert--error" role="alert"><strong>{formatted.title}</strong>{formatted.detail && <p>{formatted.detail}</p>}{formatted.code && <small>Mã: {formatted.code}</small>}</div>}
+    {renderInlineError('global')}
     {loading ? <p>Đang đọc tài khoản…</p> : tab === 'account' ? <>{account?.account ? <>
       <section className="amekit-profile-card">
         <div className="profile-avatar" aria-hidden="true">{(account.account.name || account.account.username).trim().charAt(0).toLocaleUpperCase()}</div>
@@ -274,16 +305,23 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
       <div className="button-row"><button className="primary" disabled={busy || !projectID} onClick={() => void execute('sync', { project: projectID!, ...(raw ? { allowRaw: 'true' } : {}) })}>Đồng bộ mới nhất</button><button disabled={busy || !projectID} onClick={() => void execute('offline', { project: projectID! })}>Kiểm tra tệp đã cài (offline)</button><button disabled={busy || !projectID} onClick={() => void execute('uninstall', { project: projectID! })}>Gỡ bundle</button></div>
       <p className="muted">Các thay đổi tệp được xác nhận bằng hộp thoại native.</p>
     </> : isAdmin ? <>
-      {publishNotice && <div className="amekit-alert amekit-alert--success" role="status">{publishNotice}</div>}
-      <section className="amekit-card"><h3>Bước 1 · Chọn &amp; kiểm tra thư mục</h3>
-        <label>Chế độ tương thích<select disabled={busy} value={mode} onChange={e => setMode(e.target.value)}><option value="native">Native (Chuẩn OpenCode 2.3.2 nghiêm ngặt)</option><option value="raw-adapt">Raw + Chuẩn hóa agent Claude -&gt; OpenCode (khuyên dùng cho gói Claude)</option><option value="raw">Raw (Giữ nguyên byte gốc)</option></select></label>
-        <button disabled={busy} onClick={() => void execute('import', { compatibilityMode: mode === 'raw-adapt' ? 'raw' : mode, ...(mode === 'raw-adapt' ? { adaptClaudeAgents: 'true' } : {}) })}>{busyOp?.operation === 'import' ? 'Đang quét thư mục…' : 'Chọn thư mục & nhập'}</button>
+      <div className="segmented amekit-admin-tabs" role="tablist" aria-label="Quản trị AmeKit"><button role="tab" aria-selected={adminTab === 'publish'} className={adminTab === 'publish' ? 'active' : ''} onClick={() => setAdminTab('publish')}>Phát hành mới</button><button role="tab" aria-selected={adminTab === 'history'} className={adminTab === 'history' ? 'active' : ''} onClick={() => setAdminTab('history')}>{`Lịch sử (${releases.length})`}</button></div>
+      {publishNotice && <div className={`amekit-alert ${publishNotice.includes('Chưa kích hoạt:') ? 'amekit-alert--warning' : 'amekit-alert--success'}`} role="status">{publishNotice}{adminTab !== 'history' && <button type="button" onClick={() => setAdminTab('history')}>Xem lịch sử</button>}</div>}
+      {adminTab === 'publish' ? <>
+      {renderInlineError('history')}
+      <section className="amekit-card" data-testid="amekit-source-card"><h3>1. Thư mục nguồn (agents/ &amp; skills/)</h3>
+        <div className="amekit-source-bar">
+        <label>Chế độ tương thích<select aria-label="Chế độ tương thích" disabled={busy} value={mode} onChange={e => setMode(e.target.value)}><option value="raw-adapt">Raw + Chuẩn hóa agent Claude -&gt; OpenCode (khuyên dùng cho gói Claude)</option><option value="native">Native (Chuẩn OpenCode 2.3.2 nghiêm ngặt)</option><option value="raw">Raw (Giữ nguyên byte gốc)</option></select></label>
+        <button data-testid="amekit-import-btn" disabled={busy} onClick={() => void execute('import', { compatibilityMode: mode === 'raw-adapt' ? 'raw' : mode, ...(mode === 'raw-adapt' ? { adaptClaudeAgents: 'true' } : {}) })}>{busyOp?.operation === 'import' ? 'Đang quét thư mục…' : importPreview ? 'Đổi thư mục' : 'Chọn thư mục & nhập'}</button>
+        </div>
+        {renderInlineError('source')}
         {importPreview && <div className="amekit-inspector">
-          <div className="amekit-badges"><strong className="amekit-pill">{importPreview.folderName}</strong><span className="amekit-pill">{importPreview.adaptClaudeAgents ? 'raw-adapt' : importPreview.compatibilityMode}</span><span className={`amekit-pill ${grouped.error.length ? 'amekit-readiness--blocked' : 'amekit-readiness--ready'}`}>{grouped.error.length ? `Bị chặn · ${grouped.error.length} lỗi` : 'Sẵn sàng đóng gói'}</span></div>
-          <p className="amekit-stats">{importPreview.agents.length} agents · {importPreview.skills.length} skills · {importPreview.files.length} tệp · {formatBundleSize(importPreview.files.reduce((sum, file) => sum + file.size, 0))}</p>
+          <div className="amekit-badges"><strong className="amekit-pill">{importPreview.folderName}</strong><span className="amekit-pill">{importPreview.adaptClaudeAgents ? 'raw-adapt' : importPreview.compatibilityMode}</span><span className={`amekit-pill ${grouped.error.length ? 'amekit-readiness--blocked' : 'amekit-readiness--ready'}`}>{grouped.error.length ? `Bị chặn · ${grouped.error.length} lỗi` : 'Sẵn sàng phát hành'}</span></div>
+          <p className="amekit-stats">{importPreview.agents.length} agents · {importPreview.skills.length} skills · {importPreview.files.length} tệp · {formatBundleSize(importPreview.files.reduce((sum, file) => sum + file.size, 0))} gốc</p>
+          {importPreview.files.length > 9000 && <p className="amekit-alert amekit-alert--warning">Gần giới hạn 10.000 tệp. Hãy loại bớt tệp không cần thiết trước khi phát hành.</p>}
           {grouped.suggestClaudeAdapt && mode === 'native' && <div className="amekit-alert amekit-alert--warning"><strong>Phát hiện frontmatter agent Claude không tương thích Native.</strong><p>Các trường tools, model: inherit, color cần được chuẩn hóa cho OpenCode. Chuyển chế độ rồi chọn nhập lại thư mục để kiểm tra.</p><button disabled={busy} onClick={() => setMode('raw-adapt')}>Chuyển sang "Raw + Chuẩn hóa agent Claude"</button></div>}
           {mode !== (importPreview.adaptClaudeAgents ? 'raw-adapt' : importPreview.compatibilityMode) && <p className="muted">Chế độ mới chỉ áp dụng lần nhập tiếp theo. Chọn thư mục &amp; nhập lại để cập nhật kết quả.</p>}
-          <BundleInventory agents={importPreview.agents} skills={importPreview.skills} />
+          <details className="amekit-details"><summary>Danh sách Agents ({importPreview.agents.length}) &amp; Skills ({importPreview.skills.length})</summary><BundleInventory agents={importPreview.agents} skills={importPreview.skills} /></details>
           {grouped.error.length > 0 && <div className="amekit-fix-bar">
             <span className="amekit-pill" data-testid="amekit-fix-model">Model sửa lỗi (agent &amp; skill): default{defaultModelID ? ` · ${defaultModelID}` : ''}</span>
             <p>Sửa trực tiếp các tệp agent &amp; skill bị lỗi bằng model mặc định theo API (<code>default</code>{defaultModelID ? <>: <code>{defaultModelID}</code></> : ''}); secret nhạy cảm được ẩn tự động trước khi gửi lên AI.</p>
@@ -294,8 +332,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
             </div>}
           </div>}
           {fixNotice && <p className={/Không sửa được|0 tệp/.test(fixNotice) ? 'amekit-alert amekit-alert--error' : 'amekit-fix-notice'} role={/Không sửa được|0 tệp/.test(fixNotice) ? 'alert' : 'status'}>{fixNotice}</p>}
-          <div className="amekit-issue-tabs" role="tablist" aria-label="Phân loại vấn đề">{(Object.keys(issueLabels) as IssueSeverity[]).map(severity => <button key={severity} id={`amekit-issue-${severity}`} role="tab" aria-selected={issueTab === severity} aria-controls="amekit-issue-panel" onClick={() => setIssueTab(severity)}>{issueLabels[severity]} ({grouped[severity].length})</button>)}</div>
-          <div id="amekit-issue-panel" className="amekit-issues" role="tabpanel" aria-labelledby={`amekit-issue-${issueTab}`} tabIndex={0}>{grouped[issueTab].length ? <ul>{grouped[issueTab].map((issue, index) => <li className="amekit-issue-row" key={index}><code>{issue.path || 'Bundle'}</code><span>{issue.reason}</span>{issueTab === 'error' && issue.path && <div className="amekit-issue-actions">{importPreview.fixablePaths?.includes(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('fix-import', { path: issue.path })}>{busyOp?.operation === 'fix-import' && busyOp.path === issue.path ? 'Đang sửa…' : 'Sửa bằng AI'}</button>}{canExcludeImportPath(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('exclude-import-file', { path: issue.path })}>Bỏ tệp</button>}</div>}</li>)}</ul> : <p className="muted">Không có mục nào trong nhóm này.</p>}</div>
+          {grouped.error.length > 0 ? renderIssues() : <details className="amekit-details"><summary>Chi tiết kiểm tra ({grouped.warning.length} cảnh báo · {grouped.change.length} chuyển đổi · {grouped.excluded.length} loại trừ)</summary>{renderIssues()}</details>}
           {Object.keys(appliedFixes).length > 0 && <div className="amekit-fix-list"><p className="muted">Các bản sửa đang áp dụng tạm để đóng gói (chưa ghi đè thư mục gốc nếu chưa bấm Lưu).</p>{Object.values(appliedFixes).map(fix => <article className="amekit-fix-card" key={fix.path}>
             <div className="amekit-badges"><code>{fix.path}</code><span className="amekit-pill">{fix.kind === 'ai' ? `Đã sửa bởi AI · default (${fix.model})` : 'Đã bỏ khỏi gói'}</span></div>
             <p>{fix.summary}</p>
@@ -304,10 +341,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           </article>)}</div>}
         </div>}
       </section>
-      <section className="amekit-card"><h3>Bước 2 · Đóng gói ZIP &amp; Xuất bản lên máy chủ</h3>
-        <form onSubmit={e => { e.preventDefault(); if (!busy && version.trim() && importPreview && !grouped.error.length) void execute('package', { version: version.trim(), ...(commitEnhanceSkill ? { commitEnhanceSkill } : {}), ...(commitEnhanceModel ? { commitEnhanceModel } : {}), ...(androidTranslationSkill ? { androidTranslationSkill } : {}), ...(androidTranslationModel ? { androidTranslationModel } : {}) }) }}>
-          <label>Phiên bản<input value={version} required placeholder="1.0.0" disabled={busy} onChange={e => setVersion(e.target.value)} /></label>
-          {importPreview && <>
+      {importPreview && <section className="amekit-card" data-testid="amekit-features-card"><h3>2. Tính năng tích hợp (tùy chọn)</h3><div className="amekit-feature-grid">
             <fieldset className="amekit-feature-config"><legend>Enhance (Commit message)</legend>
               <label>Skill cho Enhance (Commit message)<select aria-label="Skill cho Enhance (Commit message)" disabled={busy} value={commitEnhanceSkill} onChange={e => { setCommitEnhanceSkill(e.target.value); setPackaged(null) }}><option value="">Mặc định (Conventional Commits)</option>{importPreview.skills.map(skill => <option key={skill} value={skill}>/{skill}</option>)}</select></label>
               <label>Model cho Enhance (Commit message)<select aria-label="Model cho Enhance (Commit message)" disabled={busy} value={commitEnhanceModel} onChange={e => { setCommitEnhanceModel(e.target.value); setPackaged(null) }}>{modelOptions(commitEnhanceModel)}</select></label>
@@ -318,21 +352,27 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
               <label>Model cho Dịch Android<select aria-label="Model cho Dịch Android" disabled={busy || !androidTranslationSkill} value={androidTranslationModel} onChange={e => { setAndroidTranslationModel(e.target.value); setPackaged(null) }}>{modelOptions(androidTranslationModel)}</select></label>
               <p className="muted">Dịch strings.xml trong phiên riêng; Chat chính vẫn dùng model theo chính sách tài khoản.</p>
             </fieldset>
-          </>}
-          <div className="button-row"><button disabled={busy || !version.trim() || !importPreview || grouped.error.length > 0}>Đóng gói</button><button type="button" className={packaged ? 'primary' : ''} disabled={busy || !packaged} onClick={() => void execute('publish')}>Xuất bản gói đã chuẩn bị</button></div>
-        </form>
-        {importPreview && grouped.error.length > 0 && <p className="amekit-alert amekit-alert--warning">Đóng gói bị khóa. Hãy sửa hoặc bỏ các tệp lỗi ở Bước 1; kết quả được kiểm tra lại ngay.</p>}
-        {packaged && <p className="amekit-package-summary">Đã đóng gói v{packaged.summary.version} · {formatBundleSize(packaged.size)} · {packaged.entries} mục · SHA-256 <code>{packaged.sha256}</code> <EnhanceSummary features={packaged.summary.features} /></p>}
+      </div></section>}
+      <section className="amekit-card" data-testid="amekit-release-card"><h3>3. Phát hành cho team</h3>
+        <div className="amekit-version-bar">{editingVersion ? <><label>Phiên bản<input aria-label="Phiên bản" value={customVersion} placeholder={autoVersion} disabled={busy} onChange={e => setCustomVersion(e.target.value)} /></label><button type="button" disabled={busy} onClick={() => { setEditingVersion(false); setCustomVersion('') }}>{`Dùng tự động (v${autoVersion})`}</button></> : <><span>Phiên bản tiếp theo</span><strong className="amekit-version-badge">v{autoVersion}</strong><span className="amekit-pill">Tự tăng</span><button type="button" disabled={busy} onClick={() => { setCustomVersion(autoVersion); setEditingVersion(true) }}>Sửa phiên bản</button></>}</div>
+        <label className="checkbox"><input type="checkbox" checked={activateNow} disabled={busy} onChange={e => setActivateNow(e.target.checked)} />Kích hoạt ngay cho team sau khi xuất bản</label>
+        {importPreview && grouped.error.length > 0 && <p className="amekit-alert amekit-alert--warning">Phát hành bị khóa. Hãy sửa hoặc bỏ các tệp lỗi trong thư mục nguồn; kết quả được kiểm tra lại ngay.</p>}
+        {renderInlineError('release')}
+        {['release', 'package', 'publish'].includes(busyOp?.operation ?? '') && <div className="amekit-busy-inline" role="status"><span className="amekit-spinner" aria-hidden="true" /><span>{busyOp?.operation === 'package' ? 'Đang đóng gói…' : 'Đang phát hành…'}</span></div>}
+        <div className="amekit-release-actions">
+          <button type="button" className="primary" disabled={busy || !effectiveVersion || !importPreview || grouped.error.length > 0} onClick={() => void execute('release', { version: effectiveVersion, activate: activateNow ? 'true' : 'false', ...featurePayload })}>{busyOp?.operation === 'release' ? 'Đang phát hành…' : activateNow ? `Phát hành & kích hoạt v${effectiveVersion || autoVersion}` : `Xuất bản nháp v${effectiveVersion || autoVersion}`}</button>
+          <button type="button" disabled={busy || !effectiveVersion || !importPreview || grouped.error.length > 0} onClick={() => void execute('package', { version: effectiveVersion, ...featurePayload })}>{busyOp?.operation === 'package' ? 'Đang đóng gói…' : 'Chỉ đóng gói thử'}</button>
+        </div>
+        {packaged && <div className="amekit-package-summary">Đã đóng gói v{packaged.summary.version} · {formatBundleSize(packaged.size)} · {packaged.entries} mục · SHA-256 <code>{packaged.sha256}</code> <EnhanceSummary features={packaged.summary.features} /><button type="button" disabled={busy} onClick={() => void execute('publish')}>Xuất bản gói đã nén</button></div>}
       </section>
-      <section className="amekit-card"><div className="amekit-card-heading"><h3>Bước 3 · Bản phát hành &amp; Kích hoạt cho team</h3><div className="button-row"><button disabled={busy} onClick={() => void execute('history')}>Làm mới lịch sử</button>{cursor && <button disabled={busy} onClick={() => void execute('history', { cursor })}>Trang tiếp</button>}</div></div>
-        <p className="muted">Revision hiện tại: {revision || '—'}</p>
+      </> : <section className="amekit-card">
+        {renderInlineError('history')}
+        <div className="amekit-card-heading"><p className="muted">{activeReleaseId ? 'Có bản đang kích hoạt' : 'Chưa kích hoạt bản nào'}</p><div className="button-row"><button disabled={busy} onClick={() => void execute('history')}>Làm mới</button>{cursor && <button disabled={busy} onClick={() => void execute('history', { cursor })}>Tải thêm</button>}</div></div>
         {!releases.length && <p className="muted">Chưa có bản phát hành nào trên máy chủ.</p>}
         <div className="amekit-releases">{releases.map(release => { const id = releaseID(release); return <article className="amekit-release" key={id}><div className="amekit-card-heading"><div className="amekit-badges"><strong>v{release.version || id}</strong>{activeReleaseId === id && <span className="amekit-pill amekit-readiness--ready">Đang kích hoạt</span>}<span className="amekit-pill">{release.manifest?.compatibility?.mode || 'native'}</span></div>{activeReleaseId !== id && <button disabled={busy || !revision} onClick={() => void execute('activate', { id, revision })}>Kích hoạt</button>}</div><ReleaseSummary release={release} /></article> })}</div>
-        <details className="amekit-activation"><summary>Kích hoạt release theo lựa chọn</summary><label>Release<select value={activation} onChange={e => setActivation(e.target.value)}><option value="">Chọn release</option>{releases.map(release => { const id = releaseID(release); return <option key={id} value={id}>{release.version || id} · {release.channel}</option> })}</select></label><label>Revision hiện tại<input value={revision} onChange={e => setRevision(e.target.value)} /></label><button disabled={busy || !activation || !revision} onClick={() => void execute('activate', { id: activation, revision })}>Kích hoạt release</button></details>
-      </section>
+      </section>}
     </> : <p>Chỉ quản trị viên có thể quản lý release.</p>}
-    {busy && !['import', 'fix-import', 'fix-import-all'].includes(busyOp?.operation ?? '') && <p role="status">Đang xử lý…</p>}
-    {result !== undefined && <details key={JSON.stringify(result)} className="operation-result"><summary>Chi tiết kỹ thuật (JSON)</summary><pre>{JSON.stringify(result, null, 2)}</pre></details>}
+    {busy && !['import', 'fix-import', 'fix-import-all', 'release', 'package', 'publish'].includes(busyOp?.operation ?? '') && <p role="status">Đang xử lý…</p>}
   </div></>
   const core = <section className="amekit-core" aria-label="AmeKit">{content}</section>
   return embedded ? core : <Modal title="AmeKit" close={close}>{core}</Modal>

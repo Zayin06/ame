@@ -29,7 +29,7 @@ function deferred() {
 }
 
 // Run actual component handlers/effects with the repository's dependency-free hook harness pattern.
-function harness(component: 'Account' | 'Settings', initialProps: object, account: (operation: string, payload?: Record<string, string>) => Promise<unknown>) {
+function harness(component: 'Account' | 'Settings', initialProps: object, account: (operation: string, payload?: Record<string, string>) => Promise<unknown>, storage?: Pick<Storage, 'getItem' | 'setItem'>) {
   const slots: unknown[] = [], effects: { deps: unknown[]; cleanup?: () => void }[] = [], pending: (() => void)[] = []
   let cursor = 0, effectIndex = 0, writes = 0, props = initialProps, tree: ReactNode
   const hooks = {
@@ -62,7 +62,7 @@ function harness(component: 'Account' | 'Settings', initialProps: object, accoun
   const code = ts.transpileModule(readFileSync(new URL(`../components/${component}.tsx`, import.meta.url), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
   }).outputText
-  runInNewContext(code, { exports, Event, window: { ame: { account }, dispatchEvent() {} }, require: (name: string) => modules[name] ?? nativeRequire(name) })
+  runInNewContext(code, { exports, Event, window: { ame: { account }, localStorage: storage, dispatchEvent() {} }, require: (name: string) => modules[name] ?? nativeRequire(name) })
   const Component = exports[component] as (props: object) => ReactNode
   function render(extra: object = {}) {
     props = { ...props, ...extra }
@@ -102,21 +102,38 @@ function harness(component: 'Account' | 'Settings', initialProps: object, accoun
   return { render, find, button, click, change, AccountMarker, async flush() { await tick(); return render() }, unmount() { effects.forEach(effect => effect.cleanup?.()) } }
 }
 
-function admin(options: { initial?: ReturnType<typeof preview>; role?: string; features?: { commitEnhanceSkill?: string; commitEnhanceModel?: string; androidTranslationSkill?: string; androidTranslationModel?: string }; models?: { default_model?: string; small_model?: string; model_levels?: Partial<typeof modelLevels>; active_models?: { id: string; name: string; vision?: boolean; reasoning?: boolean }[] } | null } = {}) {
+function admin(options: { storage?: Pick<Storage, 'getItem' | 'setItem'>; serverVersion?: string; initial?: ReturnType<typeof preview>; role?: string; features?: { commitEnhanceSkill?: string; commitEnhanceModel?: string; androidTranslationSkill?: string; androidTranslationModel?: string }; models?: { default_model?: string; small_model?: string; model_levels?: Partial<typeof modelLevels>; active_models?: { id: string; name: string; vision?: boolean; reasoning?: boolean }[] } | null } = {}) {
   let imported = options.initial ?? preview(), current = imported, batchFailures: { path: string; code: string; detail?: string }[] = [], failure = '', nextFix: Promise<unknown> | undefined
   let nextImport: Promise<unknown> | undefined, nextBatch: Promise<unknown> | undefined
+  let activationError = '', historyError = '', activeID = '', revision = 1, nextRelease: Promise<unknown> | undefined
+  let releases = options.serverVersion ? [{ releaseId: 'previous', version: options.serverVersion }] : []
   const calls: { operation: string; payload?: Record<string, string> }[] = []
   const loggedIn = { account: { name: 'Admin', username: 'admin', role: options.role ?? 'admin' }, ready: true, models: options.models === null ? undefined : options.models ?? accountModels }
   const h = harness('Account', { embedded: true, close() {} }, async (operation, payload) => {
     calls.push({ operation, payload })
     if (operation === 'status' || operation === 'login') return loggedIn
     if (operation === 'logout') return null
-    if (operation === 'history') return { releases: [], active: { revision: 1 } }
-    if (operation === 'latest') return { release: { features: options.features ?? { commitEnhanceSkill: 'review' } } }
+    if (operation === 'history') {
+      if (historyError) throw new Error(historyError)
+      return { releases, active: { revision, release_id: activeID } }
+    }
+    if (operation === 'latest') return { release: { version: options.serverVersion, features: options.features ?? { commitEnhanceSkill: 'review' } } }
     if (operation === 'import') {
       if (nextImport) { const value = nextImport; nextImport = undefined; return value }
       if (failure) throw new Error(failure)
       current = imported; return current
+    }
+    if (failure) throw new Error(failure)
+    if (operation === 'release') {
+      if (nextRelease) { const value = nextRelease; nextRelease = undefined; return value }
+      const release = { releaseId: `release-${payload?.version}`, version: payload?.version ?? '' }
+      releases = [release, ...releases]
+      if (payload?.activate === 'true' && !activationError) { activeID = release.releaseId; revision++ }
+      return { release, activated: payload?.activate === 'true' && !activationError ? { release, revision } : null, activationError }
+    }
+    if (operation === 'activate') {
+      activeID = payload?.id ?? ''; revision++
+      return { release: releases.find(release => release.releaseId === activeID), revision }
     }
     if (operation === 'package') return { summary: { version: payload?.version, features: Object.fromEntries(Object.entries(payload ?? {}).filter(([key]) => key !== 'version')) }, size: 100, entries: 2, sha256: 'abc' }
     if (operation === 'publish') return { releaseId: 'release', version: '1.0.0' }
@@ -144,9 +161,12 @@ function admin(options: { initial?: ReturnType<typeof preview>; role?: string; f
     }
     if (operation === 'save-import-fix') return { saved: path }
     throw new Error(`Unexpected operation ${operation}`)
-  })
+  }, options.storage)
   return {
     ...h, calls,
+    failActivation(value: string) { activationError = value },
+    failHistory(value: string) { historyError = value },
+    delayRelease(value: Promise<unknown>) { nextRelease = value },
     setImport(value: ReturnType<typeof preview>) { imported = value },
     failBatch(value: typeof batchFailures) { batchFailures = value },
     fail(value: string) { failure = value },
@@ -160,9 +180,8 @@ async function openAdmin(h: ReturnType<typeof admin>) {
   h.click('Chọn thư mục & nhập'); return h.flush()
 }
 function packageBundle(h: ReturnType<typeof admin>) {
-  h.change('1.0.0', '1.0.0'); h.render()
-  const form = h.find(node => node.type === 'form')
-  ;(form.props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+  if (!h.render().includes('aria-label="Phiên bản"')) { h.click('Sửa phiên bản'); h.render() }
+  h.change('Phiên bản', '1.0.0'); h.render(); h.click('Chỉ đóng gói thử')
 }
 function payload(h: ReturnType<typeof admin>, operation: string) {
   return JSON.parse(JSON.stringify(h.calls.filter(call => call.operation === operation).at(-1)?.payload))
@@ -176,11 +195,11 @@ test('Admin single fix uses API default, gates busy actions, shows safe diff and
   assert.match(html, /Model sửa lỗi \(agent &amp; skill\): default · resolved-model/)
   assert.match(html, /Sửa trực tiếp các tệp agent &amp; skill bị lỗi bằng model mặc định theo API \(<code>default<\/code>: <code>resolved-model<\/code>\)/)
   assert.match(html, /secret nhạy cảm được ẩn tự động/)
-  assert.equal(h.button('Đóng gói').props.disabled, true)
+  assert.equal(h.button('Chỉ đóng gói thử').props.disabled, true)
   assert.ok(h.button('Sửa lỗi bằng AI'))
   const response = deferred()
   h.delayFix(response.promise); h.click('Sửa bằng AI', agent); h.render()
-  for (const label of ['Đang sửa…', 'Bỏ tệp', 'Sửa lỗi bằng AI', 'Chọn thư mục & nhập']) assert.equal(h.button(label).props.disabled, true)
+  for (const label of ['Đang sửa…', 'Bỏ tệp', 'Sửa lỗi bằng AI', 'Đổi thư mục']) assert.equal(h.button(label).props.disabled, true)
   const bar = h.find(node => node.props.className === 'amekit-fix-bar')
   assert.ok((bar.props.children as ReactNode[]).some(child => isValidElement<{ className?: string }>(child) && child.props.className === 'amekit-busy-inline'))
   assert.match(h.render(), /amekit-spinner.*Đang sửa agents\/helper.md.*model default.*resolved-model/s)
@@ -188,7 +207,7 @@ test('Admin single fix uses API default, gates busy actions, shows safe diff and
   response.resolve({ preview: preview([agent], []), fix: fixed(agent) })
   html = await h.flush()
   assert.deepEqual(payload(h, 'fix-import'), { path: agent })
-  assert.match(html, /Sẵn sàng đóng gói/)
+  assert.match(html, /Sẵn sàng phát hành/)
   assert.match(html, /Đã sửa bởi AI · default \(resolved-model\)/)
   assert.match(html, /chưa ghi đè thư mục gốc/)
   assert.match(html, /<details><summary>Xem thay đổi \(diff\)<\/summary><pre class="amekit-fix-diff">- \[REDACTED_SECRET_1\]\n\+ &lt;YOUR_PLACEHOLDER&gt;/)
@@ -196,11 +215,11 @@ test('Admin single fix uses API default, gates busy actions, shows safe diff and
   assert.ok(!html.includes('amekit-fix-bar'))
   packageBundle(h); html = await h.flush()
   assert.match(html, /Đã đóng gói v1\.0\.0/)
-  assert.equal(h.button('Xuất bản gói đã chuẩn bị').props.disabled, false)
+  assert.equal(h.button('Xuất bản gói đã nén').props.disabled, false)
   h.click('Lưu về thư mục gốc', agent); html = await h.flush()
   assert.deepEqual(payload(h, 'save-import-fix'), { path: agent })
   assert.equal(h.button('Đã lưu vào đĩa', agent).props.disabled, true)
-  assert.equal(h.button('Xuất bản gói đã chuẩn bị').props.disabled, true)
+  assert.doesNotMatch(html, />Xuất bản gói đã nén</)
   assert.doesNotMatch(html, /Đã đóng gói v/)
   h.click('Hoàn tác', agent); html = await h.flush()
   assert.deepEqual(payload(h, 'revert-import-fix'), { path: agent })
@@ -228,7 +247,7 @@ test('batch fixing deduplicates file errors, reports partial failures and preser
   assert.deepEqual(payload(h, 'fix-import'), { path: skill })
   assert.equal((html.match(/Đã sửa bởi AI · default \(resolved-model\)/g) ?? []).length, 2)
   assert.equal((html.match(/class="amekit-fix-card"/g) ?? []).length, 2)
-  assert.match(html, /Sẵn sàng đóng gói/)
+  assert.match(html, /Sẵn sàng phát hành/)
   assert.doesNotMatch(html, /Không sửa được 1 tệp/)
   h.unmount()
 })
@@ -246,7 +265,7 @@ test('excluding a skill clears stale Enhance selection, exposes only revert and 
   assert.equal((html.match(/>Hoàn tác<\/button>/g) ?? []).length, 2)
   assert.ok(h.button('Bỏ tệp', stray))
   h.click('Bỏ tệp', stray); html = await h.flush()
-  assert.match(html, /Sẵn sàng đóng gói/)
+  assert.match(html, /Sẵn sàng phát hành/)
   h.click('Hoàn tác', skill); html = await h.flush()
   assert.match(html, /Bị chặn · 1 lỗi/)
   assert.ok(h.button('Sửa bằng AI', skill))
@@ -273,7 +292,7 @@ test('failed fix/save/revert do not apply invalid state or mark a file as saved'
   h.fail('IMPORT_FILE_NOT_FOUND'); h.click('Hoàn tác', agent); html = await h.flush()
   assert.match(html, /Không tìm thấy tệp/)
   assert.ok(h.button('Hoàn tác', agent))
-  assert.match(html, /Sẵn sàng đóng gói/)
+  assert.match(html, /Sẵn sàng phát hành/)
   h.unmount()
 })
 
@@ -283,12 +302,12 @@ test('reimport and logout reset applied fixes/notices, saved state, and packaged
   h.click('Sửa bằng AI', agent); await h.flush()
   h.click('Lưu về thư mục gốc', agent); await h.flush()
   packageBundle(h); await h.flush()
-  h.click('Xuất bản gói đã chuẩn bị'); let html = await h.flush()
+  h.click('Xuất bản gói đã nén'); let html = await h.flush()
   assert.match(html, /Đã xuất bản v1\.0\.0/)
   h.click('Hoàn tác', agent); html = await h.flush()
   assert.doesNotMatch(html, /Đã xuất bản v/)
   h.click('Sửa bằng AI', agent); await h.flush()
-  h.click('Chọn thư mục & nhập'); html = await h.flush()
+  h.click('Đổi thư mục'); html = await h.flush()
   assert.match(html, /Bị chặn · 1 lỗi/)
   assert.doesNotMatch(html, /amekit-fix-card|amekit-fix-notice|Đã đóng gói v|Đã lưu vào đĩa/)
   h.click('Sửa bằng AI', agent); await h.flush()
@@ -307,22 +326,23 @@ test('pending, canceled and failed reimports retain preview, staged fixes, featu
   h.click('Sửa tất cả lỗi bằng AI (2)'); await h.flush()
   packageBundle(h); await h.flush()
   const pending = deferred()
-  h.delayImport(pending.promise); h.click('Chọn thư mục & nhập')
+  h.delayImport(pending.promise); h.click('Đổi thư mục')
   let html = h.render()
   assert.equal(h.button('Đang quét thư mục…').props.disabled, true)
   for (const text of ['amekit-inspector', 'amekit-fix-card', 'Đã đóng gói v1.0.0', 'Đã sửa 2 tệp bằng AI']) assert.ok(html.includes(text), text)
   assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Enhance (Commit message)').props.value, 'review')
   pending.resolve(null); html = await h.flush()
   assert.match(html, /amekit-fix-card|Đã đóng gói v1\.0\.0/)
-  assert.equal(h.button('Xuất bản gói đã chuẩn bị').props.disabled, false)
+  assert.equal(h.button('Xuất bản gói đã nén').props.disabled, false)
   h.fail('AI_FIX_PROVIDER_ERROR: HTTP 400: unsupported model setting')
-  h.click('Chọn thư mục & nhập'); html = await h.flush()
+  h.click('Đổi thư mục'); html = await h.flush()
   assert.match(html, /amekit-inspector/)
   assert.match(html, /Đã đóng gói v1\.0\.0/)
   assert.equal((html.match(/unsupported model setting/g) ?? []).length, 1)
-  assert.ok(html.indexOf('role="alert"') < html.indexOf('Bước 1'))
-  assert.match(html, /settings-content"><div class="amekit-alert amekit-alert--error" role="alert"/)
-  h.fail(''); h.setImport(preview([agent])); h.click('Chọn thư mục & nhập'); html = await h.flush()
+  const source = renderToStaticMarkup(h.find(node => node.props['data-testid'] === 'amekit-source-card'))
+  assert.match(source, /role="alert".*unsupported model setting/s)
+  assert.ok(html.indexOf('role="alert"') > html.indexOf('amekit-source-card'))
+  h.fail(''); h.setImport(preview([agent])); h.click('Đổi thư mục'); html = await h.flush()
   assert.match(html, /Bị chặn · 1 lỗi/)
   assert.doesNotMatch(html, /amekit-fix-card|Đã đóng gói v|unsupported model setting/)
   assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Enhance (Commit message)').props.value, '')
@@ -372,7 +392,7 @@ test('single-file bulk button uses fix-import-all without a model override', asy
   h.click('Sửa lỗi bằng AI'); const html = await h.flush()
   assert.deepEqual(payload(h, 'fix-import-all'), {})
   assert.match(html, /Đã sửa 1 tệp bằng AI/)
-  assert.match(html, /Sẵn sàng đóng gói/)
+  assert.match(html, /Sẵn sàng phát hành/)
   h.unmount()
 })
 
@@ -475,9 +495,9 @@ test('Admin prefills all feature fields, selects direct active models and packag
   assert.ok(html.includes('Enhance: /review · commit-active'))
   assert.ok(html.includes('Dịch Android: /review · gemini-active'))
   assert.deepEqual(payload(h, 'package'), { version: '1.0.0', ...features, commitEnhanceModel: 'commit-active' })
-  h.change('Skill cho Dịch Android', ''); h.render()
+  h.change('Skill cho Dịch Android', ''); html = h.render()
   assert.equal(h.find(node => node.props['aria-label'] === 'Model cho Dịch Android').props.disabled, true)
-  assert.equal(h.button('Xuất bản gói đã chuẩn bị').props.disabled, true)
+  assert.doesNotMatch(html, />Xuất bản gói đã nén</)
   h.unmount()
 })
 
@@ -494,7 +514,7 @@ test('Bundle installed and release history summaries retain both feature models'
   let html = await h.flush()
   assert.equal((html.match(/Enhance: \/review · commit-active/g) ?? []).length, 2)
   assert.equal((html.match(/Dịch Android: \/android-strings-translation · gemini-active/g) ?? []).length, 2)
-  h.click('Quản trị'); h.render(); html = await h.flush()
+  h.click('Quản trị'); h.render(); await h.flush(); h.click('Lịch sử (1)'); html = h.render()
   assert.ok(html.includes('Enhance: /review · commit-active'))
   assert.ok(html.includes('Dịch Android: /android-strings-translation · gemini-active'))
   h.unmount()
@@ -517,7 +537,7 @@ test('Android feature selection clears when its imported skill is excluded', asy
   const h = admin({ initial: preview([agent, skill], []), features: { androidTranslationSkill: 'review', androidTranslationModel: 'gemini' } })
   await openAdmin(h)
   h.setImport(preview([agent], []))
-  h.click('Chọn thư mục & nhập'); await h.flush()
+  h.click('Đổi thư mục'); await h.flush()
   assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Dịch Android').props.value, '')
   assert.equal(h.find(node => node.props['aria-label'] === 'Model cho Dịch Android').props.disabled, true)
   h.unmount()
@@ -538,5 +558,186 @@ test('Settings forwards project and embedded to Account without leaking its sele
   assert.equal(Object.hasOwn(account.props, 'selectedModel'), false)
   assert.equal(account.props.projectID, 'project')
   assert.equal(account.props.embedded, true)
+  h.unmount()
+})
+
+
+const cardMarkup = (h: ReturnType<typeof admin>, id: string) => renderToStaticMarkup(h.find(node => node.props['data-testid'] === id))
+function setActivateNow(h: ReturnType<typeof admin>, checked: boolean) {
+  const checkbox = h.find(node => node.type === 'input' && node.props.type === 'checkbox')
+  ;(checkbox.props.onChange as (event: unknown) => void)({ target: { checked } })
+  h.render()
+}
+
+test('Admin defaults to raw-adapt, suggests the next server version and toggles manual version editing', async () => {
+  const h = admin({ initial: preview([agent], []), serverVersion: '1.0.3' })
+  h.render(); await h.flush(); h.click('Quản trị'); h.render()
+  let html = await h.flush()
+  assert.equal(h.find(node => node.props['aria-label'] === 'Chế độ tương thích').props.value, 'raw-adapt')
+  assert.match(html, /amekit-version-badge">v1\.0\.4/)
+  assert.equal(h.button('Phát hành & kích hoạt v1.0.4').props.disabled, true)
+  h.click('Chọn thư mục & nhập'); await h.flush()
+  assert.deepEqual(payload(h, 'import'), { compatibilityMode: 'raw', adaptClaudeAgents: 'true' })
+  h.click('Sửa phiên bản'); html = h.render()
+  assert.equal(h.find(node => node.props['aria-label'] === 'Phiên bản').props.value, '1.0.4')
+  h.change('Phiên bản', ' 2.0.0 '); h.render()
+  assert.ok(h.button('Phát hành & kích hoạt v2.0.0'))
+  h.change('Phiên bản', ' '); h.render()
+  assert.equal(h.button('Chỉ đóng gói thử').props.disabled, true)
+  h.click('Dùng tự động (v1.0.4)'); html = h.render()
+  assert.doesNotMatch(html, /aria-label="Phiên bản"/)
+  assert.equal(h.button('Phát hành & kích hoạt v1.0.4').props.disabled, false)
+  h.unmount()
+})
+
+test('compatibility mode persists valid choices and safely falls back when storage is invalid or throws', async () => {
+  for (const saved of ['native', 'raw-adapt', 'raw', 'invalid', null]) {
+    const writes: [string, string][] = []
+    const h = admin({ storage: { getItem(key) { assert.equal(key, 'ame.amekit.importMode'); return saved }, setItem(key, value) { writes.push([key, value]) } } })
+    await openAdmin(h)
+    assert.equal(h.find(node => node.props['aria-label'] === 'Chế độ tương thích').props.value, saved && saved !== 'invalid' ? saved : 'raw-adapt')
+    h.change('Chế độ tương thích', 'raw'); h.render()
+    assert.deepEqual(writes, [['ame.amekit.importMode', 'raw']])
+    h.click('Đổi thư mục'); await h.flush()
+    assert.deepEqual(payload(h, 'import'), { compatibilityMode: 'raw' })
+    h.unmount()
+  }
+  const h = admin({ storage: { getItem() { throw new Error('denied') }, setItem() { throw new Error('denied') } } })
+  await openAdmin(h)
+  assert.equal(h.find(node => node.props['aria-label'] === 'Chế độ tương thích').props.value, 'raw-adapt')
+  h.change('Chế độ tương thích', 'native'); h.render()
+  assert.equal(h.find(node => node.props['aria-label'] === 'Chế độ tương thích').props.value, 'native')
+  h.unmount()
+})
+
+test('one-click release forwards all features, activates the release and advances the automatic version', async () => {
+  const features = { commitEnhanceSkill: 'review', commitEnhanceModel: 'commit', androidTranslationSkill: 'review', androidTranslationModel: 'android' }
+  const h = admin({ initial: preview([agent, skill], []), serverVersion: '1.0.3', features })
+  await openAdmin(h)
+  h.click('Phát hành & kích hoạt v1.0.4'); let html = await h.flush()
+  assert.deepEqual(payload(h, 'release'), { version: '1.0.4', activate: 'true', ...features })
+  assert.match(html, /Đã xuất bản v1\.0\.4\. Đã kích hoạt cho team/)
+  assert.ok(h.button('Phát hành & kích hoạt v1.0.5'))
+  assert.doesNotMatch(html, /Đã đóng gói v/)
+  h.click('Xem lịch sử'); html = h.render()
+  assert.match(html, /Có bản đang kích hoạt/)
+  const active = h.find(node => node.props.className === 'amekit-release' && renderToStaticMarkup(node).includes('v1.0.4'))
+  assert.match(renderToStaticMarkup(active), /Đang kích hoạt/)
+  assert.doesNotMatch(renderToStaticMarkup(active), />Kích hoạt</)
+  h.unmount()
+})
+
+test('draft release skips activation and history supports one-click activation without technical clutter', async () => {
+  const h = admin({ initial: preview([agent], []), serverVersion: '1.0.3' })
+  await openAdmin(h); setActivateNow(h, false)
+  h.click('Xuất bản nháp v1.0.4'); let html = await h.flush()
+  assert.deepEqual(payload(h, 'release'), { version: '1.0.4', activate: 'false' })
+  assert.match(html, /Đã xuất bản v1\.0\.4/)
+  assert.doesNotMatch(html, /Đã kích hoạt cho team/)
+  h.click('Lịch sử (2)'); html = h.render()
+  assert.match(html, /Chưa kích hoạt bản nào/)
+  assert.match(html, /v1\.0\.4/)
+  assert.doesNotMatch(html, /amekit-source-card|amekit-release-card|Revision hiện tại|amekit-activation|Chi tiết kỹ thuật \(JSON\)/)
+  h.click('Kích hoạt'); html = await h.flush()
+  assert.deepEqual(payload(h, 'activate'), { id: 'release-1.0.4', revision: '1' })
+  assert.match(html, /Đã kích hoạt v1\.0\.4 cho team/)
+  assert.match(html, /Đang kích hoạt/)
+  h.unmount()
+})
+
+test('activation failure and background history failure preserve the published notice and allow retry', async () => {
+  const h = admin({ initial: preview([agent], []), serverVersion: '1.0.3' })
+  await openAdmin(h)
+  h.failActivation('ACTIVATION_CONFLICT'); h.failHistory('NETWORK_ERROR')
+  h.click('Phát hành & kích hoạt v1.0.4'); let html = await h.flush()
+  assert.match(html, /Đã xuất bản v1\.0\.4/)
+  assert.match(html, /Chưa kích hoạt:.*Mở lịch sử để thử Kích hoạt lại/)
+  assert.match(html, /class="amekit-alert amekit-alert--warning" role="status"/)
+  assert.match(html, /Không thể kết nối tới máy chủ AmeCode/)
+  assert.equal(h.calls.filter(call => call.operation === 'release').length, 1)
+  h.click('Xem lịch sử'); html = h.render()
+  assert.match(html, /v1\.0\.4/)
+  assert.doesNotMatch(html, /role="alert"/)
+  h.failHistory(''); h.click('Kích hoạt'); html = await h.flush()
+  assert.match(html, /Đã kích hoạt v1\.0\.4 cho team/)
+  h.unmount()
+})
+
+test('release, package and publish errors stay inside release card, source operations stay inside source card', async () => {
+  const h = admin({ initial: preview([agent], []) })
+  await openAdmin(h)
+  for (const action of ['Phát hành & kích hoạt v1.0.0', 'Chỉ đóng gói thử']) {
+    h.fail('ZIP_EXCEEDS_32_MIB'); h.click(action); let html = await h.flush()
+    assert.match(cardMarkup(h, 'amekit-release-card'), /role="alert".*32 MiB/s)
+    assert.doesNotMatch(cardMarkup(h, 'amekit-source-card'), /role="alert"/)
+    assert.equal((html.match(/role="alert"/g) ?? []).length, 1)
+    h.fail(''); h.click('Chỉ đóng gói thử'); html = await h.flush()
+    assert.doesNotMatch(html, /role="alert"/)
+  }
+  h.fail('RELEASE_CONFLICT'); h.click('Xuất bản gói đã nén'); await h.flush()
+  assert.match(cardMarkup(h, 'amekit-release-card'), /role="alert".*đã tồn tại/s)
+  h.fail('IMPORT_REQUIRED'); h.click('Đổi thư mục'); await h.flush()
+  assert.match(cardMarkup(h, 'amekit-source-card'), /role="alert".*Chưa có dữ liệu nhập/s)
+  assert.doesNotMatch(cardMarkup(h, 'amekit-release-card'), /role="alert"/)
+  h.click('Lịch sử (0)'); assert.doesNotMatch(h.render(), /role="alert"/)
+  h.click('Phát hành mới'); h.render()
+  h.fail(''); h.setImport(preview([agent])); h.click('Đổi thư mục'); await h.flush()
+  h.fail('AI_FIX_PROVIDER_ERROR'); h.click('Sửa bằng AI', agent); await h.flush()
+  assert.match(cardMarkup(h, 'amekit-source-card'), /role="alert".*máy chủ AI/s)
+  assert.doesNotMatch(cardMarkup(h, 'amekit-release-card'), /role="alert"/)
+  h.click('Tài khoản'); assert.doesNotMatch(h.render(), /role="alert"/)
+  h.unmount()
+})
+
+test('inventory and nonblocking checks are collapsed while blocking fixes remain expanded', async () => {
+  const initial = preview([agent, skill], [{ path: agent, severity: 'warning', reason: 'legacy' }])
+  initial.skills = Array.from({ length: 91 }, (_, index) => `skill-${index}`)
+  const h = admin({ initial })
+  let html = await openAdmin(h)
+  const inventory = h.find(node => node.type === 'details' && node.props.className === 'amekit-details' && renderToStaticMarkup(node).includes('Danh sách Agents'))
+  assert.ok(!inventory.props.open)
+  assert.match(renderToStaticMarkup(inventory), /Danh sách Agents \(1\) &amp; Skills \(91\)/)
+  const checks = h.find(node => node.type === 'details' && node.props.className === 'amekit-details' && renderToStaticMarkup(node).includes('Chi tiết kiểm tra'))
+  assert.ok(!checks.props.open)
+  assert.match(renderToStaticMarkup(checks), /1 cảnh báo · 0 chuyển đổi · 0 loại trừ/)
+  assert.doesNotMatch(html, /amekit-fix-bar/)
+  h.setImport(preview([agent])); h.click('Đổi thư mục'); html = await h.flush()
+  assert.match(html, /amekit-fix-bar/)
+  assert.doesNotMatch(html, /<summary>Chi tiết kiểm tra/)
+  assert.equal(h.find(node => node.props.id === 'amekit-issue-error').props['aria-selected'], true)
+  assert.equal(h.button('Phát hành & kích hoạt v1.0.0').props.disabled, true)
+  h.unmount()
+})
+
+test('initial history failure is visible on publish, and history retry errors stay visible in history', async () => {
+  const h = admin()
+  h.failHistory('NETWORK_ERROR')
+  h.render(); await h.flush(); h.click('Quản trị'); h.render()
+  let html = await h.flush()
+  assert.ok(html.indexOf('role="alert"') < html.indexOf('amekit-source-card'))
+  h.click('Lịch sử (0)'); html = h.render()
+  assert.doesNotMatch(html, /role="alert"/)
+  h.click('Làm mới'); html = await h.flush()
+  assert.match(html, /role="alert".*Không thể kết nối/s)
+  h.failHistory(''); h.click('Làm mới'); html = await h.flush()
+  assert.doesNotMatch(html, /role="alert"/)
+  h.unmount()
+})
+
+test('pending release shows inline progress, disables actions and resets manual version after success', async () => {
+  const h = admin({ initial: preview([agent], []) })
+  await openAdmin(h)
+  h.click('Sửa phiên bản'); h.render(); h.change('Phiên bản', ' 2.0.0 '); h.render()
+  const pending = deferred(); h.delayRelease(pending.promise)
+  h.click('Phát hành & kích hoạt v2.0.0'); h.render()
+  const card = cardMarkup(h, 'amekit-release-card')
+  assert.match(card, /amekit-busy-inline.*amekit-spinner/s)
+  assert.equal(h.button('Đang phát hành…').props.disabled, true)
+  assert.equal(h.button('Chỉ đóng gói thử').props.disabled, true)
+  pending.resolve({ release: { releaseId: 'manual', version: '2.0.0' }, activated: { release: { releaseId: 'manual', version: '2.0.0' }, revision: 2 } })
+  const html = await h.flush()
+  assert.equal(payload(h, 'release').version, '2.0.0')
+  assert.doesNotMatch(html, /aria-label="Phiên bản"|amekit-spinner/)
+  assert.ok(h.button('Phát hành & kích hoạt v2.0.1'))
   h.unmount()
 })

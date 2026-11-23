@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto"
 import path from "node:path"
 import type { BundleFeatures, Release } from "./api"
 import { Features, sha256 } from "./bundle/manifest"
-import { MAX_PAYLOAD_FILES } from "./bundle/limits"
+import { MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES } from "./bundle/limits"
 import { preview, safePath, verifiedFiles, type InputFile } from "./bundle/package"
 import type { Discover } from "./runtime"
 
@@ -37,7 +37,7 @@ async function tree(root: string) {
       if (stat.isSymbolicLink() || (await realpath(target)).toLowerCase() !== target.toLowerCase()) throw new Error("REPARSE_CONFIG_REJECTED")
       if (stat.isDirectory()) { files.directories.push(name); await walk(target, name + "/") }
       else {
-        if (!stat.isFile() || stat.size > 8*1024*1024 || (size += stat.size) > 64*1024*1024) throw new Error("PERSONAL_CONFIG_TOO_LARGE")
+        if (!stat.isFile() || stat.size > MAX_FILE * 2 || (size += stat.size) > MAX_EXPANDED + 64 * 1024 * 1024) throw new Error("PERSONAL_CONFIG_TOO_LARGE")
         files.push({ path: name, data: new Uint8Array(await readFile(target)) })
       }
     }

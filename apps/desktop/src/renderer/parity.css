@@ -464,12 +464,31 @@
 .settings-navigation button { border: 1px solid transparent; background: transparent; color: var(--text-secondary); padding: 6px 11px; border-radius: var(--radius-sm); font-size: 12.5px; font-weight: 500; }
 .settings-navigation button:hover { background: var(--bg-hover); color: var(--text-primary); }
 .settings-navigation button.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
-.modal:has(.amekit-core) { width: min(700px, 100%); }
+.modal:has(.amekit-core) { width: min(880px, 92vw); max-height: 90vh; }
+.amekit-source-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px; }
+.amekit-source-bar label { min-width: 0; margin: 0; }
+.amekit-source-bar select { width: 100%; text-overflow: ellipsis; }
+.amekit-details { min-width: 0; margin-top: 12px; padding: 10px 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-canvas); }
+.amekit-details summary { cursor: pointer; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.amekit-details[open] summary { margin-bottom: 10px; color: var(--text-primary); }
+.amekit-feature-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.amekit-feature-grid .amekit-feature-config { margin: 0; }
+.amekit-version-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 14px; color: var(--text-secondary); }
+.amekit-version-bar label { flex: 1 1 180px; margin: 0; }
+.amekit-version-badge { padding: 5px 10px; border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--accent); font-size: 20px; }
+.amekit-release-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.amekit-package-summary > button { display: block; margin-top: 10px; }
+.amekit-alert > button { margin-left: 8px; }
+@media (max-width: 720px) { .amekit-feature-grid, .amekit-source-bar { grid-template-columns: minmax(0, 1fr); } .amekit-source-bar > button { justify-self: start; } }
 .amekit-core { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 16px 20px; overflow: hidden; }
 .amekit-core .account-tabs { display: inline-flex; align-self: flex-start; width: fit-content; max-width: 100%; padding: 3px; gap: 2px; margin: 0 0 14px; border-radius: var(--radius-sm); background: var(--bg-shell); border: 1px solid var(--border-subtle); overflow-x: auto; }
 .amekit-core .account-tabs button { white-space: nowrap; flex: 0 0 auto; border: 0; border-radius: 5px; padding: 5px 12px; font-size: 12px; font-weight: 500; background: transparent; color: var(--text-secondary); }
 .amekit-core .account-tabs button:hover { color: var(--text-primary); background: var(--bg-hover); }
 .amekit-core .account-tabs button.active { background: var(--bg-elevated); color: var(--text-primary); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22); }
+.amekit-core .amekit-admin-tabs { display: inline-flex; align-self: flex-start; flex-wrap: nowrap; width: fit-content; max-width: 100%; padding: 3px; gap: 2px; margin: 0 0 14px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-shell); overflow-x: auto; }
+.amekit-core .amekit-admin-tabs button { white-space: nowrap; flex: 0 0 auto; border: 0; border-radius: 5px; padding: 5px 12px; font-size: 12px; font-weight: 500; background: transparent; color: var(--text-secondary); }
+.amekit-core .amekit-admin-tabs button:hover { background: var(--bg-hover); color: var(--text-primary); }
+.amekit-core .amekit-admin-tabs button.active { background: var(--bg-elevated); color: var(--accent); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22); }
 button:focus:not(:focus-visible) { outline: none; }
 .amekit-core input:not([type="checkbox"]):not([type="radio"]), .settings-content input:not([type="checkbox"]):not([type="radio"]) { height: 34px; padding: 0 11px; background: var(--bg-canvas); border: 1px solid var(--border-default); border-radius: var(--radius-sm); transition: border-color var(--dur-fast) ease; }
 .amekit-core input:not([type="checkbox"]):not([type="radio"]):focus, .settings-content input:not([type="checkbox"]):not([type="radio"]):focus { border-color: var(--accent-border); outline: none; }

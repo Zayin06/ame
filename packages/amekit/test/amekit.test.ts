@@ -8,7 +8,8 @@ import { createAmeKit, type AmeKitDependencies, type AmeKit } from "../src/index
 import { openSessionVault, type Encryption } from "../src/session-vault"
 import { zipSync, unzipSync } from "fflate"
 import { pack, preview, safePath, secretFindings } from "../src/bundle/package"
-import { validate } from "../src/bundle/manifest"
+import { sha256, validate } from "../src/bundle/manifest"
+import { MAX_ZIP } from "../src/bundle/limits"
 import { scan, scanWithSource } from "../src/bundle/scan"
 import { AiFixError, buildCompactDiff, fixImportFileWithLlm, isFixableTextFile, redactSecretsForLlm } from "../src/bundle/ai-fix"
 import { AmeApi } from "../src/api"
@@ -44,7 +45,8 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   await mkdir(project); await mkdir(imported)
   for (const file of input()) { const target = path.join(imported, ...file.path.split("/")); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data) }
   const artifact = await bundle(settings.mode, settings.commitEnhanceSkill)
-  const rpc: unknown[] = [], requests: string[] = [], dialogs: string[] = []
+  const rpc: unknown[] = [], requests: string[] = [], dialogs: string[] = [], messages: string[] = [], events: string[] = []
+  let apiResponse: ((url: URL, init?: RequestInit) => Promise<Response | undefined>) | undefined
   let role: unknown = settings.role ?? "user", plugin = settings.plugin !== false, accepted = settings.confirm !== false, failAuth = false, failStorage = false, pickerCount = 0
   let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
   let pickResponse: (() => Promise<string | null>) | undefined
@@ -74,6 +76,8 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
       return dialogueResponse ? dialogueResponse(init.signal) : Response.json({ choices: [{ message: { content: JSON.stringify(localDialogue) } }] })
     }
     assert.equal(url.origin, "http://localhost:3211", "no real API calls")
+    events.push(`${init?.method ?? "GET"} ${url.pathname}`)
+    const response = await apiResponse?.(url, init); if (response) return response
     if (failAuth) return Response.json({ error: { code: "USER_DISABLED" } }, { status: 401 })
     if (url.pathname === "/v1/session") { const response = await sessionResponse?.(); if (response) return response }
     if (url.pathname === "/v1/amekit/releases/latest") return Response.json(artifact.latest)
@@ -86,7 +90,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   }
   const dependencies: AmeKitDependencies = {
     fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs,
-    electron: async () => ({ safeStorage: { ...(settings.encryption ?? encryption), encryptString(text: string) { if (failStorage) throw new Error("contains-sensitive-material"); return (settings.encryption ?? encryption).encryptString(text) } }, dialog: { showMessageBox: async (options: { message?: string; detail?: string }) => { dialogs.push(options.detail ?? options.message ?? ""); return { response: accepted ? 1 : 0, checkboxChecked: false } } } as never }),
+    electron: async () => ({ safeStorage: { ...(settings.encryption ?? encryption), encryptString(text: string) { if (failStorage) throw new Error("contains-sensitive-material"); return (settings.encryption ?? encryption).encryptString(text) } }, dialog: { showMessageBox: async (options: { message?: string; detail?: string }) => { dialogs.push(options.detail ?? options.message ?? ""); messages.push(options.message ?? ""); events.push("confirm"); return { response: accepted ? 1 : 0, checkboxChecked: false } } } as never }),
     discover: settings.discover ?? (async directory => {
       try { await readFile(path.join(directory, ".opencode", "agents", "helper.md")) } catch { return { agents: [], skills: [] } }
       return { agents: [{ id: "helper" }], skills: [{ id: "fixture", name: "fixture", path: path.join(directory, ".opencode", "skills", "fixture", "SKILL.md") }] }
@@ -94,7 +98,8 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   }
   const options = { userData: data, endpoint: () => ({ url: "http://127.0.0.1:3210", headers: { authorization: "Basic fixture-owner" } }), project: async (id: string) => { assert.equal(id, "project-id"); return project }, pickImport: async () => { pickerCount++; return pickResponse ? pickResponse() : imported } }
   const service = createAmeKit(options, dependencies)
-  return { service, folder, project, imported, data, rpc, requests, dialogs, options, dependencies, artifact,
+  return { service, folder, project, imported, data, rpc, requests, dialogs, messages, events, options, dependencies, artifact,
+    apiResponse: (value: (url: URL, init?: RequestInit) => Promise<Response | undefined>) => { apiResponse = value },
     role: (value: unknown) => { role = value }, plugin: (value: boolean) => { plugin = value }, confirm: (value: boolean) => { accepted = value }, disable: () => { failAuth = true }, breakStorage: () => { failStorage = true }, pickerCount: () => pickerCount,
     sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
     rpcResponse: (value?: () => Promise<Response | undefined>) => { rpcResponse = value },
@@ -463,6 +468,185 @@ test("admin import/package/publish/activate require roles and native main confir
   } finally { await f.cleanup() }
 })
 
+test("pack deterministically uses level-6 DEFLATE for more than 8.5 MiB of markdown", async () => {
+  let seed = 37
+  const block = Array.from({ length: 6000 }, () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+    return `- Review documentation example ${seed.toString(16)} before publishing.\n`
+  }).join("")
+  const data = encode(block.repeat(Math.ceil(3 * 1024 * 1024 / block.length)).slice(0, 3 * 1024 * 1024))
+  const source = preview([...input(), ...Array.from({ length: 3 }, (_, i) => ({ path: `skills/fixture/guide-${i}.md`, data }))])
+  const first = await pack(source, "1.2.3"), second = await pack(source, "1.2.3")
+  assert.ok(first.summary.expandedSize > 8.5 * 1024 * 1024)
+  assert.ok(first.bytes.length < 4 * 1024 * 1024)
+  assert.deepEqual(first.bytes, second.bytes)
+  assert.equal(first.sha256, second.sha256)
+  assert.deepEqual(await validate(first.bytes, "1.2.3"), first.summary)
+  const entries = unzipSync(first.bytes)
+  const expected = zipSync(Object.fromEntries(Object.entries(entries).map(([name, bytes]) => [name, [bytes, { level: 6, mtime: new Date(1980, 0, 1) }]])))
+  assert.deepEqual(first.bytes, expected)
+  assert.equal(new DataView(first.bytes.buffer, first.bytes.byteOffset).getUint16(8, true), 8)
+})
+
+test("validate accepts more than 1,023 payload files", async () => {
+  const source = preview([...input(), ...Array.from({ length: 1023 }, (_, i) => ({ path: `skills/fixture/doc-${i}.md`, data: encode(`Documentation ${i}.\n`) }))])
+  const packed = await pack(source, "1.2.3")
+  assert.equal((await validate(packed.bytes, "1.2.3")).fileCount, 1025)
+})
+
+test("API release metadata and downloads accept compressed bundles above 8 MiB up to 32 MiB", async () => {
+  const f = await fixture()
+  try {
+    let seed = 123
+    const data = new Uint8Array(3 * 1024 * 1024)
+    for (let i = 0; i < data.length; i++) {
+      seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5
+      data[i] = seed & 255
+    }
+    const packed = await pack(preview([...input(), ...Array.from({ length: 3 }, (_, i) => ({ path: `skills/fixture/data-${i}.bin`, data }))]), "1.2.3")
+    assert.ok(packed.bytes.length > 8 * 1024 * 1024 && packed.bytes.length <= MAX_ZIP)
+    const release = { ...f.artifact.release, size: packed.bytes.length, sha256: packed.sha256, manifest: packed.summary as Release["manifest"] }
+    const api = new AmeApi("http://localhost:3211", async (request, init) => {
+      const url = new URL(String(request))
+      if (url.pathname.endsWith("/download")) return new Response(Uint8Array.from(packed.bytes))
+      if (url.pathname.endsWith("/latest")) return Response.json({ ...f.artifact.latest, release })
+      return f.dependencies.fetch!(request, init)
+    })
+    await api.login("fixture", "fixture-password")
+    assert.deepEqual((await api.latest()).release, release)
+    const downloaded = await api.download(release)
+    assert.deepEqual(await validate(downloaded, release.version), packed.summary)
+    assert.equal(await sha256(downloaded), packed.sha256)
+    await assert.rejects(api.download({ ...release, size: MAX_ZIP + 1 }), /INVALID_RELEASE/)
+  } finally { await f.cleanup() }
+})
+
+test("installed verifies managed bundles larger than 64 MiB", async () => {
+  const f = await fixture()
+  try {
+    await login(f.service)
+    await f.service.call("sync", { project: "project-id" })
+    const statePath = path.join(f.project, ".opencode", ".amekit-release.json")
+    const state = JSON.parse(await readFile(statePath, "utf8"))
+    const data = encode("Documentation.\n".repeat(Math.ceil(3 * 1024 * 1024 / 15)))
+    const hash = await sha256(data)
+    for (let i = 0; i < 22; i++) {
+      const name = `skills/fixture/guide-${i}.md`
+      await writeFile(path.join(f.project, ".opencode", ...name.split("/")), data)
+      state.files.push({ path: name, sha256: hash })
+    }
+    assert.ok(data.length * 22 > 64 * 1024 * 1024)
+    await writeFile(statePath, JSON.stringify(state))
+    const result = await installed(f.project)
+    assert.equal(result?.files.length, 24)
+    assert.equal(result?.verification, "verified-bytes")
+  } finally { await f.cleanup() }
+})
+
+test("release confirms once, publishes fresh feature overrides and optionally activates using history revision", async t => {
+  for (const activate of ["true", undefined, "false"]) await t.test(activate ?? "default", async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      await login(f.service); await f.service.call("import", {})
+      await f.service.call("package", { version: "1.2.2" })
+      const features = { commitEnhanceSkill: "fixture", commitEnhanceModel: "other", androidTranslationSkill: "fixture", androidTranslationModel: "default" }
+      const expected = await pack(preview(input()), "1.2.3", undefined, features)
+      const release = { ...f.artifact.release, size: expected.bytes.length, sha256: expected.sha256, manifest: expected.summary as Release["manifest"] }
+      let historyCalls = 0, activations = 0
+      f.apiResponse(async (url, init) => {
+        if (url.pathname === "/v1/amekit/releases" && init?.method !== "POST") {
+          historyCalls++
+          return Response.json({ releases: [release], active: { release_id: null, revision: 17, activated_at: null }, nextCursor: null })
+        }
+        if (url.pathname === "/v1/amekit/bundles/uploads") {
+          assert.equal(JSON.parse(String(init?.body)).sha256, expected.sha256)
+        }
+        if (url.pathname.endsWith("/content")) assert.deepEqual(init?.body, expected.bytes)
+        if (url.pathname === "/v1/amekit/releases" && init?.method === "POST") return Response.json({ release })
+        if (url.pathname.endsWith("/activate")) {
+          activations++
+          assert.equal(url.pathname, `/v1/amekit/releases/${release.releaseId}/activate`)
+          assert.deepEqual(JSON.parse(String(init?.body)), { expectedRevision: 17 })
+          return Response.json({ release, revision: 18, activatedAt: 2 })
+        }
+      })
+      f.events.length = 0
+      const result = await f.service.call("release", { version: "1.2.3", ...features, ...(activate === undefined ? {} : { activate }) })
+      const packaged = { summary: expected.summary, size: expected.bytes.length, entries: expected.entries, sha256: expected.sha256 }
+      assert.deepEqual(result, activate === "false" ? { packaged, release, activated: null } : { packaged, release, activated: { release, revision: 18, activatedAt: 2 }, revision: 18 })
+      assert.equal(f.dialogs.length, 1)
+      assert.equal(f.messages[0], activate === "false" ? "Xuất bản bản nháp AmeKit?" : "Phát hành & kích hoạt AmeKit?")
+      assert.ok(f.dialogs[0].includes(`v1.2.3 (${expected.bytes.length} bytes, 2 tệp, SHA-256 ${expected.sha256.slice(0, 12)}…)`))
+      assert.equal(historyCalls, activate === "false" ? 0 : 1)
+      assert.equal(activations, activate === "false" ? 0 : 1)
+      assert.deepEqual(f.events.filter(event => event === "confirm" || event.includes("/amekit/")), [
+        "confirm", "POST /v1/amekit/bundles/uploads", `PUT /v1/amekit/bundles/uploads/${release.releaseId}/content`,
+        `POST /v1/amekit/bundles/uploads/${release.releaseId}/finalize`, "POST /v1/amekit/releases",
+        ...(activate === "false" ? [] : ["GET /v1/amekit/releases", `POST /v1/amekit/releases/${release.releaseId}/activate`]),
+      ])
+      await assert.rejects(f.service.call("publish", {}), /PACKAGE_REQUIRED/)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("release rejects cancellation, invalid input, blocked imports and non-admins before uploading", async t => {
+  for (const scenario of ["cancel", "missing", "version", "activate", "features", "blocked", "non-admin"]) await t.test(scenario, async () => {
+    const f = await fixture({ role: "admin", confirm: scenario !== "cancel" })
+    try {
+      await login(f.service)
+      if (scenario === "blocked") await writeFile(path.join(f.imported, "agents", "helper.md"), "Missing frontmatter.\n")
+      if (scenario !== "missing") await f.service.call("import", {})
+      if (scenario === "non-admin") f.role("user")
+      const payload = { version: scenario === "version" ? "not-semver" : "1.2.3", ...(scenario === "activate" ? { activate: "yes" } : {}), ...(scenario === "features" ? { commitEnhanceSkill: "missing" } : {}) }
+      const error = { cancel: /CANCELLED/, missing: /IMPORT_REQUIRED/, version: /AMEKIT_OPERATION_FAILED/, activate: /INVALID_PAYLOAD/, features: /UNKNOWN_COMMIT_ENHANCE_SKILL/, blocked: /IMPORT_BLOCKED/, "non-admin": /FORBIDDEN/ }[scenario]!
+      await assert.rejects(f.service.call("release", payload), error)
+      assert.equal(f.dialogs.length, scenario === "cancel" ? 1 : 0)
+      assert.equal(f.requests.some(request => request.includes("/uploads") || request.endsWith("/activate")), false)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("release retries activation conflicts once and preserves published releases on activation failures", async t => {
+  for (const scenario of ["retry", "conflict", "failure", "history", "auth", "forbidden", "abort"]) await t.test(scenario, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      await login(f.service); await f.service.call("import", {})
+      let histories = 0, activations = 0
+      f.apiResponse(async (url, init) => {
+        if (url.pathname === "/v1/amekit/releases" && init?.method !== "POST") {
+          histories++
+          if (scenario === "history") return Response.json({ error: { code: "HISTORY_UNAVAILABLE" } }, { status: 500 })
+          return Response.json({ releases: [f.artifact.release], active: { release_id: null, revision: 10 + histories, activated_at: null }, nextCursor: null })
+        }
+        if (!url.pathname.endsWith("/activate")) return
+        activations++
+        assert.deepEqual(JSON.parse(String(init?.body)), { expectedRevision: 10 + histories })
+        if (scenario === "abort") {
+          void f.service.dispose()
+          throw new Error("aborted")
+        }
+        if (scenario === "auth" || scenario === "forbidden") return Response.json({ error: { code: scenario === "auth" ? "USER_DISABLED" : "FORBIDDEN" } }, { status: scenario === "auth" ? 401 : 403 })
+        if (scenario === "failure") return Response.json({ error: { code: "ACTIVATION_UNAVAILABLE" } }, { status: 500 })
+        if (activations === 1 || scenario === "conflict") return Response.json({ error: { code: "ACTIVATION_CONFLICT" } }, { status: 409 })
+        return Response.json({ ...f.artifact.latest, revision: 13 })
+      })
+      if (["auth", "forbidden", "abort"].includes(scenario)) {
+        await assert.rejects(f.service.call("release", { version: "1.2.3" }), scenario === "auth" ? /USER_DISABLED/ : scenario === "forbidden" ? /FORBIDDEN/ : /CANCELLED/)
+      } else {
+        const result = await f.service.call("release", { version: "1.2.3" }) as { release: Release; activated: unknown; revision?: number; activationError?: string }
+        assert.deepEqual(result.release, f.artifact.release)
+        if (scenario === "retry") { assert.equal(result.revision, 13); assert.ok(result.activated); assert.equal(result.activationError, undefined) }
+        else { assert.equal(result.activated, null); assert.equal(result.activationError, scenario === "conflict" ? "ACTIVATION_CONFLICT" : scenario === "history" ? "HISTORY_UNAVAILABLE" : "ACTIVATION_UNAVAILABLE") }
+        await assert.rejects(f.service.call("publish", {}), /PACKAGE_REQUIRED/)
+      }
+      assert.equal(histories, ["retry", "conflict"].includes(scenario) ? 2 : 1)
+      assert.equal(activations, ["retry", "conflict"].includes(scenario) ? 2 : scenario === "history" ? 0 : 1)
+      assert.equal(f.events.filter(event => event === "POST /v1/amekit/releases").length, 1)
+      assert.equal(f.dialogs.length, 1)
+    } finally { await f.cleanup() }
+  })
+})
+
 test("commit Enhance packaging is opt-in, deterministic and validates manifest feature IDs", async () => {
   const source = preview(input())
   const baseline = await pack(source, "1.2.3")
@@ -545,10 +729,11 @@ test("commit Enhance facade packages, syncs and reads verified skills without ac
 })
 
 test("commit Enhance reader strips frontmatter, preserves markdown, bounds text and strictly decodes UTF-8", async t => {
+  const instructions = Array.from({ length: 1000 }, (_, i) => `Review documentation section ${i} before publishing.\n`).join("")
   for (const [name, bytes, expected] of [
     ["CRLF and BOM", encode("\uFEFF---\r\nname: fixture\r\ndescription: Fixture skill\r\n---\r\n\r\n# Tiêu đề\r\nKeep  two spaces.\r\n---\r\nEnd\r\n"), "# Tiêu đề\r\nKeep  two spaces.\r\n---\r\nEnd"],
     ["plain markdown", encode("  # Instructions\n\nKeep markdown.  "), "# Instructions\n\nKeep markdown."],
-    ["bounded", encode("---\nname: fixture\ndescription: Fixture skill\n---\n" + "x".repeat(16_001)), "x".repeat(16_000)],
+    ["bounded", encode("---\nname: fixture\ndescription: Fixture skill\n---\n" + instructions.slice(0, 16_001)), instructions.slice(0, 16_000)],
     ["empty", encode("---\nname: fixture\ndescription: Fixture skill\n---\n \r\n"), null],
     ["invalid UTF-8", new Uint8Array([0xc3, 0x28]), undefined],
   ] as const) await t.test(name, async () => {
@@ -648,7 +833,8 @@ test("four bundle features round-trip through API, packaging, install and verifi
 test("Android reader bounds verified instructions separately from commit Enhance", async () => {
   const f = await fixture()
   try {
-    const files = input(); files[1].data = encode("---\nname: fixture\ndescription: Fixture\n---\n" + "x".repeat(33_000))
+    const instructions = Array.from({ length: 1000 }, (_, i) => `Review documentation section ${i} before publishing.\n`).join("").slice(0, 33_000)
+    const files = input(); files[1].data = encode("---\nname: fixture\ndescription: Fixture\n---\n" + instructions)
     const packed = await pack(preview(files), "1.2.3", undefined, { commitEnhanceSkill: "fixture", androidTranslationSkill: "fixture" })
     await install(f.project, "http://localhost:3211", { ...f.artifact.release, sha256: packed.sha256, size: packed.bytes.length }, packed.bytes, f.dependencies.discover!)
     assert.equal((await readCommitEnhanceSkill(f.project))!.instructions.length, 16_000)

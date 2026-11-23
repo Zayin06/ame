@@ -194,8 +194,7 @@ async function openAdmin(h: ReturnType<typeof accountHarness>) {
   h.render(); await h.flush(); h.click('Quản trị'); h.render(); await h.flush()
 }
 function submitPackage(h: ReturnType<typeof accountHarness>) {
-  const form = h.find(node => node.type === 'form')
-  ;(form.props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+  h.click('Chỉ đóng gói thử')
 }
 
 test('Admin selector uses imported skills, prefills active release, packages selection and invalidates prepared ZIP on change', async () => {
@@ -210,8 +209,11 @@ test('Admin selector uses imported skills, prefills active release, packages sel
   assert.match(html, /<option value="team-commit" selected="">\/team-commit<\/option>/)
   assert.match(html, /<option value="review">\/review<\/option>/)
   assert.ok(!html.includes('value="git-commit"'))
-  assert.ok(html.includes('Enhance: /team-commit'))
-  h.change('1.0.0', '2.0.0'); h.render(); submitPackage(h); h.render()
+  h.click('Lịch sử (1)')
+  assert.ok(h.render().includes('Enhance: /team-commit'))
+  h.click('Phát hành mới'); h.render()
+  h.click('Sửa phiên bản'); h.render()
+  h.change('Phiên bản', '2.0.0'); h.render(); submitPackage(h); h.render()
   assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Enhance (Commit message)').props.disabled, true)
   const packaged = await h.flush()
   assert.ok(packaged.includes('Đã đóng gói v2.0.0'))
@@ -231,9 +233,9 @@ test('Admin reimport clears unavailable/default skills and logout clears prior i
   await openAdmin(h)
   h.click('Chọn thư mục & nhập'); await h.flush()
   h.change('Skill cho Enhance (Commit message)', 'review'); h.render()
-  h.setSkills(['other']); h.click('Chọn thư mục & nhập'); await h.flush()
+  h.setSkills(['other']); h.click('Đổi thư mục'); await h.flush()
   assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Enhance (Commit message)').props.value, '')
-  h.setLatest(''); h.setSkills(['team-commit']); h.click('Chọn thư mục & nhập'); await h.flush()
+  h.setLatest(''); h.setSkills(['team-commit']); h.click('Đổi thư mục'); await h.flush()
   assert.equal(h.find(node => node.props['aria-label'] === 'Skill cho Enhance (Commit message)').props.value, '')
   h.change('Skill cho Enhance (Commit message)', 'team-commit'); h.render()
   h.click('Tài khoản'); h.render(); h.click('Đăng xuất'); await h.flush()
