@@ -410,11 +410,51 @@ async function main() {
     await run('6/10 Settings light theme and no horizontal overflow', async () => {
       await key(',', 'Comma', 188, primary)
       await until('Boolean(document.querySelector(".settings-content select option[value=light]"))', 'Settings appearance theme selector')
+      const assertSettingsFit = async theme => {
+        await command('Runtime.evaluate', { expression: 'new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))', awaitPromise: true })
+        const settings = await evaluate(`(() => {
+          const content=document.querySelector('.settings-content--general'), modal=content.closest('.modal'), shortcuts=content.querySelector('[data-testid="settings-shortcuts"]');
+          const select=content.querySelector('select'), row=select.closest('.setting-row');
+          return {theme:document.documentElement.dataset.theme,text:content.textContent,collapsed:!shortcuts.open,scrollHeight:content.scrollHeight,clientHeight:content.clientHeight,scrollWidth:content.scrollWidth,clientWidth:content.clientWidth,modalHeight:modal.getBoundingClientRect().height,height:innerHeight,selectWidth:select.getBoundingClientRect().width,rowWidth:row.clientWidth};
+        })()`)
+        assert.equal(settings.theme, theme)
+        assert.doesNotMatch(settings.text, /máy chủ bên ngoài|Nâng cao|xterm\.js/)
+        assert.equal(settings.collapsed, true, 'Shortcuts must start collapsed')
+        assert.ok(settings.scrollHeight <= settings.clientHeight, `${theme} Settings vertical cutoff: ${settings.scrollHeight} > ${settings.clientHeight}`)
+        assert.ok(settings.scrollWidth <= settings.clientWidth, `${theme} Settings horizontal overflow: ${settings.scrollWidth} > ${settings.clientWidth}`)
+        assert.ok(settings.modalHeight <= settings.height * 0.88 + 1, 'Settings must respect the 88dvh modal limit')
+        assert.ok(settings.selectWidth >= 112 && settings.selectWidth < settings.rowWidth / 2, 'Theme selector must stay compact')
+      }
+      await assertSettingsFit('dark')
+      await shot('04a-settings-dark.png')
+      await command('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
+      await assertSettingsFit('dark')
+      await command('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false })
       // Native keyboard input drives the same select/change path as a user, without touching React state.
       await evaluate('[...document.querySelectorAll(".settings-content select")].find(e=>e.querySelector("option[value=light]")).focus()')
       await key('End', 'End', 35)
       await key('Enter', 'Enter', 13)
       await until('document.documentElement.dataset.theme === "light"', 'Light theme applied')
+      await assertSettingsFit('light')
+      await shot('04b-settings-light.png')
+      await command('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
+      await assertSettingsFit('light')
+      await command('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false })
+      await click('[data-testid="settings-shortcuts"] summary', 'expand Settings shortcuts')
+      await until('document.querySelector("[data-testid=settings-shortcuts]")?.open === true', 'Settings shortcuts expanded')
+      const shortcuts = await evaluate(`['dt','dd'].map(tag=>[...document.querySelectorAll('[data-testid="settings-shortcuts"] '+tag)].filter(e=>e.checkVisibility()).length)`)
+      assert.deepEqual(shortcuts, [10, 10], 'All ten shortcut keys and descriptions must become visible')
+      await shot('04c-settings-shortcuts-light.png')
+      await click('[data-testid="settings-shortcuts"] summary', 'collapse Settings shortcuts')
+      await until('document.querySelector("[data-testid=settings-shortcuts]")?.open === false', 'Settings shortcuts collapsed')
+      await assertSettingsFit('light')
+      for (const [tab, selector] of [['AmeKit', '.amekit-core'], ['Pairing', '.pairing-settings'], ['Desktop Pet', '.pet-settings']]) {
+        await clickButton('.settings-navigation', tab)
+        await until(`Boolean(document.querySelector(${quote(selector)}))`, `${tab} Settings remains selectable`)
+        assert.equal(await evaluate(`(() => {const e=document.querySelector(${quote(selector)});return e.scrollWidth>e.clientWidth})()`), false, `${tab} Settings must not overflow horizontally`)
+      }
+      await clickButton('.settings-navigation', 'Giao diện & hệ thống')
+      await assertSettingsFit('light')
       await click('.modal[aria-label="Cài đặt"] header button[aria-label="Đóng"]', 'close Settings')
       await until('!document.querySelector(".modal")', 'Settings closed')
       await command('Runtime.evaluate', { expression: 'new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))', awaitPromise: true })
@@ -663,7 +703,7 @@ async function main() {
       const setTimelinePreset = async (label, expected) => {
         await key(',', 'Comma', 188, primary)
         await until('[...document.querySelectorAll(".settings-content .setting-row__title")].some(e=>e.textContent.trim()==="Tiến trình chat")', 'Vietnamese timeline preset setting')
-        const rowSelector = await evaluate(`(() => {const row=[...document.querySelectorAll('.settings-content .setting-row')].find(e=>e.querySelector('.setting-row__title')?.textContent.trim()==='Tiến trình chat');return '.settings-content .setting-row:nth-child('+([...row.parentElement.children].indexOf(row)+1)+')'})()`)
+        const rowSelector = await evaluate(`(() => {const row=[...document.querySelectorAll('.settings-content .setting-row')].find(e=>e.querySelector('.setting-row__title')?.textContent.trim()==='Tiến trình chat');return '.settings-content .setting-row[data-setting="'+row.dataset.setting+'"]'})()`)
         assert.deepEqual(await evaluate(`[...document.querySelector(${quote(rowSelector)}).querySelectorAll('.segmented button')].map(e=>e.textContent.trim())`), ['Gọn', 'Chi tiết', 'Đầy đủ'], 'Timeline presets must use unambiguous Vietnamese labels')
         await clickButton(rowSelector, label)
         await until(`document.querySelector(${quote(rowSelector + ' .segmented .is-active')})?.textContent.trim() === ${quote(label)} && JSON.parse(localStorage.getItem('ame.ide.layout.v1'))?.timelineDetail === ${quote(expected)}`, `${label} timeline preference applied and persisted`)

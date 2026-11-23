@@ -9,5 +9,6 @@ import './parity.css'
 import './components/chat-rich.css'
 import './agent-map.css'
 import './chat-timeline.css'
+import './settings.css'
 
 createRoot(document.getElementById('root')!).render(<App />)

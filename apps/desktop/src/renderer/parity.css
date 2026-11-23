@@ -432,10 +432,6 @@ button:focus:not(:focus-visible) { outline: none; }
 .pairing-dialog > p { line-height: 1.6; }
 .pairing-dialog .button-row { display: flex; justify-content: center; }
 .pairing-dialog .pairing-code { min-height: 120px; text-align: center; }
-.settings-content .segmented { padding: 0; border: 0; }
-.settings-content .setting-row { gap: 12px; }
-.settings-content .segmented button { white-space: nowrap; }
-.settings-content .segmented__btn.is-active { background: var(--accent-soft); color: var(--accent); }
 .agent-row { display: flex; width: 100%; align-items: center; gap: 10px; text-align: left; border: 0; border-bottom: 1px solid var(--border-subtle); border-radius: 0; }
 .agent-row.active { background: var(--bg-hover); }
 .agent-row small { display: block; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
