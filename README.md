@@ -55,6 +55,12 @@ Backend riêng cấu hình `experimental.subagent_depth: 3`: root (depth 0) → 
 
 Panel **Agents** là cây session thực theo `parentID`, không phải danh sách agent có thể chọn. Mỗi hàng có trạng thái native và số descendant còn chạy; parent đã hoàn thành/dừng không đồng nghĩa toàn bộ cây đã xong. Chọn hàng để mở chat của tác vụ con. Danh sách agent ở composer vẫn là catalog riêng. Session được tải hết qua cursor; session mồ côi vẫn hiện nếu parent đã archive/không có trong danh sách.
 
+### Agent Map
+
+Bấm **Agent map** / **N subagent** trong composer hoặc **Agent map** ở đầu drawer Agents để xem sơ đồ ngang toàn bộ cây từ tác nhân gốc, kể cả khi đang mở chat con. Bấm một node để xem agent/model, trạng thái, thời gian, tokens, skills, prompt đầu tiên/gần nhất, output Markdown và công cụ đã gọi. Liên kết cha/con chuyển giữa các chi tiết; file chip mở đúng dòng trong workspace. Có thể sao chép prompt/output, mở phiên hoặc dừng agent đang chạy. Escape quay về sơ đồ, Escape lần nữa đóng hộp thoại.
+
+Sơ đồ tự cập nhật khi mở; tối đa 200 tác nhân và 200 message gần nhất mỗi phiên. Token tổng ưu tiên thống kê native đầy đủ của phiên; prompt/output/công cụ có thể thiếu khi lịch sử vượt giới hạn. Không tải Agent Map khi chỉ hiển thị badge trong composer.
+
 ## Pairing với OpenCode Android
 
 1. Mở Ame IDE, chờ backend tích hợp sẵn sàng.

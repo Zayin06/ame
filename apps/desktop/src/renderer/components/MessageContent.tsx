@@ -1,7 +1,6 @@
 import { type ReactNode } from 'react'
 import { parseFileRef, parseMarkdown, type BlockNode, type InlineNode } from '../markdown-parser'
 import { CopyButton } from './ToolCard'
-import './chat-rich.css'
 
 type OpenFile = (path: string, line?: number) => void
 

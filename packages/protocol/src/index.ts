@@ -67,6 +67,56 @@ export type TerminalInfo = { id: string; projectID: string; title: string; cols:
 export type TerminalSnapshot = TerminalInfo & { output: string; sequence: number }
 export type TerminalEvent = { type: 'terminal'; projectID: string; terminalID: string; sequence: number; data?: string; exitCode?: number }
 export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState } | { type: 'debug'; projectID: string; event: DebugEvent }
+export type AgentMapTokens = {
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  total: number
+}
+export type AgentMapSkill = { name: string; count: number }
+export type AgentMapTool = {
+  name: string
+  calls: number
+  errors: number
+  running: number
+  durationMs: number
+}
+export type AgentMapNode = {
+  id: string
+  parentID?: string
+  depth: number
+  title: string
+  agent: string
+  model?: string
+  providerID?: string
+  variant?: string
+  status: 'running' | 'idle'
+  outcome?: 'succeeded' | 'failed' | 'interrupted'
+  createdAt?: number
+  updatedAt?: number
+  durationMs?: number
+  tokens: AgentMapTokens
+  prompt: string
+  latestPrompt?: string
+  promptCount: number
+  output: string
+  error?: string
+  skills: AgentMapSkill[]
+  tools: AgentMapTool[]
+  childIDs: string[]
+  spawnedByTitle?: string
+  spawnedByAgent?: string
+  historyComplete: boolean
+}
+export type AgentMapView = {
+  rootID: string
+  activeSessionID: string
+  nodes: AgentMapNode[]
+  limited: boolean
+  fetchedAt: number
+}
 export interface DesktopApi {
   platform(): Promise<string>
   artifacts(projectID: string, sessionID?: string): Promise<ArtifactSummary[]>
@@ -150,6 +200,7 @@ export interface DesktopApi {
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
   sessionUsage(projectID: string, sessionID: string): Promise<SessionUsageView>
+  agentMap(projectID: string, sessionID: string): Promise<AgentMapView>
   models(projectID: string): Promise<Model[]>
   agents(projectID: string): Promise<Agent[]>
   prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string): Promise<void>

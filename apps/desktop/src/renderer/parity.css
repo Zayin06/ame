@@ -123,7 +123,12 @@
 .composer-toolbar__right { min-width: 0; flex-shrink: 0; flex-wrap: nowrap; }
 .composer-toolbar .send-btn { width: 28px; height: 28px; flex-shrink: 0; padding: 0; }
 .composer-toolbar .send-btn svg { width: 15px; height: 15px; }
-.ctx-strip-chip { height: 22px; padding: 0 8px; gap: 5px; font-size: 11px; min-width: 0; max-width: 100%; }
+.composer-context-strip { flex-wrap: nowrap; min-width: 0; }
+.ctx-strip-chip { height: 22px; padding: 0 8px; gap: 5px; font-size: 11px; min-width: 0; max-width: 100%; overflow: hidden; }
+.agent-map-trigger { display: inline-flex; align-items: center; gap: 5px; height: 20px; margin-left: auto; flex-shrink: 0; padding: 0 7px; border: 1px solid var(--border-default); border-radius: 10px; background: var(--bg-canvas-subtle); color: var(--text-secondary); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.agent-map-trigger:hover, .chat-drawer__action:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+.chat-drawer__head-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.chat-drawer__action { height: 24px; padding: 0 8px; border: 1px solid var(--border-default); border-radius: 6px; background: var(--bg-canvas-subtle); color: var(--text-secondary); font-size: 11px; white-space: nowrap; cursor: pointer; }
 .ctx-strip-chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ctx-strip-chip svg { width: 12px; height: 12px; color: var(--text-muted); flex-shrink: 0; }
 .composer-picker { position: relative; display: inline-flex; align-items: center; min-width: 0; max-width: 100%; border-radius: var(--radius-sm); }

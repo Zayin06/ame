@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { findPackagedExecutable } from './smoke-packaged.mjs'
@@ -51,6 +52,85 @@ async function fixture(root) {
   return projects
 }
 
+async function agentMapFixture(directory) {
+  const now = Date.now(), model = { id: 'gpt-6.1-sol', providerID: 'amecode' }
+  const tokens = (input, output, reasoning = 0, read = 0, write = 0) => ({ input, output, reasoning, cache: { read, write } })
+  const definitions = [
+    { id: 'ses_root', title: 'PaywallScreen.kt vùng cuộn độc lập', agent: 'build', outcome: 'succeeded', tokens: tokens(30000, 8200, 2000, 1500, 500), prompt: 'Coordinate the paywall scrolling change and all verification.', output: '## Paywall plan\n\nDelegate layout, build, and lint verification.', skills: [], tools: ['subagent'] },
+    { id: 'ses_l1_ui', parentID: 'ses_root', title: 'Adjust paywall scrolling layout', agent: 'android-dev', status: 'running', tokens: tokens(12000, 3200, 500, 1000, 300), prompt: 'Update PaywallScreen.kt scrolling region...', latestPrompt: 'Keep the footer fixed while the content scrolls independently.', output: '## Layout updated\n\nUpdated `src/app.ts:1` for independent scrolling.\n\n```typescript\nexport const alpha = "real workspace"\n```\n\nVerification: layout is ready for the build check.', skills: ['android-dev', 'ui-layout'], tools: ['read_file', 'edit_file', 'subagent'] },
+    { id: 'ses_l2_build', parentID: 'ses_l1_ui', title: 'Verify TypeScript & Vite build', agent: 'verifier', outcome: 'succeeded', tokens: tokens(2000, 800), prompt: 'Verify TypeScript and the Vite build for the scrolling change.', output: '## Verification passed\n\nTypeScript and Vite build completed successfully.', skills: ['build-check'], tools: ['bash'] },
+    { id: 'ses_l1_lint', parentID: 'ses_root', title: 'Static lint verification', agent: 'linter', outcome: 'failed', tokens: tokens(1500, 400), prompt: 'Run static lint verification on src/app.ts.', output: '## Lint verification\n\nResolve the reported issue in `src/app.ts:1`.', error: { type: 'LintError', message: 'Lint check failed in src/app.ts' }, skills: [], tools: ['bash'] },
+  ]
+  const sessions = definitions.map((node, index) => ({
+    id: node.id, ...(node.parentID ? { parentID: node.parentID } : {}), projectID: 'project_ui_e2e', title: node.title, agent: node.agent, model, cost: 0, tokens: node.tokens,
+    ...(node.outcome ? { outcome: node.outcome } : {}), location: { directory },
+    time: { created: now - 90000 + index * 1000, updated: now - 1000, busy: now - 60000, ...(node.status === 'running' ? {} : { idle: now - 1000 }) },
+  }))
+  const histories = new Map(definitions.map((node, index) => {
+    const created = sessions[index].time.created
+    const messages = [{ id: `${node.id}_user`, type: 'user', time: { created }, text: node.prompt }]
+    for (const [ordinal, name] of node.skills.entries()) messages.push({ id: `${node.id}_skill_${ordinal}`, type: 'skill', time: { created: created + 100 + ordinal }, skill: name, name, text: `Loaded ${name}` })
+    if (node.latestPrompt) messages.push({ id: `${node.id}_latest`, type: 'user', time: { created: created + 200 }, text: node.latestPrompt })
+    messages.push({
+      id: `${node.id}_assistant`, type: 'assistant', agent: node.agent, model, tokens: node.tokens, cost: 0,
+      time: { created: created + 300, completed: now - 1000 }, finish: node.error ? 'error' : 'stop', ...(node.error ? { error: node.error } : {}),
+      content: [
+        ...node.tools.map((name, ordinal) => ({ type: 'tool', id: `${node.id}_tool_${ordinal}`, name, time: { created: created + 400 + ordinal * 100, ran: created + 410 + ordinal * 100, completed: created + 490 + ordinal * 100 }, state: node.error ? { status: 'error', input: { path: 'src/app.ts' }, error: node.error } : { status: 'completed', input: name === 'subagent' ? { agent: 'verifier', description: 'Verify TypeScript & Vite build', prompt: definitions[2].prompt } : { path: 'src/app.ts' }, content: [{ type: 'text', text: `${name} completed` }] } })),
+        { type: 'text', text: node.output },
+      ],
+    })
+    if (node.outcome) messages.push({ id: `${node.id}_idle`, type: 'idle', time: { created: now - 500 }, outcome: node.outcome, ...(node.error ? { error: node.error } : {}) })
+    return [node.id, messages]
+  }))
+  const streams = new Set(), connections = new Set(), unexpected = [], requests = []
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1'), route = url.pathname
+    requests.push(`${req.method} ${route}`)
+    const json = (value, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)) }
+    if (req.method === 'GET' && route === '/api/info') return json({ version: '2.3.2', pid: process.pid, urls: [], paths: { tmp: directory } })
+    if (req.method === 'GET' && route === '/api/event') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+      streams.add(res)
+      res.write('data: {"type":"server.connected"}\n\n')
+      const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 5000)
+      res.on('close', () => { clearInterval(heartbeat); streams.delete(res) })
+      return
+    }
+    if (req.method === 'POST' && route === '/api/rpc/amekit-models/update') { req.resume(); return json({ output: true }) }
+    if (req.method === 'GET' && route === '/api/session') return json({ data: !url.searchParams.get('directory') || path.resolve(url.searchParams.get('directory')) === path.resolve(directory) ? sessions : [], cursor: {} })
+    const sessionRoute = /^\/api\/session\/([^/]+)(?:\/(message|permission|diff))?$/.exec(route)
+    if (req.method === 'GET' && sessionRoute) {
+      const [, id, resource] = sessionRoute
+      // Requests already queued while changing backends may still reference the previous native session.
+      if (!resource) return json({ data: sessions.find(session => session.id === id) ?? { ...sessions[0], id } })
+      if (resource === 'permission' || resource === 'diff') return json({ data: [] })
+      let messages = [...(histories.get(id) ?? [])]
+      if (url.searchParams.has('type')) messages = messages.filter(message => message.type === url.searchParams.get('type'))
+      if (url.searchParams.get('order') === 'desc') messages.reverse()
+      if (url.searchParams.has('limit')) messages = messages.slice(0, Number(url.searchParams.get('limit')))
+      return json({ data: messages, cursor: {} })
+    }
+    if (req.method === 'GET' && route === '/api/model') return json({ data: [{ ...model, modelID: model.id, name: model.id, type: 'chat', capabilities: { tools: true, input: ['text'], output: ['text'] }, variants: [], time: { released: now }, cost: [{ input: 0, output: 0 }], status: 'active', enabled: true, limit: { context: 200000, output: 8192 } }] })
+    if (req.method === 'GET' && route === '/api/agent') return json({ data: [...new Set(definitions.map(node => node.agent))].map(id => ({ id, name: id, mode: 'all', hidden: false, request: { settings: {}, headers: {}, body: {} }, permissions: [] })) })
+    if (req.method === 'GET' && route === '/api/skill') return json({ data: ['android-dev', 'ui-layout', 'build-check'].map(name => ({ id: name, name, description: `E2E ${name}`, path: path.join(directory, '.opencode', 'skills', name, 'SKILL.md'), content: `# ${name}` })) })
+    if (req.method === 'GET' && ['/api/command', '/api/experimental/artifacts'].includes(route)) return json({ data: [] })
+    unexpected.push(`${req.method} ${route}`)
+    json({ name: 'NotFoundError', message: `Unexpected fixture endpoint: ${route}` }, 404)
+  })
+  server.on('connection', connection => { connections.add(connection); connection.on('close', () => connections.delete(connection)) })
+  async function close() {
+    const closed = new Promise(resolve => server.close(() => resolve()))
+    for (const stream of streams) stream.end()
+    for (const connection of connections) connection.destroy()
+    server.closeAllConnections()
+    await closed
+  }
+  try {
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+    return { url: `http://127.0.0.1:${server.address().port}`, sessions, unexpected, requests, streams, close }
+  } catch (error) { await close(); throw error }
+}
+
 async function main() {
   const config = options(process.argv.slice(2))
   let executable, launchArgs = []
@@ -67,7 +147,7 @@ async function main() {
   }
   // Keep every disposable project/profile inside this checkout, never in a shared OS temp directory.
   const root = await mkdtemp(path.join(repoRoot, '.ame-ui-e2e-'))
-  let child, socket, spawnError, interrupted, sequence = 0, logs = '', step = 'fixture setup'
+  let child, socket, mockServer, spawnError, interrupted, sequence = 0, logs = '', step = 'fixture setup'
   const pending = new Map(), runtimeErrors = [], consoleErrors = [], logErrors = []
   const interrupt = signal => {
     interrupted = new Error(`Interrupted by ${signal}`)
@@ -89,8 +169,8 @@ async function main() {
       try { socket.send(JSON.stringify({ id, method, params })) } catch (error) { finish(error) }
     })
   }
-  async function evaluate(expression) {
-    const result = await command('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true })
+  async function evaluate(expression, timeout = 10000) {
+    const result = await command('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true }, timeout)
     if (result.exceptionDetails) throw new Error(`DOM evaluation failed: ${JSON.stringify(result.exceptionDetails)}`)
     return result.result.value
   }
@@ -144,6 +224,22 @@ async function main() {
     await key('Backspace', 'Backspace', 8)
     if (value) await command('Input.insertText', { text: value })
     await until(`document.querySelector(${quote(selector)})?.value === ${quote(value)}`, `input value ${quote(value)}`)
+  }
+  async function clickButton(scope, text) {
+    const predicate = `(() => {const scope=document.querySelector(${quote(scope)});return scope && [...scope.querySelectorAll('button')].find(e=>e.textContent.trim()===${quote(text)} && e.getClientRects().length)})()`
+    await until(`Boolean(${predicate})`, `button ${text} in ${scope}`)
+    const selector = await evaluate(`(() => {let e=${predicate};const parts=[];while(e && e!==document.documentElement){parts.unshift(e.tagName.toLowerCase()+':nth-child('+([...e.parentElement.children].indexOf(e)+1)+')');e=e.parentElement}return 'html>'+parts.join('>')})()`)
+    await click(selector, text)
+  }
+  async function setTheme(theme) {
+    await key(',', 'Comma', 188, primary)
+    await until('Boolean(document.querySelector(".settings-content select option[value=light]"))', 'Settings theme selector')
+    await evaluate('[...document.querySelectorAll(".settings-content select")].find(e=>e.querySelector("option[value=light]")).focus()')
+    await key(theme === 'dark' ? 'Home' : 'End', theme === 'dark' ? 'Home' : 'End', theme === 'dark' ? 36 : 35)
+    await key('Enter', 'Enter', 13)
+    await until(`document.documentElement.dataset.theme === ${quote(theme)}`, `${theme} theme applied through Settings`)
+    await click('.modal[aria-label="Cài đặt"] header button[aria-label="Đóng"]', 'close Settings')
+    await until('!document.querySelector(".modal")', 'Settings closed')
   }
   async function shot(name) {
     if (!config.shotsDir) return
@@ -219,7 +315,7 @@ async function main() {
     assert.deepEqual(await evaluate('[...document.querySelectorAll(".project-select .proj-name")].map(e=>e.textContent).sort()'), ['alpha', 'beta', 'gamma'], 'App must load only this suite\'s isolated projects')
     assert.deepEqual(await evaluate('[...document.querySelectorAll(".project-select")].map(e=>e.title).sort()'), projects.map(project => project.directory).sort(), 'CDP must attach to this launch and its unique project directories')
 
-    await run('1/7 legacy tabs self-heal and README renders', async () => {
+    await run('1/8 legacy tabs self-heal and README renders', async () => {
       const absoluteReadme = `${alphaDir}${path.sep}README.md`
       const legacy = { theme: 'dark', project: 'alpha', rail: true, stage: true, inspector: false, terminalOpen: false, panel: 'files', projects: { alpha: { tabs: [{ path: alphaDir, mode: 'file' }, { path: absoluteReadme, mode: 'file' }], active: `file:${alphaDir}`, selectedTabs: { file: `file:${alphaDir}` } } } }
       await evaluate(`localStorage.setItem('ame.ide.layout.v1', ${quote(JSON.stringify(legacy))}); window.__uiE2eBeforeReload = true`)
@@ -231,7 +327,7 @@ async function main() {
       await shot('01-self-healed-open-file.png')
     })
 
-    await run('2/7 project switching, filter, and Explorer binary open', async () => {
+    await run('2/8 project switching, filter, and Explorer binary open', async () => {
       for (const name of ['beta', 'gamma', 'alpha']) {
         await click(`.project-select[title=${quote(projects.find(project => project.id === name).directory)}]`, `select ${name}`)
         await until(`document.querySelector('.is-active-proj .proj-name')?.textContent === ${quote(name)}`, `active sidebar project ${name}`)
@@ -250,7 +346,7 @@ async function main() {
       await click('.tree-row[title="assets/logo.png"]', 'open binary logo.png')
     })
 
-    await run('3/7 friendly inline binary error and close recovery', async () => {
+    await run('3/8 friendly inline binary error and close recovery', async () => {
       await until('Boolean(document.querySelector(".editor-load-error[role=alert]"))', 'inline binary load error')
       const message = await evaluate('document.querySelector(".editor-load-error").textContent')
       assert.match(message, /Không thể xem trước tệp nhị phân/, 'Binary error must be humanized in Vietnamese')
@@ -266,7 +362,7 @@ async function main() {
       await noGlobalError()
     })
 
-    await run('4/7 Ctrl+P package.json and split/merge editor', async () => {
+    await run('4/8 Ctrl+P package.json and split/merge editor', async () => {
       await key('p', 'KeyP', 80, primary)
       await type('.quick-open__input', 'package.json')
       await until('[...document.querySelectorAll(".quick-open__path")].some(e=>e.textContent === "package.json")', 'package.json in QuickOpen results')
@@ -280,7 +376,7 @@ async function main() {
       await until('document.querySelectorAll(".editor-group").length === 1', 'merged editor group')
     })
 
-    await run('5/7 real rename collision produces opaque non-overlapping toast', async () => {
+    await run('5/8 real rename collision produces opaque non-overlapping toast', async () => {
       await click('button[aria-label="Thao tác package.json"]', 'package.json Explorer menu')
       await click('button[aria-label="Rename package.json"]', 'Rename package.json')
       await type('.insp-inline-name input[aria-label="Tên mới"]', 'README.md')
@@ -304,7 +400,7 @@ async function main() {
       await click('.insp-inline-name button[aria-label="Hủy nhập tên"]', 'cancel failed rename')
     })
 
-    await run('6/7 Settings light theme and no horizontal overflow', async () => {
+    await run('6/8 Settings light theme and no horizontal overflow', async () => {
       await key(',', 'Comma', 188, primary)
       await until('Boolean(document.querySelector(".settings-content select option[value=light]"))', 'Settings appearance theme selector')
       // Native keyboard input drives the same select/change path as a user, without touching React state.
@@ -326,7 +422,171 @@ async function main() {
       await shot('04-light-mode-clean.png')
     })
 
-    await run('7/7 zero runtime/console errors and clean Electron exit', async () => {
+    await run('7A/8 real bundled OpenCode Agent map', async () => {
+      await setTheme('dark')
+      await until('window.ame.connection().then(connection=>connection.connected && connection.version === "2.3.2")', 'bundled OpenCode 2.3.2 connection', 30000)
+      const session = await evaluate('window.ame.createSession("alpha")')
+      assert.ok(session.id, 'Bundled server must create a real session')
+      await click('[data-chat-drawer="agents"]', 'open real native session drawer')
+      await click(`.agent-row[data-session-id=${quote(session.id)}]`, 'select real bundled session')
+      await until(`document.querySelector('.agent-row[data-session-id=${quote(session.id)}]')?.getAttribute('aria-selected') === 'true'`, 'real session selected')
+      await click('button[aria-label="Đóng công cụ Chat"]', 'close session drawer')
+      await click('[data-testid="agent-map-trigger"]', 'open real Agent map')
+      await until('Boolean(document.querySelector(\'[role=dialog][aria-label="Agent map"]\'))', 'real Agent map dialog')
+      await click(`.agent-map-card[data-agent-node-id=${quote(session.id)}]`, 'real bundled root card')
+      await until('Boolean(document.querySelector(".agent-map-detail__title")) && document.querySelector(".agent-map-detail__meta")?.textContent.includes("main agent")', 'real Agent map detail')
+      await until('[...document.querySelectorAll(".agent-map-detail__header button")].some(e=>e.textContent.trim()==="Đang mở" && e.disabled)', 'real current-session action')
+      await click('button[aria-label="Đóng Agent map"]', 'close real Agent map')
+      await until('!document.querySelector(".agent-map-dialog")', 'real Agent map closed')
+      await noGlobalError()
+      await rendererClean()
+    })
+
+    await run('7B/8 protocol-backed nested Agent map, inspector and themes', async () => {
+      mockServer = await agentMapFixture(alphaDir)
+      try {
+        const response = await fetch(`${mockServer.url}/api/info`, { signal: AbortSignal.timeout(2000) })
+        assert.equal(response.status, 200, 'Temporary protocol server must be responsive')
+        assert.equal((await response.json()).version, '2.3.2')
+        const connected = await evaluate(`window.ame.connect(${quote(mockServer.url)})`, 30000)
+        assert.equal(connected.connected, true, 'Desktop must attach to the protocol server')
+        assert.equal(connected.url, mockServer.url)
+        await click('[data-chat-drawer="agents"]', 'open mock native session drawer')
+        await click('.agent-row[data-session-id="ses_l1_ui"]', 'select depth-1 session')
+        await until('document.querySelector(\'.agent-row[data-session-id="ses_l1_ui"]\')?.getAttribute("aria-selected") === "true"', 'nested session selected')
+        await click('button[aria-label="Đóng công cụ Chat"]', 'close session drawer')
+        await until('document.querySelector("[data-testid=agent-map-trigger]")?.textContent.includes("3 subagent")', 'family count on composer Agent map trigger')
+        const composerStrip = await evaluate(`(() => {
+          const strip=document.querySelector('.composer-context-strip').getBoundingClientRect();
+          const chip=document.querySelector('.composer-context-strip .ctx-strip-chip').getBoundingClientRect();
+          const trigger=document.querySelector('[data-testid="agent-map-trigger"]').getBoundingClientRect();
+          return {chip:{right:chip.right,top:chip.top,height:chip.height},trigger:{left:trigger.left,top:trigger.top,height:trigger.height},height:strip.height};
+        })()`)
+        assert.ok(composerStrip.chip.right <= composerStrip.trigger.left + 1, 'Context chip must not horizontally overlap the Agent map trigger')
+        assert.ok(Math.abs(composerStrip.chip.top - composerStrip.trigger.top) < 4, 'Context chip and Agent map trigger must remain on one row')
+        assert.ok(composerStrip.height <= 28 && composerStrip.chip.height <= 28 && composerStrip.trigger.height <= 28, 'Composer context strip must stay within 28px height')
+        await shot('05a-composer-strip-dark.png')
+        await click('[data-testid="agent-map-trigger"]', 'open nested Agent map')
+        await until('document.querySelectorAll(".agent-map-card").length === 4', 'full root-to-depth-2 family loaded from nested session')
+        await until('document.querySelector(".agent-map__canvas")?.textContent.includes("/android-dev") && document.querySelector(".agent-map__canvas")?.textContent.includes("/build-check")', 'skill badges on graph')
+        // Wait for the modal transition before measuring actual rendered card geometry.
+        await sleep(300)
+        const graph = await evaluate(`(() => {
+          const cards=[...document.querySelectorAll('.agent-map-card')].map(e=>{const r=e.getBoundingClientRect();return {id:e.dataset.agentNodeId,depth:Number(e.dataset.depth),status:e.dataset.status,text:e.textContent,active:e.classList.contains('is-active'),parent:e.closest('.agent-map-branch')?.parentElement?.closest('.agent-map-branch')?.querySelector('.agent-map-card')?.dataset.agentNodeId,rect:{left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width,height:r.height}}});
+          return {theme:document.documentElement.dataset.theme,cards,subtitle:document.querySelector('.agent-map__subtitle')?.textContent,connectors:document.querySelectorAll('.agent-map-children .agent-map-child').length,nestedButtons:document.querySelectorAll('.agent-map-card button').length,overflow:['.app-shell','.workspace-body'].map(selector=>{const e=document.querySelector(selector);return {selector,scrollWidth:e.scrollWidth,clientWidth:e.clientWidth}})};
+        })()`)
+        assert.equal(graph.theme, 'dark')
+        assert.match(graph.subtitle, /3 subagent/)
+        assert.match(graph.subtitle, /1 đang chạy/)
+        assert.equal(graph.connectors, 3, 'Every non-root node must have a connector wrapper')
+        assert.equal(graph.nestedButtons, 0, 'Graph cards must never contain nested buttons')
+        const expected = [
+          { id: 'ses_root', depth: 0, status: 'succeeded', title: 'PaywallScreen.kt vùng cuộn độc lập' },
+          { id: 'ses_l1_ui', depth: 1, parent: 'ses_root', status: 'running', title: 'Adjust paywall scrolling layout' },
+          { id: 'ses_l2_build', depth: 2, parent: 'ses_l1_ui', status: 'succeeded', title: 'Verify TypeScript & Vite build' },
+          { id: 'ses_l1_lint', depth: 1, parent: 'ses_root', status: 'failed', title: 'Static lint verification' },
+        ]
+        assert.deepEqual(graph.cards.map(card=>card.id).sort(), expected.map(card=>card.id).sort())
+        for (const node of expected) {
+          const card = graph.cards.find(card=>card.id === node.id)
+          assert.equal(card.depth, node.depth, `Depth for ${node.id}`)
+          assert.equal(card.status, node.status, `Status for ${node.id}`)
+          assert.equal(card.parent, node.parent, `Connector parent for ${node.id}`)
+          assert.ok(card.text.includes(node.title), `Missing title for ${node.id}`)
+          assert.ok(card.rect.width > 0 && card.rect.height > 0, `Empty card for ${node.id}`)
+          if (node.parent) assert.ok(card.rect.left > graph.cards.find(parent=>parent.id === node.parent).rect.right, `Graph must flow left-to-right into ${node.id}`)
+        }
+        const active = graph.cards.find(card=>card.id === 'ses_l1_ui')
+        assert.equal(active.active, true)
+        assert.match(active.text, /Đang xem/)
+        assert.match(graph.cards.find(card=>card.id === 'ses_root').text, /gpt-6\.1-sol.*42\.2k tokens/)
+        for (let i = 0; i < graph.cards.length; i++) for (let j = i + 1; j < graph.cards.length; j++) {
+          const a = graph.cards[i], b = graph.cards[j]
+          const overlap = Math.max(0, Math.min(a.rect.right,b.rect.right)-Math.max(a.rect.left,b.rect.left)) * Math.max(0, Math.min(a.rect.bottom,b.rect.bottom)-Math.max(a.rect.top,b.rect.top))
+          assert.equal(overlap, 0, `Cards ${a.id} and ${b.id} overlap`)
+        }
+        for (const surface of graph.overflow) assert.ok(surface.scrollWidth <= surface.clientWidth, `Horizontal overflow at ${surface.selector}`)
+        for (const [width, height] of [[1440, 900], [1100, 800]]) {
+          await command('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
+          const layout = await evaluate(`(() => {const dialog=document.querySelector('.agent-map-dialog').getBoundingClientRect();return {left:dialog.left,right:dialog.right,top:dialog.top,bottom:dialog.bottom,width:innerWidth,height:innerHeight,overflow:document.documentElement.scrollWidth>innerWidth || document.body.scrollWidth>innerWidth}})()`)
+          assert.ok(layout.left >= 0 && layout.right <= layout.width && layout.top >= 0 && layout.bottom <= layout.height, `Agent map must fit ${width}×${height}`)
+          assert.equal(layout.overflow, false, `Agent map must not overflow the page at ${width}×${height}`)
+        }
+        await command('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
+        await shot('05-agent-map-graph-dark.png')
+        await click('.agent-map-card[data-agent-node-id="ses_l1_ui"]', 'inspect layout subagent')
+        await until('document.querySelector(".agent-map-detail__title")?.textContent === "Adjust paywall scrolling layout"', 'layout agent inspector')
+        await until('document.querySelector(".agent-map-detail__body .file-chip")?.textContent.includes("src/app.ts")', 'Markdown workspace file chip')
+        const detail = await evaluate(`(() => {const body=document.querySelector('.agent-map-detail__body');return {text:body.textContent,meta:body.querySelector('.agent-map-detail__meta')?.textContent,prompt:body.querySelector('.agent-map-prompt')?.textContent,skills:body.querySelector('.agent-map-skill-list')?.textContent,code:body.querySelector('pre code')?.textContent,back:Boolean(document.querySelector('button[aria-label="Quay lại Agent map"] svg')),copyPrompt:Boolean(document.querySelector('button[aria-label="Sao chép prompt"]')),copyOutput:Boolean(document.querySelector('button[aria-label="Sao chép kết quả"]')),actions:[...document.querySelectorAll('.agent-map-detail__header button')].filter(e=>!e.disabled).map(e=>e.textContent.trim())}})()`)
+        const detailDialog = await evaluate(`(() => {const dialog=document.querySelector('.agent-map-dialog');return {isDetail:dialog.classList.contains('agent-map-dialog--detail'),width:dialog.getBoundingClientRect().width}})()`)
+        assert.equal(detailDialog.isDetail, true, 'Inspector must use the detail dialog modifier')
+        assert.ok(detailDialog.width <= 760, 'Inspector must use a compact reading column')
+        assert.equal(detail.back, true, 'Inspector must expose the back-arrow control')
+        assert.match(detail.meta, /Được gọi bởi\s*PaywallScreen\.kt vùng cuộn độc lập/)
+        assert.match(detail.meta, /android-dev.*gpt-6\.1-sol.*subagent L1/)
+        assert.match(detail.meta, /In .*Out .*Reasoning .*Cache/)
+        assert.match(detail.skills, /\/android-dev/)
+        assert.match(detail.skills, /\/ui-layout/)
+        assert.equal(detail.prompt, 'Update PaywallScreen.kt scrolling region...')
+        for (const heading of ['Skills đã gọi', 'Prompt đầu vào', 'Kết quả đầu ra', 'Công cụ đã dùng', 'Đã gọi subagent:']) assert.ok(detail.text.includes(heading), `Missing inspector section: ${heading}`)
+        for (const tool of ['read_file', 'edit_file', 'subagent']) assert.ok(detail.text.includes(tool), `Missing tool: ${tool}`)
+        assert.ok(detail.text.includes('Verify TypeScript & Vite build'), 'Inspector must show direct-child jump')
+        assert.match(detail.code, /export const alpha = "real workspace"/)
+        assert.equal(detail.copyPrompt, true)
+        assert.equal(detail.copyOutput, true)
+        assert.ok(detail.actions.includes('Dừng'), 'Running node must have stop action')
+        assert.equal(await evaluate('[...document.querySelectorAll(".agent-map-detail__header button")].some(e=>e.textContent.trim()==="Đang mở" && e.disabled)'), true, 'Current-session action must be disabled')
+        await command('Emulation.setDeviceMetricsOverride', { width: 1100, height: 800, deviceScaleFactor: 1, mobile: false })
+        const detailLayout = await evaluate(`(() => {const dialog=document.querySelector('.agent-map-dialog').getBoundingClientRect();return {left:dialog.left,right:dialog.right,top:dialog.top,bottom:dialog.bottom,width:innerWidth,height:innerHeight,overflow:document.documentElement.scrollWidth>innerWidth || document.body.scrollWidth>innerWidth}})()`)
+        assert.ok(detailLayout.left >= 0 && detailLayout.right <= detailLayout.width && detailLayout.top >= 0 && detailLayout.bottom <= detailLayout.height, 'Agent inspector must fit 1100×800')
+        assert.equal(detailLayout.overflow, false, 'Agent inspector must not overflow the page at 1100×800')
+        await command('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
+        await shot('06-agent-map-detail-dark.png')
+        await click('.agent-map-subdetails summary', 'expand latest prompt')
+        await until('document.querySelector(".agent-map-subdetails[open] .agent-map-prompt")?.textContent === "Keep the footer fixed while the content scrolls independently."', 'latest prompt and multi-turn history')
+        assert.match(await evaluate('document.querySelector(".agent-map-subdetails summary").textContent'), /2 lượt/)
+        await clickButton('.agent-map-detail__meta', 'Verify TypeScript & Vite build')
+        await until('document.querySelector(".agent-map-detail__title")?.textContent === "Verify TypeScript & Vite build"', 'child jump to depth-2 inspector')
+        assert.match(await evaluate('document.querySelector(".agent-map-detail__body").textContent'), /\/build-check/)
+        assert.equal(await evaluate('[...document.querySelectorAll(".agent-map-detail__header button")].some(e=>e.textContent.trim()==="Mở phiên" && !e.disabled)'), true, 'Other-session inspector must enable Mở phiên')
+        await key('Escape', 'Escape', 27)
+        await until('!document.querySelector(".agent-map-detail__title") && document.querySelectorAll(".agent-map-card").length === 4', 'Escape returns from detail to graph')
+        await key('Escape', 'Escape', 27)
+        await until('!document.querySelector(".agent-map-dialog")', 'second Escape closes Agent map')
+
+        await click('[data-chat-drawer="agents"]', 'open Agents drawer second entry point')
+        await clickButton('[data-testid="chat-drawer"][data-drawer="agents"]', 'Agent map')
+        await until('document.querySelectorAll(".agent-map-card").length === 4', 'Agent map opened through Agents drawer')
+        await click('.agent-map-card[data-agent-node-id="ses_l1_lint"]', 'inspect failed lint agent')
+        await until('document.querySelector(".agent-map-error-box[role=alert]")?.textContent === "Lint check failed in src/app.ts"', 'structured lint failure in inspector')
+        assert.match(await evaluate('document.querySelector(".agent-map-detail__meta").textContent'), /Thất bại/)
+        await clickButton('.agent-map-detail__meta', 'PaywallScreen.kt vùng cuộn độc lập')
+        await until('document.querySelector(".agent-map-detail__title")?.textContent === "PaywallScreen.kt vùng cuộn độc lập"', 'clickable parent jumps to root inspector')
+        await click('button[aria-label="Đóng Agent map"]', 'close inspector before Settings')
+        await until('!document.querySelector(".agent-map-dialog")', 'inspector closed')
+        if (await evaluate('Boolean(document.querySelector(".chat-corner-drawer.is-open"))')) await click('button[aria-label="Đóng công cụ Chat"]', 'close Agents drawer before Settings')
+        await setTheme('light')
+        await click('[data-chat-drawer="agents"]', 'open Light-theme Agents drawer')
+        await clickButton('[data-testid="chat-drawer"][data-drawer="agents"]', 'Agent map')
+        await until('document.documentElement.dataset.theme === "light" && document.querySelectorAll(".agent-map-card").length === 4', 'Light Agent map rendered')
+        await shot('07-agent-map-light.png')
+        await click('button[aria-label="Đóng Agent map"]', 'close Light Agent map')
+        await until('!document.querySelector(".agent-map-dialog")', 'Light Agent map closed')
+        await noGlobalError()
+        await rendererClean()
+        assert.ok(mockServer.requests.includes('GET /api/event'), 'Desktop must subscribe to real fixture SSE')
+        for (const session of mockServer.sessions) assert.ok(mockServer.requests.includes(`GET /api/session/${session.id}/message`), `Adapter must fetch history for ${session.id}`)
+      } finally {
+        // Keep SSE and fixture sessions available until Electron exits. startBackend() first
+        // disconnects the adapter and then loads the selected mock ID against the native server.
+        // The outer finally closes the fixture even when a flow or Electron shutdown fails.
+        await noGlobalError()
+        await rendererClean()
+      }
+      assert.deepEqual(mockServer.unexpected, [], 'No unexpected protocol endpoints or 404s')
+    })
+
+    await run('8/8 zero runtime/console errors and clean Electron exit', async () => {
       // Allow delayed worker/render failures to surface before and during Electron's quit lifecycle.
       await sleep(500)
       await rendererClean()
@@ -335,6 +595,10 @@ async function main() {
       assert.equal(child.signalCode, null, 'Electron must exit without a termination signal')
       assert.equal(child.exitCode, 0, 'Electron must exit with code 0')
       await rendererClean()
+      await mockServer.close()
+      assert.equal(mockServer.streams.size, 0, 'All mock SSE responses must be closed after Electron exits')
+      assert.deepEqual(mockServer.unexpected, [], 'No unexpected protocol endpoints during shutdown')
+      mockServer = undefined
     })
   } catch (error) {
     if (socket?.readyState === WebSocket.OPEN) { try { await shot('failure.png') } catch {} }
@@ -351,10 +615,13 @@ async function main() {
       } else { try { process.kill(-child.pid, 'SIGTERM') } catch {} }
       if (!await waitForExit(3000)) { child.kill('SIGKILL'); await waitForExit(2000) }
     }
-    try { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }) }
-    finally { process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm) }
+    try { if (mockServer) await mockServer.close() }
+    finally {
+      try { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }) }
+      finally { process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm) }
+    }
   }
-  console.log(`PASS UI E2E (${config.dev ? 'dev build' : 'packaged'}, ${process.platform}-${process.arch}): all 7 live flows; isolated fixtures cleaned up${config.shotsDir ? `; screenshots: ${config.shotsDir}` : ''}`)
+  console.log(`PASS UI E2E (${config.dev ? 'dev build' : 'packaged'}, ${process.platform}-${process.arch}): all 8 live flows (including 7A + 7B); isolated fixtures cleaned up${config.shotsDir ? `; screenshots: ${config.shotsDir}` : ''}`)
 }
 
 main().catch(error => { console.error(error.message); process.exitCode = 1 })

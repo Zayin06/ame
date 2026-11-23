@@ -49,6 +49,12 @@ After each completed execution, the timeline's native `snapshot.files`/`idle` pr
 
 Patch normalization is ported from the pinned OpenCode session UI and rendered using its `@pierre/diffs@1.6.1` dependency. No local HEAD/file reconstruction is used. Binary/empty patches and server truncation are explicitly labelled. Loading/errors/retry are distinct from an empty session. Project/session-scoped requests ignore disposed results; matching SSE events and reconnect invalidate the whole-session review.
 
+## Agent Map
+
+The composer and Agents drawer open a read-only Agent Map for the selected session's complete known family, including ancestors when opened from a nested session. Main validates project/session IDs; the adapter checks ownership, follows session-list cursors, then fetches the latest 200 messages per selected session with six concurrent requests and a 15-second timeout per request. The cycle-safe map is capped at 200 nodes; truncation and incomplete message history remain explicit rather than fabricated as complete data.
+
+A pure adapter projection combines native agent/model/status/outcome, session token totals (falling back to assistant messages), prompts, latest output, skills and tool activity. Running text overlays come from the existing SSE cache. The renderer's pure tree model and SSR-safe message rendering support deterministic tests. The modal refreshes on matching project events with a 250 ms debounce and polls every 2.5 seconds only while agents are running; the closed composer badge uses the existing session list without additional map requests. Detail navigation exposes parent/child links, workspace file links, copy, open-session and native cancel actions. Escape returns from detail to map, then closes the modal.
+
 ## Native nested execution
 
 The private OpenCode config sets `experimental.subagent_depth: 3`: root depth 0 plus three descendant generations. The native `subagent` tool enforces the boundary before creating depth 4; agent mode, model inheritance and permissions remain OpenCode-owned. AmeKit is embedded in core Settings and bundles remain native project agents/skills, not an extension-host dependency.

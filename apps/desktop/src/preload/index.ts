@@ -66,6 +66,7 @@ const api: DesktopApi = {
   generateCommitMessage: (id, model) => invoke('generateCommitMessage', id, model),
   sessionDiff: (id, session, from) => invoke('sessionDiff', id, session, from),
   sessionUsage: (id, session) => invoke('sessionUsage', id, session),
+  agentMap: (id, session) => invoke('agentMap', id, session),
   models: id => invoke('models', id), agents: id => invoke('agents', id),
   prompt: (id, session, text, model, agent) => invoke('prompt', id, session, text, model, agent),
   cancel: (id, session) => invoke('cancel', id, session), permissions: (id, session) => invoke('permissions', id, session),

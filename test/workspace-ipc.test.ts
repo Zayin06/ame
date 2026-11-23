@@ -20,6 +20,7 @@ type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
   { method: 'listFiles', args: ['p'] },
   { method: 'sessionUsage', args: ['p', 's'] },
+  { method: 'agentMap', args: ['p', 's'] },
   { method: 'createFile', args: ['p', 'new.txt', 'hello'] },
   { method: 'createDirectory', args: ['p', 'folder'] },
   { method: 'renamePath', args: ['p', 'old.txt', 'new.txt'] },
@@ -107,7 +108,7 @@ async function harness(directory = 'workspace') {
   let policyError = ''
   let policyGate: Promise<void> | undefined
   workspace.stagedDiffSummary = async (...args: unknown[]) => { calls.push({ method: 'stagedDiffSummary', args }); return summary }
-  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt'].map(method => [method, async (...args: unknown[]) => {
+  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args })
     if (operationGate) await operationGate
     return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
@@ -860,6 +861,10 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
     { method: 'archiveSession', args: ['p', 's', 'true'] },
     { method: 'deleteSession', args: ['p', ''] },
     ...[undefined, '', 42, null, 'x'.repeat(513)].map(session => ({ method: 'sessionUsage', args: ['p', session] })),
+    ...[undefined, '', '   ', 42, 'bad\0id', 'x'.repeat(513)].flatMap(value => [
+      { method: 'agentMap', args: [value, 's'] },
+      { method: 'agentMap', args: ['p', value] }
+    ]),
     ...[{}, { id: 'model', name: 'Model' }, { id: 'model', name: 'Model', providerID: 1 }, { id: 'model', name: 'Model', providerID: 'amecode', extra: true }].map(model => ({ method: 'generateCommitMessage', args: ['p', model] }))
   ]
   const invalidQueries = [
@@ -987,6 +992,22 @@ test('AI commit holds the authority queue through policy validation and generati
   release()
   await Promise.all([generate, following])
   assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'stagedDiffSummary', 'generateCommitMessage', 'account'])
+})
+
+test('Agent Map reads bypass an authority operation awaiting policy', { timeout: 5000 }, async () => {
+  const h = await harness()
+  let release!: () => void
+  h.gatePolicy(new Promise<void>(resolve => { release = resolve }))
+  const generate = h.dispatch('generateCommitMessage', ['p'])
+  await new Promise(resolve => setImmediate(resolve))
+  try {
+    assert.equal(await h.dispatch('agentMap', ['p', 's']), 'agentMap')
+    assert.deepEqual(plain(h.calls.at(-1)), { method: 'agentMap', args: ['p', 's'] })
+    assert.deepEqual(h.messages, [])
+  } finally {
+    release()
+    await generate
+  }
 })
 
 test('replacement previews before confirmation, cancels without writes, and skips zero-match dialogs', async () => {

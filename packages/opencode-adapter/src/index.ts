@@ -3,7 +3,8 @@ import { Service } from '@opencode/client/service'
 import path from 'node:path'
 import { summarizeUsage, usageFamily, type UsageNode } from '../../amekit/src/usage'
 import type { UsagePrices } from '../../amekit/src/usage-pricing'
-import type { Agent, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
+import type { Agent, AgentMapView, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
+import { buildAgentMap, resolveAgentMapFamily } from './agent-map'
 
 export function localURL(value: string) {
   const url = new URL(value)
@@ -228,6 +229,37 @@ export class OpenCodeAdapter {
       }
     }))
     return { origin, nodes, limited }
+  }
+  async agentMap(projectID: string, sessionID: string): Promise<AgentMapView> {
+    await this.owned(projectID, sessionID)
+    const sessions = new Map<string, SessionInfo>()
+    const cursors = new Set<string>()
+    let cursor: string | undefined
+    do {
+      const list = await this.api().session.list({ directory: this.directory(projectID), archived: false, limit: 100, cursor })
+      for (const session of list.data) sessions.set(session.id, session)
+      cursor = list.cursor.next ?? undefined
+      if (cursor && cursors.has(cursor)) throw new Error('SESSION_CURSOR_REPEATED')
+      if (cursor) cursors.add(cursor)
+    } while (cursor)
+    const family = resolveAgentMapFamily([...sessions.values()], sessionID, 200)
+    const messagesBySession = new Map<string, SessionMessageInfo[]>()
+    const historyCompleteBySession = new Map<string, boolean>()
+    let next = 0
+    await Promise.all(Array.from({ length: Math.min(6, family.entries.length) }, async () => {
+      while (next < family.entries.length) {
+        const entry = family.entries[next++]
+        const list = await this.api().message.list({ sessionID: entry.id, limit: 200, order: 'desc' }, { signal: AbortSignal.timeout(15_000) })
+        messagesBySession.set(entry.id, [...list.data].reverse())
+        historyCompleteBySession.set(entry.id, !list.cursor.next)
+      }
+    }))
+    const liveTextBySession = new Map<string, string>()
+    for (const entry of family.entries) {
+      const live = this.live.get(entry.id)
+      if (live) liveTextBySession.set(entry.id, [...live.values()].filter(item => item.kind === 'text').map(item => item.text).join('\n\n'))
+    }
+    return buildAgentMap({ family, activeSessionID: sessionID, messagesBySession, historyCompleteBySession, liveTextBySession, now: Date.now() })
   }
   async sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]> {
     await this.owned(projectID, sessionID)

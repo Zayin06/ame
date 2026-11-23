@@ -131,7 +131,7 @@ const schema = {
   debugStepOver: z.tuple([boundedID]), debugStepInto: z.tuple([boundedID]), debugStepOut: z.tuple([boundedID]),
   debugEvaluate: z.tuple([boundedID, question, boundedID.optional()]),
   projects: z.tuple([]), pickProject: z.tuple([]), removeProject: z.tuple([id]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
-  listFiles: z.tuple([id]), sessionUsage: z.tuple([id, id]),
+  listFiles: z.tuple([id]), sessionUsage: z.tuple([id, id]), agentMap: z.tuple([boundedID, boundedID]),
   save: z.tuple([id, relative, z.string().max(4 * 1024 * 1024), z.string().regex(/^[a-f0-9]{64}$/)]),
   createFile: z.tuple([id, workspacePath, content.optional()]), createDirectory: z.tuple([id, workspacePath]),
   renamePath: z.tuple([id, workspacePath, workspacePath]), deletePath: z.tuple([id, workspacePath]),
@@ -332,6 +332,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       return adapter.generateCommitMessage(summary, selected)
     }
     case 'messages': return adapter.messages(a, b)
+    case 'agentMap': return adapter.agentMap(a, b)
     case 'sessionDiff': return adapter.sessionDiff(a, b, c)
     case 'sessionUsage': {
       const pricing = await account.call('usage-prices', {}).catch(() => ({ origin: null, prices: {} })) as { origin: string | null; prices: UsagePrices }
