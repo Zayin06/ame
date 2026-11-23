@@ -36,5 +36,5 @@ export function Modal({ title, children, close }: { title: string; children: Rea
     window.addEventListener('keydown', handler, { capture: true })
     return () => { window.removeEventListener('keydown', handler, { capture: true }); if (prior?.isConnected) prior.focus() }
   }, [])
-  return <div className="modal-shade" onMouseDown={e => { if (e.target === e.currentTarget) close() }}><div ref={ref} className="modal" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}><header><h2>{title}</h2><IconButton label="Đóng" onClick={close}>×</IconButton></header>{children}</div></div>
+  return <div className="modal-shade" onMouseDown={e => { if (e.target === e.currentTarget) close() }}><div ref={ref} className="modal" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}><header><h2>{title}</h2><IconButton label="Đóng" onClick={close}><Icon name="close" /></IconButton></header>{children}</div></div>
 }

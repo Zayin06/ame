@@ -5,7 +5,6 @@ import { Icon } from './Icon'
 import { Empty, errorText, IconButton } from './Primitives'
 
 function SessionRow({ projectID, session, active, connected, onSelect, onRefresh, onRemoved }: { projectID: string; session: Session; active: boolean; connected: boolean; onSelect: () => void; onRefresh: () => Promise<void>; onRemoved: () => void }) {
-  const [menu, setMenu] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [title, setTitle] = useState(session.title)
   const [busy, setBusy] = useState(false)
@@ -20,16 +19,26 @@ function SessionRow({ projectID, session, active, connected, onSelect, onRefresh
       else if (action === 'archive') await window.ame.archiveSession(projectID, session.id, true)
       else await window.ame.deleteSession(projectID, session.id)
       removed = action !== 'rename'
-      setRenaming(false); setMenu(false)
+      setRenaming(false)
       await onRefresh()
     } catch (error) { if (!/\bCANCELLED\b/.test(errorText(error))) setError(errorText(error)) }
     finally { if (removed) onRemoved(); pending.current = false; setBusy(false) }
   }
-  return <div className="session-row" onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setMenu(false) }} onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setMenu(false); if (!busy) setRenaming(false) } }}>
-    <div className="session-row__main">
-      {renaming ? <form className="session-rename" onSubmit={event => { event.preventDefault(); void run('rename') }}><input autoFocus aria-label={`Đổi tên ${session.title || 'cuộc trò chuyện'}`} value={title} disabled={busy} onFocus={event => event.currentTarget.select()} onChange={event => setTitle(event.target.value)} onKeyDown={event => { if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) { event.stopPropagation(); if (event.key === 'Enter') event.preventDefault() } }} /><button type="submit" disabled={busy || !connected || !title.trim()}>Lưu</button><button type="button" disabled={busy} onClick={() => setRenaming(false)}>Hủy</button></form> : <><button className={`nav-item ${active ? 'is-active' : ''}`} title={session.title} onClick={onSelect}><span className="nav-item__left"><span className={`status-dot ${session.status === 'running' ? 'status-dot--active' : 'status-dot--done'}`} /><span className="nav-item__title">{session.parentID ? '↳ ' : ''}{session.title || 'Cuộc trò chuyện'}</span></span></button><button type="button" className="session-more" aria-label={`Tùy chọn: ${session.title || 'Cuộc trò chuyện'}`} aria-haspopup="menu" aria-expanded={menu} disabled={!connected || busy} onClick={() => setMenu(value => !value)}>⋯</button></>}
+  return <div className="session-row" onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (!busy) setRenaming(false) } }}>
+    <div className={`session-row__main ${active ? 'is-active' : ''}`}>
+      {renaming ? <form className="session-rename" onSubmit={event => { event.preventDefault(); void run('rename') }}>
+        <input autoFocus aria-label={`Đổi tên ${session.title || 'cuộc trò chuyện'}`} value={title} disabled={busy} onFocus={event => event.currentTarget.select()} onChange={event => setTitle(event.target.value)} onKeyDown={event => { if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) { event.stopPropagation(); if (event.key === 'Enter') event.preventDefault() } }} />
+        <button type="submit" aria-label="Lưu" title="Lưu" disabled={busy || !connected || !title.trim()}><Icon name="check" /></button>
+        <button type="button" aria-label="Hủy" title="Hủy" disabled={busy} onClick={() => setRenaming(false)}><Icon name="close" /></button>
+      </form> : <>
+        <button className={`nav-item ${active ? 'is-active' : ''}`} title={session.title} onClick={onSelect}><span className="nav-item__left"><span className={`status-dot ${session.status === 'running' ? 'status-dot--active' : 'status-dot--done'}`} /><span className="nav-item__title">{session.parentID ? '↳ ' : ''}{session.title || 'Cuộc trò chuyện'}</span></span></button>
+        <div className="session-hover-actions" role="group" aria-label={`Thao tác: ${session.title || 'Cuộc trò chuyện'}`}>
+          <button type="button" className="session-hover-btn" title="Đổi tên" aria-label={`Đổi tên: ${session.title || 'Cuộc trò chuyện'}`} disabled={!connected || busy} onClick={() => { setTitle(session.title); setRenaming(true); setError('') }}><Icon name="pencil" /></button>
+          <button type="button" className="session-hover-btn" title="Lưu trữ" aria-label={`Lưu trữ: ${session.title || 'Cuộc trò chuyện'}`} disabled={!connected || busy} onClick={() => void run('archive')}><Icon name="archive" /></button>
+          <button type="button" className="session-hover-btn session-hover-btn--danger" title="Xóa" aria-label={`Xóa: ${session.title || 'Cuộc trò chuyện'}`} disabled={!connected || busy} onClick={() => void run('delete')}><Icon name="trash" /></button>
+        </div>
+      </>}
     </div>
-    {menu && !renaming && <div className="session-actions" role="menu" aria-label={`Thao tác: ${session.title || 'Cuộc trò chuyện'}`}><button type="button" role="menuitem" disabled={busy} onClick={() => { setTitle(session.title); setRenaming(true); setMenu(false); setError('') }}>Đổi tên</button><button type="button" role="menuitem" disabled={busy} onClick={() => void run('archive')}>Lưu trữ</button><button type="button" role="menuitem" className="session-actions__delete" disabled={busy} onClick={() => void run('delete')}>Xóa</button></div>}
     {busy && <div className="session-operation-status muted" role="status">Đang cập nhật…</div>}
     {error && <div className="inline-error" role="alert">{error}</div>}
   </div>
@@ -87,7 +96,7 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
         const dirty = active ? !!git?.changes.length : metadata[project.id]?.dirty
         const shown = normalized && !project.name.toLocaleLowerCase().includes(normalized) ? items.filter(s => s.title.toLocaleLowerCase().includes(normalized)) : items
         return <section key={project.id} className={`proj-group ${active ? 'is-active-proj' : ''} ${folded[project.id] && !normalized ? 'is-folded' : ''}`}>
-          <div className="proj-row"><button className="proj-row__left project-select" title={project.directory} onClick={() => { onSelect(project.id); if (active) setFolded(value => ({ ...value, [project.id]: !value[project.id] })) }}><span className="proj-chevron"><Icon name="down" /></span><span className={`status-dot status-dot--${items.some(session => session.status === 'running') ? 'active' : 'idle'}`} /><span className="proj-name">{project.name}</span></button><div className="proj-actions">{(['files', 'search', 'git'] as const).map(tab => <button key={tab} className="proj-act-btn" aria-label={`${tab === 'files' ? 'Explorer' : tab === 'search' ? 'Search' : 'Git Diff'}: ${project.name}`} onClick={() => onTool(project.id, tab)}><Icon name={tab === 'files' ? 'folder' : tab === 'search' ? 'search' : 'git'} />{tab === 'git' && dirty && <span className="diff-dot" />}</button>)}<button className="proj-act-btn" aria-label={`New Chat: ${project.name}`} disabled={!connected || creating} onClick={() => onCreate(project.id)}>          <Icon name="plus" /></button><button className="proj-act-btn proj-remove-btn" aria-label={`Gỡ dự án: ${project.name}`} title={`Gỡ dự án ${project.name} khỏi danh sách (không xóa tệp)`} onClick={() => onRemove(project.id)}><Icon name="close" /></button></div></div>
+          <div className="proj-row"><button className="proj-row__left project-select" title={project.directory} onClick={() => { onSelect(project.id); if (active) setFolded(value => ({ ...value, [project.id]: !value[project.id] })) }}><span className="proj-chevron"><Icon name="down" /></span><span className={`status-dot status-dot--${items.some(session => session.status === 'running') ? 'active' : 'idle'}`} /><span className="proj-name">{project.name}</span></button>{dirty && <span className="proj-dirty-indicator" title="Có thay đổi Git chưa commit" aria-hidden="true" />}<div className="proj-actions">{(['files', 'search', 'git'] as const).map(tab => <button key={tab} className="proj-act-btn" aria-label={`${tab === 'files' ? 'Explorer' : tab === 'search' ? 'Search' : 'Git Diff'}: ${project.name}`} onClick={() => onTool(project.id, tab)}><Icon name={tab === 'files' ? 'folder' : tab === 'search' ? 'search' : 'git'} />{tab === 'git' && dirty && <span className="diff-dot" />}</button>)}<button className="proj-act-btn" aria-label={`New Chat: ${project.name}`} disabled={!connected || creating} onClick={() => onCreate(project.id)}><Icon name="plus" /></button><button className="proj-act-btn proj-remove-btn" aria-label={`Gỡ dự án: ${project.name}`} title={`Gỡ dự án ${project.name} khỏi danh sách (không xóa tệp)`} onClick={() => onRemove(project.id)}><Icon name="close" /></button></div></div>
           <div className="proj-chats">{active && error ? <div className="inline-error">{error}<button onClick={onRetry}>Thử lại</button></div> : active && sessionsLoading && !items.length ? <p className="rail-note muted">Đang tải…</p> : shown.map(session => <SessionRow key={session.id} projectID={project.id} session={session} active={active && sessionID === session.id} connected={connected} onSelect={() => onSession(project.id, session.id)} onRefresh={() => refreshSessions(project.id)} onRemoved={() => onSessionRemoved?.(project.id, session.id)} />)}</div>
         </section>
       })}

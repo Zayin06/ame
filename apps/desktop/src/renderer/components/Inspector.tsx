@@ -25,8 +25,8 @@ function InlineName({ label, prefix = '', initial = '', busy, submit, cancel }: 
   return <form className="insp-inline-name" onSubmit={event => { event.preventDefault(); if (!busy && value.trim()) submit(value.trim()) }} onKeyDown={event => { if (event.key === 'Escape' && !busy) { event.preventDefault(); event.stopPropagation(); cancel() } }}>
     {prefix && <span className="insp-inline-name__prefix truncate" title={prefix}>{prefix}/</span>}
     <div><input autoFocus aria-label={label} placeholder={label} value={value} disabled={busy} onChange={event => setValue(event.target.value)} onFocus={event => event.currentTarget.select()} />
-      <button type="submit" title="Xác nhận (Enter)" aria-label="Xác nhận tên" disabled={busy || !value.trim()}>✓</button>
-      <button type="button" title="Hủy (Escape)" aria-label="Hủy nhập tên" disabled={busy} onClick={cancel}>×</button></div>
+      <button type="submit" title="Xác nhận (Enter)" aria-label="Xác nhận tên" disabled={busy || !value.trim()}><Icon name="check" /></button>
+      <button type="button" title="Hủy (Escape)" aria-label="Hủy nhập tên" disabled={busy} onClick={cancel}><Icon name="close" /></button></div>
   </form>
 }
 
@@ -55,14 +55,15 @@ function Directory(props: DirectoryProps) {
     return <li key={entry.path}>
       <div className="insp-tree-entry">
         <button className="tree-row insp-row" title={entry.path} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined} onClick={() => entry.directory ? setExpanded(value => ({ ...value, [entry.path]: !value[entry.path] })) : onOpen(entry.path)}><span className="file-symbol"><Icon name={entry.directory ? expanded[entry.path] ? 'down' : 'chevron' : 'file'} /></span><span className="truncate">{entry.name}</span></button>
-        <button className="insp-tree-more" title={`Thao tác ${entry.path}`} aria-label={`Thao tác ${entry.path}`} aria-expanded={menu === entry.path} disabled={busy} onClick={() => setMenu(menu === entry.path ? null : entry.path)}>⋯</button>
+        <button className="insp-tree-more" title={`Thao tác ${entry.path}`} aria-label={`Thao tác ${entry.path}`} aria-haspopup="menu" aria-expanded={menu === entry.path} disabled={busy} onClick={() => setMenu(menu === entry.path ? null : entry.path)}><Icon name="more" /></button>
       </div>
-      {menu === entry.path && !busy && <div className="insp-tree-actions" role="group" aria-label={`Thao tác ${entry.path}`} onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); setMenu(null) } }}>
-        {entry.directory && <><button title={`New File trong ${entry.path}`} aria-label={`New File trong ${entry.path}`} onClick={() => edit({ kind: 'file', parent: entry.path })}>+ File</button><button title={`New Folder trong ${entry.path}`} aria-label={`New Folder trong ${entry.path}`} onClick={() => edit({ kind: 'directory', parent: entry.path })}>+ Folder</button></>}
-        <button title={`Rename ${entry.path}`} aria-label={`Rename ${entry.path}`} onClick={() => edit({ kind: 'rename', parent: parentPath(entry.path), entry })}>Rename</button>
-        <button title={`Delete ${entry.path}`} aria-label={`Delete ${entry.path}`} onClick={() => { setMenu(null); void mutate(() => window.ame.deletePath(projectID, entry.path), result => { startNaming(null); onDelete(result.path) }) }}>Delete</button>
-        <button title={`Copy Path ${entry.path}`} aria-label={`Copy Path ${entry.path}`} onClick={() => { setMenu(null); void mutate(async () => { if (!navigator.clipboard) throw new Error('Clipboard không khả dụng.'); await navigator.clipboard.writeText(entry.path) }, undefined, false) }}>Copy Path</button>
-        <button title={`Reveal in OS ${entry.path}`} aria-label={`Reveal in OS ${entry.path}`} onClick={() => { setMenu(null); void mutate(() => window.ame.revealPath(projectID, entry.path), undefined, false) }}>Reveal in OS</button>
+      {menu === entry.path && !busy && <div className="insp-tree-popover" role="menu" aria-label={`Thao tác ${entry.path}`}>
+        {entry.directory && <><button role="menuitem" aria-label={`New File trong ${entry.path}`} onClick={() => edit({ kind: 'file', parent: entry.path })}><Icon name="filePlus" /><span>Tệp mới</span></button><button role="menuitem" aria-label={`New Folder trong ${entry.path}`} onClick={() => edit({ kind: 'directory', parent: entry.path })}><Icon name="folderPlus" /><span>Thư mục mới</span></button></>}
+        <button role="menuitem" aria-label={`Rename ${entry.path}`} onClick={() => edit({ kind: 'rename', parent: parentPath(entry.path), entry })}><Icon name="pencil" /><span>Đổi tên</span></button>
+        <button role="menuitem" aria-label={`Copy Path ${entry.path}`} onClick={() => { setMenu(null); void mutate(async () => { if (!navigator.clipboard) throw new Error('Clipboard không khả dụng.'); await navigator.clipboard.writeText(entry.path) }, undefined, false) }}><Icon name="copy" /><span>Sao chép đường dẫn</span></button>
+        <button role="menuitem" aria-label={`Reveal in OS ${entry.path}`} onClick={() => { setMenu(null); void mutate(() => window.ame.revealPath(projectID, entry.path), undefined, false) }}><Icon name="externalLink" /><span>Mở trong thư mục</span></button>
+        <div className="insp-tree-popover__sep" role="separator" />
+        <button role="menuitem" className="insp-tree-popover__danger" aria-label={`Delete ${entry.path}`} onClick={() => { setMenu(null); void mutate(() => window.ame.deletePath(projectID, entry.path), result => { startNaming(null); onDelete(result.path) }) }}><Icon name="trash" /><span>Xóa</span></button>
       </div>}
       {editing && <InlineName key={`${naming.kind}:${entry.path}`} label={naming.kind === 'rename' ? 'Tên mới' : naming.kind === 'file' ? 'Tên tệp mới' : 'Tên thư mục mới'} prefix={naming.parent} initial={naming.kind === 'rename' ? entry.name : ''} busy={busy} submit={submitName} cancel={() => startNaming(null)} />}
       {entry.directory && expanded[entry.path] && <Directory {...props} path={entry.path} />}
@@ -75,6 +76,24 @@ function Explorer({ projectID, name, generation, onOpen, onRename, onDelete, bus
 }) {
   const [naming, setNaming] = useState<Naming | null>(null)
   const [menu, setMenu] = useState<string | null>(null)
+  const root = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (menu === null) return
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault(); event.stopPropagation()
+      root.current?.querySelector<HTMLButtonElement>('.insp-tree-more[aria-expanded="true"]')?.focus()
+      setMenu(null)
+    }
+    const outside = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Element && root.current?.contains(target) && target.closest('.insp-tree-popover, .insp-tree-more')) return
+      setMenu(null)
+    }
+    window.addEventListener('keydown', escape)
+    window.addEventListener('pointerdown', outside)
+    return () => { window.removeEventListener('keydown', escape); window.removeEventListener('pointerdown', outside) }
+  }, [menu])
   const alive = useRef(true)
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   const finish = () => { if (alive.current) setNaming(null) }
@@ -89,9 +108,9 @@ function Explorer({ projectID, name, generation, onOpen, onRename, onDelete, bus
       void mutate(() => window.ame.createFile(projectID, target), finish)
     }
   }
-  return <div data-testid="explorer">
+  return <div ref={root} data-testid="explorer">
     <div className="insp-folder-label"><Icon name="down" /><span className="truncate" title={name}>{name}</span>
-      <div className="insp-explorer-toolbar" role="group" aria-label="Explorer actions"><button title="New File ở thư mục gốc" aria-label="New File" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'file', parent: '' }) }}>+ File</button><button title="New Folder ở thư mục gốc" aria-label="New Folder" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'directory', parent: '' }) }}>+ Folder</button></div>
+      <div className="insp-explorer-toolbar" role="group" aria-label="Explorer actions"><button title="New File ở thư mục gốc" aria-label="New File" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'file', parent: '' }) }}><Icon name="filePlus" /></button><button title="New Folder ở thư mục gốc" aria-label="New Folder" disabled={busy} onClick={() => { setMenu(null); setNaming({ kind: 'directory', parent: '' }) }}><Icon name="folderPlus" /></button></div>
     </div>
     {naming && naming.kind !== 'rename' && !naming.parent && <InlineName key={naming.kind} label={naming.kind === 'file' ? 'Tên tệp mới' : 'Tên thư mục mới'} busy={busy} submit={submitName} cancel={() => setNaming(null)} />}
     <Directory projectID={projectID} path="" generation={generation} onOpen={onOpen} busy={busy} naming={naming} startNaming={setNaming} submitName={submitName} menu={menu} setMenu={setMenu} mutate={mutate} onDelete={onDelete} />
@@ -146,20 +165,20 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
   const branch = branches?.current ?? git?.branch ?? ''
   return <aside data-testid="inspector" className="inspector-pane" data-region="Project Inspector">
     <header className="inspector-pane__header"><span className="inspector-pane__title" title={name}><Icon name="folder" /><span className="truncate">{name || 'Project Inspector'}</span>{git?.branch && <span className="branch-tag">{git.branch}</span>}</span><IconButton label="Đóng Inspector (ẩn cố định)" onClick={onHide}><Icon name="left" /></IconButton></header>
-    <nav className="inspector-mode-bar" aria-label="Inspector">{(['files', 'search', 'git'] as const).map(mode => <button key={mode} className={`inspector-mode-btn ${mode === 'git' ? 'inspector-mode-btn--icon' : ''} ${tab === mode ? 'is-active' : ''}`} title={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-pressed={tab === mode} onClick={() => setTab(mode)}>{mode === 'git' && <Icon name="git" />}{mode === 'files' ? 'Explorer' : mode === 'search' ? 'Search' : changes.length > 0 && <span className="diff-dot" />}</button>)}</nav>
+    <nav className="inspector-mode-bar" aria-label="Inspector">{(['files', 'search', 'git'] as const).map(mode => <button key={mode} className={`inspector-mode-btn ${tab === mode ? 'is-active' : ''}`} title={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-label={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-pressed={tab === mode} onClick={() => setTab(mode)}><Icon name={mode === 'files' ? 'folder' : mode === 'search' ? 'search' : 'git'} />{mode === 'git' && changes.length > 0 && <span className="diff-dot" />}</button>)}</nav>
     <div className="inspector-pane__body">{!projectID ? <Empty>Mở một thư mục để bắt đầu.</Empty> : tab === 'files' ? <Explorer projectID={projectID} name={name} generation={generation} onOpen={onOpen} onRename={onRename} onDelete={onDelete} busy={busy} mutate={mutate} /> : tab === 'search' ? <ProjectSearch key={projectID} projectID={projectID} generation={generation} refresh={refresh} onOpen={onOpen} /> : <>
       <div className="scm-branch-controls"><label htmlFor="inspector-branch">Branch</label><select id="inspector-branch" aria-label="Git branch" title={branch || 'Chọn nhánh'} value={branch} disabled={busy || branchLoading || !branches} onChange={event => { const next = event.target.value; if (next !== branch) void mutate(() => window.ame.checkoutBranch(projectID, next)) }}>
         {!branches?.branches.some(item => item.name === branch) && <option value={branch}>{branch || (branchLoading ? 'Đang đọc…' : 'Chưa có nhánh')}</option>}
         {branches?.branches.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
-      </select><IconButton label="New Branch" disabled={busy} onClick={() => setNewBranch(value => !value)}>+</IconButton></div>
+      </select><IconButton label="New Branch" disabled={busy} onClick={() => setNewBranch(value => !value)}><Icon name="plus" /></IconButton></div>
       {newBranch && <InlineName label="Tên nhánh mới" busy={busy} submit={value => void mutate(() => window.ame.createBranch(projectID, value, true), () => setNewBranch(false))} cancel={() => setNewBranch(false)} />}
       {branchError && <div className="inline-error" role="alert">{branchError}</div>}
       {gitError ? <div className="inline-error">{gitError}</div> : !git ? <Empty>Đang đọc trạng thái Git…</Empty> : !changes.length ? <Empty>Không có thay đổi. Cây làm việc sạch.</Empty> : (['staged', 'working'] as const).map(group => {
         const groupChanges = changes.filter(change => group === 'staged' ? !!change.index.trim() && !['?', '!'].includes(change.index) : !!change.working.trim() || change.index === '?')
-        return groupChanges.length ? <section className="scm-section" key={group}><div className="scm-section__head"><span className="truncate">{group === 'staged' ? 'Staged Changes' : 'Changes'}</span><span className="scm-section__right"><span className="badge">{groupChanges.length}</span><IconButton label={group === 'staged' ? 'Unstage All' : 'Stage All'} disabled={busy} onClick={() => void mutate(() => group === 'staged' ? window.ame.unstageAll(projectID) : window.ame.stageAll(projectID))}>{group === 'staged' ? '−' : '+'}</IconButton></span></div>{groupChanges.map(change => <div className="scm-file-row" key={change.path}><button className="scm-file-row__main" title={`Diff với HEAD: ${change.path}`} onClick={() => onDiff(change.path)}><Icon name="file" /><span className="scm-file-name truncate">{change.path}</span></button><span className="git-badge">{group === 'staged' ? change.index : change.working.trim() || change.index}</span><IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged'))}>{group === 'staged' ? '−' : '+'}</IconButton>{group === 'working' && <IconButton label={`Discard ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.discardFile(projectID, change.path))}>↩</IconButton>}</div>)}</section> : null
+        return groupChanges.length ? <section className="scm-section" key={group}><div className="scm-section__head"><span className="truncate">{group === 'staged' ? 'Staged Changes' : 'Changes'}</span><span className="scm-section__right"><span className="badge">{groupChanges.length}</span><IconButton label={group === 'staged' ? 'Unstage All' : 'Stage All'} disabled={busy} onClick={() => void mutate(() => group === 'staged' ? window.ame.unstageAll(projectID) : window.ame.stageAll(projectID))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton></span></div>{groupChanges.map(change => <div className="scm-file-row" key={change.path}><button className="scm-file-row__main" title={`Diff với HEAD: ${change.path}`} onClick={() => onDiff(change.path)}><Icon name="file" /><span className="scm-file-name truncate">{change.path}</span></button><span className="git-badge">{group === 'staged' ? change.index : change.working.trim() || change.index}</span><IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged'))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton>{group === 'working' && <IconButton label={`Discard ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.discardFile(projectID, change.path))}><Icon name="undo" /></IconButton>}</div>)}</section> : null
       })}
     </>}</div>
-    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><span className="muted">Skill /git-commit</span><button type="button" disabled={!connected || busy || !stagedChanges.length} title={enhanceTitle} onClick={() => void mutate(() => window.ame.generateCommitMessage(projectID), result => setMessage(result.message), false)}>✦ Enhance</button></div></div><button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : '✓ Commit'}</button></form>}
+    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><span className="muted">Skill /git-commit</span><button type="button" disabled={!connected || busy || !stagedChanges.length} title={enhanceTitle} onClick={() => void mutate(() => window.ame.generateCommitMessage(projectID), result => setMessage(result.message), false)}><Icon name="sparkles" /> Enhance</button></div></div><button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : <><Icon name="check" /> Commit</>}</button></form>}
     <footer className="inspector-pane__footer"><span>{tab === 'git' ? `${changes.length} changes` : tab === 'search' ? 'Project Search' : 'Explorer'}</span><IconButton label="Làm mới dự án" onClick={refresh}><Icon name="refresh" /></IconButton></footer>
   </aside>
 }

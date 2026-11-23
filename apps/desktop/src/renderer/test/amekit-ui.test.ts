@@ -71,6 +71,32 @@ test('AmeKit errors unwrap Electron IPC wrappers and provide practical Vietnames
   }
 })
 
+test('account blockers and auth failures are humanized both bare and inside IPC errors', () => {
+  const cases: [string, RegExp, RegExp][] = [
+    ['MODEL_POLICY_PLUGIN_REQUIRED', /Cần đăng nhập.*chính sách model/, /Đăng nhập tài khoản AmeCode.*model và bundle/],
+    ['MODEL_POLICY_UNAVAILABLE', /Chưa tải được chính sách model/, /kết nối mạng.*Kiểm tra lại/],
+    ['ACCOUNT_REFRESH_REQUIRED', /Phiên đăng nhập cần được làm mới/, /Làm mới phiên.*đăng nhập lại/],
+    ['SESSION_STORAGE_UNAVAILABLE', /kho lưu trữ bảo mật/, /keychain.*credential store/],
+    ['LOCAL_SERVER_REQUIRED', /OpenCode tích hợp cục bộ/, /Giao diện & hệ thống.*backend tích hợp/],
+    ['NETWORK_ERROR', /Không thể kết nối.*AmeCode/, /kết nối mạng.*địa chỉ máy chủ/],
+    ['HTTP_ERROR', /Máy chủ AmeCode trả về lỗi/, /Thử lại.*trạng thái máy chủ/],
+    ['USER_DISABLED', /Tài khoản đã bị vô hiệu hóa/, /quản trị viên.*kích hoạt lại/],
+    ['INVALID_ROLE', /Vai trò tài khoản không hợp lệ/, /quản trị viên.*phân quyền/],
+    ['INVALID_AUTH_RESPONSE', /Phản hồi đăng nhập.*không hợp lệ/, /URL máy chủ AmeCode/],
+    ['INVALID_CREDENTIALS', /Sai tên đăng nhập hoặc mật khẩu/, /thông tin tài khoản.*thử lại/],
+    ['UNAUTHORIZED', /Sai tên đăng nhập hoặc mật khẩu/, /thông tin tài khoản.*thử lại/],
+  ]
+  for (const [code, title, detail] of cases) {
+    for (const input of [code, new Error(`Error invoking remote method 'ame:account': Error: ${code}`)]) {
+      const formatted = formatAmeKitError(input)
+      assert.equal(formatted.code, code)
+      assert.match(formatted.title, title)
+      assert.match(formatted.detail!, detail)
+      assert.doesNotMatch(`${formatted.title} ${formatted.detail}`, new RegExp(`${code}|Error invoking`))
+    }
+  }
+})
+
 test('unknown errors preserve cleaned text and the first uppercase code without unsafe lookups', () => {
   assert.deepEqual(formatAmeKitError(new Error("Error invoking remote method 'ame:account': Error: NEW_SERVER_CODE: retry later")), { code: 'NEW_SERVER_CODE', title: 'NEW_SERVER_CODE: retry later' })
   assert.deepEqual(formatAmeKitError('  Connection lost  '), { title: 'Connection lost' })

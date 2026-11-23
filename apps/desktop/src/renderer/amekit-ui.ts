@@ -16,6 +16,18 @@ export function groupIssues(rawIssues: unknown[], mode?: string) {
 }
 
 const errors: Record<string, { title: string; detail?: string }> = {
+  MODEL_POLICY_PLUGIN_REQUIRED: { title: 'Cần đăng nhập để kích hoạt chính sách model', detail: 'Đăng nhập tài khoản AmeCode bên dưới để đồng bộ cấu hình model và bundle.' },
+  MODEL_POLICY_UNAVAILABLE: { title: 'Chưa tải được chính sách model từ máy chủ', detail: 'Kiểm tra kết nối mạng hoặc bấm Kiểm tra lại.' },
+  ACCOUNT_REFRESH_REQUIRED: { title: 'Phiên đăng nhập cần được làm mới', detail: 'Bấm Làm mới phiên hoặc đăng nhập lại.' },
+  SESSION_STORAGE_UNAVAILABLE: { title: 'Không thể truy cập kho lưu trữ bảo mật của hệ thống', detail: 'Kiểm tra quyền keychain / credential store trên thiết bị.' },
+  LOCAL_SERVER_REQUIRED: { title: 'Cần chạy OpenCode tích hợp cục bộ', detail: 'Mở Giao diện & hệ thống để khởi động lại backend tích hợp.' },
+  NETWORK_ERROR: { title: 'Không thể kết nối tới máy chủ AmeCode', detail: 'Kiểm tra kết nối mạng và địa chỉ máy chủ rồi thử lại.' },
+  HTTP_ERROR: { title: 'Máy chủ AmeCode trả về lỗi', detail: 'Thử lại sau vài giây hoặc kiểm tra trạng thái máy chủ.' },
+  USER_DISABLED: { title: 'Tài khoản đã bị vô hiệu hóa', detail: 'Liên hệ quản trị viên để được kích hoạt lại.' },
+  INVALID_ROLE: { title: 'Vai trò tài khoản không hợp lệ', detail: 'Liên hệ quản trị viên để kiểm tra phân quyền.' },
+  INVALID_AUTH_RESPONSE: { title: 'Phản hồi đăng nhập từ máy chủ không hợp lệ', detail: 'Kiểm tra lại URL máy chủ AmeCode.' },
+  INVALID_CREDENTIALS: { title: 'Sai tên đăng nhập hoặc mật khẩu', detail: 'Kiểm tra lại thông tin tài khoản và thử lại.' },
+  UNAUTHORIZED: { title: 'Sai tên đăng nhập hoặc mật khẩu', detail: 'Kiểm tra lại thông tin tài khoản và thử lại.' },
   IMPORT_BLOCKED: { title: 'Không thể đóng gói vì còn lỗi trong thư mục nguồn', detail: 'Hãy xem tab Lỗi ở Bước 1 hoặc chuyển sang chế độ Raw + Chuẩn hóa agent Claude -> OpenCode nếu dùng gói Claude.' },
   INVALID_BUNDLE: { title: 'Máy chủ từ chối gói ZIP/manifest', detail: 'Kiểm tra phiên bản SemVer, giới hạn ≤ 1023 tệp và kích thước ZIP ≤ 8 MiB.' },
   RAW_INSTALL_CONFIRMATION_REQUIRED: { title: 'Cần xác nhận chế độ Raw trước khi đồng bộ', detail: "Bật tùy chọn 'Cho phép raw compatibility khi đồng bộ' rồi bấm Đồng bộ lại." },
