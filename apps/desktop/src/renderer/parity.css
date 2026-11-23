@@ -426,6 +426,10 @@ button:focus:not(:focus-visible) { outline: none; }
 .amekit-core .amekit-card { margin-bottom: 14px; padding: 16px; border: 1px solid var(--border-subtle); border-radius: 10px; background: var(--bg-elevated); }
 .amekit-core .amekit-card h3 { margin: 0 0 14px; line-height: 1.6; }
 .amekit-core .amekit-card h4 { margin: 10px 0; font-size: 12px; }
+.amekit-core .amekit-model-levels h4 { margin-top: 0; }
+.amekit-model-levels dl { display: grid; gap: 6px; margin: 0; font-size: 12px; }
+.amekit-model-levels dl > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; }
+.amekit-model-levels dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text-secondary); }
 .amekit-card-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 .amekit-card-heading > button { flex-shrink: 0; font-size: 11px; }
 .amekit-badges { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; min-width: 0; margin: 8px 0; }
@@ -450,9 +454,10 @@ button:focus:not(:focus-visible) { outline: none; }
 .amekit-issues ul { margin: 0; padding: 0; list-style: none; }
 .amekit-issues li { display: flex; flex-direction: column; gap: 4px; padding: 9px 0; border-bottom: 1px solid var(--border-subtle); overflow-wrap: anywhere; }
 .amekit-issues code, .amekit-package-summary code { font-family: var(--font-mono); }
-.amekit-core .amekit-fix-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 14px; padding: 10px 12px; border: 1px solid var(--accent-border); border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text-primary); font-size: 12px; overflow-wrap: anywhere; }
-.amekit-core .amekit-fix-bar p { flex: 1 1 240px; min-width: 0; margin: 0; line-height: 1.6; }
-.amekit-core .amekit-fix-bar button { flex: 0 1 auto; max-width: 100%; }
+.amekit-core .amekit-fix-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; min-width: 0; gap: 10px; margin-top: 14px; padding: 10px 12px; border: 1px solid var(--accent-border); border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text-primary); font-size: 12px; overflow-wrap: anywhere; }
+.amekit-core .amekit-fix-bar > .amekit-pill { flex: 0 1 auto; min-width: 0; max-width: 100%; box-sizing: border-box; white-space: normal; }
+.amekit-core .amekit-fix-bar p { flex: 1 1 100%; min-width: 0; margin: 0; line-height: 1.6; }
+.amekit-core .amekit-fix-bar button { flex: 0 1 auto; min-width: 0; max-width: 100%; box-sizing: border-box; }
 .amekit-core .amekit-issue-row { min-width: 0; overflow-wrap: anywhere; }
 .amekit-core .amekit-issue-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .amekit-core .amekit-issue-actions button { max-width: 100%; padding: 5px 9px; font-size: 11px; }

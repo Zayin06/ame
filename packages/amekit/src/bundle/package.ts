@@ -6,6 +6,7 @@ import { readArchive } from "./archive"
 import { BUNDLE_ARCHIVE_LIMITS, MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES } from "./limits"
 import { z } from "zod"
 export type ImportOptions = { compatibilityMode?: "native" | "raw"; adaptClaudeAgents?: boolean }
+const managedLevelRef = /^amecode\/(default|haiku|sonnet|opus)$/
 const CLAUDE_COLOR_HEX: Record<string, string> = {
   green: "#22c55e", blue: "#3b82f6", orange: "#f97316", purple: "#a855f7", red: "#ef4444", yellow: "#eab308",
   cyan: "#06b6d4", pink: "#ec4899", teal: "#14b8a6", indigo: "#6366f1", amber: "#f59e0b", emerald: "#10b981",
@@ -16,6 +17,14 @@ function adaptClaudeFrontmatter(value: Record<string, unknown>) {
   if ("name" in adapted) { delete adapted.name; changes.push("removed name") }
   if ("tools" in adapted) { delete adapted.tools; changes.push("removed tools") }
   if (typeof adapted.model === "string" && adapted.model.trim().toLowerCase() === "inherit") { delete adapted.model; changes.push("removed model: inherit") }
+  if (typeof adapted.model === "string") {
+    const rawModel = adapted.model.trim()
+    const match = /^(?:amecode\/)?(default|haiku|sonnet|opus)$/i.exec(rawModel)
+    if (match) {
+      const normalized = `amecode/${match[1].toLowerCase()}`
+      if (adapted.model !== normalized) { adapted.model = normalized; changes.push(`model ${rawModel} -> ${normalized}`) }
+    }
+  }
   if ("color" in adapted) {
     if (typeof adapted.color === "string") {
       const c = adapted.color.trim()
@@ -30,9 +39,10 @@ function adaptClaudeFrontmatter(value: Record<string, unknown>) {
   if (adapted.mode === undefined) { adapted.mode = "all"; changes.push("mode: all") }
   return { adapted, changes }
 }
-// Mirrors the accepted, model-independent subset of ConfigAgent.Info 2.3.2; parity-tested against the public schema.
+// Mirrors the accepted, portable subset of ConfigAgent.Info 2.3.2; parity-tested against the public schema.
 const agentMetadata = z.object({
   description: z.string(), mode: z.enum(["all", "primary", "subagent"]).optional(), system: z.string().optional(),
+  model: z.string().regex(managedLevelRef).optional(),
   hidden: z.boolean().optional(), disabled: z.boolean().optional(), steps: z.number().int().positive().optional(),
   color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
   permissions: z.array(z.object({ action: z.string(), resource: z.string(), effect: z.enum(["allow", "deny", "ask"]) }).strict()).optional(),
@@ -137,11 +147,12 @@ export function preview(input: InputFile[], inherited: Issue[] = [], options: Im
         }
         if (skill && (value.name !== id || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id))) throw new Error("skill name must match directory and use lowercase hyphenated name")
         const unsupported = agent ? Object.keys(value).filter(k => !["description", "mode", "model", "request", "system", "steps", "hidden", "disabled", "color", "permissions", "name"].includes(k)) : []
-        if (agent && raw && value.model !== undefined) issues.push({ path: file.path, severity: "warning", reason: "pinned model metadata preserved; provider/model availability and interpretation are not verified" })
+        const isManagedTier = typeof value.model === "string" && managedLevelRef.test(value.model)
+        if (agent && raw && value.model !== undefined && !isManagedTier) issues.push({ path: file.path, severity: "warning", reason: "pinned model metadata preserved; provider/model availability and interpretation are not verified" })
         if (unsupported.length) throw new Error("unsupported metadata: " + unsupported.join(", "))
         if (agent && typeof value.tools === "string") throw new Error("Claude tools require explicit capability audit; no automatic grants")
         if (agent && value.mode !== undefined && !["all", "primary", "subagent"].includes(String(value.mode))) throw new Error("invalid agent mode")
-        if (agent && !raw && value.model !== undefined) issues.push({ path: file.path, severity: "error", reason: "model dependency requires explicit supported provider adapter; remove pinned model from export" })
+        if (agent && !raw && value.model !== undefined && !isManagedTier) issues.push({ path: file.path, severity: "error", reason: "model dependency requires explicit supported provider adapter; remove pinned model from export" })
         if (agent) {
           const { name, ...native } = value
           try { agentMetadata.parse(native) }

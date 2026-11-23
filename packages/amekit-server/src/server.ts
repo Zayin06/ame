@@ -2,8 +2,43 @@ import { Plugin } from "@opencode/plugin"
 type Context = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]
 import type { Model } from "@opencode/schema/model"
 import { z } from "zod"
-import { assertModel, managedProvider, modelPolicy, providerURL } from "../../amekit/src/model-policy"
+import { assertModel, managedProvider, modelPolicy, parseModelLevel, providerURL, resolveModelLevel, type ModelLevels } from "../../amekit/src/model-policy"
 import { modelGateway } from "./model-gateway"
+
+type RuntimePolicy = { models: ReturnType<typeof modelPolicy>["models"]; default_model: string; model_levels: ModelLevels }
+type AgentModel = { id: string; model?: Model.Ref }
+type AgentModelEditor = {
+  list(): readonly AgentModel[]
+  update(id: string, update: (agent: AgentModel) => void): void
+}
+
+export function orderPolicyModels(policy: RuntimePolicy) {
+  return [...policy.models.filter(model => model.id === policy.default_model), ...policy.models.filter(model => model.id !== policy.default_model)]
+}
+
+export function formatModelLevelsSystemNote(policy: RuntimePolicy) {
+  return `[amecode-model-levels]\nActive model tiers: default = amecode/${policy.model_levels.default} (workspace default); haiku = amecode/${policy.model_levels.haiku} (fast/light tasks); sonnet = amecode/${policy.model_levels.sonnet} (balanced coding); opus = amecode/${policy.model_levels.opus} (deep reasoning). Use the corresponding amecode/default, amecode/haiku, amecode/sonnet or amecode/opus tier when selecting an agent model.`
+}
+
+export function applyAgentModelTransform(editor: AgentModelEditor, policy: RuntimePolicy | undefined) {
+  if (!policy) return
+  for (const agent of editor.list()) {
+    if (agent.model?.providerID !== managedProvider || !parseModelLevel(agent.model.id)) continue
+    editor.update(agent.id, draft => {
+      draft.model = { ...draft.model!, providerID: managedProvider as Model.Info["providerID"], id: resolveModelLevel(policy, draft.model!.id) as Model.ID }
+    })
+  }
+}
+
+export function resolveHookModel(input: { kind: string; model: Model.Ref }, policy: RuntimePolicy | undefined) {
+  if (!policy || input.model.providerID !== managedProvider) return
+  const level = parseModelLevel(input.model.id)
+  if (level) input.model = { providerID: managedProvider as Model.Info["providerID"], id: policy.model_levels[level] as Model.ID }
+  else if (input.kind === "title" && policy.models.some(model => model.id === policy.model_levels.haiku)) {
+    input.model = { providerID: managedProvider as Model.Info["providerID"], id: policy.model_levels.haiku as Model.ID }
+  }
+  if (policy.models.length === 1) input.model = { providerID: input.model.providerID, id: policy.default_model as Model.ID }
+}
 
 const updateSchema = z.object({
   role: z.enum(["admin", "user"]), catalog: z.unknown(),
@@ -22,7 +57,7 @@ export default Plugin.define({
   async setup(ctx: Context) {
     const gateway = await modelGateway(() => { const policy = active(); return policy && state.provider ? { policy, provider: state.provider } : undefined })
     const registrations: { dispose(): Promise<void> }[] = []
-    const reload = async () => { await ctx.provider.reload(); await ctx.model.reload() }
+    const reload = async () => { await ctx.provider.reload(); await ctx.model.reload(); await ctx.agent.reload() }
     let timer: ReturnType<typeof setInterval> | undefined
     const cleanup = async () => {
       clearInterval(timer); state.listeners.delete(reload)
@@ -34,7 +69,7 @@ export default Plugin.define({
       for (const record of editor.list()) editor.remove(record.provider.id)
       const policy = active()
       if (!policy) return
-      const models: Model.Info[] = policy.models.map(model => ({
+      const models: Model.Info[] = orderPolicyModels(policy).map(model => ({
         id: model.id as Model.ID, modelID: model.id as Model.ID, providerID: managedProvider as Model.Info["providerID"],
         name: model.name, capabilities: { tools: model.tool_call, input: model.vision ? ["text", "image"] : ["text"], output: ["text"] },
         variants: [], time: { released: 0 }, cost: [], status: "active", enabled: true,
@@ -47,9 +82,15 @@ export default Plugin.define({
       for (const model of editor.list()) if (!policy || model.providerID !== managedProvider || !policy.models.some(entry => entry.id === model.id)) editor.remove(model.providerID, model.id)
       if (policy) editor.default.set(managedProvider, policy.default_model)
     }))
-    registrations.push(await ctx.session.hook("experimental.model.resolve", async input => {
+    registrations.push(await ctx.agent.transform(editor => applyAgentModelTransform(editor, active())))
+    registrations.push(await ctx.session.hook("context", async input => {
       const policy = active()
-      if (policy && policy.models.length === 1 && input.model.providerID === managedProvider) input.model = { providerID: input.model.providerID, id: policy.default_model as Model.ID }
+      if (policy && !input.system.some(part => part.text.includes("[amecode-model-levels]"))) {
+        input.system.push({ type: "text", text: formatModelLevelsSystemNote(policy) })
+      }
+    }))
+    registrations.push(await ctx.session.hook("experimental.model.resolve", async input => {
+      resolveHookModel(input, active())
       check(input.model)
     }))
     registrations.push(await ctx.session.hook("model.request", async input => {

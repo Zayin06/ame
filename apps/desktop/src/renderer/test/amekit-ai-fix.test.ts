@@ -18,7 +18,9 @@ function preview(paths = [agent, skill], issues = paths.map(path => issue(path))
     fixablePaths: [...new Set(issues.map(item => item.path).filter(path => [agent, skill].includes(path)))],
   }
 }
-const fixed = (path: string) => ({ path, summary: `Đã sửa ${path}`, model: 'resolved-model', diff: '- [REDACTED_SECRET_1]\n+ <YOUR_PLACEHOLDER>' })
+const modelLevels = { default: 'resolved-model', haiku: 'fast-model', sonnet: 'balanced-model', opus: 'reasoning-model' }
+const accountModels = { default_model: modelLevels.default, small_model: modelLevels.haiku, model_levels: modelLevels }
+const fixed = (path: string) => ({ path, summary: `Đã sửa ${path}`, model: modelLevels.default, diff: '- [REDACTED_SECRET_1]\n+ <YOUR_PLACEHOLDER>' })
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 function deferred() {
   let resolve!: (value: unknown) => void
@@ -100,11 +102,11 @@ function harness(component: 'Account' | 'Settings', initialProps: object, accoun
   return { render, find, button, click, change, AccountMarker, async flush() { await tick(); return render() }, unmount() { effects.forEach(effect => effect.cleanup?.()) } }
 }
 
-function admin(options: { initial?: ReturnType<typeof preview>; selectedModel?: string; role?: string } = {}) {
+function admin(options: { initial?: ReturnType<typeof preview>; role?: string; models?: { default_model?: string; small_model?: string; model_levels?: Partial<typeof modelLevels> } | null } = {}) {
   let imported = options.initial ?? preview(), current = imported, batchFailures: { path: string; code: string }[] = [], failure = '', nextFix: Promise<unknown> | undefined
   const calls: { operation: string; payload?: Record<string, string> }[] = []
-  const loggedIn = { account: { name: 'Admin', username: 'admin', role: options.role ?? 'admin' }, ready: true }
-  const h = harness('Account', { embedded: true, close() {}, selectedModel: options.selectedModel }, async (operation, payload) => {
+  const loggedIn = { account: { name: 'Admin', username: 'admin', role: options.role ?? 'admin' }, ready: true, models: options.models === null ? undefined : options.models ?? accountModels }
+  const h = harness('Account', { embedded: true, close() {} }, async (operation, payload) => {
     calls.push({ operation, payload })
     if (operation === 'status' || operation === 'login') return loggedIn
     if (operation === 'logout') return null
@@ -158,10 +160,13 @@ function payload(h: ReturnType<typeof admin>, operation: string) {
   return JSON.parse(JSON.stringify(h.calls.filter(call => call.operation === operation).at(-1)?.payload))
 }
 
-test('Admin single fix forwards current model, gates busy actions, shows safe diff and unblocks packaging', async () => {
-  const h = admin({ initial: preview([agent]), selectedModel: ' selected-model ' })
+test('Admin single fix uses API default, gates busy actions, shows safe diff and unblocks packaging', async () => {
+  const h = admin({ initial: preview([agent]) })
   let html = await openAdmin(h)
   assert.match(html, /Bị chặn · 1 lỗi/)
+  assert.equal(h.find(node => node.props['data-testid'] === 'amekit-fix-model').props.className, 'amekit-pill')
+  assert.match(html, /Model sửa lỗi \(agent &amp; skill\): default · resolved-model/)
+  assert.match(html, /Sửa trực tiếp các tệp agent &amp; skill bị lỗi bằng model mặc định theo API \(<code>default<\/code>: <code>resolved-model<\/code>\)/)
   assert.match(html, /secret nhạy cảm được ẩn tự động/)
   assert.equal(h.button('Đóng gói').props.disabled, true)
   assert.ok(h.button('Sửa lỗi bằng AI'))
@@ -170,9 +175,9 @@ test('Admin single fix forwards current model, gates busy actions, shows safe di
   for (const label of ['Sửa bằng AI', 'Bỏ tệp', 'Sửa lỗi bằng AI', 'Chọn thư mục & nhập']) assert.equal(h.button(label).props.disabled, true)
   response.resolve({ preview: preview([agent], []), fix: fixed(agent) })
   html = await h.flush()
-  assert.deepEqual(payload(h, 'fix-import'), { path: agent, model: 'selected-model' })
+  assert.deepEqual(payload(h, 'fix-import'), { path: agent })
   assert.match(html, /Sẵn sàng đóng gói/)
-  assert.match(html, /Đã sửa bởi AI · resolved-model/)
+  assert.match(html, /Đã sửa bởi AI · default \(resolved-model\)/)
   assert.match(html, /chưa ghi đè thư mục gốc/)
   assert.match(html, /<details><summary>Xem thay đổi \(diff\)<\/summary><pre class="amekit-fix-diff">- \[REDACTED_SECRET_1\]\n\+ &lt;YOUR_PLACEHOLDER&gt;/)
   assert.equal(h.find(node => node.props.id === 'amekit-issue-excluded').props['aria-selected'], true)
@@ -205,8 +210,9 @@ test('batch fixing deduplicates file errors, reports partial failures and preser
   assert.match(html, /Bị chặn · 1 lỗi/)
   assert.ok(h.button('Hoàn tác', agent))
   assert.ok(h.button('Sửa lỗi bằng AI'))
-  h.render({ selectedModel: 'next-model' }); h.click('Sửa bằng AI', skill); html = await h.flush()
-  assert.deepEqual(payload(h, 'fix-import'), { path: skill, model: 'next-model' })
+  h.click('Sửa bằng AI', skill); html = await h.flush()
+  assert.deepEqual(payload(h, 'fix-import'), { path: skill })
+  assert.equal((html.match(/Đã sửa bởi AI · default \(resolved-model\)/g) ?? []).length, 2)
   assert.equal((html.match(/class="amekit-fix-card"/g) ?? []).length, 2)
   assert.match(html, /Sẵn sàng đóng gói/)
   assert.doesNotMatch(html, /Không sửa được 1 tệp/)
@@ -300,8 +306,8 @@ test('only backend-advertised fixable error paths get AI actions; warnings and u
   member.unmount()
 })
 
-test('blank model is omitted and single-file bulk button uses fix-import-all', async () => {
-  const h = admin({ initial: preview([agent]), selectedModel: '  ' })
+test('single-file bulk button uses fix-import-all without a model override', async () => {
+  const h = admin({ initial: preview([agent]) })
   await openAdmin(h)
   h.click('Sửa lỗi bằng AI'); const html = await h.flush()
   assert.deepEqual(payload(h, 'fix-import-all'), {})
@@ -313,10 +319,10 @@ test('blank model is omitted and single-file bulk button uses fix-import-all', a
 test('batch fixes explain the ten-file limit and keep remaining errors actionable', async () => {
   const paths = Array.from({ length: 11 }, (_, index) => `agents/helper-${index}.md`)
   const initial = { ...preview(paths), fixablePaths: paths }
-  const h = admin({ initial, selectedModel: 'batch-model' })
+  const h = admin({ initial })
   await openAdmin(h)
   h.click('Sửa tất cả lỗi bằng AI (11)'); const html = await h.flush()
-  assert.deepEqual(payload(h, 'fix-import-all'), { model: 'batch-model' })
+  assert.deepEqual(payload(h, 'fix-import-all'), {})
   assert.match(html, /Đã sửa 10 tệp bằng AI/)
   assert.match(html, /Mỗi lần sửa tối đa 10 tệp; chạy lại/)
   assert.match(html, /Bị chặn · 1 lỗi/)
@@ -338,18 +344,52 @@ test('all-failed batch preserves the blocking preview without claiming a success
   h.unmount()
 })
 
-test('Settings forwards selectedModel and project to embedded Account', () => {
+test('Account shows all API tiers and prefers the default tier mapping over the catalog default', async () => {
+  const h = admin({ models: { ...accountModels, default_model: 'legacy-default' } })
+  h.render(); let html = await h.flush()
+  assert.match(html, /<h4>Phân cấp Model từ API<\/h4>/)
+  for (const [level, id] of Object.entries(modelLevels)) assert.ok(html.includes(`<dt><code>${level}</code></dt><dd><code>${id}</code></dd>`))
+  h.click('Quản trị'); h.render(); await h.flush()
+  h.click('Chọn thư mục & nhập'); html = await h.flush()
+  assert.match(html, /Model sửa lỗi \(agent &amp; skill\): default · resolved-model/)
+  assert.doesNotMatch(html, /legacy-default/)
+  h.unmount()
+})
+
+test('Account displays legacy API tier fallbacks and uses default_model for the fix bar', async () => {
+  const h = admin({ models: { default_model: 'legacy-default', small_model: 'legacy-small' } })
+  h.render(); const html = await h.flush()
+  for (const [level, id] of Object.entries({ default: 'legacy-default', haiku: 'legacy-small', sonnet: 'legacy-default', opus: 'legacy-default' })) {
+    assert.ok(html.includes(`<dt><code>${level}</code></dt><dd><code>${id}</code></dd>`))
+  }
+  assert.match(await openAdmin(h), /Model sửa lỗi \(agent &amp; skill\): default · legacy-default/)
+  h.unmount()
+})
+
+test('Account without catalog metadata keeps the default fix explanation and omits the tier card', async () => {
+  const h = admin({ models: null })
+  h.render(); assert.doesNotMatch(await h.flush(), /Phân cấp Model từ API/)
+  const html = await openAdmin(h)
+  assert.match(html, /Model sửa lỗi \(agent &amp; skill\): default<\/span>/)
+  assert.match(html, /API \(<code>default<\/code>\); secret/)
+  assert.doesNotMatch(html, /undefined|null/)
+  h.unmount()
+})
+
+test('Settings forwards project and embedded to Account without leaking its selected model', () => {
   const h = harness('Settings', {
     initialSection: 'amekit', preferences: { project: 'project' }, theme: 'dark', connection: { connected: true },
     close() {}, setLayout() {}, setTheme() {}, setConnection() {}, onPet() {}, pet: null, sprite: '', selectedModel: 'current-model',
   }, async () => null)
   h.render()
   let account = h.find(node => node.type === h.AccountMarker)
-  assert.equal(account.props.selectedModel, 'current-model')
+  assert.equal(Object.hasOwn(account.props, 'selectedModel'), false)
   assert.equal(account.props.projectID, 'project')
   assert.equal(account.props.embedded, true)
   h.render({ selectedModel: 'changed-model' })
   account = h.find(node => node.type === h.AccountMarker)
-  assert.equal(account.props.selectedModel, 'changed-model')
+  assert.equal(Object.hasOwn(account.props, 'selectedModel'), false)
+  assert.equal(account.props.projectID, 'project')
+  assert.equal(account.props.embedded, true)
   h.unmount()
 })

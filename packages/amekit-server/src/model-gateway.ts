@@ -1,9 +1,9 @@
 import { createServer } from "node:http"
 import { randomBytes } from "node:crypto"
 import { Readable } from "node:stream"
-import { assertModel, managedProvider, type ManagedCatalog } from "../../amekit/src/model-policy"
+import { assertModel, managedProvider, parseModelLevel, type modelPolicy } from "../../amekit/src/model-policy"
 
-type Access = { policy: ManagedCatalog; provider: { base_url: string; api_key: string } }
+type Access = { policy: ReturnType<typeof modelPolicy>; provider: { base_url: string; api_key: string } }
 export async function modelGateway(access: () => Access | undefined) {
   const route = `/${randomBytes(24).toString("hex")}/v1`
   const server = createServer(async (req, res) => {
@@ -17,8 +17,14 @@ export async function modelGateway(access: () => Access | undefined) {
         if (size > 8 * 1024 * 1024) throw new Error("AMECODE_REQUEST_TOO_LARGE")
         chunks.push(Buffer.from(chunk))
       }
-      const body = Buffer.concat(chunks), payload = JSON.parse(body.toString("utf8"))
+      let body = Buffer.concat(chunks)
+      const payload = JSON.parse(body.toString("utf8"))
       const current = access()
+      const level = typeof payload?.model === "string" ? parseModelLevel(payload.model) : undefined
+      if (level && current?.policy) {
+        payload.model = current.policy.model_levels[level]
+        body = Buffer.from(JSON.stringify(payload), "utf8")
+      }
       assertModel(current?.policy, { providerID: managedProvider, id: payload.model })
       const provider = current!.provider
       const response = await fetch(provider.base_url.replace(/\/$/, "") + "/chat/completions", {

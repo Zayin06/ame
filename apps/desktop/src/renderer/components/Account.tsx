@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { errorText, Modal } from './Primitives'
 import { formatAmeKitError, formatBundleSize, groupIssues, type IssueSeverity } from '../amekit-ui'
 
-type AccountState = { origin?: string; account?: { name: string; username: string; role?: string }; ready?: boolean; reconnecting?: boolean; blocker?: string } | null
+type AccountState = { origin?: string; account?: { name: string; username: string; role?: string }; models?: { default_model?: string; small_model?: string; model_levels?: Partial<Record<'default' | 'haiku' | 'sonnet' | 'opus', string>> }; ready?: boolean; reconnecting?: boolean; blocker?: string } | null
 type Features = { commitEnhanceSkill?: string }
 type Release = { releaseId?: string; id?: string; version?: string; channel?: string; size?: number; features?: Features; manifest?: { agents?: number; skills?: number; compatibility?: { mode?: string }; features?: Features } }
 type Bundle = { version?: string; releaseId?: string; verification?: string; compatibilityWarnings?: unknown[]; compatibilityMode?: string; agents?: string[]; skills?: string[]; fileCount?: number; features?: Features } | null
@@ -37,7 +37,7 @@ function EnhanceSummary({ features }: { features?: Features }) {
 function ReleaseSummary({ release }: { release: Release }) {
   return <p className="muted">{release.manifest?.agents ?? 0} agents · {release.manifest?.skills ?? 0} skills · {formatBundleSize(release.size ?? 0)} <EnhanceSummary features={release.manifest?.features ?? release.features} /></p>
 }
-export function Account({ projectID, close, embedded = false, selectedModel }: { projectID?: string; close: () => void; embedded?: boolean; selectedModel?: string }) {
+export function Account({ projectID, close, embedded = false }: { projectID?: string; close: () => void; embedded?: boolean }) {
   const [account, setAccount] = useState<AccountState>(null)
   const [tab, setTab] = useState('account')
   const [busy, setBusy] = useState(false)
@@ -68,7 +68,13 @@ export function Account({ projectID, close, embedded = false, selectedModel }: {
   const isAdmin = account?.account?.role === 'admin' || account?.account?.role === 'owner'
   const grouped = groupIssues(importPreview?.issues ?? [], importPreview?.compatibilityMode)
   const fixableErrors = [...new Set(grouped.error.map(issue => issue.path).filter(path => importPreview?.fixablePaths?.includes(path)))]
-  const fixModel: Record<string, string> = selectedModel?.trim() ? { model: selectedModel.trim() } : {}
+  const defaultModelID = account?.models?.model_levels?.default || account?.models?.default_model || ''
+  const modelLevels = {
+    default: defaultModelID,
+    haiku: account?.models?.model_levels?.haiku || account?.models?.small_model || defaultModelID,
+    sonnet: account?.models?.model_levels?.sonnet || defaultModelID,
+    opus: account?.models?.model_levels?.opus || defaultModelID,
+  }
   const formatted = error ? formatAmeKitError(error) : undefined
   const blockerInfo = account?.blocker ? formatAmeKitError(account.blocker) : undefined
   const bundleGeneration = useRef(0)
@@ -227,6 +233,7 @@ export function Account({ projectID, close, embedded = false, selectedModel }: {
         <span className="amekit-pill amekit-profile-card__role">{account.account.role || 'member'}</span>
       </section>
       <div className={`amekit-alert ${account.ready ? 'amekit-alert--success' : 'amekit-alert--warning'}`} role="status"><strong>{account.ready ? 'Tài khoản sẵn sàng' : blockerInfo?.title || (account.reconnecting ? 'Đang kết nối lại…' : 'Tài khoản chưa sẵn sàng')}</strong>{!account.ready && blockerInfo?.detail && <p>{blockerInfo.detail}</p>}</div>
+      {(account.models?.model_levels || account.models?.default_model) && <section className="amekit-card amekit-model-levels"><h4>Phân cấp Model từ API</h4><dl>{Object.entries(modelLevels).map(([level, id]) => <div key={level}><dt><code>{level}</code></dt><dd><code>{id || '—'}</code></dd></div>)}</dl></section>}
       <div className="button-row"><button disabled={busy} onClick={() => void execute('refresh')}>Làm mới phiên</button><button disabled={busy} onClick={() => void execute('logout')}>Đăng xuất</button></div>
     </> : <form onSubmit={e => { e.preventDefault(); void execute('login', { ...(server.trim() ? { server: server.trim() } : {}), username, password }) }}>
       {account?.reconnecting ? <div className="amekit-alert amekit-alert--warning" role="status"><strong>{blockerInfo?.title || 'Đang kết nối lại tài khoản đã lưu…'}</strong>{blockerInfo?.detail && <p>{blockerInfo.detail}</p>}<div className="button-row"><button type="button" disabled={busy} onClick={() => void execute('refresh')}>Kết nối lại</button><button type="button" disabled={busy} onClick={() => void execute('logout')}>Đăng xuất tài khoản đã lưu</button></div></div> : blockerInfo && <div className="amekit-alert amekit-alert--warning" role="status"><strong>{blockerInfo.title}</strong>{blockerInfo.detail && <p>{blockerInfo.detail}</p>}</div>}
@@ -260,12 +267,16 @@ export function Account({ projectID, close, embedded = false, selectedModel }: {
           {grouped.suggestClaudeAdapt && mode === 'native' && <div className="amekit-alert amekit-alert--warning"><strong>Phát hiện frontmatter agent Claude không tương thích Native.</strong><p>Các trường tools, model: inherit, color cần được chuẩn hóa cho OpenCode. Chuyển chế độ rồi chọn nhập lại thư mục để kiểm tra.</p><button disabled={busy} onClick={() => setMode('raw-adapt')}>Chuyển sang "Raw + Chuẩn hóa agent Claude"</button></div>}
           {mode !== (importPreview.adaptClaudeAgents ? 'raw-adapt' : importPreview.compatibilityMode) && <p className="muted">Chế độ mới chỉ áp dụng lần nhập tiếp theo. Chọn thư mục &amp; nhập lại để cập nhật kết quả.</p>}
           <BundleInventory agents={importPreview.agents} skills={importPreview.skills} />
-          {grouped.error.length > 0 && <div className="amekit-fix-bar"><p>Sửa trực tiếp các tệp lỗi bằng tài khoản admin và model đang dùng; secret nhạy cảm được ẩn tự động trước khi gửi lên AI.</p>{fixableErrors.length > 0 && <button type="button" disabled={busy} onClick={() => void execute('fix-import-all', fixModel)}>{fixableErrors.length > 1 ? `Sửa tất cả lỗi bằng AI (${fixableErrors.length})` : 'Sửa lỗi bằng AI'}</button>}</div>}
+          {grouped.error.length > 0 && <div className="amekit-fix-bar">
+            <span className="amekit-pill" data-testid="amekit-fix-model">Model sửa lỗi (agent &amp; skill): default{defaultModelID ? ` · ${defaultModelID}` : ''}</span>
+            <p>Sửa trực tiếp các tệp agent &amp; skill bị lỗi bằng model mặc định theo API (<code>default</code>{defaultModelID ? <>: <code>{defaultModelID}</code></> : ''}); secret nhạy cảm được ẩn tự động trước khi gửi lên AI.</p>
+            {fixableErrors.length > 0 && <button type="button" disabled={busy} onClick={() => void execute('fix-import-all', {})}>{fixableErrors.length > 1 ? `Sửa tất cả lỗi bằng AI (${fixableErrors.length})` : 'Sửa lỗi bằng AI'}</button>}
+          </div>}
           {fixNotice && <p className="amekit-fix-notice" role="status">{fixNotice}</p>}
           <div className="amekit-issue-tabs" role="tablist" aria-label="Phân loại vấn đề">{(Object.keys(issueLabels) as IssueSeverity[]).map(severity => <button key={severity} id={`amekit-issue-${severity}`} role="tab" aria-selected={issueTab === severity} aria-controls="amekit-issue-panel" onClick={() => setIssueTab(severity)}>{issueLabels[severity]} ({grouped[severity].length})</button>)}</div>
-          <div id="amekit-issue-panel" className="amekit-issues" role="tabpanel" aria-labelledby={`amekit-issue-${issueTab}`} tabIndex={0}>{grouped[issueTab].length ? <ul>{grouped[issueTab].map((issue, index) => <li className="amekit-issue-row" key={index}><code>{issue.path || 'Bundle'}</code><span>{issue.reason}</span>{issueTab === 'error' && issue.path && <div className="amekit-issue-actions">{importPreview.fixablePaths?.includes(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('fix-import', { path: issue.path, ...fixModel })}>Sửa bằng AI</button>}{canExcludeImportPath(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('exclude-import-file', { path: issue.path })}>Bỏ tệp</button>}</div>}</li>)}</ul> : <p className="muted">Không có mục nào trong nhóm này.</p>}</div>
+          <div id="amekit-issue-panel" className="amekit-issues" role="tabpanel" aria-labelledby={`amekit-issue-${issueTab}`} tabIndex={0}>{grouped[issueTab].length ? <ul>{grouped[issueTab].map((issue, index) => <li className="amekit-issue-row" key={index}><code>{issue.path || 'Bundle'}</code><span>{issue.reason}</span>{issueTab === 'error' && issue.path && <div className="amekit-issue-actions">{importPreview.fixablePaths?.includes(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('fix-import', { path: issue.path })}>Sửa bằng AI</button>}{canExcludeImportPath(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('exclude-import-file', { path: issue.path })}>Bỏ tệp</button>}</div>}</li>)}</ul> : <p className="muted">Không có mục nào trong nhóm này.</p>}</div>
           {Object.keys(appliedFixes).length > 0 && <div className="amekit-fix-list"><p className="muted">Các bản sửa đang áp dụng tạm để đóng gói (chưa ghi đè thư mục gốc nếu chưa bấm Lưu).</p>{Object.values(appliedFixes).map(fix => <article className="amekit-fix-card" key={fix.path}>
-            <div className="amekit-badges"><code>{fix.path}</code><span className="amekit-pill">{fix.kind === 'ai' ? `Đã sửa bởi AI · ${fix.model}` : 'Đã bỏ khỏi gói'}</span></div>
+            <div className="amekit-badges"><code>{fix.path}</code><span className="amekit-pill">{fix.kind === 'ai' ? `Đã sửa bởi AI · default (${fix.model})` : 'Đã bỏ khỏi gói'}</span></div>
             <p>{fix.summary}</p>
             {fix.diff && <details><summary>Xem thay đổi (diff)</summary><pre className="amekit-fix-diff">{fix.diff}</pre></details>}
             <div className="amekit-issue-actions">{fix.kind === 'ai' && <button type="button" disabled={busy || fix.saved} onClick={() => void execute('save-import-fix', { path: fix.path })}>{fix.saved ? 'Đã lưu vào đĩa' : 'Lưu về thư mục gốc'}</button>}<button type="button" disabled={busy} title="Khôi phục gói tạm; không thay đổi tệp đã lưu trên đĩa" onClick={() => void execute('revert-import-fix', { path: fix.path })}>Hoàn tác</button></div>

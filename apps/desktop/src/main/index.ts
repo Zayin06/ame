@@ -172,7 +172,7 @@ async function pickImport() {
   const selected = await dialog.showOpenDialog(window!, { title: 'Import AmeKit agents / skills', properties: ['openDirectory'] })
   return selected.canceled ? null : selected.filePaths[0] ?? null
 }
-async function resolveModel(projectID: string, requested?: Model | string, requireRequested = false, preferDefault = false): Promise<Model> {
+async function resolveModel(projectID: string, requested?: Model | string, requireRequested = false): Promise<Model> {
   const models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')
   if (!models.length) throw new Error('AMEKIT_MODEL_REQUIRED')
   const status = await account.call('status', {}) as { account?: { role?: string }; models?: { default_model?: string; models?: { id: string }[] } } | null
@@ -185,7 +185,7 @@ async function resolveModel(projectID: string, requested?: Model | string, requi
   const selected = role === 'user'
     ? allowed.find(model => (model.modelID ?? model.id) === catalog.default_model)
     : requestedID ? allowed.find(model => model.id === requestedID || (typeof requested === 'string' && model.modelID === requestedID))
-      : requireRequested ? undefined : preferDefault ? allowed.find(model => (model.modelID ?? model.id) === catalog.default_model) : allowed[0]
+      : requireRequested ? undefined : allowed.find(model => (model.modelID ?? model.id) === catalog.default_model) ?? allowed[0]
   if (!selected) throw new Error('AMEKIT_MODEL_REQUIRED')
   await account.call('assert-model', { modelID: selected.modelID ?? selected.id, providerID: selected.providerID })
   if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
@@ -215,7 +215,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'petGenerateDialogue': {
       const project = workspace.list()[0]
       if (!project) throw new Error('AMEKIT_MODEL_REQUIRED')
-      const selected = await resolveModel(project.id, a, false, true)
+      const selected = await resolveModel(project.id, a)
       return petHost!.generate(selected.modelID ?? selected.id)
     }
     case 'terminalProfiles': return terminals.available()

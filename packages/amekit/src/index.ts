@@ -71,12 +71,12 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     packed = undefined
     return importView()
   }
-  const fixImportFile = async (targetPath: string, model?: string) => {
+  const fixImportFile = async (targetPath: string) => {
     if (!importSession || !source) throw new Error("IMPORT_REQUIRED")
     const session = importSession, fileBytes = session.workingFiles.get(targetPath)
     if (!fileBytes) throw new Error("IMPORT_FILE_NOT_FOUND")
     const fixed = await fixImportFileWithLlm({
-      api, requestedModel: model, filePath: targetPath, fileBytes,
+      api, filePath: targetPath, fileBytes,
       issues: source.issues.filter(issue => issue.path === targetPath),
       compatibilityMode: session.options.compatibilityMode ?? "native", adaptClaudeAgents: session.adaptClaudeAgents,
       availablePaths: [...session.workingFiles.keys()], signal, fetcher,
@@ -257,14 +257,14 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         await api.guard(true, signal)
         if (!importSession || !source) throw new Error("IMPORT_REQUIRED")
         const session = importSession, targetPath = payload.path
-        if (operation === "fix-import") return fixImportFile(targetPath, payload.model)
+        if (operation === "fix-import") return fixImportFile(targetPath)
         if (operation === "fix-import-all") {
           const targets = importView().fixablePaths.slice(0, 10)
           if (!targets.length) throw new Error("AI_FIX_NO_FIXABLE_ERRORS")
           const fixes: Awaited<ReturnType<typeof fixImportFile>>["fix"][] = [], failed: { path: string; code: string }[] = []
           for (const target of targets) {
             signal.throwIfAborted()
-            try { fixes.push((await fixImportFile(target, payload.model)).fix) }
+            try { fixes.push((await fixImportFile(target)).fix) }
             catch (error) {
               if (signal.aborted || !api?.account || api.account.role !== "admin") throw error
               failed.push({ path: target, code: code(error) })

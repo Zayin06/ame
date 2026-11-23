@@ -10,6 +10,7 @@ import { AgentMap } from './AgentMap'
 import { familySummaryFromSessions } from '../agent-map-model'
 import { Empty, errorText, IconButton } from './Primitives'
 import { chatSubmit } from '../chat-submit'
+import { formatModelOptionLabel, modelKey, resolvePreferredModel, type ModelLevels } from '../model-selection'
 import { TurnChanges } from './SessionChanges'
 import { ToolCard } from './ToolCard'
 import { ArtifactViewer } from './ArtifactViewer'
@@ -38,7 +39,7 @@ function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
   })
 }
 
-export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, ready, files = [], activeFile, onRequestFiles }: { timelineDetail?: TimelineDetailMode; accountRole?: string; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, ready, files = [], activeFile, onRequestFiles }: { timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
   const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
   const initialCatalog = cached?.key === connectionUrl ? cached : undefined
   const [messages, setMessages] = useState<ChatItem[]>([])
@@ -46,9 +47,16 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   const [models, setModels] = useState<Model[]>(() => initialCatalog?.models ?? [])
   const [modelProject, setModelProject] = useState<string | undefined>(() => initialCatalog ? projectID : undefined)
   const [agents, setAgents] = useState<Agent[]>(() => initialCatalog?.agents ?? [])
-  const [model, setModel] = useState(() => initialCatalog?.models[0] ? `${initialCatalog.models[0].providerID}/${initialCatalog.models[0].id}` : '')
   const [fallbackRole, setFallbackRole] = useState<string>()
+  const [fallbackDefaultModel, setFallbackDefaultModel] = useState<string>()
+  const [fallbackModelLevels, setFallbackModelLevels] = useState<Partial<ModelLevels>>()
   const role = accountRole !== undefined ? accountRole : fallbackRole
+  const effectiveDefaultModel = defaultModelID !== undefined ? defaultModelID : fallbackDefaultModel
+  const effectiveModelLevels = modelLevels !== undefined ? modelLevels : fallbackModelLevels
+  const userPickedModel = useRef(false)
+  const [model, setModel] = useState(() => resolvePreferredModel({ models: initialCatalog?.models ?? [], currentValue: '', defaultModelID: effectiveDefaultModel, role }))
+  const modelPolicy = useRef({ role, defaultModelID: effectiveDefaultModel })
+  modelPolicy.current = { role, defaultModelID: effectiveDefaultModel }
   const [agent, setAgent] = useState('')
   const [text, setText] = useState('')
   const [commands, setCommands] = useState<SlashCommand[]>(() => initialCatalog?.commands ?? [])
@@ -116,19 +124,24 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   const permissionsCountRef = useRef(permissions.length); permissionsCountRef.current = permissions.length
   const fallbackTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   useEffect(() => {
-    if (accountRole !== undefined) return
+    if (accountRole !== undefined && defaultModelID !== undefined && modelLevels !== undefined) return
     let alive = true, generation = 0
     const load = async () => {
       const current = ++generation
       try {
-        const status = await window.ame.account('status') as { account?: { role?: string } } | null
-        if (alive && current === generation) setFallbackRole(status?.account?.role)
-      } catch (e) { if (alive && current === generation) { setFallbackRole(undefined); setError(errorText(e)) } }
+        const status = await window.ame.account('status') as { account?: { role?: string }; models?: { default_model?: string; model_levels?: Partial<ModelLevels> } } | null
+        if (alive && current === generation) {
+          setFallbackRole(status?.account?.role)
+          setFallbackDefaultModel(status?.models?.default_model)
+          setFallbackModelLevels(status?.models?.model_levels)
+          if (!status?.account) userPickedModel.current = false
+        }
+      } catch (e) { if (alive && current === generation) { setFallbackRole(undefined); setFallbackDefaultModel(undefined); setFallbackModelLevels(undefined); setError(errorText(e)) } }
     }
     void load()
     window.addEventListener('ame-account-changed', load)
     return () => { alive = false; window.removeEventListener('ame-account-changed', load) }
-  }, [connected, accountRole])
+  }, [connected, accountRole, defaultModelID, modelLevels])
   useEffect(() => {
     let alive = true, generation = 0
     const hydrate = (catalog?: ProjectCatalog) => {
@@ -136,7 +149,8 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
       setModels(allowed); setAgents(catalog?.agents ?? [])
       setCommands(catalog?.commands ?? []); setSkills(catalog?.skills ?? [])
       setModelProject(catalog ? projectID : undefined)
-      setModel(value => allowed.some(item => `${item.providerID}/${item.id}` === value) ? value : allowed[0] ? `${allowed[0].providerID}/${allowed[0].id}` : '')
+      if (!allowed.length) userPickedModel.current = false
+      setModel(currentValue => resolvePreferredModel({ models: allowed, currentValue, ...modelPolicy.current, userPicked: userPickedModel.current }))
     }
     const load = async () => {
       if (!projectID || !connected) return
@@ -165,14 +179,15 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
     const catalog = cached?.key === connectionUrl ? cached : undefined
     hydrate(catalog)
     if (!catalog || Date.now() - catalog.fetchedAt >= 30_000) void load()
-    const accountChanged = () => { clearProjectCatalogs(); hydrate(); void load() }
+    const accountChanged = () => { clearProjectCatalogs(); void load() }
     window.addEventListener('ame-account-changed', accountChanged)
     return () => { alive = false; window.removeEventListener('ame-account-changed', accountChanged) }
   }, [projectID, connected, connectionUrl, report])
   useEffect(() => {
-    if (role === 'user' && models[0]) setModel(`${models[0].providerID}/${models[0].id}`)
-  }, [role, models])
-  const activeModel = projectID && connected && modelProject === projectID ? role === 'user' ? models[0] : models.find(item => `${item.providerID}/${item.id}` === model) : undefined
+    if (!role || !models.length) userPickedModel.current = false
+    setModel(currentValue => resolvePreferredModel({ models, currentValue, defaultModelID: effectiveDefaultModel, role, userPicked: userPickedModel.current }))
+  }, [role, models, effectiveDefaultModel])
+  const activeModel = projectID && connected && modelProject === projectID ? models.find(item => modelKey(item) === model) : undefined
   const activeAgent = agents.find(a => a.id === agent)
   useEffect(() => { onModelChange?.(ready ? activeModel : undefined) }, [activeModel, onModelChange, connected, ready, projectID])
   useEffect(() => {
@@ -336,9 +351,9 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
               <textarea ref={input} className="composer-input" aria-label="Yêu cầu cho agent" aria-autocomplete="list" aria-expanded={!!trigger} aria-controls={trigger ? popoverID : undefined} aria-activedescendant={trigger && choices.length ? `${popoverID}-${selectedCompletion}` : undefined} placeholder="Hỏi bất cứ điều gì — gõ yêu cầu cho agent…" value={text} disabled={!projectID || !connected} onChange={e => { setText(e.target.value); updateTrigger(e.target.value, e.target.selectionStart) }} onClick={e => updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart)} onKeyUp={e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onCompositionStart={() => { composing.current = true; setTrigger(null) }} onCompositionEnd={e => { composing.current = false; updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onKeyDown={e => { if (composing.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || handlePopoverKey(e)) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} rows={1} />
         <div className="composer-toolbar"><div className="composer-toolbar__left"><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Đính kèm ngữ cảnh" aria-label="Đính kèm ngữ cảnh" aria-expanded={attachmentPicker} aria-controls={attachmentPicker ? popoverID : undefined} onClick={() => { const open = !attachmentPicker; setAttachmentPicker(open); setAttachmentQuery(''); setCompletionIndex(0); setTrigger(null); if (open) onRequestFiles?.() }}><Icon name="plus" /></button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Slash commands & skills" aria-label="Slash commands & skills" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('/')}>/</button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="File mentions" aria-label="File mentions" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('@')}>@</button>{role === 'user' ? <span className="composer-picker composer-picker--model composer-picker--locked" role="status" aria-label="Mô hình cố định theo chính sách máy chủ" title={`Tài khoản user dùng model cố định từ máy chủ: ${activeModel?.name || model}`}>
           <span className="composer-picker__face"><Icon name="lock" /><span className="composer-picker__label">{activeModel?.name || model}</span></span>
-        </span> : <label className="composer-picker composer-picker--model" title={activeModel ? `Model: ${activeModel.name}` : 'Chọn model'}>
+        </span> : <label className="composer-picker composer-picker--model" title={activeModel ? `Model: ${formatModelOptionLabel(activeModel, effectiveModelLevels)}` : 'Chọn model'}>
           <span className="composer-picker__face" aria-hidden="true"><Icon name="sparkles" /><span className="composer-picker__label">{activeModel?.name || 'Chọn model'}</span><Icon name="down" /></span>
-          <select className="composer-picker__native" aria-label="Mô hình" value={model} onChange={e => setModel(e.target.value)} disabled={!connected || busy}><option value="">Chọn model</option>{models.map(m => <option key={`${m.providerID}/${m.id}`} value={`${m.providerID}/${m.id}`}>{m.name}</option>)}</select>
+          <select className="composer-picker__native" aria-label="Mô hình" value={model} onChange={e => { userPickedModel.current = true; setModel(e.target.value) }} disabled={!connected || busy}><option value="">Chọn model</option>{models.map(m => <option key={modelKey(m)} value={modelKey(m)}>{formatModelOptionLabel(m, effectiveModelLevels)}</option>)}</select>
         </label>}</div><div className="composer-toolbar__right"><label className="composer-picker composer-picker--agent" title={`Agent: ${activeAgent?.name || 'Default'} (policy quyền do OpenCode quản lý)`}>
           <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{activeAgent?.name || 'Default'}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Agent" value={agent} onChange={e => setAgent(e.target.value)} disabled={!connected || busy}><option value="">Default</option>{agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select>

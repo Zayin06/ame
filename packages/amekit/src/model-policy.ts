@@ -3,6 +3,13 @@ import { z } from "zod"
 import type { Role } from "./api"
 
 export const managedProvider = "amecode"
+export const MODEL_LEVELS = ["default", "haiku", "sonnet", "opus"] as const
+export type ModelLevel = (typeof MODEL_LEVELS)[number]
+export type ModelLevels = Record<ModelLevel, string>
+const levelsSchema = z.object({
+  default: z.string().min(1), haiku: z.string().min(1),
+  sonnet: z.string().min(1), opus: z.string().min(1),
+})
 const entry = z.object({
   id: z.string().min(1).max(200), name: z.string().min(1).max(200),
   tool_call: z.boolean(), vision: z.boolean(), reasoning: z.boolean().default(false),
@@ -11,18 +18,34 @@ const entry = z.object({
 export const catalogSchema = z.object({
   version: z.string().min(1).max(100), default_model: z.string().min(1),
   small_model: z.string().min(1), models: z.array(entry).min(1).max(2000),
+  model_levels: levelsSchema.optional(),
 }).superRefine((catalog, ctx) => {
   const ids = new Set(catalog.models.map(model => model.id))
-  if (ids.size !== catalog.models.length || !ids.has(catalog.default_model) || !ids.has(catalog.small_model))
+  if (ids.size !== catalog.models.length || !ids.has(catalog.default_model) || !ids.has(catalog.small_model) ||
+    (catalog.model_levels && (catalog.model_levels.default !== catalog.default_model || MODEL_LEVELS.some(level => !ids.has(catalog.model_levels![level])))))
     ctx.addIssue({ code: "custom", message: "INVALID_MODEL_DEFAULT" })
 })
 export type ManagedCatalog = z.infer<typeof catalogSchema>
+export function parseModelLevel(value: string | undefined): ModelLevel | undefined {
+  const match = /^(?:amecode\/)?(default|haiku|sonnet|opus)$/.exec(value?.trim().toLowerCase() ?? "")
+  return match?.[1] as ModelLevel | undefined
+}
+export function resolveModelLevel(policy: { default_model: string; model_levels: ModelLevels }, idOrLevel: string): string {
+  const level = parseModelLevel(idOrLevel)
+  return level ? policy.model_levels[level] : idOrLevel
+}
 export function modelPolicy(role: Role | undefined, value: unknown) {
   if (role !== "admin" && role !== "user") throw new Error("INVALID_ROLE")
   const parsed = catalogSchema.safeParse(value)
   if (!parsed.success) throw new Error("INVALID_MODEL_CATALOG")
   const catalog = parsed.data
-  return { ...catalog, models: role === "admin" ? catalog.models : catalog.models.filter(model => model.id === catalog.default_model) }
+  const model_levels: ModelLevels = role === "admin" ? {
+    default: catalog.default_model,
+    haiku: catalog.model_levels?.haiku ?? catalog.small_model,
+    sonnet: catalog.model_levels?.sonnet ?? catalog.default_model,
+    opus: catalog.model_levels?.opus ?? catalog.default_model,
+  } : { default: catalog.default_model, haiku: catalog.default_model, sonnet: catalog.default_model, opus: catalog.default_model }
+  return { ...catalog, model_levels, models: role === "admin" ? catalog.models : catalog.models.filter(model => model.id === catalog.default_model) }
 }
 export function assertModel(policy: ReturnType<typeof modelPolicy> | undefined, model: { providerID: string; id: string }) {
   if (!policy) throw new Error("AMECODE_LOGIN_REQUIRED")

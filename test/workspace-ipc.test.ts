@@ -681,6 +681,18 @@ test('side-thread and pet generation resolve canonical catalog models and enforc
   await assert.rejects(h.dispatch('prompt', ['p', 's', 'question']), /AMEKIT_MODEL_REQUIRED/)
 })
 
+test('commit messages and side-thread questions prefer the API default over catalog order', async () => {
+  const h = await harness()
+  const other = { id: 'other', modelID: 'other', name: 'Other', providerID: 'amecode' }
+  const preferred = { id: 'amecode/preferred', modelID: 'preferred', name: 'Preferred', providerID: 'amecode' }
+  h.setModels([other, preferred])
+  h.setStatus({ account: { role: 'admin' }, models: { default_model: 'preferred', models: [{ id: 'other' }, { id: 'preferred' }] } })
+  await h.dispatch('generateCommitMessage', ['p'])
+  assert.deepEqual(plain(h.calls.at(-1)?.args[1]), preferred)
+  await h.dispatch('btwAsk', ['p', 's', 'question'])
+  assert.deepEqual(plain(h.calls.at(-1)?.args[3]), preferred)
+})
+
 test('side-thread and pet generation fail closed on policy, catalog and project failures', async () => {
   const invocations = [{ method: 'btwAsk', args: ['p', 's', 'question', selectedModel] }, { method: 'petGenerateDialogue', args: ['model'] }]
   for (const invocation of invocations) {

@@ -12,6 +12,7 @@ import { validate } from "../src/bundle/manifest"
 import { scan, scanWithSource } from "../src/bundle/scan"
 import { buildCompactDiff, fixImportFileWithLlm, isFixableTextFile, redactSecretsForLlm } from "../src/bundle/ai-fix"
 import { AmeApi } from "../src/api"
+import { assertModel, catalogSchema, MODEL_LEVELS, modelPolicy, parseModelLevel, resolveModelLevel, type ModelLevels } from "../src/model-policy"
 import { parse, stringify } from "yaml"
 import { installed, install, readCommitEnhanceSkill, uninstall } from "../src/installer"
 import type { Release } from "../src/api"
@@ -101,6 +102,56 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
 }
 const login = (service: AmeKit) => service.call("login", { server: "http://localhost:3211", username: "fixture", password: "fixture-password" })
 
+test("model policy maps explicit tiers for admins and locks every user tier to the default", () => {
+  const levels: ModelLevels = { default: "balanced-v2", haiku: "fast-v1", sonnet: "coding-v3", opus: "reasoning-v4" }
+  const value = { ...catalog, default_model: levels.default, small_model: levels.haiku, model_levels: levels,
+    models: Object.values(levels).map(id => ({ ...catalog.models[0], id, name: id })) }
+  const admin = modelPolicy("admin", value)
+  assert.deepEqual(admin.model_levels, levels)
+  assert.deepEqual(admin.models.map(model => model.id), Object.values(levels))
+  const user = modelPolicy("user", value)
+  assert.deepEqual(user.models.map(model => model.id), [levels.default])
+  assert.deepEqual(user.model_levels, { default: levels.default, haiku: levels.default, sonnet: levels.default, opus: levels.default })
+  for (const level of MODEL_LEVELS) {
+    assert.equal(resolveModelLevel(admin, `amecode/${level}`), levels[level])
+    assert.equal(resolveModelLevel(user, level), levels.default)
+  }
+  assertModel(user, { providerID: "amecode", id: levels.default })
+  for (const id of [levels.haiku, levels.sonnet, levels.opus, "haiku", "amecode/opus"])
+    assert.throws(() => assertModel(user, { providerID: "amecode", id }), /AMECODE_MODEL_NOT_ALLOWED/)
+  assert.throws(() => assertModel(admin, { providerID: "other", id: levels.default }), /AMECODE_MODEL_NOT_ALLOWED/)
+  assert.deepEqual(modelPolicy("admin", catalog).model_levels, { default: "default", haiku: "other", sonnet: "default", opus: "default" })
+  assert.deepEqual(modelPolicy("user", catalog).model_levels, { default: "default", haiku: "default", sonnet: "default", opus: "default" })
+})
+
+test("model policy rejects invalid roles and incomplete or inconsistent tier catalogs", () => {
+  for (const role of [undefined, null, "owner", "Admin"])
+    assert.throws(() => modelPolicy(role as never, catalog), /INVALID_ROLE/)
+  const levels: ModelLevels = { default: "default", haiku: "other", sonnet: "default", opus: "other" }
+  const invalidLevels: unknown[] = [null, {}, { ...levels, default: "other" }]
+  for (const level of MODEL_LEVELS) {
+    const { [level]: _, ...missing } = levels
+    invalidLevels.push(missing, { ...levels, [level]: "" }, { ...levels, [level]: "absent" })
+    const parsed = catalogSchema.safeParse({ ...catalog, model_levels: { ...levels, [level]: "absent" } })
+    assert.equal(parsed.success, false)
+    if (!parsed.success) assert.ok(parsed.error.issues.some(issue => issue.message === "INVALID_MODEL_DEFAULT"))
+  }
+  for (const model_levels of invalidLevels) for (const role of ["admin", "user"] as const)
+    assert.throws(() => modelPolicy(role, { ...catalog, model_levels }), /INVALID_MODEL_CATALOG/)
+})
+
+test("model level parsing accepts only trimmed bare or managed tiers and preserves concrete IDs", () => {
+  const policy = modelPolicy("admin", catalog)
+  for (const level of MODEL_LEVELS) {
+    for (const value of [level, `amecode/${level}`, ` ${level.toUpperCase()} `, ` AMECODE/${level.toUpperCase()} `])
+      assert.equal(parseModelLevel(value), level)
+  }
+  for (const value of [undefined, "", "other/haiku", "amecode/haiku/extra", "amecode/ sonnet", "claude-3-7-sonnet", "haiku-extra"])
+    assert.equal(parseModelLevel(value), undefined)
+  for (const value of ["claude-3-7-sonnet", " Other-ID ", "other/haiku"])
+    assert.equal(resolveModelLevel(policy, value), value)
+})
+
 test("AmeKit account role views, fresh prompt authorization, encryption and logout", async () => {
   const f = await fixture()
   try {
@@ -120,6 +171,20 @@ test("AmeKit account role views, fresh prompt authorization, encryption and logo
     await assert.rejects(readFile(path.join(f.data, "amekit-session.enc")), { code: "ENOENT" })
     assert.equal(f.rpc.at(-1), null)
     await assert.rejects(f.service.call("assert-model", { modelID: "default" }), /SIGNED_OUT/)
+  } finally { await f.cleanup() }
+})
+
+test("account login, status and refresh expose role-aware API model levels", async () => {
+  const levels: ModelLevels = { default: "default", haiku: "other", sonnet: "other", opus: "other" }
+  const f = await fixture({ role: "admin", catalog: { ...catalog, model_levels: levels } })
+  try {
+    const loggedIn = await login(f.service) as { models: { model_levels: ModelLevels } }
+    assert.deepEqual(loggedIn.models.model_levels, levels)
+    const status = await f.service.call("status", {}) as typeof loggedIn
+    assert.deepEqual(status.models.model_levels, levels)
+    f.role("user")
+    const refreshed = await f.service.call("refresh", {}) as typeof loggedIn
+    assert.deepEqual(refreshed.models.model_levels, { default: "default", haiku: "default", sonnet: "default", opus: "default" })
   } finally { await f.cleanup() }
 })
 
@@ -552,6 +617,41 @@ test("Claude adaptation handles colors, preserves OpenCode metadata and concrete
   assert.doesNotMatch(new TextDecoder().decode(preview(files, [], { compatibilityMode: "raw", adaptClaudeAgents: true }).files[0].data), /model:/)
 })
 
+test("Claude raw-adapt normalizes bare and prefixed tiers without touching instruction bodies", () => {
+  for (const level of MODEL_LEVELS) for (const model of [level, ` ${level.toUpperCase()} `, ` AMECODE/${level.toUpperCase()} `, `amecode/${level}`]) {
+    const files = input(), body = "\r\nBody unchanged. 🤖\r\nFinal line"
+    files[0].data = encode(`---\n${stringify({ description: "Helpful fixture", mode: "subagent", model })}---\n${body}`)
+    const result = preview(files, [], { compatibilityMode: "raw", adaptClaudeAgents: true })
+    const text = new TextDecoder().decode(result.files[0].data), end = text.indexOf("---\n", 4)
+    assert.deepEqual(parse(text.slice(4, end)), { description: "Helpful fixture", mode: "subagent", model: `amecode/${level}` })
+    assert.equal(text.slice(end + 4), body)
+    assert.deepEqual(result.issues.filter(issue => issue.path && ["error", "warning"].includes(issue.severity)), [])
+    if (model !== `amecode/${level}`) assert.ok(result.issues.some(issue => issue.severity === "change" && issue.reason.includes(`model ${model.trim()} -> amecode/${level}`)))
+    else assert.deepEqual(result.files[0].data, files[0].data)
+  }
+})
+
+test("native and raw bundle previews accept only portable managed tier model references cleanly", () => {
+  for (const compatibilityMode of ["native", "raw"] as const) {
+    for (const level of MODEL_LEVELS) {
+      const files = input()
+      files[0].data = encode(`---\ndescription: Helpful fixture\nmodel: amecode/${level}\n---\nBody\n`)
+      const result = preview(files, [], { compatibilityMode })
+      assert.deepEqual(result.files[0].data, files[0].data)
+      assert.deepEqual(result.issues.filter(issue => issue.path), [])
+    }
+    for (const model of ["haiku", "amecode/Opus", "other/sonnet", "claude-3-7-sonnet", "amecode/opus/extra"]) {
+      const files = input()
+      files[0].data = encode(`---\ndescription: Helpful fixture\nmodel: ${model}\n---\nBody\n`)
+      const result = preview(files, [], { compatibilityMode })
+      assert.deepEqual(result.files[0].data, files[0].data)
+      assert.ok(result.issues.some(issue => compatibilityMode === "raw"
+        ? issue.severity === "warning" && /pinned model metadata preserved/.test(issue.reason)
+        : issue.severity === "error" && /model dependency requires/.test(issue.reason)))
+    }
+  }
+})
+
 test("Claude adaptation rejects non-raw modes in preview, scan and import payloads", async () => {
   for (const compatibilityMode of [undefined, "native"] as const) {
     assert.throws(() => preview(input(), [], { compatibilityMode, adaptClaudeAgents: true }), /INVALID_COMPATIBILITY_MODE/)
@@ -868,7 +968,7 @@ test("admin AI fix stages secret-safe edits, packages immediately, saves only af
     await addSecretFile(f.imported)
     f.fixResponse(async (body, init) => {
       assert.equal(JSON.stringify(body).includes(secretFixture), false)
-      assert.equal(body.model, "other"); assert.equal(body.stream, false); assert.equal(body.temperature, 0.1)
+      assert.equal(body.model, "default"); assert.equal(body.stream, false); assert.equal(body.temperature, 0.1)
       assert.equal(body.max_tokens, 8192); assert.equal(init.redirect, "error"); assert.ok(init.signal)
       return fixReply('api_key="<YOUR_API_KEY>"\n')
     })
@@ -880,7 +980,7 @@ test("admin AI fix stages secret-safe edits, packages immediately, saves only af
     const fixed = await f.service.call("fix-import", { path: secretPath, model: "other" }) as { preview: FixPreview; fix: { diff: string; redactionCount: number; model: string } }
     assert.deepEqual(fixed.preview.fixablePaths, [])
     assert.equal(fixed.preview.issues.filter(issue => issue.severity === "error").length, 0)
-    assert.equal(fixed.fix.diff.includes(secretFixture), false); assert.equal(fixed.fix.redactionCount, 1); assert.equal(fixed.fix.model, "other")
+    assert.equal(fixed.fix.diff.includes(secretFixture), false); assert.equal(fixed.fix.redactionCount, 1); assert.equal(fixed.fix.model, "default")
     const target = path.join(f.imported, ...secretPath.split("/"))
     assert.ok((await readFile(target, "utf8")).includes(secretFixture), "AI edits are staged only")
     await f.service.call("package", { version: "1.2.4" })
@@ -905,6 +1005,32 @@ test("admin AI fix stages secret-safe edits, packages immediately, saves only af
   } finally { await f.cleanup() }
 })
 
+test("agent and skill AI fixes ignore model overrides and use the concrete API default", async () => {
+  const f = await fixture({ role: "admin", catalog: { ...catalog, default_model: "other" } })
+  try {
+    await writeFile(path.join(f.imported, "agents", "helper.md"), "---\ndescription: Helpful fixture\nmodel: claude-3-7-sonnet\n---\nBody\n")
+    await writeFile(path.join(f.imported, "skills", "fixture", "SKILL.md"), "---\nname: fixture\n---\nRun checks.\n")
+    f.fixResponse(async body => {
+      assert.equal(body.model, "other", "API default wins even when it is not the first catalog model")
+      const messages = body.messages as { content: string }[]
+      assert.match(messages[0].content, /model \(optional portable tier: amecode\/default \| amecode\/haiku \| amecode\/sonnet \| amecode\/opus\)/)
+      assert.match(messages[0].content, /NO tools, name, or concrete provider model IDs/)
+      const filePath = JSON.parse(messages[1].content).filePath
+      return fixReply(filePath === "agents/helper.md"
+        ? "---\ndescription: Helpful fixture\nmodel: amecode/sonnet\n---\nBody\n"
+        : "---\nname: fixture\ndescription: Fixture skill\n---\nRun checks.\n")
+    })
+    await login(f.service); await f.service.call("import", {})
+    const agent = await f.service.call("fix-import", { path: "agents/helper.md", model: "default" }) as { fix: { model: string } }
+    assert.equal(agent.fix.model, "other")
+    const skills = await f.service.call("fix-import-all", { model: "default" }) as { preview: FixPreview; fixes: { path: string; model: string }[]; failed: unknown[] }
+    assert.deepEqual(skills.failed, [])
+    assert.deepEqual(skills.fixes.map(fix => ({ path: fix.path, model: fix.model })), [{ path: "skills/fixture/SKILL.md", model: "other" }])
+    assert.deepEqual(skills.preview.fixablePaths, [])
+    assert.equal(f.fixRequests.length, 2)
+  } finally { await f.cleanup() }
+})
+
 test("AI fix retries exact validation feedback once and fails closed without altering staged originals", async () => {
   const f = await fixture({ role: "admin" })
   try {
@@ -912,7 +1038,7 @@ test("AI fix retries exact validation feedback once and fails closed without alt
     f.fixResponse(async () => f.fixRequests.length === 1 ? fixReply("[missing](absent.md)\n") : fixReply("Use an environment lookup.\n"))
     await f.service.call("fix-import", { path: secretPath, model: "not-allowed" })
     assert.equal(f.fixRequests.length, 2)
-    assert.equal(f.fixRequests[0].model, "default", "unknown requested model falls back")
+    assert.ok(f.fixRequests.every(body => body.model === "default"), "every retry ignores the requested model")
     assert.match(JSON.stringify(f.fixRequests[1]), /missing\/unsafe local reference: absent.md/)
     await f.service.call("revert-import-fix", { path: secretPath })
     f.fixResponse(async () => fixReply("[missing](absent.md)\n"))
@@ -929,8 +1055,12 @@ test("AI fix-all applies evolving validated files and reports per-file failures 
     const second = "skills/turnstile-spin/references/z.md"
     await addSecretFile(f.imported); await addSecretFile(f.imported, second)
     await login(f.service); await f.service.call("import", {})
-    f.fixResponse(async () => f.fixRequests.length === 1 ? new Response("provider unavailable", { status: 503 }) : fixReply("Safe reference.\n"))
-    const result = await f.service.call("fix-import-all", {}) as { preview: FixPreview; fixes: { path: string }[]; failed: { path: string; code: string }[] }
+    f.fixResponse(async body => {
+      assert.equal(body.model, "default")
+      return f.fixRequests.length === 1 ? new Response("provider unavailable", { status: 503 }) : fixReply("Safe reference.\n")
+    })
+    const result = await f.service.call("fix-import-all", { model: "other" }) as { preview: FixPreview; fixes: { path: string; model: string }[]; failed: { path: string; code: string }[] }
+    assert.ok(result.fixes.every(fix => fix.model === "default"))
     assert.deepEqual(result.failed, [{ path: secretPath, code: "AI_FIX_PROVIDER_ERROR" }])
     assert.deepEqual(result.fixes.map(fix => fix.path), [second]); assert.deepEqual(result.preview.fixablePaths, [secretPath])
     await f.service.call("exclude-import-file", { path: secretPath })
@@ -1184,7 +1314,7 @@ test("AI fix compact diff keeps local context, additions/deletions and bounded t
   assert.match(capped, /\.\.\. \(\+\d+ dòng\)/)
 })
 
-test("AI fix engine uses redacted full-file requests, constrained HTTP settings and allowed model fallback", async () => {
+test("AI fix engine uses redacted full-file requests, constrained HTTP settings and always the API default", async () => {
   const f = await fixture({ role: "admin" })
   try {
     const params = await engineParams(f)
@@ -1197,10 +1327,10 @@ test("AI fix engine uses redacted full-file requests, constrained HTTP settings 
       assert.match(serialized, /likely embedded secret/)
       return Response.json({ choices: [{ message: { content: "```json\n" + JSON.stringify({ summary: "Đã thay bằng biến môi trường", content: fixedReference }) + "\n```" } }] })
     })
-    for (const [requestedModel, expected] of [[" other ", "other"], ["not-allowed", "default"], [" ", "default"]]) {
+    for (const requestedModel of ["other", " other ", "amecode/opus", "not-allowed", " ", undefined]) {
       const result = await fixImportFileWithLlm({ ...params, requestedModel })
-      assert.equal(result.model, expected)
-      assert.equal(f.fixRequests.at(-1)!.model, expected)
+      assert.equal(result.model, "default")
+      assert.equal(f.fixRequests.at(-1)!.model, "default")
       assert.equal(new TextDecoder().decode(result.contentBytes), fixedReference)
       assert.equal(result.redactionCount, 1)
       assert.equal(result.diff.includes(syntheticSecret), false)
