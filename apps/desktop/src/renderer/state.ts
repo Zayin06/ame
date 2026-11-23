@@ -25,17 +25,18 @@ export function removeTab(view: ProjectView, tab: Tab): ProjectView {
   }
   return result
 }
+export type TimelineDetailMode = 'compact' | 'detailed' | 'everything'
 export type Preferences = {
   theme: 'dark' | 'light'; widths: Record<Pane, number>; rail: boolean; inspector: boolean; stage: boolean;
   terminalOpen: boolean; inspectorTab: 'files' | 'search' | 'git'; panel: 'artifact' | 'files' | 'diff' | 'changes' | 'usage' | 'terminal' | 'subagents' | 'btw';
-  layoutMode: 'swe' | 'knowledge'; tint: 'default' | 'nord' | 'everforest'; chatWidth: 640 | 760 | 960;
+  layoutMode: 'swe' | 'knowledge'; tint: 'default' | 'nord' | 'everforest'; chatWidth: 640 | 760 | 960; timelineDetail: TimelineDetailMode;
   project?: string; projects: Record<string, ProjectView>
 }
 export const defaultWidths = { rail: 256, inspector: 240, stage: 480 }
 export const tabID = (tab: Tab) => `${tab.mode}:${tab.path}`
 export const documentID = (project: string, path: string) => JSON.stringify([project, path])
 export const clampWidth = (pane: Pane, width: number) => Math.round(Math.max(pane === 'stage' ? 300 : 190, Math.min(pane === 'stage' ? 780 : 360, width)))
-export const defaults = (): Preferences => ({ theme: 'dark', widths: { ...defaultWidths }, rail: true, inspector: false, stage: true, terminalOpen: true, inspectorTab: 'files', panel: 'files', layoutMode: 'swe', tint: 'default', chatWidth: 760, projects: {} })
+export const defaults = (): Preferences => ({ theme: 'dark', widths: { ...defaultWidths }, rail: true, inspector: false, stage: true, terminalOpen: true, inspectorTab: 'files', panel: 'files', layoutMode: 'swe', tint: 'default', chatWidth: 760, timelineDetail: 'compact', projects: {} })
 export function parsePreferences(raw: string | null): Preferences {
   const result = defaults()
   try {
@@ -54,6 +55,7 @@ export function parsePreferences(raw: string | null): Preferences {
     if (value.layoutMode === 'knowledge') result.layoutMode = 'knowledge'
     if (['nord', 'everforest'].includes(value.tint)) result.tint = value.tint
     if ([640, 760, 960].includes(value.chatWidth)) result.chatWidth = value.chatWidth
+    if (['compact', 'detailed', 'everything'].includes(value.timelineDetail)) result.timelineDetail = value.timelineDetail
     if (typeof value.project === 'string') result.project = value.project
     if (value.projects && typeof value.projects === 'object') for (const [id, view] of Object.entries(value.projects)) {
       if (!view || typeof view !== 'object') continue

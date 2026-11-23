@@ -14,4 +14,6 @@ Session changes follow the same pinned OpenCode source:
 - `packages/app/src/session/timeline/turn-diffs.ts` and `turn-diff-machine.ts`: lazy finished-turn requests, timeout, retry and stale-result handling.
 - `packages/session-ui/src/components/session-diff.ts` and `packages/util/src/encode.ts`: patch normalization/checksum ported into `apps/desktop/src/renderer/opencode-session-diff.ts`; imports adapted and `findLastIndex` expressed as an equivalent ES2022 reduction. React uses the same pinned `@pierre/diffs@1.6.1` renderer instead of the upstream Solid wrapper.
 
+Compact chat timeline semantics follow the pinned OpenCode 2.3.2 `packages/session-ui/src/timeline-next/rules.ts`, `projection.ts`, `tools/context-group.tsx`, `timeline/detail.ts` and `@opencode/util/session-turn`: tool mode priority, grouped reads, turn commentary and settled work projection are adapted into the DOM-free React view model `apps/desktop/src/renderer/chat-timeline.ts`. `TurnWorkGroup.tsx` renders its compact activity rail; Settings exposes compact/detailed/everything presets. No upstream Solid components or styles are imported.
+
 The IDE consumes upstream public APIs; it does not patch upstream server/CLI or claim that mobile end-to-end compatibility has been tested. Local provenance does not confer a redistribution license; see [notices](../THIRD_PARTY_NOTICES.md).

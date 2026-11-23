@@ -169,6 +169,76 @@ test('completed turns follow native idle/snapshot boundaries, including steered 
   assert.equal(items[2].id, 'idle1:changes')
 })
 
+test('timeline metadata spans an idle-bounded execution without restarting for steered prompts', () => {
+  const items = normalizeMessages([
+    { id: 'u1', type: 'user', text: 'first', time: { created: 0 } },
+    { id: 'a1', type: 'assistant', time: { created: 10, completed: 20 }, snapshot: { files: ['z.ts'] }, content: [
+      { type: 'text', text: 'Checking', native: { phase: 'commentary' } },
+      { type: 'reasoning', text: 'Thinking', native: { phase: 'final_answer' } },
+      { type: 'tool', name: 'read', state: { status: 'completed' } },
+    ] },
+    { id: 'steer', type: 'user', text: 'steer', time: { created: 30 } },
+    { id: 'a2', type: 'assistant', time: { created: 40, completed: 50 }, snapshot: { files: ['a.ts', 'z.ts'] }, content: [
+      { type: 'text', text: 'Done', native: { phase: 'final_answer' } },
+    ] },
+    { id: 'empty', type: 'assistant', time: { created: 55, completed: 55 }, content: [] },
+    { id: 'idle1', type: 'idle', time: { created: 60 } },
+    { id: 'u2', type: 'user', text: 'read only', time: { created: 100 } },
+    { id: 'a3', type: 'assistant', time: { created: 110 }, content: [
+      { type: 'tool', name: 'read', state: { status: 'completed' } },
+    ] },
+    { id: 'idle2', type: 'idle', time: { created: 130 } },
+  ] as SessionMessageInfo[])
+  assert.deepEqual(items.slice(0, 3), [
+    { id: 'u1', role: 'user', text: 'first', createdAt: 0 },
+    { id: 'a1:0', role: 'assistant', kind: 'text', text: 'Checking', createdAt: 10, completedAt: 20, phase: 'commentary' },
+    { id: 'a1:1', role: 'assistant', kind: 'reasoning', text: 'Thinking', createdAt: 10, completedAt: 20 },
+  ])
+  assert.equal(items[3].createdAt, 10)
+  assert.equal(items[3].completedAt, 20)
+  assert.equal(Object.hasOwn(items[3], 'phase'), false)
+  assert.deepEqual(items[4], { id: 'steer', role: 'user', text: 'steer', createdAt: 30 })
+  assert.deepEqual(items[5], { id: 'a2:0', role: 'assistant', kind: 'text', text: 'Done', createdAt: 40, completedAt: 50, phase: 'final_answer', workedMs: 60 })
+  assert.deepEqual(items[6], { id: 'idle1:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u1', files: ['a.ts', 'z.ts'] } })
+  assert.equal(items[8].workedMs, 30)
+  assert.equal(items.filter(item => item.kind === 'changes').length, 1)
+  for (const item of items.filter(item => !['a2:0', 'a3:0'].includes(item.id))) assert.equal(Object.hasOwn(item, 'workedMs'), false)
+})
+
+test('timeline metadata preserves minimal fixtures and omits unknown text phases', () => {
+  const items = normalizeMessages([
+    { id: 'u', type: 'user', text: 'hello' },
+    { id: 'a', type: 'assistant', content: [{ type: 'text', text: 'Done' }, { type: 'reasoning', text: 'Thinking' }] },
+    { id: 'idle', type: 'idle' },
+  ] as SessionMessageInfo[])
+  assert.deepEqual(items, [
+    { id: 'u', role: 'user', text: 'hello' },
+    { id: 'a:0', role: 'assistant', kind: 'text', text: 'Done' },
+    { id: 'a:1', role: 'assistant', kind: 'reasoning', text: 'Thinking' },
+  ])
+  const [unknown] = normalizeMessages([{ id: 'a', type: 'assistant', time: { created: 0, completed: 0 }, content: [
+    { type: 'text', text: 'Done', native: { phase: 'unknown' } },
+  ] }] as unknown as SessionMessageInfo[])
+  assert.deepEqual(unknown, { id: 'a:0', role: 'assistant', kind: 'text', text: 'Done', createdAt: 0, completedAt: 0 })
+})
+
+test('worked time requires a valid idle boundary and does not leak across turns', () => {
+  for (const [startedAt, idleAt, expected] of [[10, 10, 0], [10, 9, undefined], [undefined, 20, undefined], [10, undefined, undefined]] as const) {
+    const items = normalizeMessages([
+      { id: 'u', type: 'user', text: 'hello', ...(startedAt !== undefined ? { time: { created: startedAt } } : {}) },
+      { id: 'a', type: 'assistant', content: [{ type: 'text', text: 'Done' }] },
+      { id: 'idle', type: 'idle', ...(idleAt !== undefined ? { time: { created: idleAt } } : {}) },
+      { id: 'orphan', type: 'assistant', content: [{ type: 'text', text: 'No opener' }] },
+      { id: 'idle2', type: 'idle', time: { created: 100 } },
+      { id: 'u2', type: 'user', text: 'running', time: { created: 110 } },
+      { id: 'a2', type: 'assistant', content: [{ type: 'text', text: 'Not idle' }] },
+    ] as SessionMessageInfo[])
+    assert.equal(items[1].workedMs, expected)
+    assert.equal(Object.hasOwn(items[1], 'workedMs'), expected !== undefined)
+    for (const item of items.slice(2)) assert.equal(Object.hasOwn(item, 'workedMs'), false)
+  }
+})
+
 test('history normalizes reasoning and tool state without rendering HTML', () => {
   const items = normalizeMessages([{ id: 'u', type: 'user', text: '<script>not markup</script>' }, { id: 'a', type: 'assistant', content: [{ type: 'reasoning', text: 'Thinking' }, { type: 'tool', name: 'edit', state: { status: 'completed' } }] }] as SessionMessageInfo[])
   assert.equal(items[0].text, '<script>not markup</script>')

@@ -56,7 +56,7 @@ async function agentMapFixture(directory) {
   const now = Date.now(), model = { id: 'gpt-6.1-sol', providerID: 'amecode' }
   const tokens = (input, output, reasoning = 0, read = 0, write = 0) => ({ input, output, reasoning, cache: { read, write } })
   const definitions = [
-    { id: 'ses_root', title: 'PaywallScreen.kt vùng cuộn độc lập', agent: 'build', outcome: 'succeeded', tokens: tokens(30000, 8200, 2000, 1500, 500), prompt: 'Coordinate the paywall scrolling change and all verification.', output: '## Paywall plan\n\nDelegate layout, build, and lint verification.', skills: [], tools: ['subagent'] },
+    { id: 'ses_root', title: 'PaywallScreen.kt vùng cuộn độc lập', agent: 'build', outcome: 'succeeded', tokens: tokens(30000, 8200, 2000, 1500, 500), prompt: 'Coordinate the paywall scrolling change and all verification.', output: '## Paywall plan\n\nDelegate layout, build, and lint verification.', skills: [], tools: ['read_file', 'read_file', 'glob', 'grep', 'bash', 'subagent'] },
     { id: 'ses_l1_ui', parentID: 'ses_root', title: 'Adjust paywall scrolling layout', agent: 'android-dev', status: 'running', tokens: tokens(12000, 3200, 500, 1000, 300), prompt: 'Update PaywallScreen.kt scrolling region...', latestPrompt: 'Keep the footer fixed while the content scrolls independently.', output: '## Layout updated\n\nUpdated `src/app.ts:1` for independent scrolling.\n\n```typescript\nexport const alpha = "real workspace"\n```\n\nVerification: layout is ready for the build check.', skills: ['android-dev', 'ui-layout'], tools: ['read_file', 'edit_file', 'subagent'] },
     { id: 'ses_l2_build', parentID: 'ses_l1_ui', title: 'Verify TypeScript & Vite build', agent: 'verifier', outcome: 'succeeded', tokens: tokens(2000, 800), prompt: 'Verify TypeScript and the Vite build for the scrolling change.', output: '## Verification passed\n\nTypeScript and Vite build completed successfully.', skills: ['build-check'], tools: ['bash'] },
     { id: 'ses_l1_lint', parentID: 'ses_root', title: 'Static lint verification', agent: 'linter', outcome: 'failed', tokens: tokens(1500, 400), prompt: 'Run static lint verification on src/app.ts.', output: '## Lint verification\n\nResolve the reported issue in `src/app.ts:1`.', error: { type: 'LintError', message: 'Lint check failed in src/app.ts' }, skills: [], tools: ['bash'] },
@@ -75,8 +75,15 @@ async function agentMapFixture(directory) {
       id: `${node.id}_assistant`, type: 'assistant', agent: node.agent, model, tokens: node.tokens, cost: 0,
       time: { created: created + 300, completed: now - 1000 }, finish: node.error ? 'error' : 'stop', ...(node.error ? { error: node.error } : {}),
       content: [
-        ...node.tools.map((name, ordinal) => ({ type: 'tool', id: `${node.id}_tool_${ordinal}`, name, time: { created: created + 400 + ordinal * 100, ran: created + 410 + ordinal * 100, completed: created + 490 + ordinal * 100 }, state: node.error ? { status: 'error', input: { path: 'src/app.ts' }, error: node.error } : { status: 'completed', input: name === 'subagent' ? { agent: 'verifier', description: 'Verify TypeScript & Vite build', prompt: definitions[2].prompt } : { path: 'src/app.ts' }, content: [{ type: 'text', text: `${name} completed` }] } })),
-        { type: 'text', text: node.output },
+        ...node.tools.flatMap((name, ordinal) => {
+          const rootInputs = [{ path: 'README.md' }, { path: 'src/app.ts' }, { pattern: '**/*.ts' }, { pattern: 'alpha', path: 'src' }, { command: 'npm run build' }]
+          const input = name === 'subagent' ? { agent: 'verifier', description: 'Verify TypeScript & Vite build', prompt: definitions[2].prompt } : node.id === 'ses_root' ? rootInputs[ordinal] : { path: 'src/app.ts' }
+          const tool = { type: 'tool', id: `${node.id}_tool_${ordinal}`, name, time: { created: created + 400 + ordinal * 100, ran: created + 410 + ordinal * 100, completed: created + 490 + ordinal * 100 }, state: node.error ? { status: 'error', input, error: node.error } : { status: 'completed', input, content: [{ type: 'text', text: `${name} completed` }] } }
+          return node.id === 'ses_root' && ordinal === 3
+            ? [tool, { type: 'text', text: 'Workspace exploration is complete; checking the build before delegating verification.', native: { phase: 'commentary' } }]
+            : [tool]
+        }),
+        { type: 'text', text: node.output, ...(node.id === 'ses_root' ? { native: { phase: 'final_answer' } } : {}) },
       ],
     })
     if (node.outcome) messages.push({ id: `${node.id}_idle`, type: 'idle', time: { created: now - 500 }, outcome: node.outcome, ...(node.error ? { error: node.error } : {}) })
@@ -315,7 +322,7 @@ async function main() {
     assert.deepEqual(await evaluate('[...document.querySelectorAll(".project-select .proj-name")].map(e=>e.textContent).sort()'), ['alpha', 'beta', 'gamma'], 'App must load only this suite\'s isolated projects')
     assert.deepEqual(await evaluate('[...document.querySelectorAll(".project-select")].map(e=>e.title).sort()'), projects.map(project => project.directory).sort(), 'CDP must attach to this launch and its unique project directories')
 
-    await run('1/8 legacy tabs self-heal and README renders', async () => {
+    await run('1/10 legacy tabs self-heal and README renders', async () => {
       const absoluteReadme = `${alphaDir}${path.sep}README.md`
       const legacy = { theme: 'dark', project: 'alpha', rail: true, stage: true, inspector: false, terminalOpen: false, panel: 'files', projects: { alpha: { tabs: [{ path: alphaDir, mode: 'file' }, { path: absoluteReadme, mode: 'file' }], active: `file:${alphaDir}`, selectedTabs: { file: `file:${alphaDir}` } } } }
       await evaluate(`localStorage.setItem('ame.ide.layout.v1', ${quote(JSON.stringify(legacy))}); window.__uiE2eBeforeReload = true`)
@@ -327,7 +334,7 @@ async function main() {
       await shot('01-self-healed-open-file.png')
     })
 
-    await run('2/8 project switching, filter, and Explorer binary open', async () => {
+    await run('2/10 project switching, filter, and Explorer binary open', async () => {
       for (const name of ['beta', 'gamma', 'alpha']) {
         await click(`.project-select[title=${quote(projects.find(project => project.id === name).directory)}]`, `select ${name}`)
         await until(`document.querySelector('.is-active-proj .proj-name')?.textContent === ${quote(name)}`, `active sidebar project ${name}`)
@@ -346,7 +353,7 @@ async function main() {
       await click('.tree-row[title="assets/logo.png"]', 'open binary logo.png')
     })
 
-    await run('3/8 friendly inline binary error and close recovery', async () => {
+    await run('3/10 friendly inline binary error and close recovery', async () => {
       await until('Boolean(document.querySelector(".editor-load-error[role=alert]"))', 'inline binary load error')
       const message = await evaluate('document.querySelector(".editor-load-error").textContent')
       assert.match(message, /Không thể xem trước tệp nhị phân/, 'Binary error must be humanized in Vietnamese')
@@ -362,7 +369,7 @@ async function main() {
       await noGlobalError()
     })
 
-    await run('4/8 Ctrl+P package.json and split/merge editor', async () => {
+    await run('4/10 Ctrl+P package.json and split/merge editor', async () => {
       await key('p', 'KeyP', 80, primary)
       await type('.quick-open__input', 'package.json')
       await until('[...document.querySelectorAll(".quick-open__path")].some(e=>e.textContent === "package.json")', 'package.json in QuickOpen results')
@@ -376,7 +383,7 @@ async function main() {
       await until('document.querySelectorAll(".editor-group").length === 1', 'merged editor group')
     })
 
-    await run('5/8 real rename collision produces opaque non-overlapping toast', async () => {
+    await run('5/10 real rename collision produces opaque non-overlapping toast', async () => {
       await click('button[aria-label="Thao tác package.json"]', 'package.json Explorer menu')
       await click('button[aria-label="Rename package.json"]', 'Rename package.json')
       await type('.insp-inline-name input[aria-label="Tên mới"]', 'README.md')
@@ -400,7 +407,7 @@ async function main() {
       await click('.insp-inline-name button[aria-label="Hủy nhập tên"]', 'cancel failed rename')
     })
 
-    await run('6/8 Settings light theme and no horizontal overflow', async () => {
+    await run('6/10 Settings light theme and no horizontal overflow', async () => {
       await key(',', 'Comma', 188, primary)
       await until('Boolean(document.querySelector(".settings-content select option[value=light]"))', 'Settings appearance theme selector')
       // Native keyboard input drives the same select/change path as a user, without touching React state.
@@ -422,7 +429,7 @@ async function main() {
       await shot('04-light-mode-clean.png')
     })
 
-    await run('7A/8 real bundled OpenCode Agent map', async () => {
+    await run('7/10 (7A) real bundled OpenCode Agent map', async () => {
       await setTheme('dark')
       await until('window.ame.connection().then(connection=>connection.connected && connection.version === "2.3.2")', 'bundled OpenCode 2.3.2 connection', 30000)
       const session = await evaluate('window.ame.createSession("alpha")')
@@ -442,7 +449,7 @@ async function main() {
       await rendererClean()
     })
 
-    await run('7B/8 protocol-backed nested Agent map, inspector and themes', async () => {
+    await run('8/10 (7B) protocol-backed nested Agent map, inspector and themes', async () => {
       mockServer = await agentMapFixture(alphaDir)
       try {
         const response = await fetch(`${mockServer.url}/api/info`, { signal: AbortSignal.timeout(2000) })
@@ -586,7 +593,107 @@ async function main() {
       assert.deepEqual(mockServer.unexpected, [], 'No unexpected protocol endpoints or 404s')
     })
 
-    await run('8/8 zero runtime/console errors and clean Electron exit', async () => {
+    await run('9/10 (7C) settled chat timeline, activity rail and Settings presets', async () => {
+      if (await evaluate('Boolean(document.querySelector(".chat-corner-drawer.is-open"))')) await click('button[aria-label="Đóng công cụ Chat"]', 'close Agents drawer before timeline checks')
+      await setTheme('dark')
+      await click('[data-chat-drawer="agents"]', 'open session drawer for settled root')
+      await click('.agent-row[data-session-id="ses_root"]', 'select settled root session')
+      await until('document.querySelector(\'.agent-row[data-session-id="ses_root"]\')?.getAttribute("aria-selected") === "true"', 'settled root selected')
+      await click('button[aria-label="Đóng công cụ Chat"]', 'close session drawer for timeline checks')
+      const stream = '.chat-stream__inner', toggle = `${stream} [data-testid="turn-work-toggle"]`
+      const commentary = 'Workspace exploration is complete; checking the build before delegating verification.'
+      const assertCompact = async theme => {
+        await until(`document.documentElement.dataset.theme === ${quote(theme)} && document.querySelectorAll(${quote(toggle)}).length === 1 && document.querySelector(${quote(toggle)})?.getAttribute('aria-expanded') === 'false' && document.querySelector(${quote(stream + ' .msg-agent h2')})?.textContent === 'Paywall plan'`, `${theme} compact summary and rendered final Markdown answer`)
+        const compact = await evaluate(`(() => {const e=document.querySelector(${quote(stream)});return {summary:e.querySelector('[data-testid="turn-work-toggle"]').textContent,text:e.textContent,rails:e.querySelectorAll('.turn-work__list').length,cards:e.querySelectorAll('.tool-card').length,live:e.querySelectorAll('.turn-live-status').length}})()`)
+        assert.match(compact.summary, /Đã chạy 1 lệnh/, 'Build command must contribute to the compact summary')
+        assert.match(compact.summary, /đọc 2 tệp/, 'Both read targets must contribute to the summary')
+        assert.match(compact.summary, /tìm 2 lần/, 'Both searches must contribute to the summary')
+        assert.match(compact.summary, /1 subagent/, 'Subagent work must remain discoverable')
+        assert.doesNotMatch(compact.summary, /gọi \d+ subagent/, 'Trigger must not repeat the subagent badge in its headline')
+        const headline = await evaluate(`(() => {const e=document.querySelector(${quote(toggle + ' .turn-work__summary')});return {width:e.clientWidth,scroll:e.scrollWidth,overflow:getComputedStyle(e).textOverflow}})()`)
+        assert.ok(headline.scroll <= headline.width, 'Compact headline must not clip mid-word')
+        assert.notEqual(headline.overflow, 'ellipsis', 'Compact summary must wrap rather than silently truncate')
+        assert.ok(compact.text.includes('Delegate layout, build, and lint verification.'), 'Original root final answer must remain visible')
+        assert.equal(compact.text.includes(commentary), false, 'Intermediate commentary must collapse with the work')
+        assert.equal(compact.rails, 0, 'Default compact mode must not render the expanded rail')
+        assert.equal(compact.cards, 0, 'Settled compact mode must not leak full tool cards')
+        assert.equal(compact.live, 0, 'Settled root must not show a live status indicator')
+        await evaluate(`document.querySelector(${quote(toggle)}).scrollIntoView({block:'start'})`)
+      }
+      await assertCompact('dark')
+      await shot('08-chat-timeline-compact-dark.png')
+      await click(toggle, 'expand settled work summary')
+      await until(`document.querySelector(${quote(toggle)})?.getAttribute('aria-expanded') === 'true' && document.querySelectorAll(${quote(stream + ' .turn-work__list .work-row')}).length >= 6`, 'expanded activity rows')
+      const expanded = await evaluate(`(() => {const e=document.querySelector(${quote(stream + ' .turn-work__list')});return {text:e.textContent,rail:parseFloat(getComputedStyle(e).borderLeftWidth),rows:[...e.querySelectorAll('.work-row')].map(row=>row.textContent),buttons:[...e.querySelectorAll('button')].map(button=>button.textContent.trim()),cards:e.querySelectorAll('.tool-card').length}})()`)
+      assert.ok(expanded.rail > 0, 'Expanded work must display a vertical guide rail')
+      assert.ok(expanded.rows.some(text => text.includes('README.md') && text.includes('app.ts')), 'Consecutive reads must share one grouped row')
+      for (const text of ['**/*.ts', 'alpha', 'npm run build', 'Verify TypeScript & Vite build', commentary]) assert.ok(expanded.text.includes(text), `Expanded work must expose ${text}`)
+      for (const basename of ['README.md', 'app.ts']) assert.ok(expanded.buttons.includes(basename), `Expanded reads must expose a named ${basename} chip`)
+      assert.ok(!expanded.buttons.includes('Mở tệp'), 'Workspace chips must not be anonymous duplicates')
+      const assertExpandedPolish = async theme => {
+        const polish = await evaluate(`(() => {const rail=document.querySelector(${quote(stream + ' .turn-work__list')});return {done:[...rail.querySelectorAll('.work-row--completed > .work-row__line > details > summary')].map(e=>({text:e.textContent,pills:e.querySelectorAll('.turn-work__pill').length,duration:e.querySelector('.work-row__duration') && {background:getComputedStyle(e.querySelector('.work-row__duration')).backgroundColor,border:getComputedStyle(e.querySelector('.work-row__duration')).borderWidth}})),overflow:['html','body','.app-shell','.workspace-body','.chat-stream','.turn-work__list'].map(selector=>{const e=document.querySelector(selector);return {selector,scroll:e.scrollWidth,width:e.clientWidth}})}})()`)
+        assert.ok(polish.done.length >= 4, 'Expanded rail must contain completed tool rows')
+        for (const row of polish.done) {
+          assert.equal(row.pills, 0, `${theme}: completed steps must not have status pills`)
+          assert.doesNotMatch(row.text, /Hoàn tất/, 'Routine completion label must be omitted')
+          assert.ok(row.duration, 'Completed fixture tools must expose a duration')
+          assert.equal(row.duration.border, '0px', 'Duration must be unboxed')
+          assert.equal(row.duration.background, 'rgba(0, 0, 0, 0)', 'Duration must have no background')
+        }
+        for (const surface of polish.overflow) assert.ok(surface.scroll <= surface.width, `${theme} expanded timeline overflows ${surface.selector}`)
+      }
+      await assertExpandedPolish('dark')
+      for (const [target, basename] of [['README.md', 'README.md'], ['src/app.ts', 'app.ts']]) {
+        const chip = `${stream} .work-row--read-group > .work-row__line > .work-row__actions button[aria-label="Mở tệp ${target}"]`
+        assert.equal(await evaluate(`document.querySelector(${quote(chip)}).title`), `Mở tệp: ${target}`)
+        await click(chip, `open the specific ${basename} filename chip`)
+        await until(`document.querySelector('.editor-tab.selected button')?.title === ${quote(target)} && document.querySelector('.monaco-editor .view-lines')?.textContent.replace(/\\s/g, ' ').includes(${quote(basename === 'README.md' ? 'Alpha UI E2E' : 'real workspace')})`, `${basename} chip opens its matching workspace content`)
+      }
+      assert.ok(expanded.buttons.includes('Agent map'), 'Expanded subagent row must expose Agent map')
+      assert.equal(expanded.cards, 0, 'Activity rail must use compact rows, not legacy tool cards')
+      await evaluate(`document.querySelector(${quote(toggle)}).scrollIntoView({block:'start'})`)
+      await shot('09-chat-timeline-expanded-dark.png')
+      await clickButton(`${stream} .turn-work__list`, 'Agent map')
+      await until('document.querySelectorAll(".agent-map-card").length === 4', 'Agent map opened from activity rail')
+      await click('button[aria-label="Đóng Agent map"]', 'close activity rail Agent map')
+      await until('!document.querySelector(".agent-map-dialog")', 'activity rail Agent map closed')
+      await click(toggle, 'collapse settled work before changing presets')
+      await assertCompact('dark')
+
+      const setTimelinePreset = async (label, expected) => {
+        await key(',', 'Comma', 188, primary)
+        await until('[...document.querySelectorAll(".settings-content .setting-row__title")].some(e=>e.textContent.trim()==="Tiến trình chat")', 'Vietnamese timeline preset setting')
+        const rowSelector = await evaluate(`(() => {const row=[...document.querySelectorAll('.settings-content .setting-row')].find(e=>e.querySelector('.setting-row__title')?.textContent.trim()==='Tiến trình chat');return '.settings-content .setting-row:nth-child('+([...row.parentElement.children].indexOf(row)+1)+')'})()`)
+        assert.deepEqual(await evaluate(`[...document.querySelector(${quote(rowSelector)}).querySelectorAll('.segmented button')].map(e=>e.textContent.trim())`), ['Gọn', 'Chi tiết', 'Đầy đủ'], 'Timeline presets must use unambiguous Vietnamese labels')
+        await clickButton(rowSelector, label)
+        await until(`document.querySelector(${quote(rowSelector + ' .segmented .is-active')})?.textContent.trim() === ${quote(label)} && JSON.parse(localStorage.getItem('ame.ide.layout.v1'))?.timelineDetail === ${quote(expected)}`, `${label} timeline preference applied and persisted`)
+        await click('.modal[aria-label="Cài đặt"] header button[aria-label="Đóng"]', 'close timeline Settings')
+        await until('!document.querySelector(".modal")', 'timeline Settings closed')
+      }
+      await setTimelinePreset('Đầy đủ', 'everything')
+      await until(`document.querySelectorAll(${quote(stream + ' .tool-card')}).length === 6 && !document.querySelector(${quote(toggle)})`, 'all six individual tool cards in Đầy đủ mode')
+      assert.ok(await evaluate(`document.querySelector(${quote(stream)}).textContent.includes(${quote(commentary)})`), 'Đầy đủ must keep intermediate commentary inline')
+      assert.equal(await evaluate(`document.querySelector(${quote(stream + ' .msg-agent h2')})?.textContent`), 'Paywall plan', 'Preset switch must preserve final Markdown')
+      await setTimelinePreset('Gọn', 'compact')
+      await assertCompact('dark')
+      await setTheme('light')
+      await assertCompact('light')
+      const overflow = await evaluate(`['html','body','.app-shell','.workspace-body','.chat-stream'].map(selector=>{const e=document.querySelector(selector);return {selector,scrollWidth:e.scrollWidth,clientWidth:e.clientWidth}})`)
+      for (const surface of overflow) assert.ok(surface.scrollWidth <= surface.clientWidth, `Light compact timeline overflows ${surface.selector}`)
+      await shot('10-chat-timeline-compact-light.png')
+      await click(toggle, 'expand settled activity rail in Light theme')
+      await until(`document.querySelector(${quote(toggle)})?.getAttribute('aria-expanded') === 'true'`, 'Light expanded activity rail')
+      await assertExpandedPolish('light')
+      await evaluate(`document.querySelector(${quote(toggle)}).scrollIntoView({block:'start'})`)
+      await shot('10a-chat-timeline-expanded-light.png')
+      await click(toggle, 'restore Light compact state')
+      await assertCompact('light')
+      await noGlobalError()
+      await rendererClean()
+      assert.deepEqual(mockServer.unexpected, [], 'Timeline and Settings must not request unexpected protocol endpoints')
+    })
+
+    await run('10/10 zero runtime/console errors and clean Electron exit', async () => {
       // Allow delayed worker/render failures to surface before and during Electron's quit lifecycle.
       await sleep(500)
       await rendererClean()
@@ -621,7 +728,7 @@ async function main() {
       finally { process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm) }
     }
   }
-  console.log(`PASS UI E2E (${config.dev ? 'dev build' : 'packaged'}, ${process.platform}-${process.arch}): all 8 live flows (including 7A + 7B); isolated fixtures cleaned up${config.shotsDir ? `; screenshots: ${config.shotsDir}` : ''}`)
+  console.log(`PASS UI E2E (${config.dev ? 'dev build' : 'packaged'}, ${process.platform}-${process.arch}): all 10 live flows (including Agent map 7A + 7B and timeline 7C); isolated fixtures cleaned up${config.shotsDir ? `; screenshots: ${config.shotsDir}` : ''}`)
 }
 
 main().catch(error => { console.error(error.message); process.exitCode = 1 })

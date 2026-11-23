@@ -40,6 +40,16 @@ test('restores layout settings and migrates old Git selection without losing pro
   assert.equal(invalid.tint, 'default')
   assert.equal(invalid.panel, 'files')
 })
+test('timeline detail defaults to compact, restores every preset and rejects invalid values', () => {
+  assert.equal(defaults().timelineDetail, 'compact')
+  for (const raw of [null, '{}', 'invalid json']) assert.equal(parsePreferences(raw).timelineDetail, 'compact')
+  for (const timelineDetail of ['compact', 'detailed', 'everything']) {
+    assert.equal(parsePreferences(JSON.stringify({ timelineDetail })).timelineDetail, timelineDetail)
+  }
+  for (const timelineDetail of ['invalid', 'Compact', '', null, false, 1, [], {}]) {
+    assert.equal(parsePreferences(JSON.stringify({ timelineDetail })).timelineDetail, 'compact')
+  }
+})
 const clean: Buffer = { projectID: 'one', path: 'a.ts', content: 'before', text: 'before', revision: 'r1', conflict: false }
 test('file invalidation reloads clean buffers but preserves dirty edits with conflict marker', () => {
   const incoming = { path: 'a.ts', content: 'external', revision: 'r2' }

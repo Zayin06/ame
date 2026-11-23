@@ -53,7 +53,18 @@ export type ToolCallInfo = {
 }
 export type SlashCommand = { name: string; description?: string }
 export type SkillSummary = { id: string; name: string; description?: string; path: string }
-export type ChatItem = { id: string; role: string; text: string; kind?: string; tool?: ToolCallInfo; turn?: { from: string; files: string[] } }
+export type ChatItem = {
+  id: string
+  role: string
+  text: string
+  kind?: string
+  tool?: ToolCallInfo
+  turn?: { from: string; files: string[] }
+  createdAt?: number
+  completedAt?: number
+  phase?: 'commentary' | 'final_answer'
+  workedMs?: number
+}
 export type Model = { id: string; modelID?: string; name: string; providerID: string }
 export type Agent = { id: string; name: string }
 export type Permission = { id: string; sessionID: string; title: string }

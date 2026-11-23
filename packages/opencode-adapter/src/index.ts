@@ -12,22 +12,32 @@ export function localURL(value: string) {
   return url.origin
 }
 export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
-  let execution: { opener: string; files: Set<string> } | undefined
+  let execution: { opener: string; files: Set<string>; startedAt?: number; lastAssistant?: ChatItem } | undefined
   return messages.flatMap<ChatItem>(message => {
     if (message.type === 'user') {
-      execution ??= { opener: message.id, files: new Set() }
-      return [{ id: message.id, role: 'user', text: message.text }]
+      execution ??= { opener: message.id, files: new Set(), startedAt: message.time?.created }
+      return [{ id: message.id, role: 'user', text: message.text, ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }]
     }
     if (message.type === 'idle') {
+      if (execution?.lastAssistant && execution.startedAt !== undefined && message.time?.created !== undefined && message.time.created >= execution.startedAt) {
+        execution.lastAssistant.workedMs = message.time.created - execution.startedAt
+      }
       const turn = execution
       execution = undefined
       return turn?.files.size ? [{ id: `${message.id}:changes`, role: 'assistant', kind: 'changes', text: '', turn: { from: turn.opener, files: [...turn.files].sort() } }] : []
     }
     if (message.type !== 'assistant') return []
     message.snapshot?.files?.forEach(file => execution?.files.add(file))
-    return message.content.map((part, i): ChatItem => {
+    const items = message.content.map((part, i): ChatItem => {
       const id = `${message.id}:${i}`
-      if (part.type !== 'tool') return { id, role: 'assistant', kind: part.type, text: part.text }
+      const time = {
+        ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}),
+        ...(message.time?.completed !== undefined ? { completedAt: message.time.completed } : {}),
+      }
+      if (part.type !== 'tool') return {
+        id, role: 'assistant', kind: part.type, text: part.text, ...time,
+        ...(part.type === 'text' && (part.native?.phase === 'commentary' || part.native?.phase === 'final_answer') ? { phase: part.native.phase } : {}),
+      }
       let output: string | undefined
       if ('content' in part.state) for (const content of part.state.content ?? []) {
         const text = content.type === 'text' ? content.text : content.type === 'file' ? `[file: ${content.name || content.uri}]` : undefined
@@ -48,8 +58,10 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
         error: error === undefined ? undefined : typeof error === 'string' ? error : error.message || JSON.stringify(error),
         durationMs: part.time?.completed === undefined ? undefined : Math.max(0, part.time.completed - (part.time.ran ?? part.time.created)),
       }
-      return { id, role: 'assistant', kind: 'tool', text: `${part.name} · ${part.state.status}`, tool }
+      return { id, role: 'assistant', kind: 'tool', text: `${part.name} · ${part.state.status}`, tool, ...time }
     })
+    if (execution && items.length) execution.lastAssistant = items[items.length - 1]
+    return items
   })
 }
 function mapSession(s: SessionInfo): Session {

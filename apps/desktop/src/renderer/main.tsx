@@ -8,5 +8,6 @@ import '../../../../packages/ui/styles/reference-inspector.css'
 import './parity.css'
 import './components/chat-rich.css'
 import './agent-map.css'
+import './chat-timeline.css'
 
 createRoot(document.getElementById('root')!).render(<App />)
