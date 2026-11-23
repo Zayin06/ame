@@ -8,7 +8,7 @@ import { MAX_PAYLOAD_FILES } from "./bundle/limits"
 import { preview, safePath, verifiedFiles, type InputFile } from "./bundle/package"
 import type { Discover } from "./runtime"
 
-type State = { schema: 1; releaseId: string; version: string; sha256: string; origin: string; files: { path: string; sha256: string }[]; agents: string[]; skills: string[]; compatibilityMode?: "native" | "raw" }
+type State = { schema: 1; releaseId: string; version: string; sha256: string; origin: string; files: { path: string; sha256: string }[]; agents: string[]; skills: string[]; features?: { commitEnhanceSkill?: string }; compatibilityMode?: "native" | "raw" }
 function verification(state: State, files: InputFile[], runtimeReady = false) {
   const content = preview(files, [], { compatibilityMode: state.compatibilityMode })
   if (content.issues.some(i => i.severity === "error" || i.severity === "excluded")) throw new Error("INSTALL_COMPATIBILITY_BLOCKED")
@@ -52,6 +52,8 @@ function stateOf(files: InputFile[]) {
   const state = JSON.parse(new TextDecoder().decode(item.data)) as State
   if (!state || state.schema !== 1 || typeof state.releaseId !== "string" || typeof state.version !== "string" || typeof state.origin !== "string" || !/^[a-f0-9]{64}$/.test(state.sha256) || !Array.isArray(state.files) || !Array.isArray(state.agents) || !Array.isArray(state.skills) || state.files.length > MAX_PAYLOAD_FILES || !state.files.every(f => f && typeof f.path === "string" && /^(agents|skills)\//.test(f.path) && /^[a-f0-9]{64}$/.test(f.sha256))) throw new Error("INVALID_OWNERSHIP_STATE")
   if (state.compatibilityMode !== undefined && state.compatibilityMode !== "native" && state.compatibilityMode !== "raw") throw new Error("INVALID_OWNERSHIP_STATE")
+  if (state.features !== undefined && (!state.features || typeof state.features !== "object" || Array.isArray(state.features) ||
+    (state.features.commitEnhanceSkill !== undefined && (typeof state.features.commitEnhanceSkill !== "string" || !state.skills.includes(state.features.commitEnhanceSkill))))) throw new Error("INVALID_OWNERSHIP_STATE")
   const paths = new Set<string>()
   for (const file of state.files) { safePath(file.path); const key = file.path.toLowerCase(); if (paths.has(key)) throw new Error("INVALID_OWNERSHIP_STATE"); paths.add(key) }
   if (![...state.agents, ...state.skills].every(id => typeof id === "string") || state.agents.some(id => !paths.has(`agents/${id}.md`.toLowerCase())) || state.skills.some(id => !paths.has(`skills/${id}/SKILL.md`.toLowerCase()))) throw new Error("INVALID_OWNERSHIP_STATE")
@@ -82,6 +84,22 @@ export async function installed(project: string) {
     return { ...state, ...verification(state, files.filter(f => state.files.some(o => o.path === f.path))) }
   }
   return undefined
+}
+export async function readCommitEnhanceSkill(project: string): Promise<{ name: string; instructions: string } | null> {
+  const state = await installed(project)
+  const name = state?.features?.commitEnhanceSkill
+  if (!name) return null
+  const owned = state.files.find(file => file.path === `skills/${name}/SKILL.md`)
+  if (!owned) return null
+  const target = path.join(project, ".opencode", "skills", name, "SKILL.md")
+  await safeDirectory(path.dirname(target))
+  const stat = await lstat(target)
+  if (!stat.isFile() || stat.isSymbolicLink() || (await realpath(target)).toLowerCase() !== target.toLowerCase()) throw new Error("REPARSE_CONFIG_REJECTED")
+  const bytes = await readFile(target)
+  if (await sha256(bytes) !== owned.sha256) throw new Error("OWNED_FILE_CHANGED")
+  const instructions = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+    .replace(/^---[\r\n][\s\S]*?[\r\n]---(?:\r?\n|$)/, "").trim().slice(0, 16_000)
+  return instructions ? { name, instructions } : null
 }
 async function managedDirectory(project: string) {
   await safeDirectory(project)
@@ -164,7 +182,7 @@ export async function install(project: string, origin: string, release: Release,
       if (personal.some(p => { const name = p.path.toLowerCase(); return name === key || name.startsWith(key + "/") || key.startsWith(name + "/") })) throw new Error("PERSONAL_FILE_COLLISION")
       if (before.directories.some(p => p.toLowerCase() === key || p.toLowerCase().startsWith(key + "/"))) throw new Error("PERSONAL_DIRECTORY_COLLISION")
     }
-    state = { schema: 1, releaseId: release.releaseId, version: release.version, sha256: release.sha256, origin, files: await inventory(verified.files), agents: content.agents, skills: content.skills, ...(compatibilityMode === "raw" ? { compatibilityMode } : {}) }
+    state = { schema: 1, releaseId: release.releaseId, version: release.version, sha256: release.sha256, origin, files: await inventory(verified.files), agents: content.agents, skills: content.skills, ...(verified.summary.features?.commitEnhanceSkill ? { features: { commitEnhanceSkill: verified.summary.features.commitEnhanceSkill } } : {}), ...(compatibilityMode === "raw" ? { compatibilityMode } : {}) }
     return { files: [...personal, ...verified.files], state }
   }, () => discovered(project, state!, discover, signal), signal)
   return { state: { ...state!, ...verification(state!, verified.files, true) }, changed }

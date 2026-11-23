@@ -11,13 +11,14 @@ export type AuthPayload = {
 }
 export type Summary = {
   schemaVersion: 1; target: "opencode"; version: string; channel: "stable"
+  features?: { commitEnhanceSkill?: string }
   compatibility: { testedOpenCode: string[]; mode?: "native" | "raw" }; agents: number; skills: number; fileCount: number; expandedSize: number
 }
 export type Release = { releaseId: string; version: string; channel: "stable"; sha256: string; size: number; manifest: Summary; publishedAt: number; downloadUrl: string }
 export type Latest = { release: Release; revision: number; activatedAt: number }
 export type History = { releases: Release[]; active: { release_id: string | null; revision: number; activated_at: number | null }; nextCursor: string | null }
 const authSchema = z.object({ session: z.object({ token: z.string().min(1).max(8192), expires_at: z.string().datetime() }), user: z.object({ id: z.string().min(1), username: z.string().min(1), name: z.string().min(1), role: z.unknown().optional() }), provider: z.object({ base_url: z.string().url(), api_key: z.string().min(1).max(8192) }), catalog: z.unknown(), registry: z.unknown() })
-const summarySchema = z.object({ schemaVersion: z.literal(1), target: z.literal("opencode"), version: z.string(), channel: z.literal("stable"), compatibility: z.object({ testedOpenCode: z.array(z.string()), mode: z.enum(["native", "raw"]).optional() }), agents: z.number().int().positive(), skills: z.number().int().positive(), fileCount: z.number().int().positive(), expandedSize: z.number().int().nonnegative() })
+const summarySchema = z.object({ schemaVersion: z.literal(1), target: z.literal("opencode"), version: z.string(), channel: z.literal("stable"), compatibility: z.object({ testedOpenCode: z.array(z.string()), mode: z.enum(["native", "raw"]).optional() }), agents: z.number().int().positive(), skills: z.number().int().positive(), fileCount: z.number().int().positive(), expandedSize: z.number().int().nonnegative(), features: z.object({ commitEnhanceSkill: z.string().min(1).max(120).optional() }).optional() })
 const releaseSchema = z.object({ releaseId: z.string().uuid(), version: z.string().min(1), channel: z.literal("stable"), sha256: z.string().regex(/^[a-f0-9]{64}$/), size: z.number().int().positive().max(8*1024*1024), manifest: summarySchema, publishedAt: z.number().int(), downloadUrl: z.string() })
 const latestSchema = z.object({ release: releaseSchema, revision: z.number().int().nonnegative(), activatedAt: z.number().int() })
 const historySchema = z.object({ releases: z.array(releaseSchema).max(100), active: z.object({ release_id: z.string().uuid().nullable(), revision: z.number().int().nonnegative(), activated_at: z.number().int().nullable() }), nextCursor: z.string().nullable() })

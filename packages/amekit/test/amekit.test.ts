@@ -1,15 +1,17 @@
 import test, { after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
 import { createAmeKit, type AmeKitDependencies, type AmeKit } from "../src/index"
 import { openSessionVault, type Encryption } from "../src/session-vault"
+import { zipSync, unzipSync } from "fflate"
 import { pack, preview, safePath } from "../src/bundle/package"
+import { validate } from "../src/bundle/manifest"
 import { scan } from "../src/bundle/scan"
 import { parse, stringify } from "yaml"
-import { installed, install, uninstall } from "../src/installer"
+import { installed, install, readCommitEnhanceSkill, uninstall } from "../src/installer"
 import type { Release } from "../src/api"
 import { dialoguePrompt, localDialogue } from "../src/pet-dialogue"
 import type { PetHostOptions } from "../src/pet-host"
@@ -28,16 +30,16 @@ const input = () => [
   { path: "skills/fixture/SKILL.md", data: encode("---\nname: fixture\ndescription: Fixture skill\n---\nRun checks.\n") },
 ]
 async function area() { const folder = path.join(root, randomUUID()); await mkdir(folder, { recursive: true }); return folder }
-async function bundle(mode: "native" | "raw" = "native") {
-  const packed = await pack(preview(input(), [], { compatibilityMode: mode }), "1.2.3")
+async function bundle(mode: "native" | "raw" = "native", commitEnhanceSkill?: string) {
+  const packed = await pack(preview(input(), [], { compatibilityMode: mode }), "1.2.3", undefined, { commitEnhanceSkill })
   const release: Release = { releaseId: "ef2b4502-3b3f-4ac7-a223-81fdb4b77557", version: "1.2.3", channel: "stable", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"], publishedAt: 1, downloadUrl: "/ignored" }
   return { packed, release, latest: { release, revision: 1, activatedAt: 1 } }
 }
-async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number } = {}) {
+async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; commitEnhanceSkill?: string; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number } = {}) {
   const folder = await area(), project = path.join(folder, "project"), imported = path.join(folder, "source"), data = path.join(folder, "data")
   await mkdir(project); await mkdir(imported)
   for (const file of input()) { const target = path.join(imported, ...file.path.split("/")); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data) }
-  const artifact = await bundle(settings.mode)
+  const artifact = await bundle(settings.mode, settings.commitEnhanceSkill)
   const rpc: unknown[] = [], requests: string[] = [], dialogs: string[] = []
   let role: unknown = settings.role ?? "user", plugin = settings.plugin !== false, accepted = settings.confirm !== false, failAuth = false, failStorage = false, pickerCount = 0
   let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
@@ -343,6 +345,142 @@ test("admin import/package/publish/activate require roles and native main confir
     f.confirm(true)
     assert.ok(await f.service.call("activate", { id: f.artifact.release.releaseId, revision: "1" }))
     assert.ok(f.dialogs.length >= 4)
+  } finally { await f.cleanup() }
+})
+
+test("commit Enhance packaging is opt-in, deterministic and validates manifest feature IDs", async () => {
+  const source = preview(input())
+  const baseline = await pack(source, "1.2.3")
+  const empty = await pack(source, "1.2.3", undefined, { commitEnhanceSkill: " \r\n " })
+  assert.deepEqual(empty.bytes, baseline.bytes)
+  assert.equal(Object.hasOwn(baseline.summary, "features"), false)
+  assert.equal(Object.hasOwn(JSON.parse(new TextDecoder().decode(unzipSync(baseline.bytes)["manifest.json"])), "features"), false)
+  const configured = await pack(source, "1.2.3", undefined, { commitEnhanceSkill: " fixture\n" })
+  assert.deepEqual(configured.summary.features, { commitEnhanceSkill: "fixture" })
+  assert.deepEqual((await validate(configured.bytes, "1.2.3")).features, { commitEnhanceSkill: "fixture" })
+  await assert.rejects(pack(source, "1.2.3", undefined, { commitEnhanceSkill: "missing" }), /UNKNOWN_COMMIT_ENHANCE_SKILL/)
+  const rewrite = (features: unknown) => {
+    const entries = unzipSync(baseline.bytes)
+    const manifest = JSON.parse(new TextDecoder().decode(entries["manifest.json"]))
+    entries["manifest.json"] = encode(JSON.stringify({ ...manifest, features }))
+    return zipSync(entries)
+  }
+  await assert.rejects(validate(rewrite({ commitEnhanceSkill: "missing" }), "1.2.3"), /UNKNOWN_COMMIT_ENHANCE_SKILL/)
+  for (const features of [null, [], "fixture", { unexpected: true }, { commitEnhanceSkill: "fixture", unexpected: true },
+    ...["", ".", "..", "e\u0301", "a".repeat(121), "a/b", "a\\b", "a:b", "a*b", "a?b", 'a"b', "a<b", "a>b", "a|b", "a\x00b", "a\x1fb", "a\x7fb", 1].map(commitEnhanceSkill => ({ commitEnhanceSkill }))]) {
+    await assert.rejects(validate(rewrite(features), "1.2.3"), { name: "ZodError" }, JSON.stringify(features))
+  }
+  assert.deepEqual((await validate(rewrite({}), "1.2.3")).features, {})
+  const unicode = input().map(file => ({ ...file, path: file.path.replace("fixture", "kỹ-năng") }))
+  const raw = await pack(preview(unicode, [], { compatibilityMode: "raw" }), "1.2.3", undefined, { commitEnhanceSkill: "kỹ-năng" })
+  assert.deepEqual(raw.summary.features, { commitEnhanceSkill: "kỹ-năng" })
+})
+
+test("commit Enhance facade packages, syncs and reads verified skills without account locking", async () => {
+  const f = await fixture({ role: "admin", commitEnhanceSkill: "fixture" })
+  let release: (() => void) | undefined
+  try {
+    const readSkill = f.service.readCommitEnhanceSkill!.bind(f.service)
+    assert.equal(await readSkill("project-id"), null)
+    await assert.rejects(readSkill(""), /PROJECT_REQUIRED/)
+    await assert.rejects(readSkill("not-a-project"), /^Error: AMEKIT_OPERATION_FAILED$/)
+    await login(f.service)
+    const latest = await f.service.call("latest", {}) as { release: Release }
+    assert.deepEqual(latest.release.manifest.features, { commitEnhanceSkill: "fixture" })
+    const history = await f.service.call("history", {}) as { releases: Release[] }
+    assert.deepEqual(history.releases[0].manifest.features, { commitEnhanceSkill: "fixture" })
+    await f.service.call("import", {})
+    const packaged = await f.service.call("package", { version: "1.2.3", commitEnhanceSkill: " fixture " }) as { summary: Release["manifest"] }
+    assert.deepEqual(packaged.summary.features, { commitEnhanceSkill: "fixture" })
+    const published = await f.service.call("publish", {}) as Release
+    assert.deepEqual(published.manifest.features, { commitEnhanceSkill: "fixture" })
+    await assert.rejects(f.service.call("package", { version: "1.2.3", commitEnhanceSkill: "missing" }), /UNKNOWN_COMMIT_ENHANCE_SKILL/)
+    await assert.rejects(f.service.call("publish", {}), /PACKAGE_REQUIRED/)
+    const fallback = await f.service.call("package", { version: "1.2.3", commitEnhanceSkill: " " }) as typeof packaged
+    assert.equal(Object.hasOwn(fallback.summary, "features"), false)
+    for (const operation of ["sync", "installed", "offline"]) {
+      const result = await f.service.call(operation, { project: "project-id" }) as { features: unknown }
+      assert.deepEqual(result.features, { commitEnhanceSkill: "fixture" })
+    }
+    const state = JSON.parse(await readFile(path.join(f.project, ".opencode", ".amekit-release.json"), "utf8"))
+    assert.deepEqual(state.features, { commitEnhanceSkill: "fixture" })
+    const entered = new Promise<void>(resolve => {
+      f.sessionResponse(() => new Promise(done => { release = () => done(undefined); resolve() }))
+    })
+    const refreshing = f.service.call("refresh", {})
+    await entered
+    try {
+      const before = { requests: f.requests.length, rpc: f.rpc.length }
+      assert.deepEqual(await readSkill("project-id"), { name: "fixture", instructions: "Run checks." })
+      assert.equal(f.requests.length, before.requests)
+      assert.equal(f.rpc.length, before.rpc)
+    } finally { f.sessionResponse(); release?.(); await refreshing }
+    await f.service.call("logout", {})
+    const before = f.requests.length
+    assert.deepEqual(await readSkill("project-id"), { name: "fixture", instructions: "Run checks." })
+    assert.equal(f.requests.length, before)
+    const baseline = await bundle()
+    const replaced = await install(f.project, "http://localhost:3211", baseline.release, baseline.packed.bytes, f.dependencies.discover!)
+    assert.equal(Object.hasOwn(replaced.state, "features"), false, "syncing an unconfigured bundle clears the old selection")
+    assert.equal(Object.hasOwn(JSON.parse(await readFile(path.join(f.project, ".opencode", ".amekit-release.json"), "utf8")), "features"), false)
+    assert.equal(await readSkill("project-id"), null)
+    await f.service.dispose()
+    await assert.rejects(readSkill("project-id"), /AMEKIT_DISPOSED/)
+  } finally { f.sessionResponse(); release?.(); await f.cleanup() }
+})
+
+test("commit Enhance reader strips frontmatter, preserves markdown, bounds text and strictly decodes UTF-8", async t => {
+  for (const [name, bytes, expected] of [
+    ["CRLF and BOM", encode("\uFEFF---\r\nname: fixture\r\ndescription: Fixture skill\r\n---\r\n\r\n# Tiêu đề\r\nKeep  two spaces.\r\n---\r\nEnd\r\n"), "# Tiêu đề\r\nKeep  two spaces.\r\n---\r\nEnd"],
+    ["plain markdown", encode("  # Instructions\n\nKeep markdown.  "), "# Instructions\n\nKeep markdown."],
+    ["bounded", encode("---\nname: fixture\ndescription: Fixture skill\n---\n" + "x".repeat(16_001)), "x".repeat(16_000)],
+    ["empty", encode("---\nname: fixture\ndescription: Fixture skill\n---\n \r\n"), null],
+    ["invalid UTF-8", new Uint8Array([0xc3, 0x28]), undefined],
+  ] as const) await t.test(name, async () => {
+    const project = await area()
+    try {
+      const files = input(); files[1].data = bytes
+      const packed = await pack(preview(files, [], { compatibilityMode: "raw" }), "1.2.3", undefined, { commitEnhanceSkill: "fixture" })
+      const { release } = await bundle("raw")
+      await install(project, "http://localhost:3211", { ...release, sha256: packed.sha256, size: packed.bytes.length }, packed.bytes, async () => { throw new Error("MUST_NOT_DISCOVER_RAW") }, undefined, { allowRaw: true })
+      if (expected === undefined) await assert.rejects(readCommitEnhanceSkill(project), { name: "TypeError" })
+      else assert.deepEqual(await readCommitEnhanceSkill(project), expected ? { name: "fixture", instructions: expected } : null)
+    } finally { await rm(project, { recursive: true, force: true }) }
+  })
+})
+
+test("commit Enhance reader rejects malformed ownership, tampering and linked directories", async () => {
+  const f = await fixture({ commitEnhanceSkill: "fixture" })
+  try {
+    await login(f.service)
+    await f.service.call("sync", { project: "project-id" })
+    const statePath = path.join(f.project, ".opencode", ".amekit-release.json")
+    const original = JSON.parse(await readFile(statePath, "utf8"))
+    for (const features of [null, [], "fixture", true, { commitEnhanceSkill: 42 }, { commitEnhanceSkill: "missing" }]) {
+      await writeFile(statePath, JSON.stringify({ ...original, features }))
+      await assert.rejects(readCommitEnhanceSkill(f.project), /INVALID_OWNERSHIP_STATE/)
+    }
+    await writeFile(statePath, JSON.stringify({ ...original, features: {} }))
+    assert.equal(await readCommitEnhanceSkill(f.project), null)
+    const { features: _, ...legacy } = original
+    await writeFile(statePath, JSON.stringify(legacy))
+    assert.equal(await readCommitEnhanceSkill(f.project), null)
+    await writeFile(statePath, JSON.stringify({ ...original, skills: ["Fixture"], features: { commitEnhanceSkill: "Fixture" } }))
+    assert.equal(await readCommitEnhanceSkill(f.project), null, "only the exact owned entrypoint is eligible")
+    const entrypoint = path.join(f.project, ".opencode", "skills", "fixture", "SKILL.md")
+    await writeFile(statePath, JSON.stringify(original))
+    await writeFile(entrypoint, "Changed instructions.")
+    await assert.rejects(readCommitEnhanceSkill(f.project), /OWNED_FILE_CHANGED/)
+    await writeFile(entrypoint, input()[1].data)
+    const agent = path.join(f.project, ".opencode", "agents", "helper.md")
+    await writeFile(agent, "Changed agent.")
+    await assert.rejects(readCommitEnhanceSkill(f.project), /OWNED_FILE_CHANGED/, "all owned files are verified")
+    await writeFile(agent, input()[0].data)
+    const skillDirectory = path.dirname(entrypoint), linked = path.join(f.folder, "linked-skill")
+    await rename(skillDirectory, linked)
+    await symlink(linked, skillDirectory, "junction")
+    await assert.rejects(readCommitEnhanceSkill(f.project), /REPARSE_CONFIG_REJECTED/)
+    await assert.rejects(readCommitEnhanceSkill("relative-project"), /ABSOLUTE_PROJECT_REQUIRED/)
   } finally { await f.cleanup() }
 })
 

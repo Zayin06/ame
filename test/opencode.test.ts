@@ -409,11 +409,26 @@ test('commit generation sends staged context and selected model, strips fences, 
     assert.equal(call.init.method, 'POST')
     const body = JSON.parse(String(call.init.body))
     assert.deepEqual(body.model, { id: 'server-model', providerID: 'amecode' })
-    for (const expected of ['Conventional Commits', '72 characters', '3 short bullets', 'only the commit message', 'without markdown fences', 'a.ts\nb.ts', '+new behavior']) assert.ok(body.prompt.includes(expected), expected)
+    assert.equal(body.prompt, [
+      'Write a concise Conventional Commits message for the staged changes below.',
+      'Use a subject of at most 72 characters and at most 3 short bullets if there are multiple changes.',
+      'Return only the commit message, without markdown fences or extra explanation.',
+      'Files:\na.ts\nb.ts',
+      'Diff:\n+new behavior',
+    ].join('\n\n'))
     assert.ok(call.init.signal instanceof AbortSignal)
     assert.equal(call.init.signal.aborted, false)
+    const skill = { name: 'team-commit', instructions: 'Write a Vietnamese subject and summarize the intent.' }
+    output = '```text\r\nCải thiện công cụ\r\n```'
+    assert.deepEqual(await adapter.generateCommitMessage({ diff: '+team change', files: ['team.ts'], truncated: false }, model, skill), { message: 'Cải thiện công cụ', truncated: false })
+    const custom = JSON.parse(String(calls.filter(c => c.url.pathname === '/api/experimental/generate/text').at(-1)!.init.body))
+    for (const expected of [`Skill: /${skill.name}\n\n${skill.instructions}`, 'Files:\nteam.ts', 'Diff:\n+team change', 'only the commit message text', 'no markdown fences', 'no tool calls or git commands', 'no conversational preamble']) assert.ok(custom.prompt.includes(expected), expected)
+    assert.ok(!custom.prompt.includes('Conventional Commits'))
+    assert.deepEqual(custom.model, body.model)
     output = '  fix: keep plain messages  '
     assert.deepEqual(await adapter.generateCommitMessage({ diff: '', files: [], truncated: false }, model), { message: 'fix: keep plain messages', truncated: false })
+    await adapter.generateCommitMessage({ diff: '+new behavior', files: ['a.ts', 'b.ts'], truncated: true }, model, { name: 'empty', instructions: '' })
+    assert.equal(JSON.parse(String(calls.filter(c => c.url.pathname === '/api/experimental/generate/text').at(-1)!.init.body)).prompt, body.prompt)
     for (output of ['  \n ', '```\n\n```', '```text\n```']) await assert.rejects(adapter.generateCommitMessage({ diff: '', files: [], truncated: false }, model), /EMPTY_COMMIT_MESSAGE/)
   } finally { adapter.dispose() }
 })

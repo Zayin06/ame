@@ -35,6 +35,7 @@ const errors: Record<string, { title: string; detail?: string }> = {
   RELEASE_CONFLICT: { title: 'Phiên bản này đã tồn tại trên máy chủ', detail: 'Hãy đặt số phiên bản mới (ví dụ 1.0.1) và đóng gói lại.' },
   ACTIVATION_CONFLICT: { title: 'Revision kích hoạt đã thay đổi trên máy chủ', detail: 'Lịch sử đã được làm mới hoặc hãy bấm Cập nhật lịch sử rồi kích hoạt lại.' },
   IMPORT_REQUIRED: { title: 'Chưa có dữ liệu nhập hợp lệ', detail: 'Hãy chọn thư mục chứa agents/ và skills/ ở Bước 1 trước.' },
+  UNKNOWN_COMMIT_ENHANCE_SKILL: { title: 'Skill Enhance không nằm trong gói đã nhập', detail: 'Hãy chọn lại skill có trong danh sách skills/ ở Bước 1 rồi đóng gói lại.' },
   PACKAGE_REQUIRED: { title: 'Chưa có gói ZIP sẵn sàng xuất bản', detail: 'Nhập phiên bản và bấm Đóng gói ZIP ở Bước 2 trước.' },
   ZIP_EXCEEDS_8_MIB: { title: 'Gói ZIP vượt quá giới hạn 8 MiB', detail: 'Giảm dung lượng tài nguyên trong skills/ hoặc tách bớt tệp lớn.' },
   OWNED_FILE_CHANGED: { title: 'Tệp do AmeKit quản lý trong .opencode/ đã bị chỉnh sửa tay', detail: 'Khôi phục tệp về nguyên bản hoặc gỡ thủ công rồi đồng bộ lại.' },

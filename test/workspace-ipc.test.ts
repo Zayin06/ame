@@ -126,7 +126,7 @@ async function harness(directory = 'workspace') {
     }]))
   }
   adapter.models = async (...args: unknown[]) => { calls.push({ method: 'models', args }); return models }
-  const account = { call: async (...args: unknown[]) => {
+  const account: { readCommitEnhanceSkill?: (projectID: string) => Promise<{ name: string; instructions: string } | null>; call: (...args: unknown[]) => Promise<unknown> } = { call: async (...args: unknown[]) => {
     calls.push({ method: 'account', args })
     if (policyGate && args[0] !== 'status') await policyGate
     if (policyError && args[0] !== 'status') throw new Error(policyError)
@@ -171,6 +171,7 @@ async function harness(directory = 'workspace') {
   }
   return {
     dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState,
+    setCommitEnhanceReader: (reader: NonNullable<typeof account.readCommitEnhanceSkill>) => { account.readCommitEnhanceSkill = reader },
     failRemove: () => { workspace.remove = async (...args: unknown[]) => { calls.push({ method: 'remove', args }); throw new Error('REMOVE_FAILED') } },
     setProjectDirectory: (id: string, value: string) => { const previous = workspace.get; workspace.get = key => key === id ? { directory: value } : previous(key) },
     invalidateProject: () => { workspace.get = () => { throw new Error('UNKNOWN_PROJECT') } }, setPricing: (value: typeof pricing) => { pricing = value },
@@ -961,6 +962,33 @@ test('AI commit uses a fresh authorized model and bounded staged summary without
   assert.deepEqual(h.messages, [])
 })
 
+test('AI commit forwards the synced skill and silently falls back to the two-argument contract', async () => {
+  const h = await harness()
+  const skill = { name: 'team-commit', instructions: 'Use the team commit format.' }
+  for (const mode of ['configured', 'unset', 'unreadable'] as const) {
+    h.calls.length = 0
+    const projects: string[] = []
+    h.setCommitEnhanceReader(async projectID => {
+      projects.push(projectID)
+      if (mode === 'unreadable') throw new Error('OWNED_FILE_CHANGED')
+      return mode === 'configured' ? skill : null
+    })
+    await h.dispatch('generateCommitMessage', ['p'])
+    assert.deepEqual(projects, ['p'])
+    assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'stagedDiffSummary', 'generateCommitMessage'])
+    const args = plain(h.calls.at(-1)!.args)
+    assert.deepEqual(args.slice(0, 2), [
+      { diff: '+change', files: ['new.txt'], truncated: false },
+      { id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' },
+    ])
+    assert.equal(args.length, mode === 'configured' ? 3 : 2)
+    if (mode === 'configured') assert.deepEqual(args[2], skill)
+  }
+  h.setSummary({ diff: '', files: [], truncated: false })
+  h.setCommitEnhanceReader(async () => { assert.fail('Skill must not be read without staged files') })
+  await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /NO_STAGED_CHANGES/)
+})
+
 test('AI commit fails closed for unavailable models, rejected policy, or no staged changes', async () => {
   const h = await harness()
   for (const models of [[], [{ id: 'model', modelID: 'model', name: 'Model', providerID: 'external' }]]) {
@@ -991,6 +1019,22 @@ test('AI commit holds the authority queue through policy validation and generati
   assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account'])
   release()
   await Promise.all([generate, following])
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'stagedDiffSummary', 'generateCommitMessage', 'account'])
+})
+
+test('AI commit retains authority while reading a synced skill without an account operation', async () => {
+  const h = await harness()
+  let release!: (value: { name: string; instructions: string } | null) => void
+  const pending = new Promise<{ name: string; instructions: string } | null>(resolve => { release = resolve })
+  h.setCommitEnhanceReader(() => pending)
+  const generation = h.dispatch('generateCommitMessage', ['p'])
+  await new Promise(resolve => setImmediate(resolve))
+  const following = h.dispatch('account', ['status', {}])
+  try {
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'stagedDiffSummary'])
+  } finally { release(null) }
+  await Promise.all([generation, following])
   assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'stagedDiffSummary', 'generateCommitMessage', 'account'])
 })
 

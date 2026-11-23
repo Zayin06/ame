@@ -19,6 +19,8 @@ export type AmeKitOptions = {
 }
 export type AmeKit = {
   call(operation: string, payload: Record<string, string>): Promise<unknown>
+  /** Main-process only; reads verified installed instructions without taking the account mutex. */
+  readCommitEnhanceSkill?(projectID: string): Promise<{ name: string; instructions: string } | null>
   /** Main-process only; retain categorized dialogue for createPetHost. */
   generatePetDialogue(model: string, signal: AbortSignal): Promise<DialogueSet>
   dispose(): Promise<void>
@@ -126,6 +128,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     agents: state.agents,
     skills: state.skills,
     fileCount: state.files.length,
+    ...(state.features ? { features: state.features } : {}),
   })
   const execute = async (operation: string, payload: Record<string, string>): Promise<unknown> => {
     await ready
@@ -193,7 +196,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         await api.guard(true, signal)
         if (!source) throw new Error("IMPORT_REQUIRED")
         packed = undefined
-        packed = await pack(source, payload.version, signal)
+        const commitEnhanceSkill = typeof payload.commitEnhanceSkill === "string" ? payload.commitEnhanceSkill.trim() : ""
+        packed = await pack(source, payload.version, signal, { ...(commitEnhanceSkill ? { commitEnhanceSkill } : {}) })
         const { bytes, ...summary } = packed
         return { ...summary, size: bytes.length }
       }
@@ -266,6 +270,11 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   timer.unref?.()
   return {
     call,
+    async readCommitEnhanceSkill(projectID) {
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      try { return await installer.readCommitEnhanceSkill(await project(projectID)) }
+      catch (error) { throw new Error(code(error)) }
+    },
     async generatePetDialogue(model, callerSignal) {
       await ready
       if (disposed) throw new Error("AMEKIT_DISPOSED")

@@ -6,12 +6,22 @@ import { BUNDLE_ARCHIVE_LIMITS, MAX_FILE, MAX_MANIFEST, MAX_PAYLOAD_FILES } from
 export { MAX_ZIP } from "./limits"
 export const Version = z.string().regex(/^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/).max(80)
 export const Hash = z.string().regex(/^[a-f0-9]{64}$/)
+const SkillId = z
+  .string()
+  .min(1)
+  .max(120)
+  .refine(
+    (s) => s === s.normalize("NFC") && !/[\\/:*?"<>|\x00-\x1f\x7f]/.test(s) && s !== "." && s !== "..",
+    "Invalid skill ID"
+  )
+const Features = z.object({ commitEnhanceSkill: SkillId.optional() }).strict()
 const File = z.object({ path: z.string().min(1).max(240), size: z.number().int().min(0).max(MAX_FILE), sha256: Hash }).strict()
 const Manifest = z.object({
   schemaVersion: z.literal(1), target: z.literal("opencode"), version: Version, channel: z.literal("stable"),
   compatibility: z.object({ mode: z.enum(["native", "raw"]).optional(), testedOpenCode: z.array(Version).max(20) }).strict().refine(c => c.mode === "raw" || c.testedOpenCode.length > 0),
   agents: z.number().int().min(1).max(MAX_PAYLOAD_FILES), skills: z.number().int().min(1).max(MAX_PAYLOAD_FILES),
   files: z.array(File).min(2).max(MAX_PAYLOAD_FILES),
+  features: Features.optional(),
 }).strict()
 
 export async function sha256(bytes: Uint8Array) {
@@ -55,8 +65,11 @@ export async function validate(bytes: Uint8Array, version: string) {
     if (!actual || actual.size !== file.size || actual.sha256 !== file.sha256) throw new Error("Manifest hash/size/path không khớp")
     inventory.delete(file.path)
   }
+  const features = manifest.features
+  if (features?.commitEnhanceSkill && !skills.has(features.commitEnhanceSkill)) throw new Error("UNKNOWN_COMMIT_ENHANCE_SKILL")
   return {
     schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: manifest.compatibility,
+    ...(features ? { features } : {}),
     agents, skills: skills.size, fileCount: manifest.files.length,
     expandedSize: manifest.files.reduce((sum, file) => sum + file.size, 0),
   }

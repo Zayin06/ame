@@ -176,13 +176,15 @@ export function preview(input: InputFile[], inherited: Issue[] = [], options: Im
   if (total > MAX_EXPANDED) issues.push({ path: "", severity: "error", reason: "expanded payload exceeds 24 MiB" })
   return { files, issues, agents, skills, ...(raw ? { compatibilityMode: "raw" as const } : {}) }
 }
-export async function pack(source: Preview, version: string, signal?: AbortSignal) {
+export async function pack(source: Preview, version: string, signal?: AbortSignal, options: { commitEnhanceSkill?: string } = {}) {
   signal?.throwIfAborted()
   Version.parse(version)
   if (source.issues.some(i => i.severity === "error")) throw new Error("IMPORT_BLOCKED")
+  const commitEnhanceSkill = options.commitEnhanceSkill?.trim()
+  if (commitEnhanceSkill && !source.skills.includes(commitEnhanceSkill)) throw new Error("UNKNOWN_COMMIT_ENHANCE_SKILL")
   const files = [...source.files].sort((a,b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   const inventory = await Promise.all(files.map(async f => ({ path: f.path, size: f.data.length, sha256: await sha256(f.data) })))
-  const manifest = { schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: source.compatibilityMode === "raw" ? { mode: "raw", testedOpenCode: [] } : { testedOpenCode: ["2.3.2"] }, agents: source.agents.length, skills: source.skills.length, files: inventory }
+  const manifest = { schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: source.compatibilityMode === "raw" ? { mode: "raw", testedOpenCode: [] } : { testedOpenCode: ["2.3.2"] }, agents: source.agents.length, skills: source.skills.length, files: inventory, ...(commitEnhanceSkill ? { features: { commitEnhanceSkill } } : {}) }
   const entries: Zippable = Object.create(null)
   // Fixed DOS timestamp and no directory entries keep output deterministic and strict.
   for (const f of [...files, { path: "manifest.json", data: encode.encode(JSON.stringify(manifest)) }]) {

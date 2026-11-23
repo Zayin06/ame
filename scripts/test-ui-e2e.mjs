@@ -405,6 +405,15 @@ async function main() {
       await click('.error-banner button[aria-label="Đóng thông báo"]', 'dismiss error toast')
       await until('!document.querySelector(".error-banner")', 'dismissed toast')
       await click('.insp-inline-name button[aria-label="Hủy nhập tên"]', 'cancel failed rename')
+      await click('button[aria-label="Git Diff"]', 'Inspector Git Diff tab')
+      try {
+        await until('Boolean(document.querySelector(".scm-commit-dock .scm-enhance-icon-btn svg"))', 'commit Enhance wand icon')
+        assert.equal(await evaluate('document.querySelector(".scm-commit-input-bar").textContent.trim()'), '', 'Commit toolbar must contain only the wand icon, without a skill hint or Enhance text')
+        await shot('03a-scm-commit-wand-dark.png')
+      } finally {
+        await click('button[aria-label="Explorer"]', 'restore Inspector Explorer tab')
+        await until('Boolean(document.querySelector("[data-testid=explorer]"))', 'restored Explorer')
+      }
     })
 
     await run('6/10 Settings light theme and no horizontal overflow', async () => {

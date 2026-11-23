@@ -192,8 +192,14 @@ export class OpenCodeAdapter {
     const list = await this.api().skill.list({ location: { directory: this.directory(projectID) } })
     return list.data.map(({ id, name, description, path }) => ({ id, name, description, path }))
   }
-  async generateCommitMessage(summary: { diff: string; files: string[]; truncated: boolean }, model: Model): Promise<{ message: string; truncated: boolean }> {
-    const prompt = [
+  async generateCommitMessage(summary: { diff: string; files: string[]; truncated: boolean }, model: Model, skill?: { name: string; instructions: string }): Promise<{ message: string; truncated: boolean }> {
+    const prompt = skill?.instructions ? [
+      'Write a commit message for the staged changes using the following skill.',
+      `Skill: /${skill.name}\n\n${skill.instructions}`,
+      `Files:\n${summary.files.join('\n')}`,
+      `Diff:\n${summary.diff}`,
+      'Return only the commit message text: no markdown fences, no tool calls or git commands, and no conversational preamble.',
+    ].join('\n\n') : [
       'Write a concise Conventional Commits message for the staged changes below.',
       'Use a subject of at most 72 characters and at most 3 short bullets if there are multiple changes.',
       'Return only the commit message, without markdown fences or extra explanation.',

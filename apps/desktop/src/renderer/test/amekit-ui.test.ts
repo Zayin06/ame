@@ -49,6 +49,7 @@ test('AmeKit errors unwrap Electron IPC wrappers and provide practical Vietnames
     ['RELEASE_CONFLICT', /đã tồn tại/, /1\.0\.1/],
     ['ACTIVATION_CONFLICT', /Revision kích hoạt/, /lịch sử.*kích hoạt lại/i],
     ['IMPORT_REQUIRED', /Chưa có dữ liệu nhập/, /agents\/.*skills\/.*Bước 1/],
+    ['UNKNOWN_COMMIT_ENHANCE_SKILL', /Skill Enhance không nằm trong gói đã nhập/, /chọn lại skill.*skills\/.*Bước 1.*đóng gói lại/],
     ['PACKAGE_REQUIRED', /Chưa có gói ZIP/, /Bước 2/],
     ['ZIP_EXCEEDS_8_MIB', /vượt quá giới hạn 8 MiB/, /tệp lớn/],
     ['ZIP_EXCEEDS', /vượt quá giới hạn 8 MiB/, /tệp lớn/],

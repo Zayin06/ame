@@ -157,10 +157,12 @@
 }
 @container composer (max-width: 280px) { .composer-picker--locked .composer-picker__label { display: none; } }
 .scm-commit-textarea { resize: none; }
-.scm-commit-input-bar button { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: var(--radius-pill); font-size: 11px; }
-.scm-commit-input-bar button svg { width: 12px; height: 12px; }
-.scm-commit-input-bar button:not(:disabled) { color: var(--accent); cursor: pointer; }
-.scm-commit-input-bar button:disabled { cursor: not-allowed; }
+.scm-commit-input-bar { display: flex; align-items: center; justify-content: flex-end; padding: 2px 6px 6px; }
+.scm-commit-input-bar button.scm-enhance-icon-btn { padding: 0; width: 24px; height: 24px; border: 0; border-radius: var(--radius-xs); display: inline-flex; align-items: center; justify-content: center; background: transparent; color: var(--text-secondary); cursor: pointer; }
+.scm-commit-input-bar button.scm-enhance-icon-btn svg { width: 14px; height: 14px; }
+.scm-commit-input-bar button.scm-enhance-icon-btn:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+.scm-commit-input-bar button.scm-enhance-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.scm-commit-input-bar button.scm-enhance-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .policy-inline__select { padding: 0 2px 0 0; border-radius: 0; max-width: 100px; }
 .policy-inline > svg { width: 14px; height: 14px; }
 .vsc-search-file-head { width: 100%; border: 0; background: transparent; text-align: left; }

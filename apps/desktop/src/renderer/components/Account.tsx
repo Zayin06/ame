@@ -3,10 +3,11 @@ import { errorText, Modal } from './Primitives'
 import { formatAmeKitError, formatBundleSize, groupIssues, type IssueSeverity } from '../amekit-ui'
 
 type AccountState = { origin?: string; account?: { name: string; username: string; role?: string }; ready?: boolean; reconnecting?: boolean; blocker?: string } | null
-type Release = { releaseId?: string; id?: string; version?: string; channel?: string; size?: number; manifest?: { agents?: number; skills?: number; compatibility?: { mode?: string } } }
-type Bundle = { version?: string; releaseId?: string; verification?: string; compatibilityWarnings?: unknown[]; compatibilityMode?: string; agents?: string[]; skills?: string[]; fileCount?: number } | null
+type Features = { commitEnhanceSkill?: string }
+type Release = { releaseId?: string; id?: string; version?: string; channel?: string; size?: number; features?: Features; manifest?: { agents?: number; skills?: number; compatibility?: { mode?: string }; features?: Features } }
+type Bundle = { version?: string; releaseId?: string; verification?: string; compatibilityWarnings?: unknown[]; compatibilityMode?: string; agents?: string[]; skills?: string[]; fileCount?: number; features?: Features } | null
 type ImportPreview = { folderName: string; agents: string[]; skills: string[]; files: { path: string; size: number }[]; issues: unknown[]; compatibilityMode: string; adaptClaudeAgents?: boolean }
-type Packaged = { summary: { version: string }; size: number; entries: number; sha256: string }
+type Packaged = { summary: { version: string; features?: Features }; size: number; entries: number; sha256: string }
 function object(value: unknown): Record<string, unknown> { return value && typeof value === 'object' ? value as Record<string, unknown> : {} }
 function noActiveRelease(error: unknown) { return /\bNO_ACTIVE_RELEASE\b/.test(errorText(error)) }
 const releaseID = (release: Release | null) => release?.releaseId || release?.id || ''
@@ -26,8 +27,11 @@ function BundleInventory({ agents, skills }: { agents: string[]; skills: string[
     </section>
   </div>
 }
+function EnhanceSummary({ features }: { features?: Features }) {
+  return features?.commitEnhanceSkill ? <span className="amekit-pill">Enhance: /{features.commitEnhanceSkill}</span> : null
+}
 function ReleaseSummary({ release }: { release: Release }) {
-  return <p className="muted">{release.manifest?.agents ?? 0} agents · {release.manifest?.skills ?? 0} skills · {formatBundleSize(release.size ?? 0)}</p>
+  return <p className="muted">{release.manifest?.agents ?? 0} agents · {release.manifest?.skills ?? 0} skills · {formatBundleSize(release.size ?? 0)} <EnhanceSummary features={release.manifest?.features ?? release.features} /></p>
 }
 export function Account({ projectID, close, embedded = false }: { projectID?: string; close: () => void; embedded?: boolean }) {
   const [account, setAccount] = useState<AccountState>(null)
@@ -51,6 +55,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   const [noRelease, setNoRelease] = useState(false)
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null)
   const [packaged, setPackaged] = useState<Packaged | null>(null)
+  const [commitEnhanceSkill, setCommitEnhanceSkill] = useState('')
   const [publishNotice, setPublishNotice] = useState('')
   const [issueTab, setIssueTab] = useState<IssueSeverity>('excluded')
   const [activeReleaseId, setActiveReleaseId] = useState('')
@@ -122,21 +127,30 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   }, [request])
   const execute = async (operation: string, payload?: Record<string, string>) => {
     setBusy(true); setError(''); setResult(undefined)
-    if (operation === 'import') { setImportPreview(null); setPackaged(null); setPublishNotice('') }
+    if (operation === 'import') { setImportPreview(null); setPackaged(null); setPublishNotice(''); setCommitEnhanceSkill('') }
     if (operation === 'package') setPackaged(null)
     try {
       const value = await request(operation, payload)
       if (['status', 'login', 'refresh', 'logout'].includes(operation)) {
         setAccount(value as AccountState); setPassword('')
         if (operation === 'logout') {
-          setImportPreview(null); setPackaged(null); setPublishNotice(''); setLatest(null); setInstalled(null)
+          setImportPreview(null); setPackaged(null); setPublishNotice(''); setLatest(null); setInstalled(null); setCommitEnhanceSkill('')
           setReleases([]); setCursor(''); setActiveReleaseId(''); setActivation(''); setRevision(''); setNoRelease(false); setTab('account')
         }
       } else {
         setResult(value)
         if (operation === 'import') {
           const preview = value as ImportPreview | null
+          let latestSkill = ''
+          if (preview) {
+            try {
+              const data = object(await request('latest')), release = object(data.release) as Release
+              setLatest(release)
+              latestSkill = release.manifest?.features?.commitEnhanceSkill ?? release.features?.commitEnhanceSkill ?? ''
+            } catch { /* Import remains usable without an active or reachable release. */ }
+          }
           setImportPreview(preview)
+          setCommitEnhanceSkill(preview?.skills.includes(latestSkill) ? latestSkill : '')
           setIssueTab(groupIssues(preview?.issues ?? [], preview?.compatibilityMode).defaultTab)
         }
         if (operation === 'package') setPackaged(value as Packaged)
@@ -193,7 +207,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
         {noRelease && <p className="muted">Máy chủ chưa có bản phát hành nào được kích hoạt.</p>}
       </section>
       <section className="amekit-card"><h3>Bundle đang cài trong dự án</h3>
-        {installed ? <><div className="amekit-badges"><strong>v{installed.version || installed.releaseId}</strong><span className="amekit-pill">{installed.compatibilityMode || 'native'}</span></div><p>{installed.verification === 'runtime-ready' ? 'Sẵn sàng OpenCode' : 'Đã xác minh chữ ký/byte'} · {installed.fileCount ?? 0} tệp</p><BundleInventory agents={installed.agents || []} skills={installed.skills || []} /></> : <p className="muted">Dự án này chưa cài bundle nào.</p>}
+        {installed ? <><div className="amekit-badges"><strong>v{installed.version || installed.releaseId}</strong><span className="amekit-pill">{installed.compatibilityMode || 'native'}</span><EnhanceSummary features={installed.features} /></div><p>{installed.verification === 'runtime-ready' ? 'Sẵn sàng OpenCode' : 'Đã xác minh chữ ký/byte'} · {installed.fileCount ?? 0} tệp</p><BundleInventory agents={installed.agents || []} skills={installed.skills || []} /></> : <p className="muted">Dự án này chưa cài bundle nào.</p>}
       </section>
       {latest?.manifest?.compatibility?.mode === 'raw' && !raw && <div className="amekit-alert amekit-alert--warning">Bản phát hành mới nhất dùng chế độ Raw — chỉ xác minh byte, không xác minh tương thích runtime. Bật tùy chọn bên dưới trước khi đồng bộ.</div>}
       <label className="checkbox"><input type="checkbox" checked={raw} onChange={e => setRaw(e.target.checked)} />Cho phép raw compatibility khi đồng bộ</label>
@@ -215,12 +229,13 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
         </div>}
       </section>
       <section className="amekit-card"><h3>Bước 2 · Đóng gói ZIP &amp; Xuất bản lên máy chủ</h3>
-        <form onSubmit={e => { e.preventDefault(); if (!busy && version.trim() && importPreview && !grouped.error.length) void execute('package', { version: version.trim() }) }}>
+        <form onSubmit={e => { e.preventDefault(); if (!busy && version.trim() && importPreview && !grouped.error.length) void execute('package', { version: version.trim(), ...(commitEnhanceSkill ? { commitEnhanceSkill } : {}) }) }}>
           <label>Phiên bản<input value={version} required placeholder="1.0.0" disabled={busy} onChange={e => setVersion(e.target.value)} /></label>
+          {importPreview && <><label>Skill cho Enhance (Commit message)<select aria-label="Skill cho Enhance (Commit message)" disabled={busy} value={commitEnhanceSkill} onChange={e => { setCommitEnhanceSkill(e.target.value); setPackaged(null) }}><option value="">Mặc định (Conventional Commits)</option>{importPreview.skills.map(skill => <option key={skill} value={skill}>/{skill}</option>)}</select></label><p className="muted">Cấu hình này được đóng gói vào bundle; sau khi kích hoạt và đồng bộ, nút Enhance của mọi thành viên tự dùng skill đã chọn.</p></>}
           <div className="button-row"><button disabled={busy || !version.trim() || !importPreview || grouped.error.length > 0}>Đóng gói</button><button type="button" className={packaged ? 'primary' : ''} disabled={busy || !packaged} onClick={() => void execute('publish')}>Xuất bản gói đã chuẩn bị</button></div>
         </form>
         {importPreview && grouped.error.length > 0 && <p className="amekit-alert amekit-alert--warning">Đóng gói bị khóa. Hãy xử lý các lỗi ở Bước 1 rồi nhập lại thư mục.</p>}
-        {packaged && <p className="amekit-package-summary">Đã đóng gói v{packaged.summary.version} · {formatBundleSize(packaged.size)} · {packaged.entries} mục · SHA-256 <code>{packaged.sha256}</code></p>}
+        {packaged && <p className="amekit-package-summary">Đã đóng gói v{packaged.summary.version} · {formatBundleSize(packaged.size)} · {packaged.entries} mục · SHA-256 <code>{packaged.sha256}</code> <EnhanceSummary features={packaged.summary.features} /></p>}
       </section>
       <section className="amekit-card"><div className="amekit-card-heading"><h3>Bước 3 · Bản phát hành &amp; Kích hoạt cho team</h3><div className="button-row"><button disabled={busy} onClick={() => void execute('history')}>Làm mới lịch sử</button>{cursor && <button disabled={busy} onClick={() => void execute('history', { cursor })}>Trang tiếp</button>}</div></div>
         <p className="muted">Revision hiện tại: {revision || '—'}</p>

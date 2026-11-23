@@ -329,7 +329,8 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       const selected = await resolveModel(a, b)
       const summary = await workspace.stagedDiffSummary(a, 24576)
       if (summary.files.length === 0) throw new Error('NO_STAGED_CHANGES')
-      return adapter.generateCommitMessage(summary, selected)
+      const skill = (await account.readCommitEnhanceSkill?.(a).catch(() => null)) ?? null
+      return skill ? adapter.generateCommitMessage(summary, selected, skill) : adapter.generateCommitMessage(summary, selected)
     }
     case 'messages': return adapter.messages(a, b)
     case 'agentMap': return adapter.agentMap(a, b)
