@@ -171,11 +171,14 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         await api.guard(true, signal)
         resetImport()
         if (payload.compatibilityMode && !["native", "raw"].includes(payload.compatibilityMode)) throw new Error("INVALID_COMPATIBILITY_MODE")
+        if (payload.adaptClaudeAgents !== undefined && !["true", "false"].includes(payload.adaptClaudeAgents)) throw new Error("INVALID_PAYLOAD")
+        if (payload.adaptClaudeAgents === "true" && payload.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
+        const adaptClaudeAgents = payload.compatibilityMode === "raw" && payload.adaptClaudeAgents === "true"
         const root = await options.pickImport()
         if (!root) return null
         await installer.safeDirectory(root)
-        source = await scan(root, signal, { compatibilityMode: payload.compatibilityMode === "raw" ? "raw" : "native" })
-        return { issues: source.issues, agents: source.agents, skills: source.skills, compatibilityMode: source.compatibilityMode ?? "native", files: source.files.map(file => ({ path: file.path, size: file.data.length })) }
+        source = await scan(root, signal, { compatibilityMode: payload.compatibilityMode === "raw" ? "raw" : "native", adaptClaudeAgents })
+        return { issues: source.issues, agents: source.agents, skills: source.skills, compatibilityMode: source.compatibilityMode ?? "native", adaptClaudeAgents, files: source.files.map(file => ({ path: file.path, size: file.data.length })) }
       }
       case "package": {
         await api.guard(true, signal)

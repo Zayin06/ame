@@ -6,6 +6,7 @@ import { MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES } from "./limits"
 
 export async function scan(root: string, signal?: AbortSignal, options: ImportOptions = {}) {
   if (options.compatibilityMode !== undefined && options.compatibilityMode !== "native" && options.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
+  if (options.adaptClaudeAgents === true && options.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
   if (!path.isAbsolute(root)) throw new Error("SELECT_ABSOLUTE_FOLDER")
   const absolute = path.resolve(root)
   const stat = await lstat(absolute)

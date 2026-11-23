@@ -7,6 +7,8 @@ import { setTimeout as delay } from "node:timers/promises"
 import { createAmeKit, type AmeKitDependencies, type AmeKit } from "../src/index"
 import { openSessionVault, type Encryption } from "../src/session-vault"
 import { pack, preview, safePath } from "../src/bundle/package"
+import { scan } from "../src/bundle/scan"
+import { parse, stringify } from "yaml"
 import { installed, install, uninstall } from "../src/installer"
 import type { Release } from "../src/api"
 import { dialoguePrompt, localDialogue } from "../src/pet-dialogue"
@@ -339,6 +341,91 @@ test("admin import/package/publish/activate require roles and native main confir
     f.confirm(true)
     assert.ok(await f.service.call("activate", { id: f.artifact.release.releaseId, revision: "1" }))
     assert.ok(f.dialogs.length >= 4)
+  } finally { await f.cleanup() }
+})
+
+test("raw Claude adaptation preserves body bytes through scan, pack and consented install", async () => {
+  const folder = await area(), sourceRoot = path.join(folder, "source"), project = path.join(folder, "project")
+  const body = "\r\n# Hỗ trợ Android 🤖\r\nKeep indentation:  two spaces  \r\n---\r\nFinal line without newline"
+  const original = encode(`---\r\nname: Helper\r\ndescription: Helpful fixture\r\ntools: [Read, Write, Bash]\r\nmodel: inherit\r\ncolor: green\r\n---\r\n${body}`)
+  const files = input(); files[0].data = original
+  try {
+    await mkdir(project)
+    for (const file of files) {
+      const target = path.join(sourceRoot, ...file.path.split("/"))
+      await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data)
+    }
+    for (const options of [{ compatibilityMode: "raw" as const }, { compatibilityMode: "raw" as const, adaptClaudeAgents: false }]) {
+      const unchanged = await scan(sourceRoot, undefined, options)
+      assert.deepEqual(unchanged.files[0].data, original)
+      assert.equal(unchanged.issues.some(issue => issue.severity === "change"), false)
+    }
+    const adapted = await scan(sourceRoot, undefined, { compatibilityMode: "raw", adaptClaudeAgents: true })
+    const text = new TextDecoder().decode(adapted.files[0].data), end = text.indexOf("---\n", 4)
+    assert.deepEqual(parse(text.slice(4, end)), { description: "Helpful fixture", mode: "all", color: "#22c55e" })
+    assert.deepEqual(encode(text.slice(end + 4)), encode(body))
+    assert.deepEqual(adapted.files[1].data, files[1].data, "skills are never adapted")
+    assert.deepEqual(files[0].data, original, "preview does not mutate its input")
+    assert.deepEqual(await readFile(path.join(sourceRoot, "agents", "helper.md")), Buffer.from(original), "source files are untouched")
+    assert.equal(adapted.issues.filter(issue => issue.severity === "error").length, 0)
+    assert.deepEqual(adapted.issues.filter(issue => issue.severity === "warning").map(issue => issue.path), [""], "only the existing bundle-level raw compatibility disclaimer remains")
+    assert.ok(adapted.issues.some(issue => issue.severity === "change" && /removed name, removed tools, removed model: inherit, color green -> #22c55e, mode: all/.test(issue.reason)))
+    const packed = await pack(adapted, "1.2.3")
+    assert.deepEqual(packed.summary.compatibility, { mode: "raw", testedOpenCode: [] })
+    const { release } = await bundle("raw")
+    const result = await install(project, "http://localhost:3211", { ...release, sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"] }, packed.bytes, async () => { throw new Error("MUST_NOT_DISCOVER_RAW") }, undefined, { allowRaw: true })
+    assert.equal(result.state.verification, "verified-bytes")
+    assert.deepEqual(await readFile(path.join(project, ".opencode", "agents", "helper.md")), Buffer.from(adapted.files[0].data))
+  } finally { await rm(folder, { recursive: true, force: true }) }
+})
+
+test("Claude adaptation handles colors, preserves OpenCode metadata and concrete model warnings", () => {
+  const metadata = { description: "Helpful fixture", mode: "subagent", system: "system text", steps: 3, hidden: true, disabled: false,
+    permissions: [{ action: "read", resource: "*", effect: "ask" }], request: { headers: { "x-example": "value" }, body: { temperature: 0.5 } } }
+  const colors = { green: "#22c55e", blue: "#3b82f6", orange: "#f97316", purple: "#a855f7", red: "#ef4444", yellow: "#eab308", cyan: "#06b6d4", pink: "#ec4899", teal: "#14b8a6", indigo: "#6366f1", amber: "#f59e0b", emerald: "#10b981", violet: "#8b5cf6", rose: "#f43f5e", sky: "#0ea5e9", lime: "#84cc16", gray: "#6b7280", grey: "#6b7280" }
+  for (const [color, expected] of [...Object.entries(colors), [" GrEeN ", "#22c55e"], [" #AbC123 ", "#AbC123"], ["unsupported", undefined], ["constructor", undefined], [42, undefined], [null, undefined]]) {
+    const files = input(); files[0].data = encode(`---\n${stringify({ ...metadata, color })}---\nBody unchanged.\r\n`)
+    const result = preview(files, [], { compatibilityMode: "raw", adaptClaudeAgents: true })
+    const text = new TextDecoder().decode(result.files[0].data)
+    const value = parse(text.slice(4, text.indexOf("---\n", 4)))
+    assert.deepEqual(value, { ...metadata, ...(expected ? { color: expected } : {}) })
+    assert.deepEqual(result.issues.filter(issue => issue.path && ["error", "warning"].includes(issue.severity)), [])
+  }
+  const files = input()
+  const valid = preview(files, [], { compatibilityMode: "raw", adaptClaudeAgents: true })
+  assert.deepEqual(valid.files[0].data, files[0].data, "already compatible agents need no re-encoding")
+  files[0].data = encode("---\ndescription: Helpful fixture\nmodel: claude-3-7-sonnet\n---\nBody\n")
+  const pinned = preview(files, [], { compatibilityMode: "raw", adaptClaudeAgents: true })
+  assert.match(new TextDecoder().decode(pinned.files[0].data), /model: claude-3-7-sonnet/)
+  assert.ok(pinned.issues.some(issue => /pinned model metadata preserved/.test(issue.reason)))
+  files[0].data = encode("---\nname: helper\ntools: [Read]\nmodel: ' InHeRiT '\ncolor: blue\n---\nBody\n")
+  const invalid = preview(files, [], { compatibilityMode: "raw", adaptClaudeAgents: true })
+  assert.deepEqual(invalid.files[0].data, files[0].data, "missing descriptions are not adapted")
+  assert.ok(invalid.issues.some(issue => issue.reason === "description required"))
+  files[0].data = encode("---\ndescription: Helpful fixture\nmodel: ' InHeRiT '\n---\nBody\n")
+  assert.doesNotMatch(new TextDecoder().decode(preview(files, [], { compatibilityMode: "raw", adaptClaudeAgents: true }).files[0].data), /model:/)
+})
+
+test("Claude adaptation rejects non-raw modes in preview, scan and import payloads", async () => {
+  for (const compatibilityMode of [undefined, "native"] as const) {
+    assert.throws(() => preview(input(), [], { compatibilityMode, adaptClaudeAgents: true }), /INVALID_COMPATIBILITY_MODE/)
+    await assert.rejects(scan("not-absolute", undefined, { compatibilityMode, adaptClaudeAgents: true }), /INVALID_COMPATIBILITY_MODE/)
+  }
+  const f = await fixture({ role: "admin" })
+  try {
+    await login(f.service)
+    for (const adaptClaudeAgents of ["", "yes", "TRUE", "1"]) await assert.rejects(f.service.call("import", { compatibilityMode: "raw", adaptClaudeAgents }), /INVALID_PAYLOAD/)
+    for (const payload of [{ adaptClaudeAgents: "true" }, { compatibilityMode: "native", adaptClaudeAgents: "true" }] as Record<string, string>[]) await assert.rejects(f.service.call("import", payload), /INVALID_COMPATIBILITY_MODE/)
+    assert.equal(f.pickerCount(), 0)
+    await writeFile(path.join(f.imported, "agents", "helper.md"), "---\nname: Helper\ndescription: Helpful fixture\ntools: [Read]\nmodel: inherit\ncolor: green\n---\nBody\n")
+    const imported = await f.service.call("import", { compatibilityMode: "raw", adaptClaudeAgents: "true" }) as { adaptClaudeAgents: boolean; compatibilityMode: string; issues: { severity: string; path: string }[] }
+    assert.equal(imported.adaptClaudeAgents, true); assert.equal(imported.compatibilityMode, "raw")
+    assert.ok(imported.issues.some(issue => issue.severity === "change"))
+    assert.equal(imported.issues.some(issue => issue.path && ["error", "warning"].includes(issue.severity)), false)
+    await f.service.call("package", { version: "1.2.3" })
+    const unadapted = await f.service.call("import", { compatibilityMode: "raw", adaptClaudeAgents: "false" }) as typeof imported
+    assert.equal(unadapted.adaptClaudeAgents, false)
+    assert.equal(unadapted.issues.some(issue => issue.severity === "change"), false)
   } finally { await f.cleanup() }
 })
 

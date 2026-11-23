@@ -232,6 +232,10 @@
 .settings-navigation { display: flex; gap: 6px; padding: 12px 20px; border-bottom: 1px solid var(--border-subtle); }
 .settings-navigation button.active { color: var(--accent); background: var(--accent-soft); }
 .amekit-core { padding: 16px 20px; }
+.amekit-core .operation-summary { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--border-subtle); border-radius: 8px; overflow-wrap: anywhere; }
+.amekit-core .operation-summary p { margin: 3px 0; }
+.amekit-core .operation-summary ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; }
+.amekit-core .operation-result pre { max-height: 320px; overflow: auto; }
 .pairing-code { display: flex; flex-direction: column; align-items: center; gap: 8px; margin: 20px 0; }
 .pairing-code img { max-width: 100%; background: white; border-radius: 8px; }
 .pairing-code label { width: 100%; }

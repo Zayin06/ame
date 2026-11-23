@@ -5,7 +5,31 @@ import { MAX_ZIP, Version, sha256, validate } from "./manifest"
 import { readArchive } from "./archive"
 import { BUNDLE_ARCHIVE_LIMITS, MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES } from "./limits"
 import { z } from "zod"
-export type ImportOptions = { compatibilityMode?: "native" | "raw" }
+export type ImportOptions = { compatibilityMode?: "native" | "raw"; adaptClaudeAgents?: boolean }
+const CLAUDE_COLOR_HEX: Record<string, string> = {
+  green: "#22c55e", blue: "#3b82f6", orange: "#f97316", purple: "#a855f7", red: "#ef4444", yellow: "#eab308",
+  cyan: "#06b6d4", pink: "#ec4899", teal: "#14b8a6", indigo: "#6366f1", amber: "#f59e0b", emerald: "#10b981",
+  violet: "#8b5cf6", rose: "#f43f5e", sky: "#0ea5e9", lime: "#84cc16", gray: "#6b7280", grey: "#6b7280",
+}
+function adaptClaudeFrontmatter(value: Record<string, unknown>) {
+  const adapted = { ...value }, changes: string[] = []
+  if ("name" in adapted) { delete adapted.name; changes.push("removed name") }
+  if ("tools" in adapted) { delete adapted.tools; changes.push("removed tools") }
+  if (typeof adapted.model === "string" && adapted.model.trim().toLowerCase() === "inherit") { delete adapted.model; changes.push("removed model: inherit") }
+  if ("color" in adapted) {
+    if (typeof adapted.color === "string") {
+      const c = adapted.color.trim()
+      if (/^#[0-9a-fA-F]{6}$/.test(c)) {
+        if (c !== adapted.color) { adapted.color = c; changes.push("trimmed color") }
+      } else if (Object.hasOwn(CLAUDE_COLOR_HEX, c.toLowerCase())) {
+        const hex = CLAUDE_COLOR_HEX[c.toLowerCase()]
+        adapted.color = hex; changes.push(`color ${c} -> ${hex}`)
+      } else { delete adapted.color; changes.push("removed unsupported color") }
+    } else { delete adapted.color; changes.push("removed invalid color") }
+  }
+  if (adapted.mode === undefined) { adapted.mode = "all"; changes.push("mode: all") }
+  return { adapted, changes }
+}
 // Mirrors the accepted, model-independent subset of ConfigAgent.Info 2.3.2; parity-tested against the public schema.
 const agentMetadata = z.object({
   description: z.string(), mode: z.enum(["all", "primary", "subagent"]).optional(), system: z.string().optional(),
@@ -60,6 +84,7 @@ function frontmatter(file: InputFile) {
 }
 export function preview(input: InputFile[], inherited: Issue[] = [], options: ImportOptions = {}): Preview {
   if (options.compatibilityMode !== undefined && options.compatibilityMode !== "native" && options.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
+  if (options.adaptClaudeAgents === true && options.compatibilityMode !== "raw") throw new Error("INVALID_COMPATIBILITY_MODE")
   const raw = options.compatibilityMode === "raw"
   const semanticSeverity = raw ? "warning" : "error"
   const issues = [...inherited]
@@ -97,8 +122,19 @@ export function preview(input: InputFile[], inherited: Issue[] = [], options: Im
       ids.add(key)
       ;(agent ? agents : skills).push(id)
       try {
-        const { value, body } = frontmatter(file)
+        let { value, body } = frontmatter(file)
         if (typeof value.description !== "string" || !value.description.trim()) throw new Error("description required")
+        if (agent && raw && options.adaptClaudeAgents === true) {
+          const { adapted, changes } = adaptClaudeFrontmatter(value)
+          if (changes.length) {
+            const previousSize = file.data.length
+            file.data = encode.encode(`---\n${stringify(adapted)}---\n${body}`)
+            total += file.data.length - previousSize
+            if (previousSize <= MAX_FILE && file.data.length > MAX_FILE) issues.push({ path: file.path, severity: "error", reason: "file exceeds 4 MiB" })
+            issues.push({ path: file.path, severity: "change", reason: `adapted Claude frontmatter for OpenCode 2.3.2 (${changes.join(", ")}); instruction body preserved` })
+          }
+          value = adapted
+        }
         if (skill && (value.name !== id || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id))) throw new Error("skill name must match directory and use lowercase hyphenated name")
         const unsupported = agent ? Object.keys(value).filter(k => !["description", "mode", "model", "request", "system", "steps", "hidden", "disabled", "color", "permissions", "name"].includes(k)) : []
         if (agent && raw && value.model !== undefined) issues.push({ path: file.path, severity: "warning", reason: "pinned model metadata preserved; provider/model availability and interpretation are not verified" })
