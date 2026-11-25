@@ -18,11 +18,19 @@ export type ArtifactDetail = { info: ArtifactSummary; files: Record<string, stri
 export type Project = { id: string; name: string; directory: string }
 export type FileEntry = { path: string; name: string; directory: boolean }
 export type FileDocument = { path: string; content: string; revision: string }
-export type Change = { path: string; index: string; working: string }
+export type Change = { path: string; index: string; working: string; from?: string }
+export const GIT_COMMIT_HASH_PATTERN = /^[a-f0-9]{7,64}$/i
+export function isValidGitCommitHash(hash: unknown): hash is string {
+  return typeof hash === 'string' && GIT_COMMIT_HASH_PATTERN.test(hash)
+}
 /** Omitted target preserves legacy HEAD → disk comparison. */
-export type DiffTarget = { kind: 'staged' } | { kind: 'working' } | { kind: 'commit'; commit: string }
+export type DiffTarget = { kind: 'staged'; from?: string } | { kind: 'working'; from?: string } | { kind: 'commit'; commit: string; from?: string }
+  | { kind: 'range'; baseCommit: string; includeWorking?: boolean; from?: string }
+  | { kind: 'commits'; commits: string[]; includeWorking?: boolean; from?: string }
 export type DiffContent = {
   original: string; modified: string
+  patch?: string
+  truncated?: boolean
   binary?: boolean; tooLarge?: boolean; reason?: string
   sizeBytes?: number; originalSize?: number; modifiedSize?: number
 }
@@ -35,8 +43,8 @@ export type GitPushOptions = { setUpstream?: boolean }
 export type GitSyncResult = { summary: string; filesChanged?: number; conflicts?: string[]; branch?: string; remote?: string }
 export type GitCommitSummary = { hash: string; shortHash: string; subject: string; body: string; author: string; date: string; refs: string[] }
 export type GitCommitFile = { path: string; status: 'A' | 'M' | 'D' | 'R' | 'C' | 'T'; additions: number; deletions: number }
-export type GitCommitDetail = GitCommitSummary & { files: GitCommitFile[]; patch: string }
-export type GitStashEntry = { index: number; ref: string; branch: string; message: string; date: string }
+export type GitCommitDetail = GitCommitSummary & { files: GitCommitFile[]; patch: string; isMerge?: boolean }
+export type GitStashEntry = { index: number; oid?: string; ref: string; branch: string; message: string; date: string }
 export type BuildNotesMode = 'range' | 'commits'
 export type BuildNotesRequest = { mode: BuildNotesMode; baseCommit?: string; commitHashes?: string[]; includeWorking: boolean; note?: string }
 export type BuildNotesFileStat = { path: string; status: 'A' | 'M' | 'D' | 'R' | 'C' | 'T' | 'U'; additions: number; deletions: number; source: 'committed' | 'working' | 'both' }
@@ -107,6 +115,13 @@ export type AndroidTranslationInfo = SessionLockState & {
 export type AndroidTranslationPromptResult = { session: Session; model: Model; locked: boolean }
 export type CommitAgentMode = 'analyze' | 'split' | 'single' | 'custom'
 export type CommitAgentSessionState = { commitSessionIDs: string[]; lockedSessionIDs: string[] }
+export type CommitAgentSnapshot = { head: string; branchRef: string; branch?: string; indexHash: string; workingHash: string; untrackedHashes?: Record<string, string>; scope: 'staged' | 'working'; fingerprint: string; stagedFiles: string[]; workingFiles: string[] }
+export type CommitAgentPlanGroup = { message: string; files: string[] }
+export type CommitAgentPlan = { planID: string; scope: 'staged' | 'working'; snapshot: { head: string; branchRef?: string; indexHash: string; workingHash?: string; untrackedHashes?: Record<string, string> }; commits: CommitAgentPlanGroup[] }
+export type CommitAgentPlanStatus = 'active' | 'executing' | 'stale' | 'executed' | 'superseded'
+export type CommitAgentStoredPlan = { planID: string; snapshot: CommitAgentSnapshot; status: CommitAgentPlanStatus }
+export type CommitAgentExecuteFailure = { code: string; message: string; failedGroupIndex: number; failedSubject: string }
+export type CommitAgentExecuteResult = { commits: { hash: string; subject: string; files: string[] }[]; partialFailure?: CommitAgentExecuteFailure }
 export type CommitAgentInfo = CommitAgentSessionState & {
   configured: boolean
   skill?: string
@@ -117,8 +132,11 @@ export type CommitAgentInfo = CommitAgentSessionState & {
   branch?: string
   stagedCount: number
   workingCount: number
+  snapshot?: CommitAgentSnapshot
+  plans?: Record<string, CommitAgentStoredPlan>
+  messagePlanIDs?: Record<string, string>
 }
-export type CommitAgentPromptResult = { session: Session; model: Model; locked: boolean }
+export type CommitAgentPromptResult = { session: Session; model: Model; locked: boolean; planID?: string; snapshot?: CommitAgentSnapshot }
 export type Agent = { id: string; name: string }
 export type Permission = { id: string; sessionID: string; title: string }
 export type { SessionForm, SessionFormField, SessionFormOption, SessionFormWhen, SessionFormAnswer, SessionFormValue } from './session-form'
@@ -250,7 +268,7 @@ export interface DesktopApi {
   createBranch(projectID: string, name: string, checkout?: boolean): Promise<void>
   git(projectID: string): Promise<GitState>
   diff(projectID: string, relative: string, target?: DiffTarget): Promise<DiffContent>
-  stage(projectID: string, relative: string, staged: boolean): Promise<void>
+  stage(projectID: string, path: string, staged: boolean, from?: string): Promise<void>
   commit(projectID: string, message: string, options?: GitCommitOptions): Promise<void>
   gitDeleteBranch(projectID: string, name: string, force?: boolean): Promise<void>
   gitFetch(projectID: string): Promise<GitSyncResult>
@@ -263,8 +281,8 @@ export interface DesktopApi {
   gitUndoLastCommit(projectID: string): Promise<{ message: string }>
   gitStashList(projectID: string): Promise<GitStashEntry[]>
   gitStashPush(projectID: string, message?: string, includeUntracked?: boolean): Promise<void>
-  gitStashApply(projectID: string, index: number, pop?: boolean): Promise<void>
-  gitStashDrop(projectID: string, index: number): Promise<void>
+  gitStashApply(projectID: string, index: number, pop?: boolean, expectedOid?: string): Promise<void>
+  gitStashDrop(projectID: string, index: number, expectedOid?: string): Promise<void>
   connection(): Promise<Connection>
   startBackend(): Promise<Connection>
   pairingStatus(): Promise<PairingSettings>
@@ -286,8 +304,10 @@ export interface DesktopApi {
   androidTranslationPrompt(projectID: string, sessionID: string | undefined, text: string, mode?: 'update' | 'full' | 'scan' | 'custom'): Promise<AndroidTranslationPromptResult>
   androidTranslationLock(projectID: string, sessionID: string): Promise<SessionLockState>
   commitAgentInfo(projectID: string): Promise<CommitAgentInfo>
+  commitAgentSessionState(projectID: string): Promise<CommitAgentSessionState>
   commitAgentPrompt(projectID: string, sessionID: string | undefined, text: string, mode?: CommitAgentMode): Promise<CommitAgentPromptResult>
   commitAgentLock(projectID: string, sessionID: string): Promise<CommitAgentSessionState>
+  commitAgentExecutePlan(projectID: string, sessionID: string, plan: CommitAgentPlan): Promise<CommitAgentExecuteResult>
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
   sessionUsage(projectID: string, sessionID: string): Promise<SessionUsageView>

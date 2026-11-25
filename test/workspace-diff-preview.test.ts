@@ -22,6 +22,7 @@ test('Git oversized blobs are sized before loading for HEAD, index, commit and p
     git: () => ({ raw: async (args: string[]) => {
       calls.push(args)
       if (args[0] === 'cat-file' && args[1] === '-s') return String(diffPreviewLimit + 1)
+      if (args[0] === 'cat-file' && args[1] === '-t') return 'blob'
       if (args[0] === 'rev-parse') return hash
       if (args[0] === 'rev-list') return `${hash} ${'b'.repeat(40)}`
       throw new Error(`Unexpected content read: ${args.join(' ')}`)
@@ -30,7 +31,9 @@ test('Git oversized blobs are sized before loading for HEAD, index, commit and p
   const invoke = Workspaces.prototype.diff.bind(fake as unknown as Workspaces)
   assert.equal((await invoke('p', 'large.dat', { kind: 'staged' })).tooLarge, true)
   assert.equal((await invoke('p', 'large.dat', { kind: 'commit', commit: hash })).tooLarge, true)
-  assert.deepEqual(calls.filter(args => args[0] === 'cat-file'), ['HEAD', '', `${hash}^`, hash].map(ref => ['cat-file', '-s', `${ref}:./large.dat`]))
+  assert.deepEqual(calls.filter(args => args[0] === 'cat-file'), ['HEAD', '', `${hash}^`, hash].flatMap(ref => [
+    ['cat-file', '-t', `${ref}:./large.dat`], ['cat-file', '-s', `${ref}:./large.dat`],
+  ]))
 })
 
 for (const [label, bytes, flag] of [

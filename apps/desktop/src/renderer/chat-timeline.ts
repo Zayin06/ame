@@ -32,7 +32,12 @@ export function extractUserDisplayText(text: string): string {
   const normalized = text.replace(/\r\n/g, '\n')
   const marker = '\n\nUser request:\n'
   if (!/^\[STRICT SCOPE: (?:ANDROID STRINGS TRANSLATION|GIT COMMIT ASSISTANT) ONLY\]/.test(normalized) || !normalized.includes(marker)) return text
-  return normalized.slice(normalized.lastIndexOf(marker) + marker.length).replace(/^\[(?:Translation mode: (?:update|full|scan|custom)|Commit mode: (?:analyze|split|single|custom))\]\n/, '')
+  const headers = /^(?:\[(?:Commit snapshot: [A-Za-z0-9_-]+|Translation mode: (?:update|full|scan|custom)|Commit mode: (?:analyze|split|single|custom))\]\n)+/
+  let chosen = normalized.lastIndexOf(marker)
+  for (let index = normalized.indexOf(marker); index !== -1; index = normalized.indexOf(marker, index + marker.length)) {
+    if (headers.test(normalized.slice(index + marker.length))) chosen = index
+  }
+  return normalized.slice(chosen + marker.length).replace(headers, '')
 }
 
 /** Only explicit commit/text fences with a Conventional Commit subject are actionable. */

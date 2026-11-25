@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { BuildNotesMode, BuildNotesPreview, BuildNotesRequest, BuildNotesResult, GitCommitSummary, GitState } from '../../../../../packages/protocol/src/index'
+import type { BuildNotesMode, BuildNotesPreview, BuildNotesRequest, BuildNotesResult, DiffTarget, GitCommitSummary, GitState } from '../../../../../packages/protocol/src/index'
 import { formatBuildNotesError, markdownToPlainText, summarizeBuildScope } from '../build-notes-ui'
 import { formatRelativeGitDate } from '../git-ui'
 import { FileTypeIcon } from './FileTypeIcon'
@@ -13,7 +13,7 @@ export type BuildNotesPanelProps = {
   generation: number
   initialBaseCommit?: string
   onConsumeInitialBase?: () => void
-  onDiff: (path: string) => void
+  onDiff: (path: string, target?: DiffTarget) => void
   onOpenFile?: (path: string, line?: number) => void
 }
 
@@ -28,6 +28,7 @@ export function BuildNotesPanel({ projectID, connected, git, generation, initial
   const [extraNote, setExtraNote] = useState('')
   const [commits, setCommits] = useState<GitCommitSummary[]>([])
   const [preview, setPreview] = useState<BuildNotesPreview>()
+  const [previewScope, setPreviewScope] = useState<BuildNotesRequest>()
   const [result, setResult] = useState<BuildNotesResult>()
   const [notesText, setNotesText] = useState('')
   const [viewMode, setViewMode] = useState<'preview' | 'edit'>('preview')
@@ -52,7 +53,7 @@ export function BuildNotesPanel({ projectID, connected, git, generation, initial
   useEffect(() => {
     setScopeProject(projectID)
     setMode('range'); setBaseCommit(''); setSelectedHashes([]); setCommitFilter('')
-    setIncludeWorking(true); setExtraNote(''); setCommits([]); setPreview(undefined)
+    setIncludeWorking(true); setExtraNote(''); setCommits([]); setPreview(undefined); setPreviewScope(undefined)
     setResult(undefined); setNotesText(''); setViewMode('preview'); setError(undefined); setCopied('')
   }, [projectID])
 
@@ -95,10 +96,11 @@ export function BuildNotesPanel({ projectID, connected, git, generation, initial
     if (scopeProject !== projectID) return
     let active = true
     setPreview(undefined)
+    setPreviewScope(undefined)
     void (async () => {
       try {
         const loaded = await window.ame.buildNotesPreview(projectID, request)
-        if (active && current()) setPreview(loaded)
+        if (active && current()) { setPreview(loaded); setPreviewScope(request) }
       } catch (reason) { if (active) report(reason) }
     })()
     return () => { active = false }
@@ -159,7 +161,13 @@ export function BuildNotesPanel({ projectID, connected, git, generation, initial
         {preview && <><span>{summarizeBuildScope(preview)}</span>{preview.truncated && <span className="git-bn-warning">Diff đã được rút gọn</span>}</>}
         <span className="git-bn-config">Skill: {preview?.skill ? '/' + preview.skill : 'Mặc định QC'} · Model: {preview?.effectiveModelID ?? 'default'}</span>
         {preview && <details><summary>Danh sách tệp thay đổi ({preview.files.length})</summary><ul>{preview.files.map(file => <li key={file.path}>
-          <button type="button" onClick={() => onDiff(file.path)}><FileTypeIcon path={file.path} />{file.path} <span>+{file.additions} -{file.deletions}</span></button>
+          <button type="button" onClick={() => {
+            if (file.source === 'working') onDiff(file.path)
+            else if (preview.commits.length === 1 && file.source === 'committed') onDiff(file.path, { kind: 'commit', commit: preview.commits[0].hash })
+            else if (previewScope?.mode === 'range' && previewScope.baseCommit) onDiff(file.path, { kind: 'range', baseCommit: previewScope.baseCommit, includeWorking: previewScope.includeWorking && file.source === 'both' })
+            else if (preview.commits.length > 0) onDiff(file.path, { kind: 'commits', commits: preview.commits.map(commit => commit.hash), includeWorking: !!previewScope?.includeWorking && file.source === 'both' })
+            else onDiff(file.path)
+          }}><FileTypeIcon path={file.path} />{file.path} <span>+{file.additions} -{file.deletions}</span></button>
         </li>)}</ul></details>}
       </div>
       <button type="button" className="primary" data-testid="build-notes-generate-btn" disabled={!connected || busy || !hasChanges} onClick={() => void generate()}>

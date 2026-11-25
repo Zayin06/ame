@@ -6,8 +6,9 @@ import { runInNewContext } from 'node:vm'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
-import type { ChatItem, CommitAgentInfo, IdeEvent, Permission, Session, SessionForm } from '../../../../../packages/protocol/src/index'
+import type { ChatItem, CommitAgentExecuteFailure, CommitAgentInfo, IdeEvent, Permission, Session, SessionForm } from '../../../../../packages/protocol/src/index'
 import * as timeline from '../chat-timeline'
+import { extractCommitSnapshotID, inspectCommitAgentPlan, parseCommitAgentPlan } from '../../../../../packages/amekit/src/commit-plan'
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 function harness(resume = false, overrides: Partial<CommitAgentInfo> = {}) {
@@ -17,7 +18,9 @@ function harness(resume = false, overrides: Partial<CommitAgentInfo> = {}) {
   let info: CommitAgentInfo = { configured: false, effectiveModelID: 'default', fallbackToDefault: false, stagedCount: 2, workingCount: 3, branch: 'main', commitSessionIDs: resume ? ['commit-1'] : [], lockedSessionIDs: [], ...overrides }
   let sessions: Session[] = resume ? [{ id: 'commit-1', title: 'Commit', status: 'idle' }] : []
   let items: ChatItem[] = [], forms: SessionForm[] = [], permissions: Permission[] = []
-  let formsError = '', lockError = ''
+  let formsError = '', lockError = '', sessionsError = '', permissionsError = '', executeError = '', infoLoads = 0
+  let promptPlan: { planID: string; snapshot: NonNullable<CommitAgentInfo['snapshot']> } | undefined
+  let partialFailure: CommitAgentExecuteFailure | undefined
   const calls: { method: string; args: unknown[] }[] = [], applied: string[] = []
   const events = new Set<(event: IdeEvent) => void>(), listeners = new Map<string, Set<() => void>>()
   const hooks = {
@@ -26,17 +29,18 @@ function harness(resume = false, overrides: Partial<CommitAgentInfo> = {}) {
     useEffect(run: () => (() => void) | undefined, deps: unknown[]) { const i = effectIndex++, old = effects[i]; if (!old || deps.some((dep, j) => !Object.is(dep, old.deps[j]))) pending.push(() => { old?.cleanup?.(); effects[i] = { deps, cleanup: run() } }) },
   }
   const api = {
-    async commitAgentInfo() { return info },
+    async commitAgentInfo() { infoLoads++; return info },
+    async commitAgentExecutePlan(...args: unknown[]) { calls.push({ method: 'execute', args }); if (executeError) throw new Error(executeError); return { commits: [{ hash: 'created-hash-1' }, { hash: 'created-hash-2' }], partialFailure } },
     async commitAgentPrompt(...args: unknown[]) {
       calls.push({ method: 'prompt', args })
       sessions = [{ id: 'commit-1', title: 'Commit', status: 'running' }]
       info = { ...info, commitSessionIDs: ['commit-1'] }
-      items = [{ id: 'user', role: 'user', text: String(args[2]) }]
-      return { session: sessions[0], model: { id: 'default', name: 'Default', providerID: 'amecode' }, locked: false }
+      items = [...items, { id: `user-${items.length}`, role: 'user', text: `${promptPlan ? `[Commit snapshot: ${promptPlan.planID}]\n` : ''}${String(args[2])}` }]
+      return { session: sessions[0], model: { id: 'default', name: 'Default', providerID: 'amecode' }, locked: false, ...promptPlan }
     },
     async commitAgentLock(...args: unknown[]) { calls.push({ method: 'lock', args }); if (lockError) throw new Error(lockError); info = { ...info, lockedSessionIDs: [String(args[1])] }; return info },
-    async messages() { return items }, async sessions() { return sessions }, async permissions() { return permissions },
-    async forms() { if (formsError) throw new Error(formsError); return forms },
+    async messages() { return items }, async sessions() { if (sessionsError) throw new Error(sessionsError); return sessions }, async permissions() { if (permissionsError) throw new Error(permissionsError); return permissions },
+    async forms(_projectID: string, sessionID: string) { if (formsError) throw new Error(formsError); return forms.filter(form => form.sessionID === sessionID) },
     async models() { return [] }, async agentMap() { return { nodes: [] } },
     async replyPermission(...args: unknown[]) { calls.push({ method: 'permission', args }); permissions = [] },
     async cancel(...args: unknown[]) { calls.push({ method: 'cancel', args }); sessions = sessions.map(session => ({ ...session, status: 'idle' })); forms = [] },
@@ -45,6 +49,7 @@ function harness(resume = false, overrides: Partial<CommitAgentInfo> = {}) {
   const marker = () => null
   const modules: Record<string, unknown> = {
     react: hooks, '../chat-timeline': timeline,
+    '../../../../../packages/amekit/src/commit-plan': { extractCommitSnapshotID, inspectCommitAgentPlan, parseCommitAgentPlan },
     './Icon': { Icon: marker }, './MessageContent': { MessageContent: ({ text }: { text: string }) => text },
     './Primitives': { errorText: (e: unknown) => String(e).replace(/^Error: /, ''), IconButton: marker },
     './SessionChanges': { TurnChanges: marker }, './ToolCard': { ToolCard: marker },
@@ -65,14 +70,321 @@ function harness(resume = false, overrides: Partial<CommitAgentInfo> = {}) {
   function button(text: string) { return find(node => node.type === 'button' && renderToStaticMarkup(node.props.children as ReactNode).includes(text)) }
   return {
     render, find, button, calls, applied,
+    approvals: () => all(tree).filter(node => node.props['data-testid'] === 'commit-plan-approval'),
+    executeButtons: () => all(tree).filter(node => node.props['data-testid'] === 'commit-plan-execute-btn'),
+    setInfo(value: Partial<CommitAgentInfo>) { info = { ...info, ...value }; listeners.get('ame-commit-agent-changed')?.forEach(fn => fn()) },
+    setPromptPlan(value: typeof promptPlan) { promptPlan = value },
+    setPartialFailure(value: CommitAgentExecuteFailure) { partialFailure = value },
     click(text: string) { const node = button(text); assert.ok(!node.props.disabled, `${text} enabled`); (node.props.onClick as () => void)() },
     async flush() { for (let i = 0; i < 4; i++) { await tick(); render() } return render() },
-    update(value: { session?: Partial<Session>; items?: ChatItem[]; forms?: SessionForm[]; permissions?: Permission[]; formsError?: string; lockError?: string }) { if (value.session) sessions = [{ id: 'commit-1', title: 'Commit', ...value.session }]; if (value.items) items = value.items; if (value.forms) forms = value.forms; if (value.permissions) permissions = value.permissions; if (value.formsError !== undefined) formsError = value.formsError; if (value.lockError !== undefined) lockError = value.lockError },
+    update(value: { session?: Partial<Session>; sessions?: Session[]; items?: ChatItem[]; forms?: SessionForm[]; permissions?: Permission[]; formsError?: string; sessionsError?: string; permissionsError?: string; executeError?: string; lockError?: string }) { if (value.session) sessions = [{ id: 'commit-1', title: 'Commit', ...value.session }]; if (value.sessions) sessions = value.sessions; if (value.items) items = value.items; if (value.forms) forms = value.forms; if (value.permissions) permissions = value.permissions; if (value.formsError !== undefined) formsError = value.formsError; if (value.sessionsError !== undefined) sessionsError = value.sessionsError; if (value.permissionsError !== undefined) permissionsError = value.permissionsError; if (value.executeError !== undefined) executeError = value.executeError; if (value.lockError !== undefined) lockError = value.lockError },
     emit() { events.forEach(fn => fn({ type: 'opencode', projectID: 'project', sessionID: 'commit-1' })) },
     get closed() { return closed }, get refreshed() { return refreshed },
+    get infoLoads() { return infoLoads },
     unmount() { effects.forEach(effect => effect.cleanup?.()); assert.equal(events.size, 0) },
   }
 }
+
+test('initialSessionID opens A with its pending form instead of newer unlocked B', async () => {
+  for (const initialSessionID of ['A', undefined]) {
+    const h = harness(false, { commitSessionIDs: ['A', 'B'] })
+    try {
+      h.update({ sessions: ['A', 'B'].map(id => ({ id, title: id, status: 'idle' })), forms: ['A', 'B'].map(id => ({ id: `form-${id}`, sessionID: id, title: `Question ${id}`, fields: [{ key: 'answer', type: 'string' }] })) })
+      h.render({ initialSessionID }); const html = await h.flush()
+      assert.match(html, new RegExp(`Pending form: Question ${initialSessionID ?? 'B'}`))
+      assert.doesNotMatch(html, new RegExp(`Pending form: Question ${initialSessionID ? 'B' : 'A'}`))
+      assert.equal((h.find(node => !!node.props.form).props.form as SessionForm).sessionID, initialSessionID ?? 'B')
+    } finally { h.unmount() }
+  }
+})
+
+test('finish fails closed when sessions, permissions or forms rejects, including after a successful load', async () => {
+  for (const key of ['sessionsError', 'permissionsError', 'formsError'] as const) {
+    for (const previouslyReady of [false, true]) {
+      const h = harness(true)
+      try {
+        if (previouslyReady) { h.render(); await h.flush(); assert.equal(h.button('✓ Hoàn tất').props.disabled, false) }
+        h.update({ [key]: 'UNAVAILABLE' }); h.render(); h.emit()
+        assert.match(await h.flush(), /UNAVAILABLE/)
+        const finish = h.button('✓ Hoàn tất'); assert.equal(finish.props.disabled, true)
+        ;(finish.props.onClick as () => void)(); await h.flush()
+        assert.equal(h.calls.some(call => call.method === 'lock'), false)
+        h.update({ [key]: '' }); h.emit(); await h.flush()
+        assert.equal(h.button('✓ Hoàn tất').props.disabled, false)
+      } finally { h.unmount() }
+    }
+  }
+})
+
+test('finish requires a known idle session and stays disabled while prompting or running', async () => {
+  for (const status of [undefined, 'running'] as const) {
+    const h = harness(true)
+    try { h.update({ session: { status } }); h.render(); await h.flush(); assert.equal(h.button('✓ Hoàn tất').props.disabled, true) } finally { h.unmount() }
+  }
+  const h = harness(true)
+  try {
+    h.render(); await h.flush(); h.click('Viết 1 thông điệp'); h.render()
+    assert.equal(h.button('✓ Hoàn tất').props.disabled, true)
+    await h.flush(); assert.equal(h.button('✓ Hoàn tất').props.disabled, true)
+    assert.equal(h.button('Dừng phản hồi').props.disabled, false)
+  } finally { h.unmount() }
+})
+
+const snapshot = { head: 'head-before', branchRef: 'refs/heads/feature', indexHash: 'index-before', workingHash: 'working-before', untrackedHashes: { 'new.ts': 'new-hash' }, scope: 'staged' as const, fingerprint: 'fingerprint', stagedFiles: ['one.ts', 'two.ts'], workingFiles: [] }
+const planCommits = [{ message: 'feat: first\n\nChi tiết', files: ['one.ts'] }, { message: 'fix: second', files: ['two.ts'] }]
+test('structured plans show scope, HEAD and every commit, execute exact snapshot, refresh info and show hashes', async () => {
+  for (const scope of [undefined, 'working'] as const) {
+    const h = harness(true, { snapshot, plans: { happy: { planID: 'happy', snapshot, status: 'active' } } })
+    try {
+      h.update({ items: planTurn('happy').map(item => item.role === 'assistant' ? { ...item, text: `\`\`\`commit-plan\n${JSON.stringify({ scope, commits: planCommits })}\n\`\`\`` } : item) })
+      h.render(); const html = await h.flush()
+      assert.match(html, /data-testid="commit-plan-approval"/); assert.match(html, /Kế hoạch Commit chờ duyệt/)
+      assert.match(html, new RegExp(`Phạm vi: ${scope ?? 'staged'}`)); assert.match(html, /head-before/); assert.match(html, /Nhánh: refs\/heads\/feature/)
+      assert.match(html, /1\. feat: first/); assert.match(html, /2\. fix: second/); assert.match(html, /one.ts/); assert.match(html, /two.ts/)
+      const loads = h.infoLoads
+      h.click('Duyệt &amp; thực thi 2 commit')
+      const result = await h.flush()
+      assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0])), { method: 'execute', args: ['project', 'commit-1', { planID: 'happy', scope: scope ?? 'staged', snapshot: { head: snapshot.head, branchRef: snapshot.branchRef, indexHash: snapshot.indexHash, workingHash: snapshot.workingHash, untrackedHashes: snapshot.untrackedHashes }, commits: planCommits }] })
+      assert.match(result, /created-hash-1, created-hash-2/); assert.equal(h.refreshed, 1); assert.ok(h.infoLoads > loads)
+      assert.equal(h.button('Duyệt &amp; thực thi').props.disabled, true); assert.match(result, /Kế hoạch này đã thực thi/)
+    } finally { h.unmount() }
+  }
+})
+
+test('ID-bound stale plan stays disabled after info refresh without rebinding its snapshot', async () => {
+  const h = harness(true, { snapshot, plans: { saved: { planID: 'saved', snapshot, status: 'active' } } })
+  try {
+    h.update({ executeError: 'COMMIT_PLAN_STALE', items: planTurn('saved') })
+    h.render(); await h.flush(); const loads = h.infoLoads; h.click('Duyệt &amp; thực thi')
+    const html = await h.flush()
+    assert.match(html, /Trạng thái Git đã thay đổi/); assert.match(html, /Lập lại kế hoạch/)
+    assert.doesNotMatch(html, /Đã tạo commit:/); assert.equal(h.refreshed, 0); assert.equal(h.infoLoads, loads)
+    h.setInfo({ snapshot: { ...snapshot, head: 'new-head' } }); await h.flush()
+    assert.equal(h.button('Duyệt &amp; thực thi').props.disabled, true)
+    assert.match(await h.flush(), /head-before/)
+    ;(h.button('Duyệt &amp; thực thi').props.onClick as () => void)(); await h.flush()
+    assert.equal(h.calls.filter(call => call.method === 'execute').length, 1)
+  } finally { h.unmount() }
+})
+
+const planText = `\`\`\`commit-plan\n${JSON.stringify({ commits: planCommits })}\n\`\`\``
+const planTurn = (id: string): ChatItem[] => [{ id: `user-${id}`, role: 'user', text: `[Commit snapshot: ${id}]\nAnalyze` }, { id: `answer-${id}`, role: 'assistant', text: planText }]
+
+test('structured partial failure preserves created hashes, stopped group and detail, refreshes Git and makes the plan stale', async () => {
+  const h = harness(true, { plans: { saved: { planID: 'saved', snapshot, status: 'active' } } })
+  try {
+    h.setPartialFailure({ code: 'COMMIT_FAILED', message: 'Hook rejected the next commit', failedGroupIndex: 2, failedSubject: 'fix: stopped group' })
+    h.update({ items: planTurn('saved') }); h.render(); await h.flush()
+    const loads = h.infoLoads
+    h.click('Duyệt &amp; thực thi'); const html = await h.flush()
+    assert.match(html, /role="status">Đã tạo commit: created-hash-1, created-hash-2/)
+    const alert = renderToStaticMarkup(h.find(node => node.props.role === 'alert'))
+    assert.match(alert, /created-hash-1, created-hash-2/)
+    assert.match(alert, /nhóm #3: fix: stopped group/)
+    assert.match(alert, /Hook rejected the next commit/)
+    assert.equal(h.refreshed, 1); assert.ok(h.infoLoads > loads)
+    assert.match(html, /Kế hoạch đã cũ/); assert.doesNotMatch(html, /Kế hoạch này đã thực thi/)
+    assert.equal(h.executeButtons()[0].props.disabled, true)
+    h.setInfo({ plans: { saved: { planID: 'saved', snapshot, status: 'active' } } }); await h.flush()
+    ;(h.executeButtons()[0].props.onClick as () => void)(); await h.flush()
+    assert.equal(h.calls.filter(call => call.method === 'execute').length, 1)
+  } finally { h.unmount() }
+})
+
+test('executing plans block both button and handler, then recover to active from backend info', async () => {
+  const h = harness(true, { plans: { saved: { planID: 'saved', snapshot, status: 'executing' } } })
+  try {
+    h.update({ items: planTurn('saved') }); h.render()
+    assert.match(await h.flush(), /Kế hoạch đang được thực thi…/)
+    assert.equal(h.executeButtons()[0].props.disabled, true)
+    ;(h.executeButtons()[0].props.onClick as () => void)(); await h.flush()
+    assert.equal(h.calls.length, 0)
+    h.setInfo({ plans: { saved: { planID: 'saved', snapshot: { ...snapshot, head: 'new-head' }, status: 'active' } } })
+    const html = await h.flush()
+    assert.doesNotMatch(html, /Kế hoạch đang được thực thi…/)
+    assert.match(html, /head-before/); assert.equal(h.executeButtons()[0].props.disabled, false)
+    h.click('Duyệt &amp; thực thi'); await h.flush()
+    assert.equal(h.calls.filter(call => call.method === 'execute').length, 1)
+    assert.equal((h.calls[0].args[2] as { snapshot: { head: string } }).snapshot.head, snapshot.head)
+  } finally { h.unmount() }
+})
+
+test('201-file plans stay visible with exact group limit diagnostics and cannot invoke execution IPC', async () => {
+  const h = harness(true, { plans: { oversized: { planID: 'oversized', snapshot, status: 'active' } } })
+  try {
+    const commits = [planCommits[0], { message: 'feat: oversized', files: Array.from({ length: 201 }, (_, i) => `file-${i}.ts`) }]
+    h.update({ items: [...planTurn('older'), ...planTurn('oversized').map(item => item.role === 'assistant' ? { ...item, text: `\`\`\`commit-plan\n${JSON.stringify({ commits })}\n\`\`\`` } : item)] })
+    h.render(); await h.flush()
+    assert.equal(h.approvals().length, 2)
+    const card = renderToStaticMarkup(h.approvals()[1])
+    assert.match(card, /Nhóm #2 có 201 tệp, vượt giới hạn 200 tệp\/nhóm/)
+    assert.match(card, /hãy yêu cầu chia nhóm trước khi duyệt/)
+    assert.match(card, /file-200.ts/); assert.match(card, /Lập lại kế hoạch/)
+    assert.equal(h.button('Lập lại kế hoạch').props.disabled, false)
+    assert.ok(h.executeButtons().every(button => button.props.disabled))
+    for (const button of h.executeButtons()) (button.props.onClick as () => void)()
+    await h.flush(); assert.equal(h.calls.length, 0)
+  } finally { h.unmount() }
+})
+
+test('legacy cards without planID fail closed and offer replanning even with info.snapshot', async () => {
+  for (const plans of [undefined, {}]) {
+    const h = harness(true, { snapshot, plans })
+    try {
+      h.update({ items: [{ id: 'legacy', role: 'assistant', text: planText }] })
+      h.render(); const html = await h.flush()
+      assert.equal(h.executeButtons().length, 1)
+      assert.equal(h.executeButtons()[0].props.disabled, true)
+      assert.match(html, /Snapshot không còn trong phiên — hãy lập lại kế hoạch/)
+      assert.equal(h.button('Lập lại kế hoạch').props.disabled, false)
+      ;(h.executeButtons()[0].props.onClick as () => void)(); await h.flush()
+      assert.equal(h.calls.filter(call => call.method === 'execute').length, 0)
+    } finally { h.unmount() }
+  }
+})
+
+test('whitespace filenames are visibly quoted, preserve whitespace and execute exact paths', async () => {
+  const files = [' a.txt', 'a.txt', 'a.txt ']
+  const commits = [{ message: 'fix: whitespace paths', files }]
+  const h = harness(true, { plans: { spaces: { planID: 'spaces', snapshot, status: 'active' } } })
+  try {
+    h.update({ items: planTurn('spaces').map(item => item.role === 'assistant' ? { ...item, text: `\`\`\`commit-plan\n${JSON.stringify({ commits })}\n\`\`\`` } : item) })
+    h.render(); await h.flush()
+    const html = renderToStaticMarkup(h.approvals()[0])
+    assert.match(html, /<li style="white-space:pre"><code>&quot; a.txt&quot;<\/code><\/li>/)
+    assert.match(html, /<li style="white-space:pre">a.txt<\/li>/)
+    assert.match(html, /<li style="white-space:pre"><code>&quot;a.txt &quot;<\/code><\/li>/)
+    h.click('Duyệt &amp; thực thi'); await h.flush()
+    const payload = JSON.parse(JSON.stringify(h.calls[0].args[2]))
+    assert.equal(payload.planID, 'spaces')
+    assert.deepEqual(payload.commits, commits)
+  } finally { h.unmount() }
+})
+
+test('messagePlanIDs resolves quoted User request markers and takes precedence over parsed headers', async () => {
+  for (const text of ['Analyze\n\nUser request:\nquoted', '[Commit snapshot: other]\nAnalyze\n\nUser request:\nquoted', '[Commit snapshot: other]\nAnalyze']) {
+    const h = harness(true, { messagePlanIDs: { 'user-saved': 'saved' }, plans: { saved: { planID: 'saved', snapshot, status: 'active' } } })
+    try {
+      h.update({ items: planTurn('saved').map(item => item.role === 'user' ? { ...item, text } : item) })
+      h.render(); await h.flush()
+      assert.equal(h.executeButtons()[0].props.disabled, false)
+      h.click('Duyệt &amp; thực thi'); await h.flush()
+      assert.equal((h.calls[0].args[2] as { planID: string }).planID, 'saved')
+    } finally { h.unmount() }
+  }
+})
+
+test('snapshot header preceding request prose resolves planID without messagePlanIDs', async () => {
+  for (const text of ['[Commit snapshot: saved]\nAnalyze', 'Context\n\nUser request:\n[Commit snapshot: saved]\nAnalyze\n\nUser request:\nquoted']) {
+    assert.equal(extractCommitSnapshotID(text), 'saved')
+    const h = harness(true, { plans: { saved: { planID: 'saved', snapshot, status: 'active' } } })
+    try {
+      h.update({ items: planTurn('saved').map(item => item.role === 'user' ? { ...item, text } : item) })
+      h.render(); await h.flush(); h.click('Duyệt &amp; thực thi'); await h.flush()
+      assert.equal((h.calls[0].args[2] as { planID: string }).planID, 'saved')
+    } finally { h.unmount() }
+  }
+})
+
+test('aborted and hook-modified plans become stale and mismatches show a Vietnamese error', async () => {
+  for (const [executeError, expected, stale] of [
+    ['COMMIT_PLAN_ABORTED', /Thực thi kế hoạch đã bị hủy/, true],
+    ['COMMIT_PLAN_HOOK_MODIFIED_TREE', /Git hook đã thay đổi cây làm việc/, true],
+    ['COMMIT_PLAN_MISMATCH', /Kế hoạch không khớp với dữ liệu đã lưu/, false],
+  ] as const) {
+    const h = harness(true, { plans: { saved: { planID: 'saved', snapshot, status: 'active' } } })
+    try {
+      h.update({ items: planTurn('saved'), executeError }); h.render(); await h.flush()
+      h.click('Duyệt &amp; thực thi'); const html = await h.flush()
+      assert.match(html, expected)
+      assert.equal(h.executeButtons()[0].props.disabled, stale)
+      if (stale) {
+        assert.match(html, /Lập lại kế hoạch/)
+        h.setInfo({ plans: { saved: { planID: 'saved', snapshot, status: 'active' } } }); await h.flush()
+        assert.equal(h.executeButtons()[0].props.disabled, true)
+        ;(h.executeButtons()[0].props.onClick as () => void)(); await h.flush()
+        assert.equal(h.calls.filter(call => call.method === 'execute').length, 1)
+      }
+    } finally { h.unmount() }
+  }
+})
+
+test('stale ID-bound plans require a new prompt and new planID; only the latest plan can execute once', async () => {
+  const first = { ...snapshot, branch: 'feature-first' }
+  const second = { ...snapshot, head: 'head-second', branchRef: 'refs/heads/second' }
+  const h = harness(true, { snapshot: second, plans: { first: { planID: 'first', snapshot: first, status: 'active' } } })
+  try {
+    h.update({ items: planTurn('first'), executeError: 'COMMIT_PLAN_STALE' })
+    h.render(); assert.match(await h.flush(), /Nhánh: feature-first/)
+    h.click('Duyệt &amp; thực thi'); await h.flush()
+    assert.equal(h.executeButtons()[0].props.disabled, true)
+    assert.match(h.render(), /Kế hoạch đã cũ/)
+    h.setInfo({ plans: { first: { planID: 'first', snapshot: second, status: 'active' } } }); await h.flush()
+    assert.equal(h.executeButtons()[0].props.disabled, true)
+    assert.match(h.render(), /HEAD: <code>head-before/)
+    h.setPromptPlan({ planID: 'second', snapshot: second })
+    h.click('Lập lại kế hoạch'); await h.flush()
+    assert.deepEqual(h.calls.at(-1)?.args.slice(0, 3), ['project', 'commit-1', 'Lập lại kế hoạch'])
+    h.update({ session: { status: 'idle' }, executeError: '', items: [...planTurn('first'), ...planTurn('second')] }); h.emit(); await h.flush()
+    assert.deepEqual(h.executeButtons().map(node => node.props.disabled), [true, false])
+    assert.match(h.render(), /Kế hoạch đã được thay thế/)
+    ;(h.executeButtons()[0].props.onClick as () => void)(); await h.flush()
+    assert.equal(h.calls.filter(call => call.method === 'execute').length, 1)
+    ;(h.executeButtons()[1].props.onClick as () => void)(); await h.flush()
+    const executions = h.calls.filter(call => call.method === 'execute')
+    assert.deepEqual(JSON.parse(JSON.stringify(executions[0].args[2])), { planID: 'first', scope: 'staged', snapshot: { head: first.head, branchRef: first.branchRef, indexHash: first.indexHash, workingHash: first.workingHash, untrackedHashes: first.untrackedHashes }, commits: planCommits })
+    assert.deepEqual(JSON.parse(JSON.stringify(executions[1].args[2])), { planID: 'second', scope: 'staged', snapshot: { head: second.head, branchRef: second.branchRef, indexHash: second.indexHash, workingHash: second.workingHash, untrackedHashes: second.untrackedHashes }, commits: planCommits })
+    assert.deepEqual(h.executeButtons().map(node => node.props.disabled), [true, true])
+    assert.match(h.render(), /Kế hoạch này đã thực thi/)
+  } finally { h.unmount() }
+})
+
+test('restored stale, executed, superseded and missing ID snapshots fail closed even with current info.snapshot', async () => {
+  for (const status of ['stale', 'executed', 'superseded', 'missing'] as const) {
+    const h = harness(true, { snapshot, plans: status === 'missing' ? {} : { saved: { planID: 'saved', snapshot, status } } })
+    try {
+      h.update({ items: planTurn('saved') }); h.render(); const html = await h.flush()
+      assert.equal(h.executeButtons()[0].props.disabled, true)
+      assert.match(html, status === 'missing' ? /Snapshot không còn trong phiên/ : status === 'stale' ? /Kế hoạch đã cũ/ : status === 'executed' ? /Kế hoạch này đã thực thi/ : /Kế hoạch đã được thay thế/)
+      ;(h.executeButtons()[0].props.onClick as () => void)(); await h.flush()
+      assert.equal(h.calls.length, 0)
+    } finally { h.unmount() }
+  }
+})
+
+test('historical turns without IDs cannot borrow current snapshot when stored plans exist', async () => {
+  const h = harness(true, { snapshot, plans: {} })
+  try {
+    h.update({ items: [{ id: 'legacy', role: 'assistant', text: planText }, ...planTurn('missing')] })
+    h.render(); await h.flush()
+    assert.deepEqual(h.executeButtons().map(node => node.props.disabled), [true, true])
+    assert.doesNotMatch(h.approvals().map(card => renderToStaticMarkup(card)).join(''), /head-before/)
+  } finally { h.unmount() }
+})
+
+test('legacy cards never bind an older turn or ambiguous multi-plan history', async () => {
+  for (const items of [
+    [{ id: 'old', role: 'assistant', text: planText }, { id: 'new-request', role: 'user', text: 'Another request' }],
+    [{ id: 'old', role: 'assistant', text: planText }, { id: 'new-request', role: 'user', text: 'Another request' }, { id: 'new', role: 'assistant', text: planText }],
+  ] satisfies ChatItem[][]) {
+    const h = harness(true, { snapshot })
+    try {
+      h.update({ items }); h.render(); await h.flush()
+      assert.ok(h.executeButtons().every(button => button.props.disabled))
+      assert.doesNotMatch(h.approvals().map(card => renderToStaticMarkup(card)).join(''), /head-before/)
+    } finally { h.unmount() }
+  }
+})
+
+test('plan approval is hidden for malformed plans and locked or running sessions', async () => {
+  for (const mode of ['malformed', 'locked', 'running']) {
+    const h = harness(true, { snapshot, lockedSessionIDs: mode === 'locked' ? ['commit-1'] : [] })
+    try {
+      h.update({ session: { status: mode === 'running' ? 'running' : 'idle' }, items: [{ id: 'plan', role: 'assistant', text: `\`\`\`commit-plan\n${mode === 'malformed' ? '{}' : JSON.stringify({ commits: planCommits })}\n\`\`\`` }] })
+      h.render({ initialSessionID: 'commit-1' }); assert.doesNotMatch(await h.flush(), /data-testid="commit-plan-approval"/)
+    } finally { h.unmount() }
+  }
+})
 
 test('all three presets use dedicated commit prompts without requiring a configured skill', async () => {
   for (const [title, mode, pattern] of [['Phân tích &amp; đề xuất', 'analyze', /question/], ['Phân tích &amp; thực thi', 'split', /UTF-8/], ['Viết 1 thông điệp', 'single', /không cắt 64KB/]] as const) {

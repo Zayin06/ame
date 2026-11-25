@@ -1,20 +1,22 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { simpleGit } from 'simple-git'
 import { parseDocument } from 'yaml'
-import { buildNotesSummary, checkoutBranch, createBranch, deleteBranch, discardFile, gitFetch, gitPull, gitPush, gitLog, gitCommitDetail, gitUndoLastCommit, gitStashList, gitStashPush, gitStashApply, gitStashDrop, hasRemote, mapGitNetworkError, listBranches, stageAll, stagedDiffSummary, unstageAll, validateBranchName } from '../packages/ide-core/src/git-ops'
+import { buildNotesSummary, checkoutBranch, createBranch, deleteBranch, discardFile, executeCommitPlan, gitCommitPlanSnapshot, gitFetch, gitPull, gitPush, gitLog, gitCommitDetail, gitUndoLastCommit, gitStashList, gitStashPush, gitStashApply, gitStashDrop, hasRemote, mapGitNetworkError, listBranches, stageAll, stagedDiffSummary, unstageAll, validateBranchName } from '../packages/ide-core/src/git-ops'
+import type { CommitAgentPlan } from '../packages/protocol/src/index'
+import { gitFileCommitPatch } from '../packages/ide-core/src/git-ops'
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, objectFormat = 'sha1') {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'ame-git-ops-'))
   t.after(() => rm(temporary, { recursive: true, force: true }))
   const root = path.join(temporary, 'repo')
   await mkdir(root)
   const git = simpleGit(root, { maxConcurrentProcesses: 1, trimmed: false }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
-  await git.raw(['init', '--initial-branch=main'])
+  await git.raw(['init', '--initial-branch=main', `--object-format=${objectFormat}`])
   await git.addConfig('user.name', 'Ame Git Ops Test')
   await git.addConfig('user.email', 'git-ops@example.invalid')
   await git.addConfig('commit.gpgSign', 'false')
@@ -24,6 +26,571 @@ async function fixture(t: TestContext) {
   const commit = async () => { await stageAll(root); await git.raw(['-c', 'core.hooksPath=', 'commit', '-m', 'fixture']) }
   return { root, temporary, git, write, read, commit }
 }
+
+test('merge detail lists stats and patch against only the first parent', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('base.txt', 'base\n'); await commit()
+  await git.raw(['checkout', '-b', 'side'])
+  await write('side.txt', 'nội dung nhánh phụ\n'); await commit()
+  await git.raw(['checkout', 'main'])
+  await write('main.txt', 'main only\n'); await commit()
+  await git.raw(['merge', '--no-ff', 'side', '-m', 'merge side'])
+  const detail = await gitCommitDetail(root, (await git.raw(['rev-parse', 'HEAD'])).trim())
+  assert.equal(detail.isMerge, true)
+  assert.deepEqual(detail.files, [{ path: 'side.txt', status: 'A', additions: 1, deletions: 0 }])
+  assert.match(detail.patch, /\+nội dung nhánh phụ/)
+  assert.ok(!detail.patch.includes('main only'))
+})
+
+test('commit plan snapshots are read-only, scoped and UTF-8 byte limited', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  const unborn = await gitCommitPlanSnapshot(root)
+  assert.equal(unborn.head, '(unborn)'); assert.equal(unborn.scope, 'working')
+  await write('tracked.txt', 'base\n'); await commit()
+  await write('tracked.txt', 'chào 🌏\n'.repeat(100))
+  await write('untracked.txt', 'untracked\n')
+  const before = await git.raw(['status', '--porcelain=v1', '-z'])
+  const full = await gitCommitPlanSnapshot(root)
+  assert.equal(full.scope, 'working')
+  assert.deepEqual(full.stagedFiles, [])
+  assert.deepEqual(full.workingFiles, ['tracked.txt', 'untracked.txt'])
+  assert.match(full.diffPreview, /\+chào 🌏/)
+  assert.match(full.stat, /tracked.txt/)
+  assert.match(full.indexHash, /^[a-f0-9]{64}$/)
+  assert.match(full.workingHash, /^[a-f0-9]{64}$/)
+  assert.match(full.fingerprint, /^[a-f0-9]{64}$/)
+  const offset = Buffer.from(full.diffPreview).indexOf(Buffer.from('🌏'))
+  for (const limit of [0, offset + 1, offset + 2, offset + 3]) {
+    const limited = await gitCommitPlanSnapshot(root, limit)
+    assert.equal(limited.truncated, true); assert.ok(Buffer.byteLength(limited.diffPreview) <= limit)
+    assert.ok(!limited.diffPreview.includes('�')); assert.equal(limited.fingerprint, full.fingerprint)
+  }
+  assert.equal(await git.raw(['status', '--porcelain=v1', '-z']), before)
+  for (const limit of [-1, NaN, Infinity, 1.2]) await assert.rejects(gitCommitPlanSnapshot(root, limit), /INVALID_MAX_BYTES/)
+})
+
+test('commit plan splits staged changes into two UTF-8 Vietnamese commits', async t => {
+  const { root, git, write, commit, read } = await fixture(t)
+  await write('base.txt', 'base\n'); await commit()
+  await write('lời chào.txt', 'chào 🌏\n'); await write('-second.txt', 'thứ hai\n'); await stageAll(root)
+  const snapshot = await gitCommitPlanSnapshot(root)
+  const messages = ['feat: thêm lời chào 🌏\n\nNội dung tiếng Việt.', 'fix: sửa tệp thứ hai']
+  const result = await executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: messages.map((message, i) => ({ message, files: [i ? '-second.txt' : 'lời chào.txt'] })) })
+  assert.deepEqual(result.commits.map(commit => commit.subject), messages.map(message => message.split('\n')[0]))
+  for (const [i, committed] of result.commits.entries()) {
+    assert.match(committed.hash, /^[a-f0-9]+$/)
+    assert.equal((await git.raw(['show', '-s', '--format=%B', committed.hash])).trimEnd(), messages[i])
+    assert.deepEqual((await gitCommitDetail(root, committed.hash)).files.map(file => file.path), committed.files)
+  }
+  assert.equal(await git.raw(['status', '--porcelain=v1']), '')
+  assert.equal(await read('lời chào.txt'), 'chào 🌏\n')
+})
+
+test('direct staged commit preserves unstaged hunks; working plans support unborn repositories', async t => {
+  const { root, git, write, read } = await fixture(t)
+  await write('first.txt', 'đầu tiên\n'); await write('second.txt', 'thứ hai\n')
+  let snapshot = await gitCommitPlanSnapshot(root)
+  await executeCommitPlan(root, { planID: 'test-plan', scope: 'working', snapshot, commits: [{ message: 'thêm đầu tiên', files: ['first.txt'] }, { message: 'thêm thứ hai', files: ['second.txt'] }] })
+  await write('first.txt', 'staged\n'); await stageAll(root)
+  await write('first.txt', 'unstaged\n')
+  snapshot = await gitCommitPlanSnapshot(root)
+  await executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'chỉ index', files: snapshot.stagedFiles }] })
+  assert.equal(await git.raw(['show', 'HEAD:first.txt']), 'staged\n')
+  assert.equal(await read('first.txt'), 'unstaged\n')
+  assert.equal(await git.raw(['diff', '--cached', '--name-only']), '')
+})
+
+test('split staged plans preserve rename pairs and omitted staged blobs', async t => {
+  const { root, git, write, commit, read } = await fixture(t)
+  await write('old.txt', 'unchanged rename\n'); await commit()
+  await rename(path.join(root, 'old.txt'), path.join(root, 'new.txt'))
+  await write('second.txt', 'second\n'); await write('omitted.txt', 'omitted\n'); await stageAll(root)
+  const snapshot = await gitCommitPlanSnapshot(root)
+  assert.ok(snapshot.stagedFiles.includes('old.txt')); assert.ok(snapshot.stagedFiles.includes('new.txt'))
+  const result = await executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'đổi tên', files: ['new.txt'] }, { message: 'thêm tệp', files: ['second.txt'] }] })
+  assert.deepEqual(result.commits[0].files.sort(), ['new.txt', 'old.txt'])
+  assert.equal(await read('new.txt'), 'unchanged rename\n')
+  assert.equal(await read('omitted.txt'), 'omitted\n')
+  assert.deepEqual((await git.status()).not_added, [])
+  assert.equal(await git.raw(['diff', '--cached', '--name-only']), 'omitted.txt\n')
+})
+
+test('stale HEAD, index and working fingerprints reject without changing Git', async t => {
+  for (const mutation of ['head', 'index', 'working'] as const) {
+    const { root, git, write, commit } = await fixture(t)
+    await write('file.txt', 'initial\n'); await commit()
+    await write('file.txt', 'planned\n'); await stageAll(root)
+    const snapshot = await gitCommitPlanSnapshot(root)
+    const plan: CommitAgentPlan = { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'planned', files: ['file.txt'] }] }
+    if (mutation === 'head') await git.raw(['commit', '--allow-empty', '-m', 'external'])
+    if (mutation === 'index') { await write('file.txt', 'external staged\n'); await stageAll(root) }
+    if (mutation === 'working') await write('file.txt', 'external unstaged\n')
+    const before = await gitCommitPlanSnapshot(root)
+    await assert.rejects(executeCommitPlan(root, plan), /COMMIT_PLAN_STALE/)
+    assert.deepEqual(await gitCommitPlanSnapshot(root), before)
+  }
+})
+
+test('invalid and out-of-scope plans reject before any write', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('first.txt', 'base\n'); await write('second.txt', 'base\n'); await commit()
+  await write('first.txt', 'staged\n'); await write('second.txt', 'staged\n'); await stageAll(root)
+  await write('first.txt', 'unstaged\n'); await write('outside-scope.txt', 'local\n')
+  const snapshot = await gitCommitPlanSnapshot(root)
+  const plan: CommitAgentPlan = { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'first', files: ['first.txt'] }, { message: 'second', files: ['second.txt'] }] }
+  const cases: [CommitAgentPlan, RegExp][] = [
+    [{ ...plan, commits: [{ message: 'bad', files: ['outside-scope.txt'] }] }, /COMMIT_PLAN_OUT_OF_SCOPE/],
+    [{ ...plan, commits: [{ message: 'bad', files: ['../escape'] }] }, /INVALID_PATH/],
+    [{ ...plan, commits: [] }, /INVALID_COMMIT_PLAN/],
+    [{ ...plan, commits: Array(31).fill(plan.commits[0]) }, /INVALID_COMMIT_PLAN/],
+    [{ ...plan, commits: [{ message: ' ', files: ['second.txt'] }] }, /INVALID_COMMIT_PLAN/],
+    [{ ...plan, commits: [{ message: 'bad\0message', files: ['second.txt'] }] }, /INVALID_COMMIT_PLAN/],
+    [{ ...plan, commits: [{ message: 'x'.repeat(10001), files: ['second.txt'] }] }, /INVALID_COMMIT_PLAN/],
+    [{ ...plan, commits: [{ message: 'empty', files: [] }] }, /INVALID_COMMIT_PLAN/],
+    [{ ...plan, commits: [{ message: 'duplicate', files: ['second.txt'] }, { message: 'duplicate', files: ['./second.txt'] }] }, /INVALID_COMMIT_PLAN/],
+  ]
+  for (const [invalid, error] of cases) {
+    await assert.rejects(executeCommitPlan(root, invalid), error)
+    assert.deepEqual(await gitCommitPlanSnapshot(root), snapshot)
+  }
+  assert.equal((await git.raw(['log', '--oneline'])).trim().split('\n').length, 1)
+})
+
+test('unborn staged splits and subset plans do not lose working files', async t => {
+  const { root, git, write, read } = await fixture(t)
+  await write('first.txt', 'first\n'); await write('second.txt', 'second\n'); await stageAll(root)
+  const snapshot = await gitCommitPlanSnapshot(root)
+  await executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'chỉ một', files: ['first.txt'] }] })
+  assert.equal(await read('second.txt'), 'second\n')
+  assert.equal(await git.raw(['ls-files']), 'first.txt\nsecond.txt\n')
+  assert.equal(await git.raw(['show', ':second.txt']), 'second\n')
+  assert.deepEqual((await git.status()).not_added, [])
+})
+
+test('#1 merge conflict and operation markers reject without changing merge metadata or index bytes', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('a', 'v0\n'); await write('b', 'v0\n'); await commit()
+  await git.raw(['checkout', '-b', 'side']); await write('a', 'side\n'); await commit()
+  await git.raw(['checkout', 'main']); await write('a', 'main\n'); await commit()
+  await git.raw(['merge', 'side']).catch(() => {})
+  await write('b', 'independent\n'); await git.raw(['add', '--', 'b'])
+  const snapshot = await gitCommitPlanSnapshot(root, 0, { includeDiff: false })
+  const plan: CommitAgentPlan = { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'b only', files: ['b'] }] }
+  const merge = await readFile(path.join(root, '.git', 'MERGE_HEAD'))
+  const index = await readFile(path.join(root, '.git', 'index'))
+  const unmerged = await git.raw(['ls-files', '--unmerged', '-z'])
+  assert.ok(unmerged)
+  await assert.rejects(executeCommitPlan(root, plan), /COMMIT_PLAN_REPO_BUSY/)
+  assert.deepEqual(await readFile(path.join(root, '.git', 'MERGE_HEAD')), merge)
+  assert.deepEqual(await readFile(path.join(root, '.git', 'index')), index)
+  assert.equal(await git.raw(['ls-files', '--unmerged', '-z']), unmerged)
+  await rm(path.join(root, '.git', 'MERGE_HEAD'))
+  await assert.rejects(executeCommitPlan(root, plan), /COMMIT_PLAN_REPO_CONFLICT/)
+  assert.deepEqual(await readFile(path.join(root, '.git', 'index')), index)
+  for (const marker of ['CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-merge', 'rebase-apply']) {
+    const target = path.join(root, '.git', marker)
+    if (marker.startsWith('rebase')) await mkdir(target)
+    else await writeFile(target, 'active\n')
+    await assert.rejects(executeCommitPlan(root, plan), /COMMIT_PLAN_REPO_BUSY/)
+    assert.deepEqual(await readFile(path.join(root, '.git', 'index')), index)
+    await rm(target, { recursive: true })
+  }
+})
+
+test('#2 staged subset preserves HEAD/index/disk versions and split mixed hunks', async t => {
+  const { root, git, write, read, commit } = await fixture(t)
+  await write('a', 'v0\n'); await write('b', 'v0\n'); await commit()
+  await write('a', 'v1\n'); await write('b', 'v1\n'); await stageAll(root)
+  await write('b', 'v2\n'); await write('a', 'a on disk\n')
+  const index = await git.raw(['ls-files', '--stage', '-z'])
+  const snapshot = await gitCommitPlanSnapshot(root)
+  await executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'only a', files: ['a'] }] })
+  assert.equal(await git.raw(['show', 'HEAD:a']), 'v1\n')
+  assert.equal(await git.raw(['show', 'HEAD:b']), 'v0\n')
+  assert.equal(await git.raw(['show', ':b']), 'v1\n')
+  assert.equal(await git.raw(['ls-files', '--stage', '-z']), index)
+  assert.equal(await read('b'), 'v2\n'); assert.equal(await read('a'), 'a on disk\n')
+})
+
+async function hook(root: string, name: string, body: string) {
+  const hooks = path.join(root, '.git', 'plan-test-hooks')
+  await mkdir(hooks, { recursive: true })
+  await writeFile(path.join(hooks, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
+  await simpleGit(root).addConfig('core.hooksPath', hooks)
+}
+
+test('R4 #3/#7 post-commit branch switches never pollute the other real index', async t => {
+  for (const count of [1, 2]) await t.test(`${count} groups`, async t => {
+    const { root, git, write, commit } = await fixture(t)
+    await write('a', 'base a\n'); await write('b', 'base b\n'); await commit()
+    await git.raw(['branch', 'other'])
+    const otherHead = (await git.raw(['rev-parse', 'other'])).trim()
+    await write('a', 'planned a\n'); if (count === 2) await write('b', 'planned b\n')
+    const snapshot = await gitCommitPlanSnapshot(root)
+    await hook(root, 'post-commit', 'unset GIT_INDEX_FILE\ngit checkout -f other')
+    const plan: CommitAgentPlan = { planID: 'r4-switch', scope: 'working', snapshot, commits: ['a', 'b'].slice(0, count).map(file => ({ message: `update ${file}`, files: [file] })) }
+    if (count === 1) assert.equal((await executeCommitPlan(root, plan)).commits.length, 1)
+    else await assert.rejects(executeCommitPlan(root, plan), (error: any) => {
+      assert.equal(error.code, 'COMMIT_PLAN_ABORTED')
+      assert.equal(error.failedGroupIndex, 1); assert.equal(error.failedSubject, 'update b')
+      assert.equal(error.commits.length, 1); assert.deepEqual(error.commits[0].files, ['a'])
+      assert.ok(error.cause instanceof Error)
+      return true
+    })
+    assert.equal((await git.raw(['branch', '--show-current'])).trim(), 'other')
+    assert.equal((await git.raw(['rev-parse', 'other'])).trim(), otherHead)
+    assert.equal(await git.raw(['diff', '--cached', '--name-only']), '')
+    assert.equal(await git.raw(['show', ':a']), 'base a\n')
+    assert.equal(await git.raw(['show', 'main:a']), 'planned a\n')
+    assert.equal(await git.raw(['show', 'main:b']), 'base b\n')
+  })
+})
+
+test('R4 #4 effective identity and commit config survive relative and conditional includes', async t => {
+  for (const conditional of [false, true]) await t.test(conditional ? 'includeIf' : 'include.path', async t => {
+    const { root, git, write, commit } = await fixture(t)
+    await write('a', 'base\n'); await commit()
+    const identityConfig = '[user]\n name = Included Author\n email = author@example.invalid\n[committer]\n name = Included Committer\n email = committer@example.invalid\n[commit]\n gpgSign = false\n[core]\n commentChar = ";"\n'
+    await writeFile(path.join(root, '.git', 'identity.conf'), identityConfig)
+    const key = conditional ? 'includeIf.gitdir/i:**/repo/.git.path' : 'include.path'
+    await git.addConfig(key, 'identity.conf')
+    const author = (await git.raw(['var', 'GIT_AUTHOR_IDENT'])).trim()
+    const committer = (await git.raw(['var', 'GIT_COMMITTER_IDENT'])).trim()
+    assert.match(author, /^Included Author </); assert.match(committer, /^Included Committer </)
+    await write('a', 'planned\n')
+    await hook(root, 'pre-commit', '[ "$(git config --get core.commentChar)" = ";" ] || exit 1')
+    const snapshot = await gitCommitPlanSnapshot(root)
+    await executeCommitPlan(root, { planID: 'r4-identity', scope: 'working', snapshot, commits: [{ message: 'included identity\n; ignored comment', files: ['a'] }] })
+    assert.equal((await git.raw(['log', '-1', '--format=%an <%ae>%n%cn <%ce>'])).trim(), 'Included Author <author@example.invalid>\nIncluded Committer <committer@example.invalid>')
+  })
+})
+
+test('R4 #5 isolated prepare-commit-msg sees annotated tags and other refs', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('a', 'base\n'); await commit()
+  await git.raw(['tag', '-a', 'v1.0', '-m', 'release'])
+  await git.raw(['tag', 'lightweight']); await git.raw(['branch', 'other'])
+  const refs = await git.raw(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/tags', 'refs/heads/other'])
+  await hook(root, 'prepare-commit-msg', 'git rev-parse --verify refs/tags/lightweight >/dev/null || exit 1\ngit rev-parse --verify refs/heads/other >/dev/null || exit 1\nprintf "release %s\\n" "$(git describe --tags)" > "$1"')
+  await write('a', 'planned\n')
+  const snapshot = await gitCommitPlanSnapshot(root)
+  const result = await executeCommitPlan(root, { planID: 'r4-tags', scope: 'working', snapshot, commits: [{ message: 'original', files: ['a'] }] })
+  assert.equal(result.commits[0].subject, 'release v1.0')
+  assert.equal(await git.raw(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/tags', 'refs/heads/other']), refs)
+})
+
+test('R4 #6 working plans replace files with directories and directories with files', async t => {
+  for (const fileToDir of [true, false]) await t.test(fileToDir ? 'seed -> seed/a' : 'dir/a -> dir', async t => {
+    const { root, git, write, commit } = await fixture(t)
+    if (fileToDir) await write('seed', 'old\n')
+    else { await mkdir(path.join(root, 'dir')); await write('dir/a', 'old\n') }
+    await commit()
+    await rm(path.join(root, fileToDir ? 'seed' : 'dir'), { recursive: true })
+    if (fileToDir) { await mkdir(path.join(root, 'seed')); await write('seed/a', 'new\n') }
+    else await write('dir', 'new\n')
+    const snapshot = await gitCommitPlanSnapshot(root)
+    // Intentionally request additions first; update-index must reorder deletions.
+    const files = fileToDir ? ['seed/a', 'seed'] : ['dir', 'dir/a']
+    const result = await executeCommitPlan(root, { planID: 'r4-replacement', scope: 'working', snapshot, commits: [{ message: 'replace shape', files }] })
+    assert.deepEqual(result.commits[0].files.sort(), [...files].sort())
+    assert.equal(await git.raw(['show', `HEAD:${files[0]}`]), 'new\n')
+    assert.equal(await git.raw(['status', '--porcelain=v1']), '')
+  })
+})
+
+test('R4 #10 SHA-256 build notes accept full hashes for ranges and selected commits', async t => {
+  const { root, git, write, commit } = await fixture(t, 'sha256')
+  await write('a', 'base\n'); await commit()
+  const base = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  await write('a', 'next\n'); await commit()
+  const head = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  assert.equal(head.length, 64)
+  for (const request of [{ mode: 'range' as const, baseCommit: base }, { mode: 'commits' as const, commitHashes: [head] }]) {
+    const summary = await buildNotesSummary(root, { ...request, includeWorking: false })
+    assert.equal(summary.additions, 1); assert.equal(summary.deletions, 1)
+    assert.match(summary.diff, /\+next/)
+  }
+})
+
+test('R4 #11 merge build notes use first-parent stats and patch', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('base', 'base\n'); await commit()
+  await git.raw(['checkout', '-b', 'side']); await write('side', 'side only\n'); await commit()
+  await git.raw(['checkout', 'main']); await write('main', 'main only\n'); await commit()
+  await git.raw(['merge', '--no-ff', 'side', '-m', 'merge'])
+  const summary = await buildNotesSummary(root, { mode: 'commits', commitHashes: [(await git.raw(['rev-parse', 'HEAD'])).trim()], includeWorking: false })
+  assert.deepEqual(summary.files, [{ path: 'side', status: 'A', additions: 1, deletions: 0, source: 'committed' }])
+  assert.equal(summary.additions, 1); assert.equal(summary.deletions, 0)
+  assert.match(summary.diff, /\+side only/); assert.ok(!summary.diff.includes('main only'))
+})
+
+test('R4 #12 unborn working notes reflect post-stage edits and deletes, not index blobs', async t => {
+  const { root, git, write } = await fixture(t)
+  await write('edited', 'staged old\n'); await write('deleted', 'staged deleted\n'); await stageAll(root)
+  await write('edited', 'latest disk\n'); await rm(path.join(root, 'deleted'))
+  const index = await git.raw(['ls-files', '--stage', '-z'])
+  const summary = await buildNotesSummary(root, { mode: 'commits', includeWorking: true })
+  assert.deepEqual(summary.files, [{ path: 'edited', status: 'A', additions: 1, deletions: 0, source: 'working' }])
+  assert.match(summary.diff, /\+latest disk/); assert.ok(!summary.diff.includes('staged'))
+  assert.equal(await git.raw(['ls-files', '--stage', '-z']), index)
+})
+
+test('R4 #13 file patches select multiple commits in topo order plus current working changes', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('file.txt', 'base\n'); await commit()
+  const base = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  await write('file.txt', 'first\n'); await commit()
+  const first = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  await write('unrelated', 'not selected\n'); await commit()
+  await write('file.txt', 'last\n'); await commit()
+  const last = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  await write('file.txt', 'staged\n'); await stageAll(root); await write('file.txt', 'working chào 🌏\n')
+  const before = await git.raw(['status', '--porcelain=v1', '-z'])
+  const patch = await gitFileCommitPatch(root, 'file.txt', [first, last, first], true)
+  assert.equal((patch.match(/^# commit /gm) ?? []).length, 2)
+  assert.ok(patch.indexOf(last.slice(0, 7)) < patch.indexOf(first.slice(0, 7)))
+  assert.match(patch, /\+first/); assert.match(patch, /\+last/); assert.match(patch, /\+working chào 🌏/)
+  assert.ok(!patch.includes('+staged')); assert.ok(!patch.includes('unrelated'))
+  assert.ok(!(await gitFileCommitPatch(root, 'file.txt', [base])).includes('working'))
+  await write('new.txt', 'untracked chào 🌏\n')
+  assert.match(await gitFileCommitPatch(root, 'new.txt', [last], true), /\+untracked chào 🌏/)
+  assert.equal(await git.raw(['status', '--porcelain=v1', '-z']), before + '?? new.txt\0')
+  for (const hashes of [[], ['HEAD'], ['f'.repeat(40)], Array(51).fill(last)]) await assert.rejects(gitFileCommitPatch(root, 'file.txt', hashes), /INVALID_COMMIT_HASH/)
+  await assert.rejects(gitFileCommitPatch(root, '../escape', [last]), /INVALID_PATH/)
+  await git.raw(['checkout', '-f', '-b', 'foreign', base]); await write('foreign', 'foreign\n'); await commit()
+  const foreign = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  await git.raw(['checkout', 'main'])
+  await assert.rejects(gitFileCommitPatch(root, 'file.txt', [foreign]), /INVALID_COMMIT_HASH/)
+})
+
+test('R4 #13 file patch output is bounded to 4 MiB without splitting UTF-8', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('large.txt', 'base\n'); await commit()
+  const head = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  const content = 'chào 🌏\n'.repeat(500_000)
+  await write('large.txt', content); await write('untracked.txt', content)
+  for (const file of ['large.txt', 'untracked.txt']) {
+    const patch = await gitFileCommitPatch(root, file, [head], true)
+    assert.ok(Buffer.byteLength(patch) <= 4 * 1024 * 1024)
+    assert.ok(Buffer.byteLength(patch) > 4 * 1024 * 1024 - 4)
+    assert.ok(!patch.includes('\ufffd'))
+  }
+})
+
+test('R3 #1 isolated hooks cannot replace, drop or add files to the approved tree', async t => {
+  for (const mutation of ['replace', 'drop', 'add'] as const) {
+    await t.test(mutation, async t => {
+      const { root, git, write, commit } = await fixture(t)
+      await write('a.txt', 'base a\n'); await write('b.txt', 'base b\n'); await commit()
+      await write('a.txt', 'staged A\n'); await write('b.txt', 'staged b\n'); await stageAll(root)
+      await write('a.txt', 'disk B\n')
+      const snapshot = await gitCommitPlanSnapshot(root)
+      const index = await readFile(path.join(root, '.git', 'index'))
+      await hook(root, 'pre-commit', mutation === 'replace' ? 'git add -- a.txt' : mutation === 'drop' ? 'git reset HEAD -- b.txt' : 'printf "generated\\n" > changelog.txt\ngit add -- changelog.txt')
+      await assert.rejects(executeCommitPlan(root, { planID: 'r3-hook-tree', scope: 'staged', snapshot, commits: [{ message: 'approved', files: ['a.txt', 'b.txt'] }] }), /COMMIT_PLAN_HOOK_MODIFIED_TREE/)
+      assert.equal((await git.raw(['rev-parse', 'HEAD'])).trim(), snapshot.head)
+      assert.equal((await git.raw(['rev-parse', 'refs/heads/main'])).trim(), snapshot.head)
+      assert.equal((await git.raw(['rev-list', '--count', 'main'])).trim(), '1')
+      assert.deepEqual(await readFile(path.join(root, '.git', 'index')), index)
+      assert.equal(await git.raw(['show', ':a.txt']), 'staged A\n')
+      assert.equal(await git.raw(['ls-files', '--', 'changelog.txt']), '')
+    })
+  }
+})
+
+test('R3 #2 working blobs respect CRLF attributes and clean filters just like git add', async t => {
+  for (const filter of [false, true]) {
+    await t.test(filter ? 'clean filter' : 'CRLF normalization', async t => {
+      const { root, git, write, read, commit } = await fixture(t)
+      await write('.gitattributes', filter ? '*.txt filter=plan-clean\n' : '*.txt text eol=crlf\n')
+      if (filter) {
+        await git.addConfig('filter.plan-clean.clean', 'sed s/WORK/CLEAN/g')
+        await git.addConfig('filter.plan-clean.smudge', 'sed s/CLEAN/WORK/g')
+        await git.addConfig('filter.plan-clean.required', 'true')
+      }
+      await commit()
+      const disk = filter ? 'WORK content\n' : 'first\r\nsecond\r\n'
+      await write('a.txt', disk)
+      const expectedOid = (await git.raw(['hash-object', '--path', 'a.txt', 'a.txt'])).trim()
+      const snapshot = await gitCommitPlanSnapshot(root)
+      await executeCommitPlan(root, { planID: 'r3-filters', scope: 'working', snapshot, commits: [{ message: 'normalized', files: ['a.txt'] }] })
+      assert.equal((await git.raw(['rev-parse', 'HEAD:a.txt'])).trim(), expectedOid)
+      assert.equal(await git.raw(['show', 'HEAD:a.txt']), filter ? 'CLEAN content\n' : 'first\nsecond\n')
+      assert.equal(await read('a.txt'), disk)
+      assert.equal(await git.raw(['status', '--porcelain=v1']), '')
+    })
+  }
+})
+
+test('R3 #4 real Git preserves leading-space names in staged subset commits', async t => {
+  const { root, git, write } = await fixture(t)
+  await write(' a.txt', 'leading space\n'); await write('a.txt', 'no space\n'); await stageAll(root)
+  const snapshot = await gitCommitPlanSnapshot(root)
+  const result = await executeCommitPlan(root, { planID: 'r3-leading-space', scope: 'staged', snapshot, commits: [{ message: 'leading only', files: [' a.txt'] }] })
+  assert.deepEqual(result.commits[0].files, [' a.txt'])
+  assert.equal(await git.raw(['ls-tree', '-r', '--name-only', '-z', 'HEAD']), ' a.txt\0')
+  assert.equal(await git.raw(['diff', '--cached', '--name-only', '-z']), 'a.txt\0')
+  assert.equal(await git.raw(['show', ':a.txt']), 'no space\n')
+})
+
+test('R3 #6 nested Git repositories are omitted from staged and working committable files', async t => {
+  for (const scope of ['staged', 'working'] as const) {
+    await t.test(scope, async t => {
+      const { root, git, write } = await fixture(t)
+      const nested = path.join(root, 'local-tools')
+      await mkdir(nested)
+      const nestedGit = simpleGit(nested)
+      await nestedGit.raw(['init'])
+      await write('local-tools/tool.txt', 'local tool\n')
+      await nestedGit.raw(['add', '--', 'tool.txt'])
+      await nestedGit.raw(['-c', 'user.name=Nested Test', '-c', 'user.email=nested@example.invalid', '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=', 'commit', '-m', 'nested'])
+      await write('a.txt', 'planned\n')
+      if (scope === 'staged') await git.raw(['add', '--', 'a.txt'])
+      const snapshot = await gitCommitPlanSnapshot(root)
+      assert.equal(snapshot.scope, scope)
+      assert.ok(!snapshot.workingFiles.some(file => file.startsWith('local-tools')))
+      if (scope === 'staged') assert.equal(snapshot.untrackedHashes, undefined)
+      else assert.deepEqual(Object.keys(snapshot.untrackedHashes ?? {}), ['a.txt'])
+      const result = await executeCommitPlan(root, { planID: 'r3-nested-repo', scope, snapshot, commits: [{ message: 'a only', files: ['a.txt'] }] })
+      assert.deepEqual(result.commits[0].files, ['a.txt'])
+      assert.equal(await git.raw(['diff', 'HEAD', '--name-only']), '')
+      assert.equal(await git.raw(['diff', '--cached', '--name-only']), '')
+      assert.equal(await git.raw(['ls-tree', '--name-only', 'HEAD', '--', 'local-tools']), '')
+      assert.equal((await nestedGit.raw(['rev-list', '--count', 'HEAD'])).trim(), '1')
+    })
+  }
+})
+
+test('R3 #7 working commit loop ignores unrelated untracked content changed by post-commit', async t => {
+  const { root, git, write, read, commit } = await fixture(t)
+  await write('base.txt', 'base\n'); await commit()
+  for (const name of ['a.txt', 'b.txt', 'c.txt']) await write(name, `${name}\n`)
+  await write('unrelated.txt', 'original local\n')
+  const snapshot = await gitCommitPlanSnapshot(root)
+  await hook(root, 'post-commit', 'if [ "$(git rev-list --count HEAD)" = 2 ]; then printf "changed local\\n" > unrelated.txt; fi')
+  const result = await executeCommitPlan(root, { planID: 'r3-unrelated-untracked', scope: 'working', snapshot, commits: ['a.txt', 'b.txt', 'c.txt'].map(file => ({ message: `add ${file}`, files: [file] })) })
+  assert.equal(result.commits.length, 3)
+  assert.deepEqual(result.commits.map(commit => commit.files), [['a.txt'], ['b.txt'], ['c.txt']])
+  assert.equal(await read('unrelated.txt'), 'changed local\n')
+  assert.equal(await git.raw(['status', '--porcelain=v1']), '?? unrelated.txt\n')
+})
+
+test('R3 #9 SHA-256 repositories support staged and working deletions and commit detail', async t => {
+  for (const scope of ['staged', 'working'] as const) {
+    await t.test(scope, async t => {
+      const { root, git, write, commit } = await fixture(t, 'sha256')
+      await write('a.txt', 'delete me\n'); await commit()
+      await rm(path.join(root, 'a.txt'))
+      if (scope === 'staged') await git.raw(['add', '-u'])
+      const snapshot = await gitCommitPlanSnapshot(root)
+      const result = await executeCommitPlan(root, { planID: 'r3-sha256', scope, snapshot, commits: [{ message: 'delete a', files: ['a.txt'] }] })
+      assert.deepEqual(result.commits[0].files, ['a.txt'])
+      const hash = (await git.raw(['rev-parse', 'HEAD'])).trim()
+      assert.equal(hash.length, 64)
+      assert.deepEqual((await gitCommitDetail(root, hash)).files.map(file => [file.path, file.status]), [['a.txt', 'D']])
+      assert.equal(await git.raw(['status', '--porcelain=v1']), '')
+    })
+  }
+})
+
+test('R3 #10 commit result reports the actual subject rewritten by commit-msg', async t => {
+  const { root, git, write } = await fixture(t)
+  await write('a.txt', 'content\n'); await stageAll(root)
+  await hook(root, 'commit-msg', 'printf "rewritten subject\\n\\nHook body.\\n" > "$1"')
+  const snapshot = await gitCommitPlanSnapshot(root)
+  const result = await executeCommitPlan(root, { planID: 'r3-actual-subject', scope: 'staged', snapshot, commits: [{ message: 'original subject', files: ['a.txt'] }] })
+  assert.equal(result.commits[0].subject, 'rewritten subject')
+  assert.equal(result.commits[0].subject, (await git.raw(['log', '-1', '--format=%s'])).trimEnd())
+})
+
+test('#3 post-commit mutation of the real index aborts group two and reports group one', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('a', 'v0\n'); await write('b', 'v0\n'); await commit()
+  await write('a', 'v1\n'); await write('b', 'v1\n'); await stageAll(root)
+  await write('unrelated', 'never commit\n')
+  const snapshot = await gitCommitPlanSnapshot(root)
+  await hook(root, 'post-commit', 'unset GIT_INDEX_FILE\ngit add -- unrelated')
+  await assert.rejects(executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'a only', files: ['a'] }, { message: 'b only', files: ['b'] }] }), (error: any) => {
+    assert.match(error.message, /COMMIT_PLAN_ABORTED.*Đã tạo 1 commit.*nhóm #2/s)
+    assert.deepEqual(error.commits[0].files, ['a'])
+    assert.ok(error.message.includes(error.commits[0].hash))
+    return true
+  })
+  assert.equal((await git.raw(['rev-list', '--count', 'HEAD'])).trim(), '2')
+  assert.equal(await git.raw(['show', 'HEAD:a']), 'v1\n')
+  assert.equal(await git.raw(['show', 'HEAD:b']), 'v0\n')
+  assert.equal(await git.raw(['ls-tree', '--name-only', 'HEAD', '--', 'unrelated']), '')
+  assert.equal(await git.raw(['show', ':unrelated']), 'never commit\n')
+})
+
+test('#4 quiet commit-msg hook failure rejects without advancing HEAD or modifying the real index', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('a', 'v0\n'); await commit(); await write('a', 'v1\n'); await stageAll(root)
+  const snapshot = await gitCommitPlanSnapshot(root)
+  const index = await readFile(path.join(root, '.git', 'index'))
+  await hook(root, 'commit-msg', 'exit 1')
+  await assert.rejects(executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'blocked', files: ['a'] }] }), /GIT_COMMAND_FAILED: git commit exit 1.*Đã tạo 0 commit/s)
+  assert.equal((await git.raw(['rev-parse', 'HEAD'])).trim(), snapshot.head)
+  assert.deepEqual(await readFile(path.join(root, '.git', 'index')), index)
+})
+
+test('working groups abort on hook edits and retain completed commits without absorbing unrelated stage entries', async t => {
+  for (const mutation of ['disk', 'index'] as const) {
+    const { root, git, write, commit } = await fixture(t)
+    await write('a', 'v0\n'); await write('b', 'v0\n'); await commit()
+    await write('a', 'v1\n'); await write('b', 'v1\n'); await write('unrelated', 'local\n')
+    const snapshot = await gitCommitPlanSnapshot(root)
+    await hook(root, 'post-commit', mutation === 'disk' ? 'printf "external\\n" > b' : 'unset GIT_INDEX_FILE\ngit add -- unrelated')
+    await assert.rejects(executeCommitPlan(root, { planID: 'test-plan', scope: 'working', snapshot, commits: [{ message: 'a only', files: ['a'] }, { message: 'b only', files: ['b'] }] }), (error: any) => {
+      assert.match(error.message, /COMMIT_PLAN_(STALE|ABORTED)/)
+      assert.deepEqual(error.commits[0].files, ['a'])
+      return true
+    })
+    assert.equal((await git.raw(['rev-list', '--count', 'main'])).trim(), '2')
+    assert.equal(await git.raw(['show', 'main:b']), 'v0\n')
+    assert.equal(await git.raw(['ls-tree', '--name-only', 'main', '--', 'unrelated']), '')
+  }
+})
+
+test('#5 untracked content changes invalidate snapshots even with identical porcelain status', async t => {
+  const { root, git, write } = await fixture(t)
+  await write('new.txt', 'first\n')
+  const snapshot = await gitCommitPlanSnapshot(root)
+  const status = await git.raw(['status', '--porcelain=v1', '-z'])
+  await write('new.txt', 'other\n')
+  const changed = await gitCommitPlanSnapshot(root)
+  assert.equal(await git.raw(['status', '--porcelain=v1', '-z']), status)
+  assert.notEqual(snapshot.workingHash, changed.workingHash)
+  assert.notEqual(snapshot.untrackedHashes?.['new.txt'], changed.untrackedHashes?.['new.txt'])
+  await assert.rejects(executeCommitPlan(root, { planID: 'test-plan', scope: 'working', snapshot, commits: [{ message: 'new', files: ['new.txt'] }] }), /COMMIT_PLAN_STALE/)
+  assert.equal(await git.raw(['ls-files', '--stage', '-z']), '')
+})
+
+test('#6 switching branches at identical HEAD and index invalidates the approved plan', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('a', 'v0\n'); await commit(); await write('a', 'v1\n'); await stageAll(root)
+  const snapshot = await gitCommitPlanSnapshot(root)
+  await git.raw(['checkout', '-b', 'alt'])
+  const changed = await gitCommitPlanSnapshot(root)
+  assert.equal(snapshot.branchRef, 'refs/heads/main'); assert.equal(changed.branch, 'alt')
+  assert.equal(changed.head, snapshot.head); assert.equal(changed.indexHash, snapshot.indexHash)
+  assert.notEqual(changed.fingerprint, snapshot.fingerprint)
+  await assert.rejects(executeCommitPlan(root, { planID: 'test-plan', scope: 'staged', snapshot, commits: [{ message: 'a', files: ['a'] }] }), /COMMIT_PLAN_STALE/)
+})
+
+test('#10/#11 focused bounded previews prioritize files, preserve UTF-8 and can skip all diff presentation', async t => {
+  const { root, write } = await fixture(t)
+  await write('a-large', 'large 🌏\n'.repeat(200_000)); await write('z-focus', 'focused chào 🌏\n'); await stageAll(root)
+  const focused = await gitCommitPlanSnapshot(root, 512, { focusFiles: ['z-focus'] })
+  assert.ok(focused.diffPreview.startsWith('diff --git a/z-focus'))
+  assert.match(focused.diffPreview, /focused chào 🌏/)
+  assert.ok(Buffer.byteLength(focused.diffPreview) <= 512); assert.equal(focused.truncated, true)
+  assert.ok(!focused.diffPreview.includes('�'))
+  const noDiff = await gitCommitPlanSnapshot(root, 512, { includeDiff: false, focusFiles: ['../not-read'] })
+  assert.equal(noDiff.stat, ''); assert.equal(noDiff.diffPreview, ''); assert.equal(noDiff.truncated, false)
+  assert.equal(noDiff.fingerprint, focused.fingerprint)
+  await assert.rejects(gitCommitPlanSnapshot(root, 512, { focusFiles: ['missing'] }), /COMMIT_PLAN_OUT_OF_SCOPE/)
+})
 
 test('build notes range and non-contiguous commits stay on HEAD and preserve metadata and net stats', async t => {
   const { root, git, write, commit } = await fixture(t)
@@ -96,7 +663,7 @@ test('build notes support staged and untracked working-only unborn repositories'
   const empty = await buildNotesSummary(root, { mode: 'range', includeWorking: false })
   assert.deepEqual(empty.files, []); assert.equal(empty.branch, 'main'); assert.deepEqual(empty.commits, [])
   const summary = await buildNotesSummary(root, { mode: 'commits', includeWorking: true })
-  assert.equal(summary.workingFileCount, 2); assert.match(summary.diff, /\+index/); assert.match(summary.diff, /\+local/)
+  assert.equal(summary.workingFileCount, 2); assert.match(summary.diff, /\+latest/); assert.match(summary.diff, /\+local/)
   assert.deepEqual(summary.files.find(file => file.path === 'staged.txt'), { path: 'staged.txt', status: 'A', additions: 1, deletions: 0, source: 'working' })
   await assert.rejects(buildNotesSummary(root, { mode: 'range', baseCommit: '1234567', includeWorking: true }), /INVALID_BUILD_BASE_COMMIT/)
   await assert.rejects(buildNotesSummary(root, { mode: 'commits', commitHashes: ['1234567'], includeWorking: true }), /INVALID_BUILD_BASE_COMMIT/)

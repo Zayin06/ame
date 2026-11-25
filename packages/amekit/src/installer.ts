@@ -155,8 +155,8 @@ async function transaction(project: string, prepare: (before: Awaited<ReturnType
     if (await fingerprint(before) !== await fingerprint(await tree(config))) throw new Error("CONFIG_CHANGED_DURING_SYNC")
     signal?.throwIfAborted()
     await journal(managed, { schema: 1, stage: path.basename(stage), backup: path.basename(backup), hadConfig: await exists(config) }); journaled = true
-    if (await exists(config)) { await rename(config, backup); moved = true }
-    await rename(stage, config); activated = true
+    if (await exists(config)) { await retryFs(() => rename(config, backup)); moved = true }
+    await retryFs(() => rename(stage, config)); activated = true
     await verify()
     if (next.state) await checkOwned(await tree(config), next.state)
     if (await fingerprint(await tree(config)) !== stagedFingerprint) throw new Error("CONFIG_CHANGED_AFTER_ACTIVATION")
@@ -165,9 +165,9 @@ async function transaction(project: string, prepare: (before: Awaited<ReturnType
   } catch (error) {
     if (activated) {
       retainStage = true
-      await rename(config, stage)
+      await retryFs(() => rename(config, stage))
     }
-    if (moved) await rename(backup, config)
+    if (moved) await retryFs(() => rename(backup, config))
     settled = true
     throw error
   } finally {

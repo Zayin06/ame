@@ -1,7 +1,27 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { documentID, tabID, type Buffer, type ProjectView } from '../state'
-import { changePathDocuments, deleteFromView, navigationPosition, renameBuffers, renameView, resolveWorkspaceFilePath, sanitizeProjectView } from '../workspace-paths'
+import { changePathDocuments, deleteFromView, navigationPosition, renameBuffers, renameView, resolveExactWorkspacePath, resolveWorkspaceFilePath, sanitizeProjectView } from '../workspace-paths'
+
+test('exact workspace paths preserve filename whitespace and line-like suffixes', () => {
+  const root = 'E:\\Extensions\\chrome-MD-This-Page'
+  for (const path of [' note.md', 'sub/ note.md', 'a.txt ', 'readme#L2', 'docs/readme#L10-L20', 'a.txt:10']) assert.equal(resolveExactWorkspacePath(path, root), path)
+  assert.equal(resolveExactWorkspacePath(root + '\\ note.md', root), ' note.md')
+  assert.equal(resolveExactWorkspacePath(root + '\\readme#L2', root), 'readme#L2')
+  assert.equal(resolveExactWorkspacePath('e:/extensions/CHROME-md-this-page/sub/ note.md', root + '\\'), 'sub/ note.md')
+  assert.equal(resolveExactWorkspacePath('././sub\\ note.md'), 'sub/ note.md')
+  assert.equal(resolveExactWorkspacePath('sub//readme#L2'), 'sub/readme#L2')
+  assert.equal(resolveExactWorkspacePath('/home/project/ note.md', '/home/project'), ' note.md')
+  assert.equal(resolveExactWorkspacePath('/ note.md', '/'), ' note.md')
+  assert.equal(resolveExactWorkspacePath('\\\\server\\share\\project\\readme#L2', '\\\\server\\share\\project'), 'readme#L2')
+})
+test('exact workspace paths reject traversal, external paths, roots, metadata, controls and URLs', () => {
+  const root = 'E:\\Extensions\\chrome-MD-This-Page'
+  for (const path of ['', '.', './', '..', '../secret', 'sub/../secret', 'sub/./note.md', root, root + '\\', root + '-other\\note.md', 'C:\\outside.txt', '.git', '.git/config', '.GIT. ', '.GIT. /config', 'sub/.git/config', 'a\u0000.txt', 'a\u001f.txt', 'a\u007f.txt', '\tnote.md', 'note\n.md', 'https://example.com/note.md', 'file:///tmp/note.md', 'sub/', 'sub\\', ':', 'a:stream', 'C:note.md']) assert.equal(resolveExactWorkspacePath(path, root), null, path)
+  for (const directory of [undefined, '', '   ']) assert.equal(resolveExactWorkspacePath(root + '\\note.md', directory), null)
+  assert.equal(resolveExactWorkspacePath('/Home/project/note.md', '/home/project'), null)
+  assert.equal(resolveExactWorkspacePath('/home/project', '/home/project'), null)
+})
 
 test('workspace file paths normalize absolute Windows and POSIX references with line ranges', () => {
   const root = 'E:\\Extensions\\chrome-MD-This-Page'
@@ -17,6 +37,18 @@ test('workspace file paths reject root directories, external paths, metadata, tr
   for (const value of [root, root + '\\', root + '/:10', 'E:\\Extensions\\chrome-MD-This-Page-other\\README.md', 'C:\\outside.txt', '..', '../secret', 'src/../secret', 'src/./app.ts', '.git/config', '.GIT. /config', 'src/.git/config', 'https://example.com/app.ts', 'file:///tmp/a', 'src/', '.', '', 'C:', 'C:10', 'a.ts:0', 'a.ts:20-10', 'a.ts:9007199254740992', 'a.ts#L10-L0', 'a\u0000.ts', 'a\n.ts', '\ta.ts']) assert.equal(resolveWorkspaceFilePath(value, root), null, value)
   assert.equal(resolveWorkspaceFilePath('/Home/project/app.ts', '/home/project'), null)
   assert.equal(resolveWorkspaceFilePath('C:\\workspace\\app.ts'), null)
+})
+test('saved project views preserve distinct exact filenames while healing absolute tabs', () => {
+  const root = 'E:\\Extensions\\chrome-MD-This-Page'
+  const saved: ProjectView = {
+    tabs: [' note.md', 'note.md', 'readme#L2', 'readme', root + '\\ note.md', root + '\\readme#L2'].map(path => ({ path, mode: 'file' })),
+    active: `file:${root}\\ note.md`, selectedTabs: { file: `file:${root}\\readme#L2` }
+  }
+  const healed = sanitizeProjectView(saved, root)
+  assert.deepEqual(healed.tabs.map(tabID), ['file: note.md', 'file:note.md', 'file:readme#L2', 'file:readme'])
+  assert.equal(healed.active, 'file: note.md')
+  assert.equal(healed.selectedTabs?.file, 'file:readme#L2')
+  assert.equal(sanitizeProjectView(healed, root), healed)
 })
 test('saved project views heal tabs, deduplicate by mode and remap active and selected IDs', () => {
   const root = 'E:\\Extensions\\chrome-MD-This-Page', absolute = root + '\\README.md'

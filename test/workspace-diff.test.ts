@@ -8,20 +8,23 @@ import { readFile } from 'node:fs/promises'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
 import { z } from 'zod'
+import { GIT_COMMIT_HASH_PATTERN } from '../packages/protocol/src/index'
+import { COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH } from '../packages/amekit/src/commit-agent'
 
 test('diff IPC validates discriminated targets and forwards legacy and scoped requests', async () => {
   const source = await readFile('apps/desktop/src/main/index.ts', 'utf8')
   const calls: unknown[][] = []
   const dispatch = runInNewContext(ts.transpileModule(source.slice(source.indexOf('const text ='), source.indexOf('let authority:')), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\ncall', {
+    GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
     z, pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
     workspace: { diff: (...args: unknown[]) => { calls.push(args); return { original: '', modified: '' } } }
   }) as (method: string, args: unknown[]) => Promise<unknown>
-  for (const target of [undefined, { kind: 'staged' }, { kind: 'working' }, { kind: 'commit', commit: 'ABCDEF1' }]) {
+  for (const target of [undefined, { kind: 'staged' }, { kind: 'working' }, { kind: 'commit', commit: 'ABCDEF1' }, { kind: 'commit', commit: 'a'.repeat(64) }]) {
     await dispatch('diff', target ? ['p', 'file', target] : ['p', 'file'])
     assert.deepEqual(calls.at(-1), ['p', 'file', target])
   }
-  for (const target of [{ kind: 'commit' }, { kind: 'commit', commit: 'HEAD' }, { kind: 'commit', commit: 'a'.repeat(41) }, { kind: 'staged', commit: 'abcdef1' }, { kind: 'other' }, 'staged']) await assert.rejects(dispatch('diff', ['p', 'file', target]))
-  assert.equal(calls.length, 4)
+  for (const target of [{ kind: 'commit' }, { kind: 'commit', commit: 'HEAD' }, { kind: 'commit', commit: 'a'.repeat(65) }, { kind: 'staged', commit: 'abcdef1' }, { kind: 'other' }, 'staged']) await assert.rejects(dispatch('diff', ['p', 'file', target]))
+  assert.equal(calls.length, 5)
 })
 
 test('diff scopes isolate partial staging and read historical snapshots including root and deletion', async t => {
@@ -62,7 +65,7 @@ test('diff scopes isolate partial staging and read historical snapshots includin
   const deleted = (await git.revparse(['HEAD'])).trim()
   assert.deepEqual(await workspaces.diff(project.id, file, { kind: 'commit', commit: deleted }), { original: working, modified: '' })
   assert.deepEqual(await workspaces.diff(project.id, file, { kind: 'commit', commit: root }), { original: '', modified: base })
-  for (const commit of ['HEAD', '123456', 'a'.repeat(41), '1234567^']) await assert.rejects(workspaces.diff(project.id, file, { kind: 'commit', commit }), /INVALID_DIFF_TARGET/)
+  for (const commit of ['HEAD', '123456', 'a'.repeat(65), '1234567^']) await assert.rejects(workspaces.diff(project.id, file, { kind: 'commit', commit }), /INVALID_DIFF_TARGET/)
   await assert.rejects(workspaces.diff(project.id, file, { kind: 'commit', commit: '0'.repeat(40) }))
   await assert.rejects(workspaces.diff(project.id, '../outside', { kind: 'staged' }), /PATH_OUTSIDE_WORKSPACE/)
 })

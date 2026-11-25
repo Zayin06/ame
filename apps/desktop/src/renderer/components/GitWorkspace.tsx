@@ -245,8 +245,8 @@ export function GitWorkspace(props: GitWorkspaceProps) {
           {!changes.length && <p>Cây làm việc sạch. Dùng Amend hoặc tạo thay đổi mới trước khi commit.</p>}
           {!!changes.length && !stagedChanges.length && <p>Stage tệp để bắt đầu soạn commit.</p>}
           <ul>{stagedChanges.map(file => <li key={file.path}>
-            <button type="button" onClick={() => props.onDiff(file.path, { kind: 'staged' })}><FileTypeIcon path={file.path} />{file.path}<span>{file.index}</span></button>
-            <button type="button" aria-label={`Bỏ stage ${file.path}`} disabled={busy} onClick={() => void run('Bỏ stage', async () => { await window.ame.stage(projectID, file.path, false) })}>Bỏ stage</button>
+            <button type="button" onClick={() => props.onDiff(file.path, { kind: 'staged', ...(file.from ? { from: file.from } : {}) })}><FileTypeIcon path={file.path} />{file.path}<span>{file.index}</span></button>
+            <button type="button" aria-label={`Bỏ stage ${file.path}`} disabled={busy} onClick={() => void run('Bỏ stage', async () => { await window.ame.stage(projectID, file.path, false, file.from) })}>Bỏ stage</button>
           </li>)}</ul>
         </section>
       </>}
@@ -268,6 +268,7 @@ export function GitWorkspace(props: GitWorkspaceProps) {
         {detailLoading && <p role="status">Đang tải commit…</p>}
         {detail && <article className="git-history__detail">
           <h2>{detail.subject}</h2><p style={{ whiteSpace: 'pre-wrap' }}>{detail.body}</p>
+          {detail.isMerge && <small>Merge commit · so sánh theo parent thứ nhất (first-parent)</small>}
           <ul>{detail.files.map(file => <li key={file.path}><button type="button" onClick={() => props.onDiff(file.path, { kind: 'commit', commit: detail.hash })}><span>{file.status}</span><FileTypeIcon path={file.path} />{file.path}<span>+{file.additions} −{file.deletions}</span></button></li>)}</ul>
           <pre className="git-commit-patch">{detail.patch}</pre>
         </article>}
@@ -290,9 +291,9 @@ export function GitWorkspace(props: GitWorkspaceProps) {
         {!stashLoading && !stashes.length && <p>Chưa có stash.</p>}
         <ul>{stashes.map(stash => <li key={stash.ref}>
           <code>{stash.ref}</code><span>{stash.branch}</span><strong>{stash.message}</strong><time dateTime={stash.date}>{formatRelativeGitDate(stash.date)}</time>
-          <button type="button" disabled={busy || stashLoading} onClick={() => void run('Pop Stash', async () => { await window.ame.gitStashApply(projectID, stash.index, true) })}>Pop</button>
-          <button type="button" disabled={busy || stashLoading} onClick={() => void run('Apply Stash', async () => { await window.ame.gitStashApply(projectID, stash.index, false) })}>Apply</button>
-          <button type="button" disabled={busy || stashLoading} onClick={() => void run('Xóa Stash', async () => { await window.ame.gitStashDrop(projectID, stash.index) })}>Xóa</button>
+          <button type="button" disabled={busy || stashLoading} onClick={() => void run('Pop Stash', async () => { await window.ame.gitStashApply(projectID, stash.index, true, stash.oid) })}>Pop</button>
+          <button type="button" disabled={busy || stashLoading} onClick={() => void run('Apply Stash', async () => { await window.ame.gitStashApply(projectID, stash.index, false, stash.oid) })}>Apply</button>
+          <button type="button" disabled={busy || stashLoading} onClick={() => void run('Xóa Stash', async () => { await window.ame.gitStashDrop(projectID, stash.index, stash.oid) })}>Xóa</button>
         </li>)}</ul>
       </div>}
     </section>

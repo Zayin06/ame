@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react'
-import type { AndroidTranslationInfo, CommitAgentInfo, ChatItem, Model, Permission, PermissionMode, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
+import type { AndroidTranslationInfo, CommitAgentSessionState, ChatItem, Model, Permission, PermissionMode, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
 import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
 import { type Preferences, type Tab, type TimelineDetailMode } from '../state'
@@ -26,7 +26,30 @@ type ChatDraft = { text: string; attachments: ComposerAttachment[] }
 type DraftThread = { value: ChatDraft; listeners: Set<() => void> }
 // In-memory only: drafts survive project/New Chat remounts, including inline files.
 const chatDrafts = new Map<string, DraftThread>()
+const inFlightDraftKeys = new Set<string>()
+const deferredCleanupKeys = new Set<string>()
+const draftPermissionModes = new Map<string, PermissionMode>()
 const draftKey = (project: string | undefined, session: string | undefined, draftID: number) => JSON.stringify([project, session ?? `draft:${draftID}`])
+function cleanupDraftKey(key: string) {
+  if (inFlightDraftKeys.has(key)) { deferredCleanupKeys.add(key); return }
+  chatDrafts.delete(key)
+  draftPermissionModes.delete(key)
+  deferredCleanupKeys.delete(key)
+}
+export function cleanupProjectChatDrafts(projectID: string) {
+  for (const key of new Set([...chatDrafts.keys(), ...draftPermissionModes.keys()])) {
+    if (JSON.parse(key)[0] === projectID) cleanupDraftKey(key)
+  }
+}
+export function cleanupSessionChatDraft(projectID: string, sessionID: string) { cleanupDraftKey(draftKey(projectID, sessionID, 0)) }
+export function cleanupAbandonedNewChatDraft(projectID: string, draftID: number) { cleanupDraftKey(draftKey(projectID, undefined, draftID)) }
+export function __chatDraftKeysForTest() {
+  return { drafts: [...chatDrafts.keys()], permissionModes: [...draftPermissionModes.keys()], inFlight: [...inFlightDraftKeys], deferred: [...deferredCleanupKeys] }
+}
+function cleanupEmptyDraft(draft: DraftThread) {
+  if (draft.listeners.size || draft.value.text || draft.value.attachments.length) return
+  for (const [key, value] of chatDrafts) if (value === draft && !inFlightDraftKeys.has(key)) cleanupDraftKey(key)
+}
 function chatDraft(key: string): DraftThread {
   let draft = chatDrafts.get(key)
   if (!draft) { draft = { value: { text: '', attachments: [] }, listeners: new Set() }; chatDrafts.set(key, draft) }
@@ -35,9 +58,9 @@ function chatDraft(key: string): DraftThread {
 function updateDraft(draft: DraftThread, update: (value: ChatDraft) => ChatDraft) {
   draft.value = update(draft.value)
   draft.listeners.forEach(listener => listener())
+  cleanupEmptyDraft(draft)
 }
 let attachmentSequence = 0
-const draftPermissionModes = new Map<string, PermissionMode>()
 export const permissionModeOptions: { value: PermissionMode; label: string; description: string }[] = [
   { value: 'default', label: 'Mặc định', description: 'Dùng chính sách quyền mặc định của OpenCode.' },
   { value: 'ask', label: 'Hỏi trước', description: 'Hỏi trước khi sửa tệp, chạy shell hoặc truy cập ngoài workspace.' },
@@ -69,7 +92,7 @@ function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
   })
 }
 
-export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, onOpenCommitAgent, ready, files = [], activeFile, onRequestFiles }: { draftID?: number; focusNonce?: number; timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; onOpenCommitAgent?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, onOpenCommitAgent, ready, files = [], activeFile, onRequestFiles }: { draftID?: number; focusNonce?: number; timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; onOpenCommitAgent?: (sessionID?: string) => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
   const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
   const initialCatalog = cached?.key === connectionUrl ? cached : undefined
   const [messages, setMessages] = useState<ChatItem[]>([])
@@ -89,7 +112,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const translationSessionIDs = androidInfo?.translationSessionIDs ?? []
   const lockedTranslation = !!sessionID && lockedTranslationIDs.includes(sessionID)
   const translationSession = !!sessionID && translationSessionIDs.includes(sessionID)
-  const [commitAgentState, setCommitAgentState] = useState<{ projectID: string; info: CommitAgentInfo }>()
+  const [commitAgentState, setCommitAgentState] = useState<{ projectID: string; info: CommitAgentSessionState }>()
   const commitAgentInfo = commitAgentState?.projectID === projectID ? commitAgentState?.info : undefined
   const commitSession = !!sessionID && !!commitAgentInfo?.commitSessionIDs.includes(sessionID)
   const lockedCommit = !!sessionID && !!commitAgentInfo?.lockedSessionIDs.includes(sessionID)
@@ -99,7 +122,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     const load = async () => {
       if (!projectID || !connected) return
       const request = ++generation
-      const info = await window.ame.commitAgentInfo?.(projectID).catch(() => null)
+      const info = await (window.ame.commitAgentSessionState ? window.ame.commitAgentSessionState(projectID) : window.ame.commitAgentInfo?.(projectID))?.catch(() => null)
       if (alive && request === generation && info) setCommitAgentState({ projectID, info })
     }
     void load()
@@ -134,10 +157,11 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const [model, setModel] = useState(() => resolvePreferredModel({ models: chatModelsForPolicy(initialCatalog?.models ?? [], role, effectiveDefaultModel), currentValue: '', defaultModelID: effectiveDefaultModel, role }))
   const modelPolicy = useRef({ role, defaultModelID: effectiveDefaultModel })
   modelPolicy.current = { role, defaultModelID: effectiveDefaultModel }
-  const permissionScope = JSON.stringify([connectionUrl, projectID, sessionID || draftID])
+  const key = draftKey(projectID, sessionID, draftID)
+  const permissionScope = JSON.stringify([connectionUrl, key])
   const [permissionAttempt, setPermissionAttempt] = useState(0)
   const [modeState, setModeState] = useState<{ scope: string; mode: PermissionMode; status: 'loading' | 'ready' | 'error'; error?: string }>(() => ({ scope: permissionScope, mode: 'default', status: sessionID ? 'loading' : 'ready' }))
-  const permissionMode = modeState.scope === permissionScope ? modeState.mode : !sessionID ? draftPermissionModes.get(permissionScope) ?? 'default' : 'default'
+  const permissionMode = modeState.scope === permissionScope ? modeState.mode : !sessionID ? draftPermissionModes.get(key) ?? 'default' : 'default'
   const permissionStatus = modeState.scope === permissionScope ? modeState.status : sessionID ? 'loading' : 'ready'
   const permissionLoading = permissionStatus !== 'ready'
   const [updatingPermission, setUpdatingPermission] = useState(false)
@@ -149,7 +173,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     let alive = true
     const request = ++permissionRequest.current
     if (!sessionID) {
-      setModeState({ scope: permissionScope, mode: draftPermissionModes.get(permissionScope) ?? 'default', status: 'ready' })
+      setModeState({ scope: permissionScope, mode: draftPermissionModes.get(key) ?? 'default', status: 'ready' })
       return
     }
     if (!projectID || !connected) return
@@ -162,7 +186,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const changePermissionMode = async (mode: PermissionMode) => {
     if (!projectID || permissionPending.current || busy || permissionLoading) return
     if (!sessionID) {
-      draftPermissionModes.set(permissionScope, mode)
+      draftPermissionModes.set(key, mode)
       setModeState({ scope: permissionScope, mode, status: 'ready' })
       return
     }
@@ -173,8 +197,13 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     } catch (e) { report(e) }
     finally { permissionPending.current = false; setUpdatingPermission(false) }
   }
-  const draft = chatDraft(draftKey(projectID, sessionID, draftID))
-  const { text, attachments } = useSyncExternalStore(listener => { draft.listeners.add(listener); return () => { draft.listeners.delete(listener) } }, () => draft.value, () => draft.value)
+  const draft = chatDraft(key)
+  const subscription = useRef<{ draft: DraftThread; subscribe: (listener: () => void) => () => void } | undefined>(undefined)
+  if (subscription.current?.draft !== draft) subscription.current = { draft, subscribe: listener => {
+    draft.listeners.add(listener)
+    return () => { draft.listeners.delete(listener); cleanupEmptyDraft(draft) }
+  } }
+  const { text, attachments } = useSyncExternalStore(subscription.current.subscribe, () => draft.value, () => draft.value)
   const setText = (value: string | ((current: string) => string)) => updateDraft(draft, current => ({ ...current, text: typeof value === 'function' ? value(current.text) : value }))
   const setAttachments = (value: ComposerAttachment[] | ((current: ComposerAttachment[]) => ComposerAttachment[])) => updateDraft(draft, current => ({ ...current, attachments: typeof value === 'function' ? value(current.attachments) : value }))
   const [commands, setCommands] = useState<SlashCommand[]>(() => initialCatalog?.commands ?? [])
@@ -205,13 +234,18 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const currentProject = useRef(projectID); currentProject.current = projectID
   const createdSession = useRef<string | undefined>(undefined)
   const submittingDraft = useRef(draft)
+  const submittingDraftKey = useRef(key)
   const submit = useRef<ReturnType<typeof chatSubmit> | undefined>(undefined)
   const submitProject = useRef(projectID)
   if (!submit.current || submitProject.current !== projectID) {
     submitProject.current = projectID
     submit.current = chatSubmit(window.ame, session => {
       if (currentProject.current !== projectID) return
-      chatDrafts.set(draftKey(projectID, session.id, draftID), submittingDraft.current)
+      if (!deferredCleanupKeys.has(submittingDraftKey.current)) {
+        const sessionKey = draftKey(projectID, session.id, draftID)
+        chatDrafts.set(sessionKey, submittingDraft.current)
+        inFlightDraftKeys.add(sessionKey)
+      }
       createdSession.current = session.id; onCreated(session)
     })
   }
@@ -480,6 +514,9 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     const submitted = text, submittedSession = sessionID, submittedProject = projectID, submittedAttachments = attachments
     const submittedIDs = new Set(submittedAttachments.map(item => item.id))
     submittingDraft.current = draft
+    submittingDraftKey.current = key
+    if (inFlightDraftKeys.has(key)) return
+    inFlightDraftKeys.add(key)
     setBusy(true)
     try {
       if (!await submit.current!(projectID, sessionID, prompt, selectedModel, undefined, files.length ? files : undefined, draftID, permissionMode)) return
@@ -487,8 +524,17 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
         setTrigger(null); setAttachmentPicker(false)
       }
       updateDraft(draft, current => ({ text: current.text === submitted ? '' : current.text, attachments: current.attachments.filter(item => !submittedIDs.has(item.id)) }))
+      if (!submittedSession) cleanupAbandonedNewChatDraft(submittedProject, draftID)
       refresh.current(); onActivity()
-    } catch (e) { report(e) } finally { setBusy(false) }
+    } catch (e) { report(e) } finally {
+      for (const flightKey of [...inFlightDraftKeys]) {
+        if (flightKey !== key && chatDrafts.get(flightKey) !== draft) continue
+        inFlightDraftKeys.delete(flightKey)
+        if (deferredCleanupKeys.has(flightKey)) cleanupDraftKey(flightKey)
+      }
+      cleanupEmptyDraft(draft)
+      setBusy(false)
+    }
   }
   const reply = async (permission: Permission, response: 'once' | 'always' | 'reject') => {
     if (!projectID) return
@@ -551,7 +597,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
         {forms.map(form => <SessionFormCard key={`${projectID}:${sessionID}:${form.id}`} projectID={projectID!} form={form} disabled={!connected || lockedTranslation || commitSession || lockedCommit} onResolved={id => { setForms(current => current.filter(form => form.id !== id)); refresh.current() }} />)}
         {permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
-      {commitSession || lockedCommit ? <div className="translation-locked-banner" role="status" data-testid="commit-agent-locked-banner"><Icon name="lock" /><p>{lockedCommit ? 'Phiên Trợ lý Commit AI này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Trợ lý Commit AI riêng. Mở Trợ lý Commit AI để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p><button type="button" onClick={() => onOpenCommitAgent?.()}>Trợ lý Commit AI</button><button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <>
+      {commitSession || lockedCommit ? <div className="translation-locked-banner" role="status" data-testid="commit-agent-locked-banner"><Icon name="lock" /><p>{lockedCommit ? 'Phiên Trợ lý Commit AI này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Trợ lý Commit AI riêng. Mở Trợ lý Commit AI để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p><button type="button" onClick={() => onOpenCommitAgent?.(sessionID)}>Trợ lý Commit AI</button><button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <>
       {lockedTranslation || translationSession ? <div className="translation-locked-banner" role="status" data-testid="translation-locked-banner"><Icon name="lock" /><p>{lockedTranslation ? 'Phiên dịch Android này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Dịch Android riêng. Mở Dịch Android để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p>{!lockedTranslation && <button type="button" onClick={() => onOpenAndroidTranslation?.()}>Dịch Android</button>}<button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <div className="composer-dock"><div className="composer-dock__inner">{(projectName || sessionID) && <div className="composer-context-strip">{sessionID ? <button className="ctx-strip-chip" onClick={() => onOpenPanel('changes')} title="Thay đổi của toàn bộ session, từ OpenCode snapshots"><Icon name="diff" /><span>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files changed`}</span>{changesStatus === 'ready' && projectName && <span className="ctx-strip-chip__meta">· {projectName}</span>}</button> : <span>Project: <strong>{projectName}</strong>{branch ? ` (${branch})` : ''}</span>}{sessionID && <button type="button" className="agent-map-trigger" data-testid="agent-map-trigger" title="Mở Agent map (sơ đồ subagents, skill, prompt và output)" onClick={() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }}><span className={`agent-map-dot ${agentFamily.runningCount > 0 ? 'agent-map-dot--running' : agentFamily.subagentCount > 0 ? 'agent-map-dot--succeeded' : 'agent-map-dot--idle'}`} aria-hidden="true" /><span>{agentFamily.subagentCount > 0 ? `${agentFamily.subagentCount} subagent` : 'Agent map'}</span></button>}</div>}      <form className="composer-card" onSubmit={e => { e.preventDefault(); void send() }} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) { setTrigger(null); setAttachmentPicker(false) } }}>
               <ComposerAttachmentStrip attachments={attachments} onRemove={id => setAttachments(current => current.filter(attachment => attachment.id !== id))} />
               <ComposerDropOverlay active={dragActive} />

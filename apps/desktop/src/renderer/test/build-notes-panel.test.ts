@@ -139,6 +139,37 @@ test('specific commits support author/hash/subject filtering, multiselect, desel
   h.unmount()
 })
 
+test('file diffs use the resolved preview commit, range or commit-set scope and leave working files unscoped', async () => {
+  for (const scenario of [
+    { mode: 'range', source: 'committed', commits: [first], baseCommit: second.hash, includeWorking: true, target: { kind: 'commit', commit: first.hash } },
+    { mode: 'range', source: 'both', commits: [first, second], baseCommit: first.hash, includeWorking: true, target: { kind: 'range', baseCommit: first.hash, includeWorking: true } },
+    { mode: 'range', source: 'committed', commits: [first, second], baseCommit: first.hash, includeWorking: true, target: { kind: 'range', baseCommit: first.hash, includeWorking: false } },
+    { mode: 'range', source: 'both', commits: [first, second], baseCommit: first.hash, includeWorking: false, target: { kind: 'range', baseCommit: first.hash, includeWorking: false } },
+    { mode: 'commits', source: 'both', commits: [first, second], includeWorking: true, target: { kind: 'commits', commits: [first.hash, second.hash], includeWorking: true } },
+    { mode: 'commits', source: 'committed', commits: [first, second], includeWorking: true, target: { kind: 'commits', commits: [first.hash, second.hash], includeWorking: false } },
+    { mode: 'range', source: 'both', commits: [first, second], includeWorking: false, target: { kind: 'commits', commits: [first.hash, second.hash], includeWorking: false } },
+    { mode: 'range', source: 'working', commits: [first], baseCommit: second.hash, includeWorking: true, target: undefined },
+    { mode: 'range', source: 'working', commits: [], includeWorking: true, target: undefined },
+    { mode: 'range', source: 'committed', commits: [], includeWorking: false, target: undefined },
+  ] as const) {
+    const diffs: { path: string; target: unknown; argumentCount: number }[] = []
+    const h = harness({ onDiff(...args) { diffs.push({ path: args[0], target: args[1], argumentCount: args.length }) } }, {
+      async buildNotesPreview() { return { ...preview, commits: [...scenario.commits], commitCount: scenario.commits.length, files: [{ ...preview.files[0], source: scenario.source }] } },
+    })
+    try {
+      h.render(); await h.flush()
+      if (scenario.mode === 'commits') { h.click('Chọn lẻ commit'); h.render() }
+      else if ('baseCommit' in scenario && scenario.baseCommit) { h.change(h.byID('build-notes-base-select'), scenario.baseCommit); h.render() }
+      h.change(h.byID('build-notes-include-working'), scenario.includeWorking); await h.flush()
+      h.invoke(h.find(node => node.type === 'button' && text(node).startsWith('checkout.ts')))
+      assert.equal(diffs.length, 1)
+      assert.equal(diffs[0].path, 'checkout.ts')
+      assert.deepEqual(diffs[0].target === undefined ? undefined : plain(diffs[0].target), scenario.target)
+      assert.equal(diffs[0].argumentCount, scenario.target === undefined ? 1 : 2)
+    } finally { h.unmount() }
+  }
+})
+
 test('generation is one-shot, forwards context, supports editable Markdown, preview/file callbacks and both copy formats', async () => {
   const pending = deferred<BuildNotesResult>(), requests: BuildNotesRequest[] = [], opened: unknown[][] = []
   const h = harness({ onOpenFile(...args) { opened.push(args) } }, {

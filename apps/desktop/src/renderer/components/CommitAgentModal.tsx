@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ChatItem, CommitAgentInfo, CommitAgentMode, Model, Permission, Session, SessionForm } from '../../../../../packages/protocol/src/index'
+import { extractCommitSnapshotID, inspectCommitAgentPlan } from '../../../../../packages/amekit/src/commit-plan'
+import type { ChatItem, CommitAgentInfo, CommitAgentMode, CommitAgentStoredPlan, Model, Permission, Session, SessionForm } from '../../../../../packages/protocol/src/index'
 import { extractCommitMessagesFromText, extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
 import type { TimelineDetailMode } from '../state'
 import { SessionFormCard } from './SessionFormCard'
@@ -20,13 +21,15 @@ const notify = () => window.dispatchEvent(new Event('ame-commit-agent-changed'))
 type Props = {
   projectID: string; projectName?: string; projectDirectory?: string; connected: boolean; theme: 'dark' | 'light'
   timelineDetail?: TimelineDetailMode
+  initialSessionID?: string
   onClose: () => void; onActivity: () => void; onGitRefresh: () => void
   onApplyCommitMessage: (message: string) => void; onOpenFile: (path: string, line?: number) => void
 }
 
-export function CommitAgentModal({ projectID, projectName, projectDirectory, connected, theme, timelineDetail = 'compact', onClose, onActivity, onGitRefresh, onApplyCommitMessage, onOpenFile }: Props) {
+export function CommitAgentModal({ projectID, projectName, projectDirectory, connected, theme, timelineDetail = 'compact', initialSessionID, onClose, onActivity, onGitRefresh, onApplyCommitMessage, onOpenFile }: Props) {
   const [info, setInfo] = useState<CommitAgentInfo>()
-  const [session, setSession] = useState<Session>()
+  const [planSnapshots, setPlanSnapshots] = useState<Record<string, CommitAgentStoredPlan>>({})
+  const [session, setSession] = useState<Session | undefined>(initialSessionID !== undefined ? { id: initialSessionID, title: 'Trợ lý Commit AI' } : undefined)
   const [model, setModel] = useState<Model>()
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
@@ -35,6 +38,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
   const [busy, setBusy] = useState(false)
   const [replying, setReplying] = useState(false)
   const [loaded, setLoaded] = useState(false)
+  const [sessionStateReady, setSessionStateReady] = useState(false)
   const [revision, setRevision] = useState(0)
   const [error, setError] = useState('')
   const [applied, setApplied] = useState('')
@@ -47,6 +51,21 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
   const locked = !!sessionID && !!info?.lockedSessionIDs.includes(sessionID)
   const running = session?.status === 'running' || forms.length > 0
   const available = connected && !!(model?.id || info?.effectiveModelID) && !locked && !busy && !running && !forms.length && (!sessionID || loaded)
+  // Never replace a previously bound snapshot, including after a Git refresh.
+  const mergePlans = (plans: Record<string, CommitAgentStoredPlan>) => setPlanSnapshots(current => {
+    const next = { ...current }
+    for (const [id, plan] of Object.entries(plans)) {
+      const previous = current[id]
+      next[id] = previous ? { ...previous, status: previous.status === 'active' || previous.status === 'executing' ? plan.status : previous.status } : { ...plan, snapshot: { ...plan.snapshot, stagedFiles: [...plan.snapshot.stagedFiles], workingFiles: [...plan.snapshot.workingFiles], untrackedHashes: plan.snapshot.untrackedHashes && { ...plan.snapshot.untrackedHashes } } }
+    }
+    return next
+  })
+  const turns = projectChatTimeline(messages, { running, mode: timelineDetail, pendingForms: forms.length > 0 })
+  const planCards = turns.flatMap(turn => turn.blocks.flatMap(block => {
+    const inspection = block.kind === 'text' ? inspectCommitAgentPlan(block.item.text) : null
+    return inspection ? [{ turn, block, inspection, key: `${sessionID}:${turn.id}:${block.id}` }] : []
+  }))
+  const latestPlan = planCards.at(-1)
 
   useEffect(() => {
     mounted.current = true
@@ -75,9 +94,10 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
         const value = await window.ame.commitAgentInfo(projectID)
         if (!alive || request !== generation) return
         setInfo(current => ({ ...value, lockedSessionIDs: [...new Set([...value.lockedSessionIDs, ...(current?.lockedSessionIDs ?? [])])] }))
+        if (value.plans) mergePlans(value.plans)
         if (!initialized.current) {
           initialized.current = true
-          const id = value.commitSessionIDs.filter(id => !value.lockedSessionIDs.includes(id)).at(-1)
+          const id = initialSessionID ?? value.commitSessionIDs.filter(id => !value.lockedSessionIDs.includes(id)).at(-1)
           if (id) setSession({ id, title: 'Trợ lý Commit AI' })
         }
       } catch (e) { if (alive && request === generation) setError(errorText(e)) }
@@ -90,6 +110,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
   }, [projectID, connected])
 
   useEffect(() => {
+    setSessionStateReady(false)
     if (!sessionID || !connected) return
     let alive = true, loading = false, queued = false
     const load = async () => {
@@ -106,6 +127,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
         const failed = [items, pending, sessions, pendingForms].find(result => result.status === 'rejected')
         if (failed?.status === 'rejected') setError(`Không tải được một phần dữ liệu phiên commit: ${errorText(failed.reason)}`)
         const latest = sessions.status === 'fulfilled' ? sessions.value.find(item => item.id === sessionID) : undefined
+        setSessionStateReady(sessions.status === 'fulfilled' && pending.status === 'fulfilled' && pendingForms.status === 'fulfilled' && latest?.status === 'idle')
         if (latest) setSession(latest)
       } finally { loading = false; if (alive && queued) { queued = false; void load() } }
     }
@@ -134,13 +156,14 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
 
   const send = async (value = text, mode: CommitAgentMode = 'custom') => {
     if (!available || !value.trim() || operation.current) return
-    operation.current = true; setBusy(true); setError(''); setApplied('')
+    operation.current = true; setBusy(true); setSessionStateReady(false); setError(''); setApplied('')
     const request = epoch.current
     try {
       const result = await window.ame.commitAgentPrompt(projectID, sessionID, value.trim(), mode)
       notify(); callbacks.current.onActivity()
       if (!mounted.current || request !== epoch.current) return
       setSession(result.session); currentSession.current = result.session.id; setModel(result.model)
+      if (result.planID && result.snapshot) mergePlans({ [result.planID]: { planID: result.planID, snapshot: result.snapshot, status: 'active' } })
       setText(''); setLoaded(false); setRevision(value => value + 1)
       if (result.locked) setInfo(current => current ? { ...current, lockedSessionIDs: [...new Set([...current.lockedSessionIDs, result.session.id])] } : current)
     } catch (e) {
@@ -150,7 +173,34 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
       }
     } finally { operation.current = false; if (mounted.current) setBusy(false) }
   }
-  const finishDisabled = !connected || !sessionID || busy || running || locked || !loaded || permissions.length > 0 || forms.length > 0
+  const finishDisabled = !connected || !sessionID || busy || running || locked || !loaded || !sessionStateReady || session?.status !== 'idle' || permissions.length > 0 || forms.length > 0
+  const executePlan = async (plan: NonNullable<ReturnType<typeof inspectCommitAgentPlan>>['plan'], key: string, planID: string | null) => {
+    const stored = planID ? planSnapshots[planID] : undefined
+    if (!planID || !connected || !sessionID || busy || running || locked || !stored || stored.status !== 'active' || key !== latestPlan?.key || latestPlan.inspection.violations.length > 0 || operation.current) return
+    const id = sessionID, request = epoch.current, snapshot = stored.snapshot
+    const valid = () => mounted.current && request === epoch.current && currentSession.current === id
+    operation.current = true; setBusy(true); setError(''); setApplied('')
+    try {
+      const result = await window.ame.commitAgentExecutePlan(projectID, id, { planID, scope: plan.scope ?? snapshot.scope, snapshot: { head: snapshot.head, branchRef: snapshot.branchRef, indexHash: snapshot.indexHash, workingHash: snapshot.workingHash, untrackedHashes: snapshot.untrackedHashes }, commits: plan.commits })
+      if (result.commits.length > 0) callbacks.current.onGitRefresh()
+      if (!valid()) return
+      const created = `Đã tạo commit: ${result.commits.map(commit => commit.hash).join(', ')}`
+      setPlanSnapshots(current => ({ ...current, [planID]: { ...stored, status: result.partialFailure ? 'stale' : 'executed' } }))
+      if (result.commits.length > 0) setApplied(created)
+      if (result.partialFailure) setError(`${created}. Dừng tại nhóm #${result.partialFailure.failedGroupIndex + 1}: ${result.partialFailure.failedSubject}. ${result.partialFailure.message}`)
+      if (result.commits.length > 0) {
+        const value = await window.ame.commitAgentInfo(projectID)
+        if (valid()) { setInfo(value); if (value.plans) mergePlans(value.plans) }
+      }
+    } catch (e) {
+      if (!valid()) return
+      const message = errorText(e)
+      setError(message.includes('COMMIT_PLAN_HOOK_MODIFIED_TREE') ? 'Git hook đã thay đổi cây làm việc. Hãy lập lại kế hoạch trước khi duyệt.' : message.includes('COMMIT_PLAN_STALE') ? 'Trạng thái Git đã thay đổi kể từ khi lập kế hoạch. Hãy bấm hoặc gửi yêu cầu "Lập lại kế hoạch" trước khi duyệt.' : /COMMIT_PLAN_.*MISMATCH/.test(message) ? 'Kế hoạch không khớp với dữ liệu đã lưu. Hãy lập lại kế hoạch trước khi duyệt.' : message.includes('COMMIT_PLAN_ABORTED') ? 'Thực thi kế hoạch đã bị hủy. Hãy lập lại kế hoạch trước khi duyệt.' : message)
+      if (/COMMIT_PLAN_(STALE|ABORTED|HOOK_MODIFIED_TREE)/.test(message)) {
+        setPlanSnapshots(current => ({ ...current, [planID]: { ...stored, status: 'stale' } }))
+      }
+    } finally { operation.current = false; if (mounted.current) setBusy(false) }
+  }
   const finish = async () => {
     if (finishDisabled || !sessionID || operation.current) return
     operation.current = true; setBusy(true); setError('')
@@ -165,7 +215,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
   const newSession = () => {
     if (busy || operation.current) return
     epoch.current++; setSession(undefined); currentSession.current = undefined; setModel(undefined)
-    setMessages([]); setPermissions([]); setForms([]); setText(''); setLoaded(false); setError(''); setApplied(''); follow.current = true
+    setMessages([]); setPermissions([]); setForms([]); setText(''); setLoaded(false); setSessionStateReady(false); setError(''); setApplied(''); follow.current = true
     input.current?.focus()
   }
   const reply = async (permission: Permission, response: 'once' | 'always' | 'reject') => {
@@ -187,7 +237,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
       {error && <div className="inline-error" role="alert">{error}</div>}
       {applied && <div role="status">{applied}</div>}
       <div ref={stream} className="chat-stream translation-modal__timeline" onScroll={event => { const el = event.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
-        {!info ? <p role="status">Đang tải cấu hình commit…</p> : sessionID && !loaded ? <p role="status">Đang tải phiên commit…</p> : !messages.length && !locked ? <div className="translation-presets"><h3>Commit rõ ràng, thay đổi atomic</h3><p>Phân tích diff trong phiên riêng. Xác nhận cách tách trước khi agent thực thi commit.</p><div className="translation-presets__grid">{presets.map(preset => <button key={preset.mode} type="button" disabled={!available} onClick={() => void send(preset.text, preset.mode)}><strong>{preset.title}</strong><span>{preset.text}</span></button>)}</div></div> : projectChatTimeline(messages, { running, mode: timelineDetail, pendingForms: forms.length > 0 }).map(turn => <section key={turn.id} className="chat-turn">
+        {!info ? <p role="status">Đang tải cấu hình commit…</p> : sessionID && !loaded ? <p role="status">Đang tải phiên commit…</p> : !messages.length && !locked ? <div className="translation-presets"><h3>Commit rõ ràng, thay đổi atomic</h3><p>Phân tích diff trong phiên riêng. Xác nhận cách tách trước khi agent thực thi commit.</p><div className="translation-presets__grid">{presets.map(preset => <button key={preset.mode} type="button" disabled={!available} onClick={() => void send(preset.text, preset.mode)}><strong>{preset.title}</strong><span>{preset.text}</span></button>)}</div></div> : turns.map(turn => <section key={turn.id} className="chat-turn">
           {turn.user && <article className="msg-user"><MessageContent text={extractUserDisplayText(turn.user.text) || '…'} onOpenFile={onOpenFile} /></article>}
           <div className="msg-turn-body">{turn.blocks.map(block => {
             if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
@@ -196,8 +246,21 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
             if (block.kind === 'error') return <div key={block.id} className="inline-error" role="alert">{block.item.text}{/compaction|token limit|context/i.test(block.item.text) && <p>Ngữ cảnh phiên vượt giới hạn token. Hãy mở Phiên mới để tiếp tục.</p>}</div>
             const item = block.item
             if (block.kind === 'tool' && item.tool?.name === 'question' && (item.tool.status === 'running' || item.tool.status === 'streaming') && running) return <ActiveToolsView key={block.id} items={[item]} {...actions} />
-            const commits = block.kind === 'text' ? extractCommitMessagesFromText(item.text) : []
-            return <article key={block.id} className="msg-agent">{block.kind === 'tool' && item.tool ? <ToolCard call={item.tool} {...actions} /> : block.kind === 'changes' && item.turn && sessionID ? <TurnChanges projectID={projectID} sessionID={sessionID} from={item.turn.from} files={item.turn.files} theme={theme} /> : block.kind === 'reasoning' ? <details className="thought-block"><summary>Suy nghĩ</summary><MessageContent text={item.text || '…'} onOpenFile={onOpenFile} /></details> : <MessageContent text={item.text || '…'} onOpenFile={onOpenFile} />}{commits.length > 0 && <div className="button-row commit-agent-modal__apply">{commits.map((message, index) => <button key={index} type="button" onClick={() => { onApplyCommitMessage(message); setApplied('Đã điền vào ô Commit') }}>{commits.length === 1 ? 'Điền vào ô Commit' : `Điền commit #${index + 1}`}</button>)}</div>}</article>
+             const commits = block.kind === 'text' ? extractCommitMessagesFromText(item.text) : []
+              const inspection = block.kind === 'text' ? inspectCommitAgentPlan(item.text) : null
+              const plan = inspection?.plan
+             const planID = turn.user ? (info?.messagePlanIDs?.[turn.user.id] ?? extractCommitSnapshotID(turn.user.text)) : null
+             const key = `${sessionID}:${turn.id}:${block.id}`
+             const stored = planID ? planSnapshots[planID] : undefined
+             const boundSnapshot = stored?.snapshot
+              const reason = inspection?.violations.length ? inspection.violations.map(v => `Nhóm #${v.groupIndex + 1} có ${v.fileCount} tệp, vượt giới hạn ${v.maxFiles} tệp/nhóm — hãy yêu cầu chia nhóm trước khi duyệt.`).join(' ') : !planID || !boundSnapshot ? 'Snapshot không còn trong phiên — hãy lập lại kế hoạch' : key !== latestPlan?.key ? 'Kế hoạch đã được thay thế' : stored?.status === 'executing' ? 'Kế hoạch đang được thực thi…' : stored?.status === 'executed' ? 'Kế hoạch này đã thực thi' : stored?.status === 'stale' ? 'Kế hoạch đã cũ — hãy yêu cầu lập lại kế hoạch' : stored?.status === 'superseded' ? 'Kế hoạch đã được thay thế' : ''
+             return <article key={block.id} className="msg-agent">{block.kind === 'tool' && item.tool ? <ToolCard call={item.tool} {...actions} /> : block.kind === 'changes' && item.turn && sessionID ? <TurnChanges projectID={projectID} sessionID={sessionID} from={item.turn.from} files={item.turn.files} theme={theme} /> : block.kind === 'reasoning' ? <details className="thought-block"><summary>Suy nghĩ</summary><MessageContent text={item.text || '…'} onOpenFile={onOpenFile} /></details> : <MessageContent text={item.text || '…'} onOpenFile={onOpenFile} />}{commits.length > 0 && <div className="button-row commit-agent-modal__apply">{commits.map((message, index) => <button key={index} type="button" onClick={() => { onApplyCommitMessage(message); setApplied('Đã điền vào ô Commit') }}>{commits.length === 1 ? 'Điền vào ô Commit' : `Điền commit #${index + 1}`}</button>)}</div>}{plan && !locked && !running && <section data-testid="commit-plan-approval">
+               <h3>Kế hoạch Commit chờ duyệt</h3>{boundSnapshot && <><p>Nhánh: {boundSnapshot.branch || boundSnapshot.branchRef}</p><p>Phạm vi: {plan.scope ?? boundSnapshot.scope}</p><p>HEAD: <code>{boundSnapshot.head}</code></p></>}
+              <ol>{plan.commits.map((commit, index) => <li key={index}><strong>{index + 1}. {commit.message.split('\n')[0]}</strong><ul>{commit.files.map(file => <li key={file} style={{ whiteSpace: 'pre' }}>{/^\s|\s$/.test(file) ? <code>{JSON.stringify(file)}</code> : file}</li>)}</ul></li>)}</ol>
+               {reason && <p role="status">{reason}</p>}
+               <button type="button" data-testid="commit-plan-execute-btn" disabled={!!reason || !connected || busy || !sessionID} onClick={() => { if (!inspection?.violations.length) void executePlan(plan, key, planID) }}>Duyệt &amp; thực thi {plan.commits.length} commit</button>
+               {reason && key === latestPlan?.key && <button type="button" disabled={!available} onClick={() => void send('Lập lại kế hoạch')}>Lập lại kế hoạch</button>}
+            </section>}</article>
           })}</div>
         </section>)}
         {interruptedQuestion && <div className="warning" role="status">Câu hỏi trước đó đã bị gián đoạn và không còn hiệu lực. Trả lời tiếp bên dưới hoặc mở Phiên mới.</div>}

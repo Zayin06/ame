@@ -1,16 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, watch, type FSWatcher } from 'node:fs'
+import { existsSync, watch, realpath as fsRealpath, type FSWatcher } from 'node:fs'
 import { readFile, readdir, realpath, stat, lstat, writeFile, mkdir, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { simpleGit } from 'simple-git'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { diffContent, diffPreviewLimit, readDiffSide, type DiffSide } from './diff-content'
-import type { BuildNotesRequest, Project, FileDocument, FileEntry, GitState, GitBranches, GitCommitOptions, GitPushOptions, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
+import type { BuildNotesRequest, CommitAgentPlan, Project, FileDocument, FileEntry, GitState, GitBranches, GitCommitOptions, GitPushOptions, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
 import * as workspaceFs from './workspace-fs'
 import { searchWorkspace, replaceInWorkspace } from './search'
 import * as gitOps from './git-ops'
 import type { DiffTarget } from '../../protocol/src/index'
+import { isValidGitCommitHash } from '../../protocol/src/index'
 
 const revision = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
 const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf])
@@ -20,6 +21,7 @@ export class Workspaces {
   private watchTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private saves = new Map<string, Promise<unknown>>()
   private fileBoms = new Map<string, Map<string, boolean>>()
+  private projectQueue: Promise<unknown> = Promise.resolve()
   constructor(private storage: string, private changed: (projectID: string) => void = () => {}) {}
   async load() {
     let stored: unknown
@@ -31,23 +33,30 @@ export class Workspaces {
     }
   }
   list() { return [...this.projects.values()] }
-  async add(directory: string, id = randomUUID(), persist = true): Promise<Project> {
-    const resolved = await realpath(directory)
-    if (!(await stat(resolved)).isDirectory()) throw new Error('NOT_A_DIRECTORY')
-    const existing = this.list().find(p => p.directory === resolved)
-    if (existing) return existing
-    const project = { id, name: path.basename(resolved), directory: resolved }
-    this.projects.set(id, project)
-    try {
-      const watcher = watch(resolved, { recursive: true }, (_event, file) => {
-        if (file && /(^|[\\/])(node_modules|\.git|dist|out|build|coverage|release|release-[^\\/]+|\.next|\.nuxt|\.turbo|\.cache|\.plasmo|\.vite|\.parcel-cache|storybook-static|\.venv|venv|__pycache__|target|vendor|\.pm)([\\/]|$)/i.test(String(file))) return
-        this.scheduleWatchChange(id)
-      })
-      watcher.on('error', () => this.scheduleWatchChange(id))
-      this.watchers.set(id, watcher)
-    } catch { /* Read/save remain available on filesystems without recursive watch. */ }
-    if (persist) { await mkdir(path.dirname(this.storage), { recursive: true }); await writeFile(this.storage, JSON.stringify(this.list()), 'utf8') }
-    return project
+  async add(directory: string, id: string = randomUUID(), persist = true): Promise<Project> {
+    return this.queueProject(async () => {
+      const resolved = await realpath(directory)
+      if (!(await stat(resolved)).isDirectory()) throw new Error('NOT_A_DIRECTORY')
+      const existing = this.list().find(p => p.directory === resolved)
+      if (existing) return existing
+      const project = { id, name: path.basename(resolved), directory: resolved }
+      if (persist) await this.writeProjectsAtomic([...this.list(), project])
+      this.projects.set(id, project)
+      try {
+        const watcher = watch(resolved, { recursive: true }, (_event, file) => {
+          if (file && /(^|[\\/])(node_modules|\.git|dist|out|build|coverage|release|release-[^\\/]+|\.next|\.nuxt|\.turbo|\.cache|\.plasmo|\.vite|\.parcel-cache|storybook-static|\.venv|venv|__pycache__|target|vendor|\.pm)([\\/]|$)/i.test(String(file))) return
+          this.scheduleWatchChange(id)
+        })
+        watcher.on('error', () => this.scheduleWatchChange(id))
+        this.watchers.set(id, watcher)
+      } catch { /* Read/save remain available on filesystems without recursive watch. */ }
+      return project
+    })
+  }
+  private queueProject<T>(operation: () => Promise<T>): Promise<T> {
+    const task = this.projectQueue.catch(() => {}).then(operation)
+    this.projectQueue = task
+    return task
   }
   private scheduleWatchChange(id: string) {
     clearTimeout(this.watchTimers.get(id))
@@ -57,14 +66,16 @@ export class Workspaces {
     }, 150))
   }
   async remove(id: string): Promise<void> {
-    this.get(id)
-    await this.writeProjectsAtomic(this.list().filter(project => project.id !== id))
-    clearTimeout(this.watchTimers.get(id))
-    this.watchTimers.delete(id)
-    this.watchers.get(id)?.close()
-    this.watchers.delete(id)
-    this.projects.delete(id)
-    this.fileBoms.delete(id)
+    return this.queueProject(async () => {
+      this.get(id)
+      await this.writeProjectsAtomic(this.list().filter(project => project.id !== id))
+      clearTimeout(this.watchTimers.get(id))
+      this.watchTimers.delete(id)
+      this.watchers.get(id)?.close()
+      this.watchers.delete(id)
+      this.projects.delete(id)
+      this.fileBoms.delete(id)
+    })
   }
   private async writeProjectsAtomic(projects: Project[]): Promise<void> {
     await mkdir(path.dirname(this.storage), { recursive: true })
@@ -126,6 +137,11 @@ export class Workspaces {
     }
     return files.sort()
   }
+  private async fileKey(id: string, resolvedTarget: string): Promise<string> {
+    const nativePath = await promisify(fsRealpath.native)(resolvedTarget).catch(() => resolvedTarget)
+    const info = await stat(resolvedTarget, { bigint: true })
+    return info.ino !== 0n ? `ino:${info.dev}:${info.ino}` : process.platform === 'win32' ? nativePath.toLowerCase() : nativePath
+  }
   async read(id: string, relative: string): Promise<FileDocument> {
     const target = await this.resolve(id, relative)
     const info = await stat(target)
@@ -138,17 +154,20 @@ export class Workspaces {
     let metadata = this.fileBoms.get(id)
     if (!metadata) { metadata = new Map(); this.fileBoms.set(id, metadata) }
     metadata.set(JSON.stringify([relative, fileRevision]), bytes.subarray(0, 3).equals(utf8Bom))
+    metadata.set(JSON.stringify([await this.fileKey(id, target), fileRevision]), bytes.subarray(0, 3).equals(utf8Bom))
     return { path: relative, content, revision: fileRevision }
   }
   async save(id: string, relative: string, content: string, expected: string): Promise<FileDocument> {
     if (Buffer.byteLength(content) > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
-    const key = `${id}:${relative}`
+    const resolvedTarget = await this.resolve(id, relative)
+    const key = await this.fileKey(id, resolvedTarget)
     const previous = this.saves.get(key) ?? Promise.resolve()
     const task = previous.catch(() => {}).then(async () => {
       const target = await this.resolve(id, relative)
+      if (await this.fileKey(id, target) !== key) throw new Error('FILE_CONFLICT: File was replaced before saving.')
       const current = await readFile(target)
       if (revision(current) !== expected) throw new Error('FILE_CONFLICT: File changed on disk. Reload before saving.')
-      const hasBom = this.fileBoms.get(id)?.get(JSON.stringify([relative, expected])) ?? current.subarray(0, 3).equals(utf8Bom)
+      const hasBom = this.fileBoms.get(id)?.get(JSON.stringify([key, expected])) ?? this.fileBoms.get(id)?.get(JSON.stringify([relative, expected])) ?? current.subarray(0, 3).equals(utf8Bom)
       const bytes = Buffer.from(hasBom && !content.startsWith('\uFEFF') ? '\uFEFF' + content : content, 'utf8')
       if (bytes.length > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
       await writeFile(target, bytes)
@@ -188,6 +207,18 @@ export class Workspaces {
   }
   async stagedDiffSummary(id: string, maxBytes?: number) {
     return gitOps.stagedDiffSummary(this.get(id).directory, maxBytes)
+  }
+  async commitPlanSnapshot(id: string, maxDiffBytes?: number, options?: { focusFiles?: readonly string[]; includeDiff?: boolean }) {
+    return gitOps.gitCommitPlanSnapshot(this.get(id).directory, maxDiffBytes, options)
+  }
+  async executeCommitPlan(id: string, plan: CommitAgentPlan) {
+    let result
+    try { result = await gitOps.executeCommitPlan(this.get(id).directory, plan) } catch (error) {
+      if (Array.isArray((error as { commits?: unknown[] })?.commits) && (error as { commits: unknown[] }).commits.length > 0) this.changed(id)
+      throw error
+    }
+    this.changed(id)
+    return result
   }
   async buildNotesSummary(id: string, request: BuildNotesRequest, maxDiffBytes?: number) {
     return gitOps.buildNotesSummary(this.get(id).directory, request, maxDiffBytes)
@@ -252,12 +283,12 @@ export class Workspaces {
     await gitOps.gitStashPush(this.get(id).directory, message, includeUntracked)
     this.changed(id)
   }
-  async gitStashApply(id: string, index: number, pop?: boolean) {
-    await gitOps.gitStashApply(this.get(id).directory, index, pop)
+  async gitStashApply(id: string, index: number, pop?: boolean, expectedOid?: string) {
+    await gitOps.gitStashApply(this.get(id).directory, index, pop, expectedOid)
     this.changed(id)
   }
-  async gitStashDrop(id: string, index: number) {
-    await gitOps.gitStashDrop(this.get(id).directory, index)
+  async gitStashDrop(id: string, index: number, expectedOid?: string) {
+    await gitOps.gitStashDrop(this.get(id).directory, index, expectedOid)
     this.changed(id)
   }
   private git(id: string) {
@@ -286,21 +317,28 @@ export class Workspaces {
     const gitDir = path.resolve(root, (await git.raw(['rev-parse', '--git-dir'])).trim())
     const hasRemote = await gitOps.hasRemote(root)
     const merging = result.conflicted.length > 0 || existsSync(path.join(gitDir, 'MERGE_HEAD')) || existsSync(path.join(gitDir, 'REBASE_HEAD'))
-    return { branch: result.current ?? '(unborn)', changes: result.files.map(f => ({ path: f.path, index: f.index, working: f.working_dir })), tracking: result.tracking ?? null, ahead: result.ahead ?? 0, behind: result.behind ?? 0, hasRemote, merging }
+    const renamed = new Map(result.renamed.map(file => [file.to, file.from]))
+    return { branch: result.current ?? '(unborn)', changes: result.files.map(f => ({ path: f.path, index: f.index, working: f.working_dir, ...(renamed.has(f.path) ? { from: renamed.get(f.path)! } : {}) })), tracking: result.tracking ?? null, ahead: result.ahead ?? 0, behind: result.behind ?? 0, hasRemote, merging }
   }
   async diff(id: string, relative: string, target?: DiffTarget) {
     const file = await this.gitPath(id, relative)
     const git = this.git(id)
-    if (target && (!['staged', 'working', 'commit'].includes(target.kind) || (target.kind === 'commit' && !/^[a-f0-9]{7,40}$/i.test(target.commit)))) throw new Error('INVALID_DIFF_TARGET')
+    if (target && (!['staged', 'working', 'commit', 'range', 'commits'].includes(target.kind) ||
+      (target.kind === 'commit' && !isValidGitCommitHash(target.commit)) ||
+      (target.kind === 'range' && !isValidGitCommitHash(target.baseCommit)) ||
+      (target.kind === 'commits' && (!Array.isArray(target.commits) || target.commits.length < 1 || target.commits.length > 50 || !target.commits.every(isValidGitCommitHash))))) throw new Error('INVALID_DIFF_TARGET')
+    const from = target?.from === undefined ? file : await this.gitPath(id, target.from)
     // A missing path is an empty side; a failed read of an existing blob is not.
     const empty: DiffSide = { content: '', size: 0 }
-    const blob = async (ref: string): Promise<DiffSide> => {
-      const spec = `${ref}:./${file}`
+    const blob = async (ref: string, blobPath = file): Promise<DiffSide> => {
+      const spec = `${ref}:./${blobPath}`
+      const objectType = await git.raw(['cat-file', '-t', spec]).then(value => value.trim(), () => '')
+      if (objectType === 'tree') return empty
       let size: number
       try { size = Number((await git.raw(['cat-file', '-s', spec])).trim()) } catch {
         const tracked = await git.raw(ref === ''
-          ? ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', file]
-          : ['--literal-pathspecs', 'ls-tree', '-r', '--name-only', '-z', ref, '--', file])
+          ? ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', blobPath]
+          : ['--literal-pathspecs', 'ls-tree', '-r', '--name-only', '-z', ref, '--', blobPath])
         if (tracked) throw new Error('GIT_DIFF_READ_FAILED')
         return empty
       }
@@ -313,18 +351,37 @@ export class Workspaces {
         return stdout
       })
     }
-    if (target?.kind === 'commit') {
+    if (target?.kind === 'commits' && (target.commits.length !== 1 || target.includeWorking)) {
+      const patch = await gitOps.gitFileCommitPatch(this.get(id).directory, file, target.commits, !!target.includeWorking)
+      return { original: '', modified: '', patch, truncated: patch.endsWith('\n[Diff truncated at 4 MiB]\n') }
+    }
+    if (target?.kind === 'commit' || target?.kind === 'commits') {
       // Resolve once, validating existence and distinguishing root commits from read errors.
-      const hash = (await git.raw(['rev-parse', '--verify', `${target.commit}^{commit}`])).trim()
+      const commit = target.kind === 'commit' ? target.commit : target.commits[0]
+      const hash = (await git.raw(['rev-parse', '--verify', `${commit}^{commit}`])).trim()
       const parents = (await git.raw(['rev-list', '--parents', '-n', '1', hash])).trim().split(/\s+/)
-      return diffContent(parents[1] ? await blob(`${hash}^`) : empty, await blob(hash))
+      return diffContent(parents[1] ? await blob(`${hash}^`, from) : empty, await blob(hash))
     }
     const head = async () => {
       const exists = await git.raw(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false)
-      return exists ? blob('HEAD') : empty
+      return exists ? blob('HEAD', from) : empty
     }
     if (target?.kind === 'staged') return diffContent(await head(), await blob(''))
-    const original = target?.kind === 'working' ? await blob('') : await head()
+    let base: string | undefined
+    if (target?.kind === 'range') {
+      try {
+        base = (await git.raw(['rev-parse', '--verify', `${target.baseCommit}^{commit}`])).trim()
+        await git.raw(['merge-base', '--is-ancestor', base, 'HEAD'])
+        if ((await git.raw(['merge-base', base, 'HEAD'])).trim() !== base) throw new Error('INVALID_DIFF_TARGET')
+      } catch { throw new Error('INVALID_DIFF_TARGET') }
+      if (!target.includeWorking) return diffContent(await blob(base, from), await blob('HEAD'))
+      const hashes = (await git.raw(['rev-list', '--topo-order', `${base}..HEAD`, '--'])).trim().split(/\s+/).filter(Boolean)
+      if (hashes.length > 0) {
+        const patch = await gitOps.gitFileCommitPatch(this.get(id).directory, file, hashes, true, hashes.length)
+        return { original: '', modified: '', patch, truncated: patch.endsWith('\n[Diff truncated at 4 MiB]\n') }
+      }
+    }
+    const original = base ? await blob(base, from) : target?.kind === 'working' ? await blob('', from) : await head()
     let modified = empty
     try {
       const disk = await this.resolve(id, relative), info = await stat(disk)
@@ -333,13 +390,18 @@ export class Workspaces {
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
     return diffContent(original, modified)
   }
-  async stage(id: string, relative: string, staged: boolean) {
+  async stage(id: string, relative: string, staged: boolean, from?: string) {
     const file = await this.gitPath(id, relative)
-    const spec = `:(literal)${file}`
-    if (staged) await this.git(id).raw(['add', '--', spec])
+    const files = [file]
+    if (from !== undefined) {
+      const source = await this.gitPath(id, from)
+      if (!staged || existsSync(path.join(this.get(id).directory, source)) || await this.git(id).raw(['ls-files', '--stage', '-z', '--', `:(literal)${source}`])) files.push(source)
+    }
+    const specs = [...new Set(files)].map(value => `:(literal)${value}`)
+    if (staged) await this.git(id).raw(['add', '-A', '--', ...specs])
     else {
       const head = await this.git(id).raw(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false)
-      await this.git(id).raw(head ? ['reset', 'HEAD', '--', spec] : ['rm', '--cached', '--', spec])
+      await this.git(id).raw(head ? ['reset', 'HEAD', '--', ...specs] : ['rm', '--cached', '--', ...specs])
     }
     this.changed(id)
   }

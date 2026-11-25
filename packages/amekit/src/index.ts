@@ -14,8 +14,8 @@ import { readUsagePrices, type UsagePrices } from "./usage-pricing"
 import { generatePetDialogue as generateDialogue } from "./pet-generation"
 import type { DialogueSet } from "./pet-dialogue"
 export type { BundleFeatures } from "./api"
-export { detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore } from "./android-translation"
-export { buildCommitAgentPrompt, createCommitAgentLockStore, COMMIT_AGENT_SCOPE_HEADER } from "./commit-agent"
+export { detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore, canonicalWorkspaceScope } from "./android-translation"
+export { buildCommitAgentPrompt, createCommitAgentLockStore, parseCommitAgentPlan, COMMIT_AGENT_SCOPE_HEADER } from "./commit-agent"
 
 export type AmeKitBundleEvent = { version: string; releaseId: string; auto: boolean; action: "synced" | "uninstalled" }
 export type AmeKitOptions = {

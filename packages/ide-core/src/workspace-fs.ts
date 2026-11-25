@@ -1,5 +1,6 @@
 import { lstat, mkdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 function fail(code: string): never { throw Object.assign(new Error(code), { code }) }
 function inside(root: string, target: string) {
@@ -80,6 +81,12 @@ export async function renameOrMove(root: string, fromRelative: string, toRelativ
   const from = await validateWorkspacePath(root, fromRelative)
   const to = await validateWorkspacePath(from.rootReal, toRelative)
   const info = await lstat(from.target)
+  if (process.platform === 'win32' && from.target !== to.target && from.target.toLowerCase() === to.target.toLowerCase()) {
+    const temporary = path.join(path.dirname(from.target), `.ame-rename-${randomUUID()}`)
+    await rename(from.target, temporary)
+    try { await rename(temporary, to.target) } catch (error) { await rename(temporary, from.target); throw error }
+    return { from: from.normalized, to: to.normalized }
+  }
   const relative = path.relative(from.target, to.target)
   if (!relative || (info.isDirectory() && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) fail('INVALID_MOVE')
   if (await existing(to.target)) fail('ALREADY_EXISTS')

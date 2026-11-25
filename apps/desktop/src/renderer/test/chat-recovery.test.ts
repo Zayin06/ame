@@ -13,8 +13,8 @@ function elements(node: ReactNode): ReactElement<any>[] {
 }
 
 // Execute the real component and its effects with deterministic hook lifecycles.
-function harness(overrides: Record<string, any> = {}) {
-  const filename = new URL('../components/Chat.tsx', import.meta.url)
+function harness(overrides: Record<string, any> = {}, app = false) {
+  const filename = new URL(app ? '../App.tsx' : '../components/Chat.tsx', import.meta.url)
   const nativeRequire = createRequire(filename)
   let slots: any[] = [], cursor = 0, effects: (() => void)[] = []
   const cleanups: (() => void)[] = []
@@ -24,6 +24,10 @@ function harness(overrides: Record<string, any> = {}) {
     commands: async () => [], skills: async () => [], onEvent: () => () => {},
     messages: async () => [], permissions: async () => [], forms: async () => [],
     sessionPermissionMode: async () => 'ask', prompt: async () => {},
+    platform: async () => 'win32', petState: async () => null, projects: async () => [{ id: 'p', name: 'P', directory: 'C:/p' }],
+    connection: async () => ({ connected: true, url: '' }), account: async () => null,
+    sessions: async () => [], git: async () => ({}), debugState: async () => ({ status: 'idle', frames: [], variables: [], breakpoints: [] }),
+    read: async () => ({ path: 'a.txt', content: 'disk', revision: '1' }),
     createSession: async () => ({ id: 'created', title: 'Created' }), ...overrides,
   }
   const hooks = {
@@ -34,7 +38,16 @@ function harness(overrides: Record<string, any> = {}) {
     },
     useRef(initial: any) { const index = cursor++; return slots[index] ??= { current: initial } },
     useId: () => 'test-id',
-    useSyncExternalStore(_subscribe: any, snapshot: any) { return snapshot() },
+    useCallback(callback: any, deps: any[]) {
+      const index = cursor++, old = slots[index]
+      if (!old || deps.some((value, i) => !Object.is(value, old.deps[i]))) slots[index] = { callback, deps }
+      return slots[index].callback
+    },
+    useSyncExternalStore(subscribe: any, snapshot: any) {
+      const index = cursor++
+      if (slots[index] !== subscribe) { cleanups[index]?.(); slots[index] = subscribe; cleanups[index] = subscribe(() => {}) }
+      return snapshot()
+    },
     useEffect(effect: any, deps: any[]) {
       const index = cursor++, old = slots[index]
       if (old && deps && deps.length === old.length && deps.every((value, i) => Object.is(value, old[i]))) return
@@ -43,13 +56,16 @@ function harness(overrides: Record<string, any> = {}) {
     },
   }
   const exports: any = {}
-  const code = ts.transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText
+  const code = ts.transpileModule(readFileSync(filename, 'utf8').replaceAll('import.meta.env.DEV', 'false'), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText
   runInNewContext(code, {
-    exports, window: { ame: api, addEventListener() {}, removeEventListener() {} },
+    exports, window: { ame: api, confirm: () => true, addEventListener() {}, removeEventListener() {} },
+    localStorage: { getItem: () => JSON.stringify({ ...nativeRequire(app ? './state' : '../state').defaults(), project: 'p', stage: true, panel: 'files', projects: { p: { tabs: [{ mode: 'file', path: 'a.txt' }] } } }), setItem() {} },
+    document: { documentElement: { dataset: {}, style: { setProperty() {} } } },
     setTimeout, clearTimeout, requestAnimationFrame: () => {},
     require: (name: string) => {
       if (name === 'react') return hooks
-      if (name.startsWith('./')) return new Proxy({}, { get: (_target, key) => key === 'errorText' ? (e: any) => e.message : () => null })
+      if (name === 'monaco-editor') return { editor: { getModels: () => [] }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } }
+      if (name.startsWith('./') && (!app || name.startsWith('./components/'))) return new Proxy({}, { get: (_target, key) => key === 'errorText' || key === 'humanizeIdeError' ? (e: any) => e.message : String(key) })
       return nativeRequire(name)
     },
   })
@@ -62,12 +78,12 @@ function harness(overrides: Record<string, any> = {}) {
   let tree: ReactNode
   function render(patch: any = {}) {
     props = { ...props, ...patch }; cursor = 0
-    tree = exports.Chat(props)
+    tree = app ? exports.App() : exports.Chat(props)
     const pending = effects; effects = []; pending.forEach(effect => effect())
     return tree
   }
   return {
-    api, render,
+    api, render, lifecycle: exports,
     remount(patch: any) { cleanups.forEach(cleanup => cleanup?.()); cleanups.length = 0; slots = []; return render(patch) },
     nodes: () => elements(tree),
     input: () => elements(tree).find(node => node.type === 'textarea')!,
@@ -156,5 +172,163 @@ test('messages render while forms fail, with independent retry and retained prev
     h.render({ connected: false }); h.render({ connected: true }); await h.settle()
     assert.ok(h.nodes().some(node => node.props.form?.id === 'form'))
     assert.ok(h.nodes().some(node => node.props.text === 'Visible history'))
+  } finally { h.dispose() }
+})
+
+test('Commit AI banner opens the currently selected session, including locked sessions', async () => {
+  const opened: string[] = []
+  const h = harness({ commitAgentInfo: async () => ({ commitSessionIDs: ['A', 'B'], lockedSessionIDs: ['B'] }) })
+  try {
+    h.render({ onOpenCommitAgent: (id: string) => opened.push(id) }); await h.settle()
+    elements(h.warning('commit-agent-locked-banner')).find(node => node.props.children === 'Trợ lý Commit AI')!.props.onClick()
+    h.render({ sessionID: 'B' }); await h.settle()
+    elements(h.warning('commit-agent-locked-banner')).find(node => node.props.children === 'Trợ lý Commit AI')!.props.onClick()
+    assert.deepEqual(opened, ['A', 'B'])
+  } finally { h.dispose() }
+})
+
+test('Chat prefers lightweight commit session state on mount and OpenCode SSE without loading Git info', async () => {
+  const calls: string[] = [], events = new Set<(event: any) => void>()
+  let infoCalls = 0
+  const h = harness({
+    commitAgentSessionState: async (projectID: string) => { calls.push(projectID); return { commitSessionIDs: ['A'], lockedSessionIDs: [] } },
+    commitAgentInfo: async () => { infoCalls++; return { commitSessionIDs: [], lockedSessionIDs: [] } },
+    onEvent: (listener: (event: any) => void) => { events.add(listener); return () => events.delete(listener) },
+  })
+  try {
+    h.render(); await h.settle()
+    assert.deepEqual(calls, ['p']); assert.ok(h.warning('commit-agent-locked-banner'))
+    events.forEach(listener => listener({ type: 'opencode', projectID: 'p', sessionID: 'A' }))
+    await new Promise(resolve => setTimeout(resolve, 350)); await h.settle()
+    assert.deepEqual(calls, ['p', 'p'])
+    h.render({ sessionID: 'normal' }); await h.settle()
+    assert.equal(h.warning('commit-agent-locked-banner'), undefined)
+    assert.deepEqual(calls, ['p', 'p', 'p'])
+    assert.equal(infoCalls, 0, 'Chat must not read Git snapshots or diffs')
+  } finally { h.dispose() }
+  assert.equal(events.size, 0)
+})
+
+test('Chat does not fall back to expensive Git info when the lightweight API rejects', async () => {
+  let infoCalls = 0
+  const h = harness({
+    commitAgentSessionState: async () => { throw new Error('offline') },
+    commitAgentInfo: async () => { infoCalls++; return { commitSessionIDs: [], lockedSessionIDs: [] } },
+  })
+  try { h.render(); await h.settle(); assert.ok(h.input()); assert.equal(infoCalls, 0) } finally { h.dispose() }
+})
+
+for (const scope of ['project', 'session', 'new'] as const) {
+  test(`${scope} cleanup releases drafts with attachments and permission modes without touching other projects`, async () => {
+    const h = harness()
+    try {
+      h.render({ sessionID: scope === 'session' ? 'A' : undefined, draftID: 7 }); await h.settle()
+      type(h, 'discard'); attach(h)
+      if (scope !== 'session') h.nodes().find(node => node.type === 'select' && node.props.value === 'default')!.props.onChange({ target: { value: 'readonly' } })
+      h.remount({ projectID: 'other', sessionID: 'A' }); type(h, 'keep'); attach(h)
+      if (scope === 'project') h.lifecycle.cleanupProjectChatDrafts('p')
+      else if (scope === 'session') h.lifecycle.cleanupSessionChatDraft('p', 'A')
+      else h.lifecycle.cleanupAbandonedNewChatDraft('p', 7)
+      const keys = h.lifecycle.__chatDraftKeysForTest()
+      assert.ok(!keys.drafts.some((key: string) => JSON.parse(key)[0] === 'p'))
+      assert.ok(!keys.permissionModes.some((key: string) => JSON.parse(key)[0] === 'p'))
+      assert.equal(h.input().props.value, 'keep'); assert.equal(attachments(h).length, 1)
+      h.remount({ projectID: 'p', sessionID: scope === 'session' ? 'A' : undefined, draftID: 7 })
+      assert.equal(h.input().props.value, ''); assert.equal(attachments(h).length, 0)
+    } finally { h.dispose() }
+  })
+
+  test(`${scope} cleanup defers in-flight draft disposal until send finishes, including failures`, async () => {
+    for (const fail of [false, true]) {
+      let finish!: () => void
+      const h = harness({ prompt: () => new Promise<void>((resolve, reject) => { finish = () => fail ? reject(new Error('offline')) : resolve() }) })
+      try {
+        h.render({ sessionID: scope === 'session' ? 'A' : undefined, draftID: 7 }); await h.settle()
+        type(h, 'sending'); attach(h)
+        h.input().props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() {} })
+        await h.settle()
+        if (scope === 'project') h.lifecycle.cleanupProjectChatDrafts('p')
+        else if (scope === 'session') h.lifecycle.cleanupSessionChatDraft('p', 'A')
+        else h.lifecycle.cleanupAbandonedNewChatDraft('p', 7)
+        const key = JSON.stringify(['p', scope === 'session' ? 'A' : 'draft:7'])
+        assert.ok(h.lifecycle.__chatDraftKeysForTest().drafts.includes(key))
+        assert.ok(h.lifecycle.__chatDraftKeysForTest().deferred.includes(key))
+        h.remount({ projectID: 'other', sessionID: 'B' })
+        finish(); await h.settle()
+        const keys = h.lifecycle.__chatDraftKeysForTest()
+        assert.ok(!keys.drafts.includes(key)); assert.equal(keys.inFlight.length, 0); assert.equal(keys.deferred.length, 0)
+        if (scope === 'project') assert.ok(!keys.drafts.some((key: string) => JSON.parse(key)[0] === 'p'))
+      } finally { h.dispose() }
+    }
+  })
+}
+
+test('empty drafts are reclaimed after their last subscriber unmounts', async () => {
+  const h = harness()
+  h.render(); await h.settle(); type(h, 'temporary'); attach(h)
+  type(h, '')
+  h.nodes().find(node => Array.isArray(node.props.attachments) && node.props.onRemove)!.props.onRemove(attachments(h)[0].id)
+  h.render(); h.dispose()
+  assert.equal(h.lifecycle.__chatDraftKeysForTest().drafts.length, 0)
+})
+
+test('project removal while createSession is pending cannot recreate a session draft or retain attachments', async () => {
+  let created!: (session: any) => void, finish!: () => void
+  const h = harness({ createSession: () => new Promise(resolve => { created = resolve }), prompt: () => new Promise<void>(resolve => { finish = resolve }) })
+  try {
+    h.render({ sessionID: undefined, draftID: 1 }); await h.settle()
+    type(h, 'pending create'); attach(h)
+    h.input().props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() {} })
+    h.lifecycle.cleanupProjectChatDrafts('p')
+    h.remount({ projectID: 'other', sessionID: 'B' })
+    created({ id: 'late', title: 'Late' }); await h.settle()
+    assert.ok(!h.lifecycle.__chatDraftKeysForTest().drafts.includes(JSON.stringify(['p', 'late'])))
+    finish(); await h.settle()
+    assert.ok(!h.lifecycle.__chatDraftKeysForTest().drafts.some((key: string) => JSON.parse(key)[0] === 'p'))
+    assert.equal(h.lifecycle.__chatDraftKeysForTest().deferred.length, 0)
+  } finally { h.dispose() }
+})
+
+test('App passes the Chat session to CommitAgentModal and clears it for generic entry points and project changes', async () => {
+  const h = harness({}, true)
+  try {
+    h.render(); await h.settle()
+    h.nodes().find(node => node.type === 'Chat')!.props.onOpenCommitAgent('commit-A'); h.render()
+    let modal = h.nodes().find(node => node.type === 'CommitAgentModal')!
+    assert.equal(modal.props.initialSessionID, 'commit-A'); assert.equal(modal.key, 'p:commit-A')
+    modal.props.onClose(); h.render()
+    // Open the inspector through its titlebar control, then use its generic trigger.
+    h.nodes().find(node => typeof node.props.label === 'string' && node.props.label.startsWith('Project Inspector'))!.props.onClick(); h.render()
+    h.nodes().find(node => node.type === 'Inspector')!.props.onOpenCommitAgent(); h.render()
+    modal = h.nodes().find(node => node.type === 'CommitAgentModal')!
+    assert.equal(modal.props.initialSessionID, undefined); assert.equal(modal.key, 'p:')
+    h.nodes().find(node => node.type === 'ProjectRail')!.props.onSelect('other'); h.render(); h.render()
+    assert.equal(h.nodes().find(node => node.type === 'CommitAgentModal'), undefined)
+  } finally { h.dispose() }
+})
+
+test('slow reload preserves intervening editor input and its dirty state; unchanged buffers reload cleanly', async () => {
+  let finish!: (doc: any) => void, reads = 0
+  const disk = { path: 'a.txt', content: 'disk', revision: '1', language: 'text' }
+  const h = harness({ read: async () => ++reads === 1 ? disk : new Promise(resolve => { finish = resolve }) }, true)
+  const editor = () => h.nodes().find(node => node.type === 'EditorStage')!
+  try {
+    h.render(); await h.settle(); await h.settle()
+    assert.equal(editor().props.buffer.text, 'disk')
+    editor().props.onChange('before reload'); h.render()
+    editor().props.onReload()
+    editor().props.onChange('typed while reading'); h.render()
+    finish({ ...disk, content: 'new disk', revision: '2' }); await h.settle()
+    assert.equal(editor().props.buffer.text, 'typed while reading')
+    assert.equal(editor().props.buffer.content, 'disk')
+    assert.ok(editor().props.dirtyPaths.has('a.txt'))
+    // A text round-trip is still an edit: version protection must reject it.
+    editor().props.onReload()
+    editor().props.onChange('temporary'); editor().props.onChange('typed while reading'); h.render()
+    finish({ ...disk, content: 'new disk', revision: '2' }); await h.settle()
+    assert.equal(editor().props.buffer.text, 'typed while reading')
+    editor().props.onReload(); finish({ ...disk, content: 'new disk', revision: '2' }); await h.settle()
+    assert.equal(editor().props.buffer.text, 'new disk')
+    assert.equal(editor().props.dirtyPaths.size, 0)
   } finally { h.dispose() }
 })

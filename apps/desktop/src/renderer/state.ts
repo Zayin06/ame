@@ -1,4 +1,5 @@
 import type { DiffTarget, FileDocument } from '../../../../packages/protocol/src/index'
+import { isValidGitCommitHash } from '../../../../packages/protocol/src/index'
 
 export type Pane = 'rail' | 'inspector' | 'stage'
 export type Tab = { path: string; mode: 'file' | 'diff'; target?: DiffTarget }
@@ -34,13 +35,19 @@ export type Preferences = {
 }
 export const defaultWidths = { rail: 256, inspector: 240, stage: 480 }
 export const tabID = (tab: Tab) => tab.mode === 'diff' && tab.target
-  ? `diff:${JSON.stringify([tab.path, tab.target.kind, tab.target.kind === 'commit' ? tab.target.commit.toLowerCase() : null])}`
+  ? `diff:${JSON.stringify(tab.target.kind === 'range'
+    ? [tab.path, 'range', tab.target.baseCommit.toLowerCase(), !!tab.target.includeWorking]
+    : tab.target.kind === 'commits'
+      ? [tab.path, 'commits', tab.target.commits.map(c => c.toLowerCase()), !!tab.target.includeWorking]
+      : [tab.path, tab.target.kind, tab.target.kind === 'commit' ? tab.target.commit.toLowerCase() : null])}`
   : `${tab.mode}:${tab.path}`
 export const diffID = (project: string, tab: Tab) => documentID(project, tabID(tab))
 export const tabTitle = (tab: Tab) => {
   const name = tab.path.split(/[\\/]/).pop()
   if (tab.mode !== 'diff') return name
-  const label = tab.target?.kind === 'commit' ? tab.target.commit.slice(0, 7) : tab.target?.kind === 'staged' ? 'Staged' : tab.target?.kind === 'working' ? 'Changes' : 'HEAD → Disk'
+  const label = tab.target?.kind === 'range' ? `${tab.target.baseCommit.slice(0, 7)}..${tab.target.includeWorking ? 'Disk' : 'HEAD'}`
+    : tab.target?.kind === 'commits' ? `${tab.target.commits.length} commits${tab.target.includeWorking ? ' + Disk' : ''}`
+      : tab.target?.kind === 'commit' ? tab.target.commit.slice(0, 7) : tab.target?.kind === 'staged' ? 'Staged' : tab.target?.kind === 'working' ? 'Changes' : 'HEAD → Disk'
   return `${name} (${label})`
 }
 export const documentID = (project: string, path: string) => JSON.stringify([project, path])
@@ -71,7 +78,10 @@ export function parsePreferences(raw: string | null): Preferences {
       const v = view as Partial<ProjectView>
        const tabs: Tab[] = Array.isArray(v.tabs) ? v.tabs.filter(t => t && typeof t.path === 'string' && (t.mode === 'file' || t.mode === 'diff')).map(t => {
          const target = t.target
-         const valid = target?.kind === 'staged' || target?.kind === 'working' || (target?.kind === 'commit' && typeof target.commit === 'string' && /^[a-f0-9]{7,40}$/i.test(target.commit))
+         const valid = target?.kind === 'staged' || target?.kind === 'working'
+           || (target?.kind === 'commit' && isValidGitCommitHash(target.commit))
+           || (target?.kind === 'range' && isValidGitCommitHash(target.baseCommit) && (target.includeWorking === undefined || typeof target.includeWorking === 'boolean'))
+           || (target?.kind === 'commits' && Array.isArray(target.commits) && target.commits.length >= 1 && target.commits.length <= 50 && target.commits.every(isValidGitCommitHash) && (target.includeWorking === undefined || typeof target.includeWorking === 'boolean'))
          return { path: t.path, mode: t.mode, ...(t.mode === 'diff' && valid ? { target } : {}) }
        }) : []
       result.projects[id] = { session: typeof v.session === 'string' ? v.session : undefined, tabs, active: typeof v.active === 'string' ? v.active : undefined }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import path from 'node:path'
 import { OpenCodeAdapter, localURL, normalizeMessages } from '../packages/opencode-adapter/src/index'
+import { SessionActivity } from '../packages/opencode-adapter/src/session-activity'
 import type { IdeEvent } from '../packages/protocol/src/index'
 import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
 import type { SessionInfo, SessionMessageInfo } from '@opencode/client'
@@ -10,6 +11,108 @@ import type { UsagePrices } from '../packages/amekit/src/usage-pricing'
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 const waitFor = async (check: () => boolean) => { for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)) }; throw new Error('TIMED_OUT') }
+
+test('a newer persisted execution resets every recovery flag and invalidates old checkpoints', () => {
+  const activity = new SessionActivity()
+  const first = { id: 's', title: 'Session', status: 'running' as const, busyAt: 100 }
+  activity.pending('s', 'permissions', ['old-permission'])
+  activity.pending('s', 'forms', ['old-form'])
+  activity.snapshot('s', ['old-tool'], 'working')
+  activity.map(first)
+  activity.accept({ id: 'completed', durable: { aggregateID: 's', seq: 1, version: 1 }, type: 'session.execution.succeeded', created: 200, data: { sessionID: 's' } })
+  const kinds = ['permissions', 'forms', 'tools'] as const
+  for (const kind of kinds) assert.equal(activity.needsRecovery('s', kind), false)
+  const checkpoints = kinds.map(kind => activity.checkpoint('s', kind))
+  const executionCurrent = activity.executionCheckpoint('s')
+
+  const second = activity.map({ ...first, busyAt: 300, idleAt: 200 })
+  assert.equal(second.status, 'running')
+  assert.equal(second.activity, 'thinking')
+  assert.equal(second.outcome, undefined)
+  for (const kind of kinds) assert.equal(activity.needsRecovery('s', kind), true)
+  for (const current of checkpoints) assert.equal(current(), false)
+  assert.equal(executionCurrent(), false)
+})
+
+test('sessions recover a missed execution start after idle and reject old in-flight reconciliation', async () => {
+  const calls = { permissions: 0, forms: 0, tools: 0 }
+  let busy = 100, idle: number | undefined, activeCalls = 0, notifications = 0
+  let stream!: ReadableStreamDefaultController<Uint8Array>, release!: (value: Response) => void
+  const stale = new Promise<Response>(resolve => { release = resolve })
+  const adapter = new OpenCodeAdapter(() => { notifications++ }, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      stream = controller; init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session') return json({ data: [{ id: 's', time: { busy, idle } }], cursor: {} })
+    if (url.pathname === '/api/session/active') return ++activeCalls === 2 ? stale : json({ data: { s: { type: 'running' } } })
+    if (url.pathname.endsWith('/permission')) { calls.permissions++; return json({ data: busy === 300 ? [{ id: 'new-permission', sessionID: 's' }] : [] }) }
+    if (url.pathname.endsWith('/form')) { calls.forms++; return json({ data: [] }) }
+    if (url.pathname.endsWith('/message')) { calls.tools++; return json({ data: [], cursor: {} }) }
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', process.cwd())
+  try {
+    await adapter.connect('http://localhost:4096')
+    assert.equal((await adapter.sessions('p'))[0].activity, 'thinking')
+    assert.deepEqual(calls, { permissions: 1, forms: 1, tools: 1 })
+    const oldReconciliation = adapter.sessions('p')
+    await waitFor(() => activeCalls === 2)
+    const before = notifications
+    stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'session.execution.succeeded', created: 200, data: { sessionID: 's' } })}\n\n`))
+    await waitFor(() => notifications > before)
+    idle = 200
+    assert.equal((await adapter.sessions('p'))[0].status, 'idle')
+    busy = 300 // No session.execution.started SSE for this turn.
+    const second = (await adapter.sessions('p'))[0]
+    assert.equal(second.status, 'running')
+    assert.equal(second.activity, 'waiting')
+    assert.deepEqual(calls, { permissions: 2, forms: 2, tools: 2 })
+    release(json({ data: {} }))
+    await oldReconciliation
+    const current = (await adapter.sessions('p'))[0]
+    assert.equal(current.status, 'running', 'old active response cannot mark the new execution idle')
+    assert.equal(current.activity, 'waiting')
+    assert.deepEqual(calls, { permissions: 2, forms: 2, tools: 2 })
+  } finally { release(json({ data: {} })); adapter.dispose() }
+})
+
+test('persisted execution changes invalidate in-flight recovery before new snapshots arrive', async () => {
+  let busy = 100, activeCalls = 0, recoveries = 0
+  let releaseOld!: (value: Response) => void, releaseNew!: (value: Response) => void
+  const oldSnapshot = new Promise<Response>(resolve => { releaseOld = resolve })
+  const newActive = new Promise<Response>(resolve => { releaseNew = resolve })
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session') return json({ data: [{ id: 's', time: { busy } }], cursor: {} })
+    if (url.pathname === '/api/session/active') return ++activeCalls === 2 ? newActive : json({ data: { s: { type: 'running' } } })
+    if (url.pathname.endsWith('/permission') || url.pathname.endsWith('/form') || url.pathname.endsWith('/message')) {
+      recoveries++
+      if (busy === 100) return oldSnapshot
+      return json({ data: [], cursor: {} })
+    }
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', process.cwd())
+  try {
+    await adapter.connect('http://localhost:4096')
+    const oldRecovery = adapter.sessions('p')
+    await waitFor(() => recoveries === 3)
+    busy = 300
+    const newRecovery = adapter.sessions('p')
+    await waitFor(() => activeCalls === 2)
+    releaseOld(json({ data: [{ id: 'stale-prompt', sessionID: 's' }], cursor: {} }))
+    assert.equal((await oldRecovery)[0].activity, 'thinking', 'old prompts must be discarded before new recovery finishes')
+    releaseNew(json({ data: { s: { type: 'running' } } }))
+    assert.equal((await newRecovery)[0].activity, 'thinking')
+    assert.equal(recoveries, 6, 'stale snapshots must not mark new sections recovered')
+  } finally { releaseOld(json({ data: [], cursor: {} })); releaseNew(json({ data: {} })); adapter.dispose() }
+})
 
 test('sessions reconcile persisted running state with live executions and safely fall back', async t => {
   for (const scenario of ['zombie', 'running', '404', 'array', 'invalid-value', 'null', 'new-execution'] as const) await t.test(scenario, async () => {

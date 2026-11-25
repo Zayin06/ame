@@ -235,7 +235,8 @@ export class OpenCodeAdapter {
       if (cursor && cursors.has(cursor)) throw new Error('SESSION_CURSOR_REPEATED')
       if (cursor) cursors.add(cursor)
     } while (cursor)
-    const running = [...sessions.values()].filter(s => s.status === 'running')
+    // Detect persisted execution changes before capturing reconciliation/recovery checkpoints.
+    const running = [...sessions.values()].map(s => this.activity.map(s)).filter(s => s.status === 'running')
     if (running.length) {
       const current = new Map(running.map(s => [s.id, this.activity.executionCheckpoint(s.id)]))
       try {

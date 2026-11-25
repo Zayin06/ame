@@ -1,5 +1,23 @@
 import { activateTab, documentID, removeTab, tabID, type Buffer, type ProjectView, type Tab } from './state'
 
+export function resolveExactWorkspacePath(rawPath: string, projectDirectory?: string): string | null {
+  if (!rawPath || /[\u0000-\u001f\u007f]/.test(rawPath) || /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(rawPath) || /[\\/]$/.test(rawPath)) return null
+  const normalize = (path: string) => path.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/g, '')
+  let relative: string
+  if (/^[a-zA-Z]:[\\/]|^[\\/]/.test(rawPath)) {
+    if (!projectDirectory?.trim()) return null
+    const candidate = normalize(rawPath), root = normalize(projectDirectory.trim())
+    const windows = /^[a-zA-Z]:\//.test(candidate) || /^[a-zA-Z]:\//.test(root)
+    const compare = (path: string) => windows ? path.toLowerCase() : path
+    if (compare(candidate) === compare(root) || !compare(candidate).startsWith(`${compare(root)}/`)) return null
+    relative = candidate.slice(root.length + 1)
+  } else relative = rawPath.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/\/+/g, '/')
+  // Numeric line-like suffixes are literal filename text here, not navigation metadata.
+  if (!relative || relative === '.' || relative.startsWith('/') || relative.includes('\0') || relative.replace(/:[1-9]\d*(?:-[1-9]\d*)?$/, '').includes(':')) return null
+  if (relative.split('/').some(segment => !segment || segment === '.' || segment === '..' || segment.replace(/[. ]+$/, '').toLowerCase() === '.git')) return null
+  return relative
+}
+
 export function resolveWorkspaceFilePath(rawPath: string, projectDirectory?: string): { path: string; line?: number; endLine?: number } | null {
   const value = rawPath.trim()
   if (!value || /[\u0000-\u001f\u007f]/.test(rawPath) || /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(value)) return null
@@ -29,9 +47,9 @@ export function sanitizeProjectView(view: ProjectView, projectDirectory?: string
   const tabs: Tab[] = [], mapped = new Map<string, Tab>(), seen = new Set<string>()
   for (const tab of view.tabs) {
     if (tab.mode !== 'file' && tab.mode !== 'diff') continue
-    const file = resolveWorkspaceFilePath(tab.path, projectDirectory)
-    if (!file) continue
-    const resolved = { ...tab, path: file.path }
+    const path = resolveExactWorkspacePath(tab.path, projectDirectory)
+    if (!path) continue
+    const resolved = { ...tab, path }
     const key = tabID(resolved)
     mapped.set(tabID(tab), resolved)
     if (!seen.has(key)) { tabs.push(resolved); seen.add(key) }

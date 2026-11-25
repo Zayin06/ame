@@ -56,6 +56,9 @@ export class SessionActivity {
     if (state.busyAt !== undefined && (session.busyAt ?? -1) > Math.max(state.busyAt, state.idleAt ?? -1)) {
       state.tools.clear(); state.phase = 'thinking'; state.status = undefined; state.outcome = undefined
       state.permissions.clear(); state.forms.clear()
+      state.recovered.clear()
+      state.revisions.permissions++; state.revisions.forms++; state.revisions.tools++
+      state.executionRevision++
       state.busyAt = session.busyAt
     }
     state.busyAt ??= session.busyAt

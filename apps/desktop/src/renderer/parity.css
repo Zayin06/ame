@@ -46,6 +46,10 @@
 .commit-agent-modal .commit-agent-modal__apply { display: flex; flex-wrap: wrap; gap: 8px; min-width: 0; max-width: 100%; margin-top: 10px; padding: 8px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-elevated); }
 .commit-agent-modal .commit-agent-modal__apply button { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-color: var(--border-default); }
 .commit-agent-modal .commit-agent-modal__apply button:hover:not(:disabled) { border-color: var(--accent); }
+.commit-agent-modal :is(.commit-plan-approval, [data-testid="commit-plan-approval"]) { display: grid; gap: 10px; box-sizing: border-box; min-width: 0; max-width: 100%; margin: 14px 0; padding: 14px; border: 1px solid var(--accent-border, var(--border-default)); border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text-primary); overflow-wrap: anywhere; }
+.commit-agent-modal :is(.commit-plan-approval, [data-testid="commit-plan-approval"]) :is(h3, p) { margin: 0; line-height: 1.6; }
+.commit-agent-modal :is(.commit-plan-approval, [data-testid="commit-plan-approval"]) :is(pre, code) { min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.commit-agent-modal :is(.commit-plan-approval, [data-testid="commit-plan-approval"]) button { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .android-translate-trigger { white-space: nowrap; }
 @media (max-width: 720px) { .translation-presets__grid { grid-template-columns: minmax(0, 1fr); } .translation-modal__header, .translation-modal__metadata { padding-left: 14px; padding-right: 14px; } .translation-modal .chat-stream__inner { padding: 12px 14px; } .translation-modal .translation-composer { padding: 10px 14px; } }
 

@@ -27,11 +27,13 @@ import { z } from 'zod'
 import { rendererSource, isRendererDocument } from '../apps/desktop/src/main/renderer-source'
 import { replaceInWorkspace } from '../packages/ide-core/src/search'
 import { validateWorkspacePath } from '../packages/ide-core/src/workspace-fs'
-import type { BuildNotesRequest, DesktopApi } from '../packages/protocol/src/index'
+import { GIT_COMMIT_HASH_PATTERN, type BuildNotesRequest, type DesktopApi } from '../packages/protocol/src/index'
 import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
 import type { AmeKit } from '../packages/amekit/src/index'
-import { buildAndroidTranslationPrompt, createTranslationLockStore } from '../packages/amekit/src/android-translation'
-import { buildCommitAgentPrompt, createCommitAgentLockStore } from '../packages/amekit/src/commit-agent'
+import { canonicalWorkspaceScope, buildAndroidTranslationPrompt, createTranslationLockStore } from '../packages/amekit/src/android-translation'
+import { Workspaces } from '../packages/ide-core/src/workspace'
+import simpleGit from 'simple-git'
+import { buildCommitAgentPrompt, createCommitAgentLockStore, extractCommitSnapshotID, parseCommitAgentPlan, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH } from '../packages/amekit/src/commit-agent'
 
 type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
@@ -67,7 +69,9 @@ const examples: Invocation[] = [
   { method: 'gitStashList', args: ['p'] },
   { method: 'gitStashPush', args: ['p', 'work in progress', true] },
   { method: 'gitStashApply', args: ['p', 0, true] },
+  { method: 'gitStashApply', args: ['p', 0, false, 'a'.repeat(40)] },
   { method: 'gitStashDrop', args: ['p', 0] },
+  { method: 'gitStashDrop', args: ['p', 0, 'a'.repeat(40)] },
   { method: 'renameSession', args: ['p', 's', 'New title'] },
   { method: 'archiveSession', args: ['p', 's', true] },
   { method: 'deleteSession', args: ['p', 's'] },
@@ -119,6 +123,7 @@ const translationExamples: Invocation[] = [
 
 const commitAgentExamples: Invocation[] = [
   { method: 'commitAgentInfo', args: ['p'] },
+  { method: 'commitAgentSessionState', args: ['p'] },
   { method: 'commitAgentPrompt', args: ['p', undefined, 'Analyze changes', 'analyze'] },
   { method: 'commitAgentLock', args: ['p', 'commit-1'] }
 ]
@@ -177,7 +182,7 @@ async function harness(directory = 'workspace') {
   const resolved = [{ ok: true, kind: 'workspace-file', path: 'src/app.ts', name: 'app.ts' }]
   let preview = { filesChanged: 2, replacements: 3, previews: [] }
   const result = { filesChanged: 2, replacements: 3, previews: [] }
-  const workspace: Record<string, (...args: any[]) => any> = Object.fromEntries([...examples.map(({ method }) => method), 'stage', 'commit', 'remove'].map(method => [method, async (...args: unknown[]) => {
+  const workspace: Record<string, (...args: any[]) => any> = Object.fromEntries([...examples.map(({ method }) => method), 'stage', 'diff', 'commit', 'remove'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args })
     if (method === 'replaceInProject') return (args[1] as { dryRun?: boolean }).dryRun === true ? preview : result
     return method
@@ -206,8 +211,10 @@ async function harness(directory = 'workspace') {
   const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['forms', 'replyForm', 'cancelForm', 'sessionPermissionMode', 'updateSessionPermissionMode', 'renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt', 'cancel'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args })
     if (operationGate) await operationGate
+    if (method === 'prompt' && extractCommitSnapshotID(String(args[2]))) sessionMessages = [...sessionMessages, { id: randomUUID(), role: 'user', text: args[2] }]
     return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
   }]))
+  adapter.sessionPermissionMode = async (...args: unknown[]) => { calls.push({ method: 'sessionPermissionMode', args }); return 'readonly' }
   adapter.generateBuildNotes = async (...args: unknown[]) => {
     calls.push({ method: 'generateBuildNotes', args })
     if (operationGate) await operationGate
@@ -263,8 +270,20 @@ async function harness(directory = 'workspace') {
     sessionIDs: (project: string) => [...(commitSessions.get(project) ?? [])],
     lockedSessionIDs: (project: string) => [...(commitLocked.get(project) ?? [])]
   }
+  // In-memory fixtures expose the same directory-scoped API as the persistent stores.
+  for (const store of [translationLocks, commitAgentLocks]) {
+    for (const method of Object.keys(store)) {
+      const methods = store as Record<string, (...args: any[]) => any>
+      const original = methods[method]
+      methods[method] = (scope: string, ...args: any[]) => original(scope === 'p' ? canonicalWorkspaceScope(directory) : scope, ...args)
+    }
+  }
+  let permissions: unknown[] = [], forms: unknown[] = []
+  adapter.permissions = async (...args: unknown[]) => { calls.push({ method: 'permissions', args }); return permissions }
+  const originalForms = adapter.forms
+  adapter.forms = async (...args: unknown[]) => { await originalForms(...args); return forms }
   let detected = { isAndroid: true, stringsFiles: ['app/src/main/res/values/strings.xml'] }
-  let sessions = [{ id: 'translation-1', title: 'Translation' }]
+  let sessions: { id: string; title: string; status?: 'idle' | 'running' }[] = [{ id: 'translation-1', title: 'Translation' }]
   let sessionMessages: unknown[] = []
   let sessionModel: string | undefined
   adapter.agentMap = async (...args: unknown[]) => {
@@ -275,8 +294,9 @@ async function harness(directory = 'workspace') {
   adapter.sessions = async (...args: unknown[]) => { calls.push({ method: 'sessions', args }); return sessions }
   adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
-    z, URL, Buffer, process, randomUUID, window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
-    translationLocks, buildAndroidTranslationPrompt, commitAgentLocks, buildCommitAgentPrompt,
+    z, URL, Buffer, process, randomUUID, Error, GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
+    window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
+    translationLocks, buildAndroidTranslationPrompt, commitAgentLocks, buildCommitAgentPrompt, extractCommitSnapshotID, parseCommitAgentPlan, canonicalWorkspaceScope,
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
     detectAndroidProject: async (...args: unknown[]) => { calls.push({ method: 'detectAndroidProject', args }); return detected },
     pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
@@ -302,12 +322,14 @@ async function harness(directory = 'workspace') {
     } }
   }
   adapter.detach = (...args: unknown[]) => { calls.push({ method: 'detach', args }) }
-  const { dispatch, lspServices, debuggers } = runInNewContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\n({ dispatch, lspServices, debuggers })', context) as {
+  adapter.attach = (...args: unknown[]) => { calls.push({ method: 'attach', args }) }
+  const { call, dispatch, lspServices, debuggers } = runInNewContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\n({ call, dispatch, lspServices, debuggers })', context) as {
+    call: (method: string, args: unknown[]) => Promise<unknown>
     dispatch: (method: string, args: unknown[]) => Promise<unknown>
     lspServices: Map<string, any>; debuggers: Map<string, any>
   }
   return {
-    dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState, resolved,
+    call, dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState, resolved,
     setReplacement: (replace: (...args: any[]) => Promise<unknown>) => { workspace.replaceInProject = replace },
     onConfirm: (callback: () => Promise<void>) => { onConfirm = callback },
     setPicked: (value: typeof picked) => { picked = value },
@@ -324,6 +346,9 @@ async function harness(directory = 'workspace') {
     setSessionModel: (value: string) => { sessionModel = value },
     failInterrupt: () => { adapter.cancel = async () => { throw new Error('INTERRUPT_FAILED') } },
     setSessions: (value: typeof sessions) => { sessions = value },
+    setPending: (p: unknown[], f: unknown[]) => { permissions = p; forms = f },
+    setWorkspaceMethod: (method: string, handler: (...args: any[]) => any) => { workspace[method] = handler },
+    setAdapterMethod: (method: string, handler: (...args: any[]) => any) => { adapter[method] = handler },
     translationLocks,
     useLockStore: (store: ReturnType<typeof createTranslationLockStore>) => { context.translationLocks = store },
     commitAgentLocks,
@@ -522,6 +547,32 @@ async function appRenderer(overrides: Record<string, (...args: any[]) => any> = 
     tick: async (delay: number) => { for (const [id, timer] of [...timers]) if (timer.delay === delay) { timers.delete(id); timer.callback() }; await flushRendererPromises(); await settle() }
   }
 }
+
+test('App forwards Explorer and Git literal paths while Chat resolves file references', async () => {
+  const h = await appRenderer()
+  try {
+    h.calls.length = 0
+    for (const file of [' note.md', 'readme#L2']) {
+      h.props('Inspector').onOpen(file)
+      await h.settle()
+      assert.deepEqual(h.calls.filter(call => call.method === 'read').at(-1), { method: 'read', args: ['p', file] })
+      assert.equal(h.props('EditorStage').active.path, file)
+    }
+    h.props('Inspector').onOpenGitWorkspace()
+    await h.settle()
+    for (const file of [' note.md', 'readme#L2']) {
+      h.props('GitWorkspace').onDiff(file)
+      await h.settle()
+      assert.deepEqual(h.calls.filter(call => call.method === 'diff').at(-1), { method: 'diff', args: ['p', file, undefined] })
+    }
+    h.props('Chat').onOpenFile(' readme#L2 ')
+    await h.settle()
+    assert.deepEqual(h.calls.filter(call => call.method === 'read').at(-1), { method: 'read', args: ['p', 'readme'] })
+    const target = h.props('EditorStage').target
+    assert.deepEqual(plain({ path: target.path, line: target.line }), { path: 'readme', line: 2 })
+    assert.deepEqual(h.calls.filter(call => call.method === 'read').map(call => call.args[1]), [' note.md', 'readme#L2', 'readme'])
+  } finally { h.dispose() }
+})
 
 test('App New Chat rotates draft identity and ignores in-flight creation callbacks from the old draft', async () => {
   for (const phase of ['create', 'prompt']) {
@@ -1381,7 +1432,7 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
     { method: 'gitDeleteBranch', args: ['p', 'main', 'true'] },
     ...[{ setUpstream: 'true' }, { force: true }].map(options => ({ method: 'gitPush', args: ['p', options] })),
     ...[0, -1, 1.5, 201, Infinity, '40'].map(limit => ({ method: 'gitLog', args: ['p', limit] })),
-    ...['HEAD', '-abcdef0', 'abc', 'g'.repeat(40), 'a'.repeat(41)].map(hash => ({ method: 'gitCommitDetail', args: ['p', hash] })),
+    ...['HEAD', '-abcdef0', 'abc', 'g'.repeat(40), 'a'.repeat(65)].map(hash => ({ method: 'gitCommitDetail', args: ['p', hash] })),
     ...[-1, 1.5, 10001, Infinity, '0'].flatMap(index => [
       { method: 'gitStashApply', args: ['p', index] }, { method: 'gitStashDrop', args: ['p', index] }
     ]),
@@ -1423,7 +1474,9 @@ test('new IPC dispatch preserves arguments and optional defaults without stage o
     calls.length = 0
     const result = await dispatch(method, args)
     assert.deepEqual(plain(calls), [{ method, args }])
-    if (method !== 'replaceInProject') assert.equal(result, method)
+    if (method === 'forms') assert.deepEqual(result, [])
+    else if (method === 'sessionPermissionMode') assert.equal(result, 'readonly')
+    else if (method !== 'replaceInProject') assert.equal(result, method)
   }
   for (const [method, args] of [
     ['createFile', ['p', 'new.txt']], ['createBranch', ['p', 'feature']],
@@ -1482,7 +1535,7 @@ test('build notes IPC validates strict bounded requests before any service acces
   const invalid = [
     null, {}, { ...buildNotesRequest, mode: 'all' }, { mode: 'range' },
     { ...buildNotesRequest, includeWorking: 'true' }, { ...buildNotesRequest, extra: true },
-    ...['', 'abcdef', 'a'.repeat(41), 'ggggggg', 'HEAD', 'abcdef0\0', '--all'].flatMap(hash => [
+    ...['', 'abcdef', 'a'.repeat(65), 'ggggggg', 'HEAD', 'abcdef0\0', '--all'].flatMap(hash => [
       { ...buildNotesRequest, baseCommit: hash }, { ...buildNotesRequest, commitHashes: [hash] },
     ]),
     { ...buildNotesRequest, commitHashes: Array(51).fill('abcdef0') },
@@ -1508,6 +1561,48 @@ test('build notes IPC validates strict bounded requests before any service acces
     }
   }
   assert.deepEqual(h.messages, [])
+})
+
+test('Git and build notes IPC share SHA-256 hash validation and forward range and commits diff targets', async () => {
+  const h = await harness()
+  const invocations = (hash: string): Invocation[] => [
+    { method: 'gitCommitDetail', args: ['p', hash] },
+    ...[
+      { kind: 'commit', commit: hash, from: ' old.txt' },
+      { kind: 'range', baseCommit: hash, includeWorking: true, from: ' old.txt' },
+      { kind: 'commits', commits: [hash], includeWorking: false, from: ' old.txt' },
+    ].map(target => ({ method: 'diff', args: ['p', 'new.txt', target] })),
+    ...['buildNotesPreview', 'generateBuildNotes'].flatMap(method => [
+      { method, args: ['p', { mode: 'range', baseCommit: hash, includeWorking: false }] },
+      { method, args: ['p', { mode: 'commits', commitHashes: [hash], includeWorking: false }] },
+    ]),
+  ]
+  for (const hash of ['a'.repeat(64), 'ABCDEF01'.repeat(8)]) {
+    for (const { method, args } of invocations(hash)) {
+      await h.dispatch(method, args)
+      if (method === 'gitCommitDetail' || method === 'diff') assert.deepEqual(plain(h.calls.at(-1)), { method, args })
+      else assert.deepEqual(plain(h.calls.filter(call => call.method === 'buildNotesSummary').at(-1)!.args), ['p', args[1], 56_000])
+    }
+  }
+  h.calls.length = 0
+  for (const hash of ['a'.repeat(65), 'a'.repeat(128), 'g'.repeat(64), 'abcdef', 'HEAD', 'a'.repeat(63) + '\0']) {
+    for (const { method, args } of invocations(hash)) await assert.rejects(h.dispatch(method, args), `${method}: ${hash}`)
+  }
+  for (const target of [
+    { kind: 'range', baseCommit: 'abcdef0', extra: true },
+    { kind: 'range', baseCommit: 'abcdef0', includeWorking: 'true' },
+    { kind: 'commits', commits: [] },
+    { kind: 'commits', commits: Array(51).fill('abcdef0') },
+    { kind: 'commits', commits: ['abcdef0'], extra: true },
+  ]) await assert.rejects(h.dispatch('diff', ['p', 'new.txt', target]))
+  assert.deepEqual(h.calls, [])
+  for (const target of [
+    { kind: 'range', baseCommit: 'a'.repeat(64) },
+    { kind: 'commits', commits: Array(50).fill('a'.repeat(64)) },
+  ]) {
+    await h.dispatch('diff', ['p', 'new.txt', target])
+    assert.deepEqual(plain(h.calls.at(-1)), { method: 'diff', args: ['p', 'new.txt', target] })
+  }
 })
 
 test('build notes preview omits diff bytes and reports skill and active or fallback model metadata', async () => {
@@ -2017,11 +2112,449 @@ test('translation lock serializes after pending prompts and permanently rejects 
     await restarted.dispatch('prompt', ['p', 'main-chat', 'Normal chat', selectedModel])
     assert.equal(reloaded.isLocked('another-project', 'translation-1'), false)
     await restarted.dispatch('androidTranslationLock', ['p', 'translation-1'])
-    assert.deepEqual(reloaded.lockedSessionIDs('p'), ['translation-1'])
+    assert.deepEqual(reloaded.lockedSessionIDs(canonicalWorkspaceScope('workspace')), ['translation-1'])
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 const commitSkill = { name: 'git-commit', instructions: 'Inspect every diff before proposing commits.', directory: 'workspace/.opencode/skills/git-commit' }
+const approvedPlan = { planID: 'registered-in-test', scope: 'staged' as const, snapshot: { head: 'head', indexHash: 'index' }, commits: [{ message: 'feat: cập nhật', files: ['new.txt'] }] }
+const assistantPlan = (plan: { scope?: string; commits: typeof approvedPlan.commits } = approvedPlan) => ({ role: 'assistant', kind: 'text', text: '```commit-plan\n' + JSON.stringify({ scope: plan.scope, commits: plan.commits }) + '\n```' })
+function approveTurn(h: Awaited<ReturnType<typeof harness>>, planID: string) {
+  const prompt = h.calls.filter(call => call.method === 'prompt' && extractCommitSnapshotID(String(call.args[2])) === planID).at(-1)!
+  h.setSessionMessages([{ id: `user-${planID}`, role: 'user', text: prompt.args[2] }, assistantPlan()])
+}
+async function registerPlan(h: Awaited<ReturnType<typeof harness>>, sessionID = 'commit-1') {
+  h.setSessions([{ id: sessionID, title: 'Commit', status: 'idle' }])
+  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
+  const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
+  approveTurn(h, result.planID)
+  return { ...approvedPlan, planID: result.planID }
+}
+
+test('stage and every diff target forward rename origins and reject malformed origin paths', async () => {
+  const h = await harness()
+  for (const staged of [true, false]) {
+    await h.dispatch('stage', ['p', 'new.txt', staged, 'old.txt'])
+    assert.deepEqual(plain(h.calls.pop()), { method: 'stage', args: ['p', 'new.txt', staged, 'old.txt'] })
+  }
+  for (const target of [{ kind: 'staged' }, { kind: 'working' }, { kind: 'commit', commit: 'abcdef0' }]) {
+    await h.dispatch('diff', ['p', 'new.txt', { ...target, from: 'old.txt' }])
+    assert.deepEqual(plain(h.calls.pop()), { method: 'diff', args: ['p', 'new.txt', { ...target, from: 'old.txt' }] })
+    for (const from of ['', 'bad\0path', 'x'.repeat(4097), null, 42]) await assert.rejects(h.dispatch('diff', ['p', 'new.txt', { ...target, from }]))
+  }
+  for (const from of ['', 'bad\0path', 'x'.repeat(4097), null, 42]) await assert.rejects(h.dispatch('stage', ['p', 'new.txt', true, from]))
+  assert.equal(h.calls.length, 0)
+})
+
+const commitSnapshot = () => ({ ...approvedPlan.snapshot, branchRef: 'refs/heads/main', workingHash: 'working', fingerprint: 'fingerprint-1', stagedFiles: ['new.txt'], workingFiles: ['untracked.txt'], untrackedHashes: { 'untracked.txt': 'hash' }, scope: 'staged' as const, stat: 'new.txt | 1 +', diffPreview: '+snapshot-only', truncated: false })
+
+test('commit planning creates readonly sessions and includes backend snapshot only in planning prompts', async () => {
+  const h = await harness()
+  const snapshot = commitSnapshot()
+  h.setWorkspaceMethod('commitPlanSnapshot', async id => { assert.equal(id, 'p'); return snapshot })
+  h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
+  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).snapshot, undefined)
+  await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
+  assert.deepEqual(plain(h.calls.find(call => call.method === 'createSession')), { method: 'createSession', args: ['p', 'readonly'] })
+  assert.match(String(h.calls.find(call => call.method === 'prompt')!.args[2]), /\+snapshot-only/)
+})
+
+test('commit lock and execution reject missing/running sessions or pending approvals without writing locks or cancelling', async () => {
+  for (const method of ['commitAgentLock', 'commitAgentExecutePlan']) {
+    for (const state of ['missing', 'running', 'permission', 'form', 'idle']) {
+      const h = await harness()
+      const plan = await registerPlan(h)
+      h.calls.length = 0
+      await h.commitAgentLocks.recordSession('p', 'commit-1')
+      h.setSessions(state === 'missing' ? [] : [{ id: 'commit-1', title: 'Commit', status: state === 'running' ? 'running' : 'idle' }])
+      h.setPending(state === 'permission' ? [{}] : [], state === 'form' ? [{}] : [])
+      let executions = 0
+      const result = { commits: [{ hash: 'abc', subject: 'feat: cập nhật', files: ['new.txt'] }] }
+      h.setWorkspaceMethod('executeCommitPlan', async (id, actual) => { executions++; assert.equal(id, 'p'); assert.equal(actual.planID, plan.planID); assert.deepEqual(plain(actual.commits), approvedPlan.commits); return result })
+      const args = method === 'commitAgentLock' ? ['p', 'commit-1'] : ['p', 'commit-1', plan]
+      if (state === 'idle') {
+        const actual = await h.dispatch(method, args)
+        assert.deepEqual(plain(actual), method === 'commitAgentLock' ? { commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'] } : result)
+      } else await assert.rejects(h.dispatch(method, args), state === 'missing' || state === 'running' ? /COMMIT_AGENT_SESSION_RUNNING/ : /COMMIT_AGENT_SESSION_PENDING_APPROVAL/)
+      assert.equal(h.commitAgentLocks.isLocked('p', 'commit-1'), state === 'idle' && method === 'commitAgentLock')
+      assert.equal(executions, state === 'idle' && method === 'commitAgentExecutePlan' ? 1 : 0)
+      for (const check of ['sessions', 'permissions', 'forms']) assert.ok(h.calls.some(call => call.method === check), check)
+      assert.equal(h.calls.some(call => call.method === 'cancel'), false)
+      assert.equal(h.calls.some(call => call.method === 'ame:event'), state === 'idle' && method === 'commitAgentLock')
+    }
+  }
+})
+
+test('commit plan IDs bind immutable backend snapshots, supersede old plans and reject foreign ownership', async () => {
+  const h = await harness(), snapshot = commitSnapshot()
+  h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
+  h.setWorkspaceMethod('commitPlanSnapshot', async () => snapshot)
+  const first = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
+  assert.match(first.planID, /^[a-f0-9-]{36}$/)
+  assert.equal(Object.isFrozen(first.snapshot), true)
+  assert.equal(Object.isFrozen(first.snapshot.stagedFiles), true)
+  assert.equal(Object.isFrozen(first.snapshot.untrackedHashes), true)
+  for (const key of ['stat', 'diffPreview', 'truncated']) assert.equal(key in first.snapshot, false)
+  snapshot.stagedFiles.push('injected.ts'); snapshot.untrackedHashes['untracked.txt'] = 'mutated'
+  assert.deepEqual(plain(first.snapshot.stagedFiles), ['new.txt'])
+  assert.equal(first.snapshot.untrackedHashes['untracked.txt'], 'hash')
+  const second = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any
+  approveTurn(h, second.planID)
+  let executions = 0
+  h.setWorkspaceMethod('executeCommitPlan', async (_id, plan) => {
+    executions++
+    assert.equal(plan.snapshot, second.snapshot)
+    return { commits: [] }
+  })
+  const info = await h.dispatch('commitAgentInfo', ['p']) as any
+  assert.equal(info.plans[first.planID].status, 'superseded')
+  for (const planID of [first.planID, 'unknown']) await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID }]), /COMMIT_PLAN_STALE/)
+  await h.commitAgentLocks.recordSession('p', 'foreign')
+  h.setSessions([{ id: 'foreign', title: 'Foreign' }])
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'foreign', { ...approvedPlan, planID: second.planID }]), /COMMIT_PLAN_STALE/)
+  h.setProjectDirectory('q', 'other')
+  await h.commitAgentLocks.recordSession(canonicalWorkspaceScope('other'), 'foreign')
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['q', 'foreign', { ...approvedPlan, planID: second.planID }]), /COMMIT_PLAN_STALE/)
+  assert.deepEqual(plain((await h.dispatch('commitAgentInfo', ['q']) as any).plans), {})
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: second.planID, snapshot: { head: 'forged', indexHash: 'forged' } }])
+  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[second.planID].status, 'executed')
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: second.planID }]), /COMMIT_PLAN_STALE/)
+  assert.equal(executions, 1)
+})
+
+test('stale commit plan IDs remain invalid even with a replacement renderer snapshot', async () => {
+  const h = await harness()
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
+  const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
+  approveTurn(h, result.planID)
+  let executions = 0
+  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; throw new Error('COMMIT_PLAN_STALE: changed') })
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: result.planID }]), /COMMIT_PLAN_STALE/)
+  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[result.planID].status, 'stale')
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: result.planID, snapshot: { head: 'fresh', indexHash: 'fresh' } }]), /COMMIT_PLAN_STALE/)
+  assert.equal(executions, 1)
+})
+
+test('commit plan history retains only the latest 100 records and evicted IDs cannot execute', async () => {
+  const h = await harness()
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
+  const first = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
+  let latest = first
+  for (let i = 0; i < 100; i++) latest = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue'])
+  const { plans } = await h.dispatch('commitAgentInfo', ['p']) as any
+  assert.equal(Object.keys(plans).length, 100)
+  assert.equal(plans[first.planID], undefined)
+  assert.equal(plans[latest.planID].status, 'active')
+  assert.equal(Object.values(plans).filter((plan: any) => plan.status === 'superseded').length, 99)
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: first.planID }]), /COMMIT_PLAN_STALE/)
+})
+
+test('commit execution requires a plan ID and the exact authoritative assistant plan for its turn', async () => {
+  const h = await harness(), plan = await registerPlan(h)
+  let executions = 0
+  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
+  const { planID: _omitted, ...missingID } = plan
+  h.calls.length = 0
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', missingID]))
+  assert.deepEqual(h.calls, [])
+  for (const modified of [
+    { ...plan, scope: 'working' },
+    { ...plan, commits: [{ ...plan.commits[0], message: 'forged' }] },
+    { ...plan, commits: [{ ...plan.commits[0], files: ['forged.txt'] }] },
+    { ...plan, commits: [...plan.commits, ...plan.commits] },
+  ]) await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', modified]), /COMMIT_PLAN_MISMATCH/)
+  const user = { role: 'user', text: `[Commit snapshot: ${plan.planID}]` }
+  for (const messages of [[], [user], [user, { ...assistantPlan(), kind: 'reasoning' }], [user, { role: 'user', text: 'next turn' }, assistantPlan()]]) {
+    h.setSessionMessages(messages)
+    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_UNVERIFIED/)
+  }
+  assert.equal(executions, 0)
+  h.setSessionMessages([user, assistantPlan({ commits: [{ message: 'outdated', files: ['old.txt'] }] }), assistantPlan({ commits: plan.commits }), { role: 'assistant', text: 'not a plan' }])
+  await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan])
+  assert.equal(executions, 1)
+})
+
+test('concurrent commit execution rejects an executing plan without a second workspace call', async () => {
+  const h = await harness(), plan = await registerPlan(h)
+  let release!: () => void, started!: () => void, executions = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const ready = new Promise<void>(resolve => { started = resolve })
+  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; started(); await gate; return { commits: [] } })
+  // Exercise the handler directly; dispatch additionally serializes authority operations.
+  const first = h.call('commitAgentExecutePlan', ['p', 'commit-1', plan])
+  await ready
+  try {
+    assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[plan.planID].status, 'executing')
+    await assert.rejects(h.call('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_STALE/)
+    assert.equal(executions, 1)
+  } finally { release(); await first }
+})
+
+test('failed planning preserves executable active plans unless the computed snapshot drifted', async () => {
+  for (const state of ['unchanged', 'absent', 'drifted']) {
+    const h = await harness(), plan = await registerPlan(h)
+    h.setWorkspaceMethod('commitPlanSnapshot', async () => state === 'absent' ? undefined : { ...commitSnapshot(), fingerprint: state === 'drifted' ? 'changed' : 'fingerprint-1' })
+    h.setAdapterMethod('prompt', async () => { throw new Error('PROMPT_FAILED') })
+    await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /PROMPT_FAILED/)
+    const info = await h.dispatch('commitAgentInfo', ['p']) as any
+    assert.deepEqual(Object.keys(info.plans), [plan.planID])
+    assert.equal(info.plans[plan.planID].status, state === 'drifted' ? 'stale' : 'active')
+    let executions = 0
+    h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
+    if (state === 'drifted') await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_STALE/)
+    else await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan])
+    assert.equal(executions, state === 'drifted' ? 0 : 1)
+  }
+})
+
+test('messagePlanIDs binds user requests containing nested User request markers and executes by message ID', async () => {
+  const h = await harness()
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
+  let user: any
+  h.setAdapterMethod('prompt', async (_project, _session, text) => {
+    user = { id: 'nested-request', role: 'user', text }
+    h.setSessionMessages([user, assistantPlan()])
+  })
+  const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze\n\nUser request:\nexample']) as any
+  assert.ok(user.text.includes('\n\nUser request:\nexample'))
+  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).messagePlanIDs[user.id], result.planID)
+  h.setWorkspaceMethod('executeCommitPlan', async () => ({ commits: [] }))
+  await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: result.planID }])
+})
+
+test('execution errors invalidate unsafe plans and restore active plans after retryable failures without partial commits', async () => {
+  for (const error of [new Error('temporary'), new Error('COMMIT_PLAN_ABORTED'), new Error('COMMIT_PLAN_HOOK_MODIFIED_TREE'), Object.assign(new Error('temporary'), { commits: { length: 1 } }), Object.assign(new Error('temporary'), { commits: [] })]) {
+    const h = await harness(), plan = await registerPlan(h)
+    h.setWorkspaceMethod('executeCommitPlan', async () => { throw error })
+    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), error)
+    assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[plan.planID].status, error.message === 'temporary' ? 'active' : 'stale')
+  }
+})
+
+test('commit execution returns partial results and makes the plan stale with explicit or fallback failure metadata', async () => {
+  const commits = [{ hash: 'a'.repeat(64), subject: 'feat: first group', files: ['new.txt'] }]
+  const failures = [
+    Object.assign(new Error('hook changed tree'), { commits, code: 'COMMIT_PLAN_HOOK_MODIFIED_TREE', failedGroupIndex: 2, failedSubject: 'feat: next group' }),
+    Object.assign(new Error('partial failure'), { commits, code: 42, failedGroupIndex: 'bad', failedSubject: null }),
+    { commits, toString: () => 'non-Error failure' },
+  ]
+  for (const error of failures) {
+    const h = await harness(), plan = await registerPlan(h)
+    let executions = 0
+    h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; throw error })
+    const result = await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan])
+    assert.deepEqual(plain(result), {
+      commits,
+      partialFailure: error === failures[0]
+        ? { code: 'COMMIT_PLAN_HOOK_MODIFIED_TREE', message: 'hook changed tree', failedGroupIndex: 2, failedSubject: 'feat: next group' }
+        : { code: 'COMMIT_PLAN_ABORTED', message: error instanceof Error ? error.message : String(error), failedGroupIndex: 1, failedSubject: '' },
+    })
+    assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[plan.planID].status, 'stale')
+    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_STALE/)
+    assert.equal(executions, 1)
+  }
+})
+
+test('commit planning without a permission getter requires a confirmed readonly update, including new sessions', async () => {
+  for (const confirmed of [true, false]) {
+    const h = await harness()
+    h.setAdapterMethod('sessionPermissionMode', undefined as any)
+    h.setAdapterMethod('updateSessionPermissionMode', async () => confirmed ? 'readonly' : 'default')
+    if (confirmed) await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
+    else await assert.rejects(h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']), /COMMIT_AGENT_READONLY_REQUIRED/)
+    assert.equal(h.calls.some(call => call.method === 'prompt'), confirmed)
+  }
+})
+
+test('every commit planning turn upgrades legacy default permissions and fails closed on failed confirmation', async () => {
+  for (const failure of ['none', 'throws', 'wrong', 'unconfirmed', 'read-fails']) {
+    const h = await harness(), order: string[] = []
+    await h.commitAgentLocks.recordSession('p', 'commit-1')
+    h.setSessions([{ id: 'commit-1', title: 'Legacy Commit' }])
+    h.setSessionModel('server-model'); h.setSessionMessages([{}])
+    let mode = 'default'
+    h.setAdapterMethod('sessionPermissionMode', async () => { order.push(`read:${mode}`); if (failure === 'read-fails') throw new Error('offline'); return mode })
+    h.setAdapterMethod('updateSessionPermissionMode', async (project, session, next) => {
+      assert.deepEqual([project, session, next], ['p', 'commit-1', 'readonly']); order.push('update')
+      if (failure === 'throws') throw new Error('denied')
+      if (failure !== 'wrong' && failure !== 'unconfirmed') mode = next
+      return failure === 'wrong' ? 'default' : 'readonly'
+    })
+    h.setAdapterMethod('prompt', async () => { assert.equal(mode, 'readonly'); order.push('prompt') })
+    if (failure === 'none') {
+      await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue'])
+      assert.deepEqual(order, ['read:default', 'update', 'read:readonly', 'prompt'])
+      mode = 'default'; order.length = 0
+      await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue again'])
+      assert.deepEqual(order, ['read:default', 'update', 'read:readonly', 'prompt'])
+    } else {
+      await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /COMMIT_AGENT_READONLY_REQUIRED/)
+      assert.equal(order.includes('prompt'), false)
+    }
+  }
+})
+
+test('commit planning refreshes diff on fingerprint changes and explicit replans, prioritizing mentioned scoped files', async () => {
+  const h = await harness()
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  let snapshot = commitSnapshot()
+  const reads: unknown[][] = []
+  h.setWorkspaceMethod('commitPlanSnapshot', async (...args) => { reads.push(args); return snapshot })
+  await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
+  h.setSessionMessages([{}])
+  await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue'])
+  assert.doesNotMatch(String(h.calls.filter(call => call.method === 'prompt').at(-1)!.args[2]), /Backend snapshot/)
+  for (const request of ['Review staged.ts', 'lập lại kế hoạch']) {
+    snapshot = { ...snapshot, fingerprint: request.startsWith('Review') ? 'fingerprint-2' : snapshot.fingerprint, diffPreview: `+latest ${request}` }
+    await h.dispatch('commitAgentPrompt', ['p', 'commit-1', request])
+    const prompt = String(h.calls.filter(call => call.method === 'prompt').at(-1)!.args[2])
+    assert.match(prompt, /Backend snapshot/); assert.ok(prompt.includes(snapshot.diffPreview))
+    assert.deepEqual(plain(reads.at(-1)), ['p', 48_000, { includeDiff: true, focusFiles: request.startsWith('Review') ? ['staged.ts'] : [] }])
+  }
+})
+
+test('commit session state performs no Git or snapshot reads and info never reads full diffs', async () => {
+  const h = await harness()
+  await h.commitAgentLocks.recordSession('p', 'commit-1'); await h.commitAgentLocks.lockSession('p', 'commit-1')
+  h.setWorkspaceMethod('status', async () => { throw new Error('UNEXPECTED_GIT') })
+  h.setWorkspaceMethod('commitPlanSnapshot', async () => { throw new Error('UNEXPECTED_SNAPSHOT') })
+  assert.deepEqual(plain(await h.dispatch('commitAgentSessionState', ['p'])), { commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'] })
+  assert.deepEqual(h.calls, [])
+  h.setWorkspaceMethod('status', async () => ({ branch: 'main', changes: [] }))
+  assert.deepEqual(plain((await h.dispatch('commitAgentInfo', ['p']) as any).plans), {})
+})
+
+test('commit execution rejects foreign/locked sessions and serializes with authority operations', async () => {
+  const h = await harness()
+  h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
+  let executions = 0
+  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'foreign', approvedPlan]), /COMMIT_AGENT_SESSION_REQUIRED/)
+  await h.commitAgentLocks.recordSession('p', 'commit-1')
+  await h.commitAgentLocks.lockSession('p', 'commit-1')
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', approvedPlan]), /COMMIT_AGENT_SESSION_LOCKED/)
+  await h.commitAgentLocks.recordSession('p', 'commit-2')
+  h.setSessions([{ id: 'commit-2', title: 'Commit', status: 'idle' }])
+  const plan = await registerPlan(h, 'commit-2')
+  h.calls.length = 0
+  let release!: () => void
+  h.gatePolicy(new Promise<void>(resolve => { release = resolve }))
+  const policy = h.dispatch('account', ['refresh', {}])
+  await new Promise(resolve => setImmediate(resolve))
+  const execute = h.dispatch('commitAgentExecutePlan', ['p', 'commit-2', plan])
+  const lock = h.dispatch('commitAgentLock', ['p', 'commit-2'])
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(executions, 0)
+  assert.equal(h.calls.some(call => call.method === 'sessions'), false)
+  release(); await policy; await execute; await lock
+  assert.equal(executions, 1)
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-2', approvedPlan]), /COMMIT_AGENT_SESSION_LOCKED/)
+})
+
+test('commit execution rejects a 201-file group at the schema before workspace execution', async () => {
+  const h = await harness(), plan = await registerPlan(h)
+  let executions = 0
+  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
+  h.calls.length = 0
+  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', {
+    ...plan, commits: [{ ...plan.commits[0], files: Array.from({ length: 201 }, (_, index) => `file-${index}.txt`) }],
+  }]), (error: any) => error.issues?.some((issue: any) => issue.code === 'too_big' && issue.path.join('.') === '2.commits.0.files'))
+  assert.equal(executions, 0)
+  assert.deepEqual(h.calls, [])
+})
+
+test('commit execute plan validates bounded strict payloads before any side effects', async () => {
+  const h = await harness()
+  const group = approvedPlan.commits[0]
+  const invalid = [
+    null, {}, { ...approvedPlan, extra: true }, { ...approvedPlan, scope: 'all' },
+    ...['', ' ', 'bad\0id', 'x'.repeat(513)].flatMap(value => [
+      { ...approvedPlan, snapshot: { head: value, indexHash: 'index' } },
+      { ...approvedPlan, snapshot: { head: 'head', indexHash: value } },
+      { ...approvedPlan, snapshot: { ...approvedPlan.snapshot, workingHash: value } }
+    ]),
+    { ...approvedPlan, snapshot: { ...approvedPlan.snapshot, extra: true } },
+    ...[[], Array(31).fill(group), [{ ...group, extra: true }],
+      ...['', ' ', 'bad\0message', 'x'.repeat(10001)].map(message => [{ ...group, message }]),
+      ...[[], Array(201).fill('new.txt'), [''], ['bad\0path'], ['x'.repeat(4097)]].map(files => [{ ...group, files }])
+    ].map(commits => ({ ...approvedPlan, commits }))
+  ]
+  for (const plan of invalid) await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 's', plan]))
+  for (const args of [[], ['p', 's'], ['p', 's', approvedPlan, 'extra'], ['', 's', approvedPlan], ['p', 'bad\0id', approvedPlan]]) await assert.rejects(h.dispatch('commitAgentExecutePlan', args))
+  assert.deepEqual(h.calls, [])
+})
+
+test('IPC execution rejects a stale real Git index then commits an approved fresh snapshot', async () => {
+  const root = await mkdtemp(path.join(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'commit-stale-ipc-'))
+  const workspace = new Workspaces(path.join(root, 'projects.json'), () => {})
+  try {
+    const directory = path.join(root, 'repo'); await mkdir(directory)
+    const git = simpleGit(directory)
+    await git.init(); await git.addConfig('user.name', 'IPC Test'); await git.addConfig('user.email', 'ipc@example.test')
+    await writeFile(path.join(directory, 'new.txt'), 'initial\n'); await git.add('new.txt'); await git.commit('initial')
+    await writeFile(path.join(directory, 'new.txt'), 'first change\n'); await git.add('new.txt')
+    const project = await workspace.add(directory)
+    const head = await git.revparse(['HEAD'])
+    const h = await harness(directory)
+    await h.commitAgentLocks.recordSession('p', 'commit-1')
+    h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
+    h.setWorkspaceMethod('commitPlanSnapshot', () => workspace.commitPlanSnapshot(project.id))
+    const first = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
+    approveTurn(h, first.planID)
+    await writeFile(path.join(directory, 'new.txt'), 'changed index\n'); await git.add('new.txt')
+    h.setWorkspaceMethod('executeCommitPlan', (_id, plan) => workspace.executeCommitPlan(project.id, plan))
+    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: first.planID }]), /COMMIT_PLAN_STALE/)
+    assert.equal(await git.revparse(['HEAD']), head)
+    assert.equal(await git.show([':new.txt']), 'changed index\n')
+    const fresh = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Refresh']) as any
+    approveTurn(h, fresh.planID)
+    const result = await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', {
+      ...approvedPlan, planID: fresh.planID
+    }]) as any
+    assert.equal(result.commits.length, 1)
+    assert.equal(result.commits[0].subject, approvedPlan.commits[0].message)
+    assert.equal(await git.revparse([result.commits[0].hash]), await git.revparse(['HEAD']))
+    assert.equal((await git.status()).isClean(), true)
+  } finally { await workspace.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('directory-scoped special sessions and permanent locks survive removal, re-add and legacy migration for both features', async () => {
+  const root = await mkdtemp(path.join(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'scope-ipc-'))
+  try {
+    for (const legacy of [false, true]) {
+      const directory = path.join(root, 'repo'), scope = canonicalWorkspaceScope(directory)
+      const translationFile = path.join(root, `translation-${legacy}.json`), commitFile = path.join(root, `commit-${legacy}.json`)
+      const translations = createTranslationLockStore(translationFile), commits = createCommitAgentLockStore(commitFile)
+      await translations.load(); await commits.load()
+      const key = legacy ? 'p' : scope
+      await translations.recordSession(key, 'translation-1'); await translations.recordSession(key, 'translation-open'); await translations.lockSession(key, 'translation-1')
+      await commits.recordSession(key, 'commit-1'); await commits.recordSession(key, 'commit-open'); await commits.lockSession(key, 'commit-1')
+      const h = await harness(directory); h.useLockStore(translations); h.useCommitLockStore(commits)
+      assert.deepEqual(plain((await h.dispatch('commitAgentInfo', ['p']) as any).commitSessionIDs), ['commit-1', 'commit-open'])
+      assert.deepEqual(plain((await h.dispatch('androidTranslationInfo', ['p']) as any).translationSessionIDs), ['translation-1', 'translation-open'])
+      await h.dispatch('removeProject', ['p'])
+      h.setWorkspaceMethod('add', async () => ({ id: 'new-project', directory }))
+      h.setWorkspaceMethod('get', id => { if (id !== 'new-project') throw new Error('UNKNOWN_PROJECT'); return { id, directory } })
+      h.setWorkspaceMethod('list', () => [])
+      h.setPicked({ canceled: false, filePaths: [directory] })
+      assert.equal((await h.dispatch('pickProject', []) as any).id, 'new-project')
+      const reloadedTranslations = createTranslationLockStore(translationFile), reloadedCommits = createCommitAgentLockStore(commitFile)
+      await reloadedTranslations.load(); await reloadedCommits.load()
+      h.useLockStore(reloadedTranslations); h.useCommitLockStore(reloadedCommits)
+      const commitInfo = await h.dispatch('commitAgentInfo', ['new-project']) as any
+      const translationInfo = await h.dispatch('androidTranslationInfo', ['new-project']) as any
+      assert.deepEqual(plain(commitInfo.commitSessionIDs), ['commit-1', 'commit-open']); assert.deepEqual(plain(commitInfo.lockedSessionIDs), ['commit-1'])
+      assert.deepEqual(plain(translationInfo.translationSessionIDs), ['translation-1', 'translation-open']); assert.deepEqual(plain(translationInfo.lockedSessionIDs), ['translation-1'])
+      for (const [session, error] of [['commit-1', /COMMIT_AGENT_SESSION_LOCKED/], ['commit-open', /COMMIT_AGENT_SESSION_REQUIRED/], ['translation-1', /TRANSLATION_SESSION_LOCKED/], ['translation-open', /ANDROID_TRANSLATION_SESSION_REQUIRED/]] as const) await assert.rejects(h.dispatch('prompt', ['new-project', session, 'Code', selectedModel]), error)
+      assert.deepEqual(reloadedCommits.sessionIDs('p'), []); assert.deepEqual(reloadedTranslations.translationSessionIDs('p'), [])
+      if (legacy) for (const file of [translationFile, commitFile]) assert.equal(Object.hasOwn(JSON.parse(await readFile(file, 'utf8')).sessions, 'p'), false)
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 
 test('commit agent info reports feature policy, Git counts and independent lock state with a usable default skill', async () => {
   const h = await harness()
@@ -2032,7 +2565,7 @@ test('commit agent info reports feature policy, Git counts and independent lock 
   assert.deepEqual(plain(await h.dispatch('commitAgentInfo', ['p'])), {
     configured: true, skill: 'git-commit', configuredModelID: 'feature', effectiveModelID: 'feature', effectiveModelName: 'Feature',
     fallbackToDefault: false, branch: 'feature/commit', stagedCount: 2, workingCount: 3,
-    commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1']
+    commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'], plans: {}, messagePlanIDs: {}
   })
   h.setCommitEnhanceFeatureReader(async () => ({ skill: null, rawSkillName: 'missing-skill', model: 'inactive' }))
   const fallback = await h.dispatch('commitAgentInfo', ['p']) as any
@@ -2131,7 +2664,7 @@ test('commit agent preserves legacy verified skill instructions without guessing
   assert.equal((h.calls.filter(call => call.method === 'prompt').at(-1)!.args[3] as any).modelID, 'changed')
 })
 
-test('commit agent lock queues after prompts, persists across restart, cancels generation and notifies even on cancel failure', async () => {
+test('commit agent lock queues after prompts, persists across restart and never cancels generation', async () => {
   const root = await mkdtemp(path.join(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'commit-ipc-'))
   try {
     const file = path.join(root, 'commit-agent-locks.json')
@@ -2147,7 +2680,7 @@ test('commit agent lock queues after prompts, persists across restart, cancels g
     assert.equal(store.isLocked('p', 'commit-1'), false)
     release(); await pending
     assert.deepEqual(plain(await lock), { commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'] })
-    assert.deepEqual(plain(h.calls.filter(call => call.method === 'cancel')), [{ method: 'cancel', args: ['p', 'commit-1'] }])
+    assert.deepEqual(plain(h.calls.filter(call => call.method === 'cancel')), [])
     assert.deepEqual(plain(h.calls.at(-1)), { method: 'ame:event', args: [{ type: 'opencode', projectID: 'p', sessionID: 'commit-1' }] })
     const reloaded = createCommitAgentLockStore(file); await reloaded.load()
     const restarted = await harness(); restarted.useCommitLockStore(reloaded)
@@ -2155,8 +2688,9 @@ test('commit agent lock queues after prompts, persists across restart, cancels g
     await assert.rejects(restarted.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /COMMIT_AGENT_SESSION_LOCKED/)
     await restarted.dispatch('prompt', ['p', 'main-chat', 'Code', selectedModel])
     restarted.failInterrupt()
-    await assert.rejects(restarted.dispatch('commitAgentLock', ['p', 'commit-1']), /INTERRUPT_FAILED/)
-    assert.equal(reloaded.isLocked('p', 'commit-1'), true)
+    restarted.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
+    await restarted.dispatch('commitAgentLock', ['p', 'commit-1'])
+    assert.equal(reloaded.isLocked(canonicalWorkspaceScope('workspace'), 'commit-1'), true)
     assert.equal(reloaded.isSession('q', 'commit-1'), false)
     assert.deepEqual(plain(restarted.calls.at(-1)), { method: 'ame:event', args: [{ type: 'opencode', projectID: 'p', sessionID: 'commit-1' }] })
   } finally { await rm(root, { recursive: true, force: true }) }
@@ -2400,6 +2934,10 @@ test('preload forwards all new methods, optional arguments, return values and re
   assert.ok(api)
   const methods = api as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
   for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples, ...commitAgentExamples, ...buildNotesExamples,
+    { method: 'stage', args: ['p', 'new.txt', true] },
+    { method: 'stage', args: ['p', 'new.txt', false, 'old.txt'] },
+    { method: 'diff', args: ['p', 'new.txt', { kind: 'staged', from: 'old.txt' }] },
+    { method: 'commitAgentExecutePlan', args: ['p', 'commit-1', approvedPlan] },
     { method: 'openExternal', args: ['https://example.com/answer'] },
     { method: 'confirmProjectRemoval', args: ['p', ['visible.txt', 'hidden.txt']] },
     { method: 'removeProject', args: ['p'] },

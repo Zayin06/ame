@@ -7,6 +7,13 @@ const skippedDirectories = new Set([".git", "node_modules", "build", ".gradle", 
 const androidMarkers = new Set(["AndroidManifest.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"])
 const samePath = (a: string, b: string) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
 
+/** Stable across project removal/re-addition; does not require the workspace to exist. */
+export function canonicalWorkspaceScope(directory: string): string {
+  const resolved = path.resolve(directory), root = path.parse(resolved).root
+  const normalized = resolved.length > root.length ? resolved.replace(process.platform === "win32" ? /[\\/]+$/ : /\/+$/, "") : resolved
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
 export async function detectAndroidProject(projectDir: string, signal?: AbortSignal): Promise<{ isAndroid: boolean; stringsFiles: string[] }> {
   signal?.throwIfAborted()
   await safeDirectory(projectDir)
@@ -106,12 +113,24 @@ export function createTranslationLockStore(filePath: string) {
       data = next
     } finally { await rm(temporary, { force: true }) }
   }
-  const add = (kind: "sessions" | "locked", projectID: string, sessionID: string) => enqueue(async () => {
-    checkLoaded(); checkIDs(projectID, sessionID)
-    if (data[kind][projectID]?.includes(sessionID)) return
+  const mergedIDs = (kind: "sessions" | "locked", scope: string, legacyScope?: string) => {
+    checkLoaded()
+    return [...new Set([...(data[kind][scope] ?? []), ...(legacyScope && legacyScope !== scope ? data[kind][legacyScope] ?? [] : [])])]
+  }
+  const add = (kind: "sessions" | "locked", scope: string, sessionID: string, legacyScope?: string) => enqueue(async () => {
+    checkLoaded(); checkIDs(scope, sessionID)
+    if (legacyScope !== undefined && !validID(legacyScope)) throw new Error("INVALID_TRANSLATION_SESSION")
+    const migrate = legacyScope !== undefined && legacyScope !== scope && (Object.hasOwn(data.sessions, legacyScope) || Object.hasOwn(data.locked, legacyScope))
+    if (!migrate && data[kind][scope]?.includes(sessionID)) return
     const next = parseLocks(data)
-    next.sessions[projectID] = [...new Set([...(next.sessions[projectID] ?? []), sessionID])]
-    if (kind === "locked") next.locked[projectID] = [...(next.locked[projectID] ?? []), sessionID]
+    if (migrate) {
+      for (const bucket of ["sessions", "locked"] as const) {
+        next[bucket][scope] = mergedIDs(bucket, scope, legacyScope)
+        delete next[bucket][legacyScope!]
+      }
+    }
+    next.sessions[scope] = [...new Set([...(next.sessions[scope] ?? []), sessionID])]
+    if (kind === "locked") next.locked[scope] = [...new Set([...(next.locked[scope] ?? []), sessionID])]
     await save(next)
   })
   return {
@@ -129,11 +148,11 @@ export function createTranslationLockStore(filePath: string) {
       if (await checkFile()) data = parseLocks(JSON.parse(await readFile(target, "utf8")))
       loaded = true
     }),
-    recordSession: (projectID: string, sessionID: string) => add("sessions", projectID, sessionID),
-    lockSession: (projectID: string, sessionID: string) => add("locked", projectID, sessionID),
-    isTranslationSession(projectID: string, sessionID: string) { checkLoaded(); return data.sessions[projectID]?.includes(sessionID) ?? false },
-    isLocked(projectID: string, sessionID: string) { checkLoaded(); return data.locked[projectID]?.includes(sessionID) ?? false },
-    lockedSessionIDs(projectID: string) { checkLoaded(); return [...(data.locked[projectID] ?? [])] },
-    translationSessionIDs(projectID: string) { checkLoaded(); return [...(data.sessions[projectID] ?? [])] },
+    recordSession: (scope: string, sessionID: string, legacyScope?: string) => add("sessions", scope, sessionID, legacyScope),
+    lockSession: (scope: string, sessionID: string, legacyScope?: string) => add("locked", scope, sessionID, legacyScope),
+    isTranslationSession(scope: string, sessionID: string, legacyScope?: string) { return mergedIDs("sessions", scope, legacyScope).includes(sessionID) },
+    isLocked(scope: string, sessionID: string, legacyScope?: string) { return mergedIDs("locked", scope, legacyScope).includes(sessionID) },
+    lockedSessionIDs(scope: string, legacyScope?: string) { return mergedIDs("locked", scope, legacyScope) },
+    translationSessionIDs(scope: string, legacyScope?: string) { return mergedIDs("sessions", scope, legacyScope) },
   }
 }

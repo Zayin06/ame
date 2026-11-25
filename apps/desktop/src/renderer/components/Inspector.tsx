@@ -342,12 +342,12 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
             const meta = gitStatusMeta(rawStatus)
             const { name, dir } = splitFilePath(change.path)
             return <div className="scm-file-row" data-status={meta.dataStatus} key={change.path}>
-              <button type="button" className="scm-file-row__main" title={`${group === 'staged' ? 'Staged' : 'Changes'}: ${change.path}`} onClick={() => onDiff(change.path, { kind: group })}>
+              <button type="button" className="scm-file-row__main" data-git-group={group} data-git-path={change.path} title={`${group === 'staged' ? 'Staged' : 'Changes'}: ${change.from ? `${change.from} → ` : ''}${change.path}`} onClick={() => onDiff(change.path, { kind: group, ...(group === 'staged' && change.from ? { from: change.from } : {}) })}>
                 <FileTypeIcon path={change.path} /><span className="scm-file-name">{name}</span>{dir && <span className="scm-file-dir">{dir}</span>}
               </button>
               <div className="scm-file-row__right">
                 <span className="scm-row-actions">
-                  <IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged'))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton>
+                  <IconButton label={group === 'staged' ? `Bỏ stage ${change.path}` : `Stage ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.stage(projectID, change.path, group !== 'staged', group === 'staged' ? change.from : undefined))}><Icon name={group === 'staged' ? 'minus' : 'plus'} /></IconButton>
                   {group === 'working' && <IconButton label={`Discard ${change.path}`} disabled={busy} onClick={() => void mutate(() => window.ame.discardFile(projectID, change.path))}><Icon name="undo" /></IconButton>}
                 </span>
                 <span className={`git-badge git-badge--${meta.dataStatus}`} title={meta.label}>{meta.code}</span>

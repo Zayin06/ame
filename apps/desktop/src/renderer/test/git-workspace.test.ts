@@ -10,6 +10,8 @@ import type { GitCommitSummary, GitStashEntry } from '../../../../../packages/pr
 import { GitWorkspace, type GitWorkspaceProps } from '../components/GitWorkspace'
 import { FileTypeIcon } from '../components/FileTypeIcon'
 import { Icon } from '../components/Icon'
+import * as primitives from '../components/Primitives'
+import type { Inspector } from '../components/Inspector'
 import { BuildNotesPanel } from '../components/BuildNotesPanel'
 import * as gitUI from '../git-ui'
 import * as scm from '../scm-commit'
@@ -110,7 +112,7 @@ function harness(extra: Partial<GitWorkspaceProps> = {}, api: Record<string, unk
 
 const first: GitCommitSummary = { hash: 'abcdef123', shortHash: 'abcdef1', subject: 'feat: first', body: 'Full body', author: 'Alice', date: '2026-11-23T00:00:00Z', refs: ['HEAD -> main'] }
 const second: GitCommitSummary = { ...first, hash: '987654321', shortHash: '9876543', subject: 'fix: second', body: '', author: 'Bob', refs: [] }
-const stash: GitStashEntry = { index: 0, ref: 'stash@{0}', branch: 'main', message: 'saved work', date: first.date }
+const stash: GitStashEntry = { index: 0, oid: 'a'.repeat(40), ref: 'stash@{0}', branch: 'main', message: 'saved work', date: first.date }
 
 test('header renders accessible workspace, branch/sync badges and close callback', async () => {
   const html = renderToStaticMarkup(createElement(GitWorkspace, base))
@@ -318,7 +320,7 @@ test('undo restores message and refreshes; amend prefill and commit shortcut res
   assert.equal(h.props.message, 'restored commit'); assert.equal(refreshes, 1)
   h.invoke(h.find(node => node.type === 'button' && text(node).startsWith('staged.ts'))); assert.deepEqual(diffs, ['staged.ts'])
   h.click('Bỏ stage'); await h.flush(); h.click('Stage tất cả (1 tệp)'); await h.flush()
-  assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['stage', 'project', 'staged.ts', false])))
+  assert.ok(calls.some(call => call[0] === 'stage' && call[1] === 'project' && call[2] === 'staged.ts' && call[3] === false && call[4] === undefined))
   assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['stageAll', 'project'])))
   h.render({ message: '', git: { branch: 'main', changes: [] } })
   h.change('Sửa commit gần nhất (Amend)', true); await h.flush()
@@ -333,6 +335,75 @@ test('undo restores message and refreshes; amend prefill and commit shortcut res
   assert.deepEqual(plain(calls.at(-1)), ['commit', 'project', 'feat: first\n\nFull body', { amend: true, noVerify: true }])
   assert.match(h.render(), /Cây làm việc sạch/)
   h.unmount()
+})
+
+test('staged rename forwards its original path to diff and unstage', async () => {
+  const diffs: unknown[][] = [], stages: unknown[][] = []
+  const h = harness({ git: { branch: 'main', changes: [{ path: 'new.txt', from: 'old.txt', index: 'R', working: ' ' }] }, onDiff(...args) { diffs.push(args) } }, { async stage(...args: unknown[]) { stages.push(args) } })
+  try {
+    h.render(); await h.flush()
+    h.invoke(h.find(node => node.type === 'button' && text(node).startsWith('new.txt')))
+    assert.deepEqual(plain(diffs), [['new.txt', { kind: 'staged', from: 'old.txt' }]])
+    h.click('Bỏ stage'); await h.flush()
+    assert.deepEqual(plain(stages), [['project', 'new.txt', false, 'old.txt']])
+  } finally { h.unmount() }
+})
+
+test('Inspector stages only the destination of a staged rename with working edits, but unstages both paths', async () => {
+  const stages: unknown[][] = []
+  const exports: Record<string, unknown> = {}, nativeRequire = createRequire(import.meta.url)
+  const source = readFileSync(new URL('../components/Inspector.tsx', import.meta.url), 'utf8')
+  const code = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX, target: ScriptTarget.ES2022 } }).outputText
+  const hooks = {
+    useState: (initial: unknown) => [initial, () => {}],
+    useRef: (initial: unknown) => ({ current: initial }),
+    useEffect() {},
+  }
+  const modules: Record<string, unknown> = { react: hooks, './Icon': { Icon }, './Primitives': primitives }
+  runInNewContext(code, {
+    exports,
+    window: { ame: { async stage(...args: unknown[]) { stages.push(args) } } },
+    require: (name: string) => modules[name] ?? nativeRequire(name),
+  })
+  const Component = exports.Inspector as typeof Inspector
+  let tree: ReactNode = Component({
+    projectID: 'project', tab: 'git', generation: 0,
+    git: { branch: 'main', changes: [{ path: 'new.txt', from: 'old.txt', index: 'R', working: 'M' }] }, gitError: '',
+    setTab() {}, refresh() {}, onOpen() {}, onRename() {}, onDelete() {}, onDiff() {}, onHide() {},
+    report(error) { assert.fail(String(error)) },
+  })
+  while (isValidElement(tree) && typeof tree.type === 'function') tree = (tree.type as (props: unknown) => ReactNode)(tree.props)
+  function all(node: ReactNode): ReactElement<Record<string, unknown>>[] {
+    if (Array.isArray(node)) return node.flatMap(all)
+    if (!isValidElement<Record<string, unknown>>(node)) return []
+    return [node, ...all(node.props.children as ReactNode)]
+  }
+  const nodes = all(tree)
+  for (const group of ['working', 'staged']) {
+    assert.ok(nodes.some(node => node.props['data-git-group'] === group && node.props['data-git-path'] === 'new.txt'))
+    const control = nodes.find(node => node.props.label === `${group === 'staged' ? 'Bỏ stage' : 'Stage'} new.txt`)
+    assert.ok(control, `expected ${group} stage control`)
+    assert.notEqual(control.props.disabled, true)
+    ;(control.props.onClick as () => void)()
+    await tick()
+  }
+  assert.deepEqual(stages, [['project', 'new.txt', true, undefined], ['project', 'new.txt', false, 'old.txt']])
+})
+
+test('merge commit detail explains first-parent comparison and lists merged files', async () => {
+  for (const isMerge of [true, false]) {
+    const h = harness({ activeTab: 'history' }, {
+      async gitLog() { return [first] },
+      async gitCommitDetail() { return { ...first, isMerge, files: [{ path: 'merged.ts', status: 'M', additions: 4, deletions: 2 }], patch: 'merge patch' } },
+    })
+    try {
+      h.render(); await h.flush(); h.invoke(h.find(node => node.type === 'button' && text(node).startsWith(first.shortHash)))
+      const html = await h.flush()
+      assert.match(html, /merged.ts/); assert.match(html, /\+4 −2/)
+      if (isMerge) assert.match(html, /Merge commit · so sánh theo parent thứ nhất \(first-parent\)/)
+      else assert.doesNotMatch(html, /first-parent/)
+    } finally { h.unmount() }
+  }
 })
 
 test('history loads log and selected detail, filters locally, and keeps HEAD undo tied to the actual first commit', async () => {
@@ -372,14 +443,14 @@ test('stash push, list, apply, pop and drop reload the list and refresh worktree
   let html = await h.flush()
   assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['push', 'project', 'my work', true])))
   assert.match(html, /stash@\{0\}/); assert.match(html, /saved work/); assert.match(html, /Stash \(1\)/)
-  h.click('Apply'); await h.flush(); assert.deepEqual(plain(calls.find(call => call[0] === 'apply')), ['apply', 'project', 0, false])
+  h.click('Apply'); await h.flush(); assert.deepEqual(plain(calls.find(call => call[0] === 'apply')), ['apply', 'project', 0, false, stash.oid])
   h.click('Pop'); html = await h.flush(); assert.match(html, /Chưa có stash/)
-  assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['apply', 'project', 0, true])))
+  assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['apply', 'project', 0, true, stash.oid])))
   h.change('Gồm tệp mới (untracked)', false); h.render()
   h.invoke(h.find(node => node.type === 'form'), 'onSubmit', { preventDefault() {} }); await h.flush()
   assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['push', 'project', '', false])))
   h.click('Xóa'); html = await h.flush()
-  assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['drop', 'project', 0])))
+  assert.ok(calls.some(call => JSON.stringify(call) === JSON.stringify(['drop', 'project', 0, stash.oid])))
   assert.match(html, /Chưa có stash/); assert.equal(refreshes, 5)
   h.unmount()
 })

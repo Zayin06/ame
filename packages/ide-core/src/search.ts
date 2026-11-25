@@ -37,6 +37,12 @@ function glob(pattern: string, anchored = false): RegExp {
       if (pattern[index + 1] === '/') { source += '(?:.*/)?'; index++ } else source += '.*'
     } else if (character === '*') source += '[^/]*'
     else if (character === '?') source += '[^/]'
+    else if (character === '[' && pattern.indexOf(']', index + 1) > index + 1) {
+      const end = pattern.indexOf(']', index + 1)
+      const members = pattern.slice(index + 1, end)
+      source += `[${members.startsWith('!') ? '^' + members.slice(1) : members}]`
+      index = end
+    }
     else source += character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   }
   return new RegExp(`${anchored || pattern.includes('/') ? '^' : '(?:^|/)'}${source}$`)
@@ -78,7 +84,7 @@ function abort(signal?: AbortSignal) { signal?.throwIfAborted() }
 function limit(value: number | undefined, fallback: number) { return value === undefined || !Number.isFinite(value) ? fallback : Math.max(0, Math.floor(value)) }
 function matcher(query: SearchQuery) {
   const source = query.regex ? query.query : query.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  try { return new RegExp(query.wholeWord ? `\\b(?:${source})\\b` : source, query.caseSensitive ? 'g' : 'gi') }
+  try { return new RegExp(query.wholeWord ? `(?<![\\p{L}\\p{M}\\p{N}_])(?:${source})(?![\\p{L}\\p{M}\\p{N}_])` : source, (query.caseSensitive ? 'g' : 'gi') + (query.wholeWord ? 'u' : '')) }
   catch { throw Object.assign(new Error('INVALID_REGEX'), { code: 'INVALID_REGEX' }) }
 }
 
@@ -127,7 +133,7 @@ async function* textFiles(root: string, query: SearchQuery, signal?: AbortSignal
         }
         if (size > maxBytes || bytes.subarray(0, size).includes(0)) continue
         let content: string
-        try { content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, size)) } catch { continue }
+        try { content = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size)) } catch { continue }
         abort(signal)
         yield { path: relative, content, revision: revision(bytes.subarray(0, size)) }
       } finally { await handle.close() }
@@ -148,7 +154,7 @@ function* lineMatches(content: string, expression: RegExp): Generator<SearchMatc
       yield { line: index + 1, column: match.index + 1, length: match[0].length,
         lineText: `${start ? '…' : ''}${lines[index].slice(start, end)}${end < lines[index].length ? '…' : ''}`,
         matchText: match[0].slice(0, 100), snippetStart: start + 1, snippetTruncated }
-      if (!match[0].length) expression.lastIndex++
+      if (!match[0].length) expression.lastIndex += expression.unicode && (lines[index].codePointAt(expression.lastIndex) ?? 0) > 0xffff ? 2 : 1
     }
   }
 }
@@ -240,8 +246,10 @@ export async function replaceInWorkspace(root: string, options: ReplaceOptions, 
     const { after, count } = replacementText(file.content, expression, options, maxMatches - result.replacements)
     result.replacements += count
     if (after !== file.content) {
+      const raw = await readFile((await validateWorkspacePath(rootReal, file.path)).target, 'utf8')
+      const bom = raw.startsWith('\uFEFF') ? '\uFEFF' : ''
       result.filesChanged++
-      result.previews.push({ path: file.path, revision: file.revision, count, sampleBefore: file.content.slice(0, 500), sampleAfter: after.slice(0, 500) })
+      result.previews.push({ path: file.path, revision: file.revision, count, sampleBefore: (bom + file.content).slice(0, 500), sampleAfter: (bom + after).slice(0, 500) })
     }
     if (filesSearched >= maxFiles || result.replacements >= maxMatches) break
   }
@@ -249,6 +257,8 @@ export async function replaceInWorkspace(root: string, options: ReplaceOptions, 
 }
 
 function replacementText(content: string, expression: RegExp, options: ReplaceOptions, maximum: number) {
+    const bom = content.startsWith('\uFEFF') ? '\uFEFF' : ''
+    if (bom) content = content.slice(1)
     let count = 0
     // Split with captured separators so CRLF, LF, and CR are preserved byte-for-byte.
     const after = content.split(/(\r\n|\n|\r)/).map((line, index) => {
@@ -276,5 +286,5 @@ function replacementText(content: string, expression: RegExp, options: ReplaceOp
         })
       })
     }).join('')
-    return { after, count }
+    return { after: bom + after, count }
 }

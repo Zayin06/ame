@@ -19,6 +19,40 @@ test('commit display strips scoped instructions and all supported commit modes',
   assert.equal(extractUserDisplayText('[Commit mode: split]\nNormal request'), '[Commit mode: split]\nNormal request')
 })
 
+test('display strips consecutive snapshot and mode metadata while preserving the original request body', () => {
+  const scope = '[STRICT SCOPE: GIT COMMIT ASSISTANT ONLY]'
+  const request = 'Lập lại kế hoạch\n\nGiữ nguyên câu thoại 😀\n[Commit snapshot: literal-in-body]'
+  for (const headers of [
+    '[Commit snapshot: plan-123]\n[Commit mode: split]\n',
+    '[Commit snapshot: plan-123]\n',
+    '[Commit mode: split]\n[Commit snapshot: plan-123]\n',
+    '[Commit snapshot: plan-123]\n[Translation mode: full]\n',
+  ]) {
+    const wrapped = `${scope}\nInstructions\n\nUser request:\n${headers}${request}`
+    assert.equal(extractUserDisplayText(wrapped), request)
+    assert.equal(extractUserDisplayText(wrapped.replace(/\n/g, '\r\n')), request)
+  }
+  const ordinary = '[Commit snapshot: plan-123]\n[Commit mode: split]\nNormal request'
+  assert.equal(extractUserDisplayText(ordinary), ordinary)
+  const unknown = '[Commit mode: unsupported]\nrequest'
+  assert.equal(extractUserDisplayText(`${scope}\n\nUser request:\n${unknown}`), unknown)
+})
+
+test('display prefers the last metadata-bearing request marker and preserves markers inside user prose', () => {
+  const userText = 'Docs:\n\nUser request:\nexample\n\nKeep this ending 😀\n'
+  for (const scope of ['GIT COMMIT ASSISTANT', 'ANDROID STRINGS TRANSLATION']) {
+    for (const headers of ['[Commit snapshot: plan-123]\n', '[Commit snapshot: plan-123]\n[Commit mode: split]\n', '[Translation mode: full]\n']) {
+      const wrapped = `[STRICT SCOPE: ${scope} ONLY]\nDiff preview:\n\nUser request:\n[Commit snapshot: fake]\nFake body\n\nUser request:\n${headers}${userText}`
+      assert.equal(extractUserDisplayText(wrapped), userText)
+      assert.equal(extractUserDisplayText(wrapped.replace(/\n/g, '\r\n')), userText)
+    }
+  }
+  const scope = '[STRICT SCOPE: GIT COMMIT ASSISTANT ONLY]'
+  assert.equal(extractUserDisplayText(`${scope}\n\nUser request:\nearlier\n\nUser request:\nlast`), 'last')
+  const invalidHeader = '[Commit snapshot: invalid id]\nrequest'
+  assert.equal(extractUserDisplayText(`${scope}\n\nUser request:\n${invalidHeader}`), invalidHeader)
+})
+
 test('commit extraction keeps complete trimmed messages, supports eight commits and caps at twenty', () => {
   const message = 'feat(git): thêm trợ lý commit\n\n- Đọc toàn bộ diff\n- Hỏi xác nhận'
   assert.deepEqual(extractCommitMessagesFromText(`Answer\n\`\`\`commit\n  ${message}\n\n\`\`\``), [message])
