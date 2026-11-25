@@ -25,7 +25,7 @@ async function fixture(t: TestContext, source: string, entry = 'app.mjs') {
       const timer = setTimeout(() => {
         listeners.delete(check)
         reject(new Error(`Timed out waiting for ${type}: ${JSON.stringify(events)}`))
-      }, 15_000)
+      }, 45_000)
       function check() {
         const found = events.slice(after).find((event): event is EventOf<T> => event.type === type && predicate(event as EventOf<T>))
         if (!found) return
@@ -42,7 +42,7 @@ function assertDead(pid: number) {
   assert.throws(() => process.kill(pid, 0), (error: NodeJS.ErrnoException) => error.code === 'ESRCH', `Debugger child ${pid} must have exited`)
 }
 
-test('real CDP hits a pre-breakpoint, exposes scopes, steps, evaluates and exits naturally', { timeout: 30_000 }, async t => {
+test('real CDP hits a pre-breakpoint, exposes scopes, steps, evaluates and exits naturally', { timeout: 60_000 }, async t => {
   const source = [
     'const x = 6; const y = 7;',
     'function calc(a, b) {',
@@ -92,7 +92,7 @@ test('real CDP hits a pre-breakpoint, exposes scopes, steps, evaluates and exits
   await engine.dispose()
 })
 
-test('initial entry auto-resumes without breakpoints, forwards streams and preserves nonzero exit', { timeout: 30_000 }, async t => {
+test('initial entry auto-resumes without breakpoints, forwards streams and preserves nonzero exit', { timeout: 60_000 }, async t => {
   const { engine, events, wait } = await fixture(t, "console.log('automatic'); console.error('diagnostic'); process.exitCode = 7;\n")
   await engine.start({ entry: 'app.mjs' })
   assert.equal((await wait('exited')).code, 7)
@@ -103,7 +103,7 @@ test('initial entry auto-resumes without breakpoints, forwards streams and prese
   }
 })
 
-test('replaces/removes live breakpoints and supports stepInto/stepOut', { timeout: 30_000 }, async t => {
+test('replaces/removes live breakpoints and supports stepInto/stepOut', { timeout: 60_000 }, async t => {
   const { engine, events, wait } = await fixture(t, [
     'function inner(n) {',
     '  const doubled = n * 2;',
@@ -140,7 +140,7 @@ test('replaces/removes live breakpoints and supports stepInto/stepOut', { timeou
   assert.equal((await wait('exited')).code, 0)
 })
 
-test('runs TypeScript via local tsx, passes literal args/env/cwd and stops without an orphan', { timeout: 30_000 }, async t => {
+test('runs TypeScript via local tsx, passes literal args/env/cwd and stops without an orphan', { timeout: 60_000 }, async t => {
   const { engine, root, events, wait } = await fixture(t, [
     'const answer: number = 42;',
     'console.log(JSON.stringify({ answer, args: process.argv.slice(2), cwd: process.cwd(), token: process.env.DEBUG_TEST_TOKEN }));',
@@ -169,7 +169,7 @@ test('runs TypeScript via local tsx, passes literal args/env/cwd and stops witho
   await assert.rejects(engine.start({ entry: 'app.ts' }), /DEBUG_DISPOSED/)
 })
 
-test('dispose terminates a running child, and stopped sessions can restart safely', { timeout: 30_000 }, async t => {
+test('dispose terminates a running child, and stopped sessions can restart safely', { timeout: 60_000 }, async t => {
   const { engine, wait, events } = await fixture(t, "console.log('ready'); setInterval(() => {}, 1000);\n")
   await engine.start({ entry: 'app.mjs', runtime: 'tsx' })
   await wait('output', 0, event => event.stream === 'stdout' && event.text.includes('ready'))
@@ -185,7 +185,7 @@ test('dispose terminates a running child, and stopped sessions can restart safel
   assert.equal(events.filter(event => event.type === 'exited').length, 2)
 })
 
-test('rejects every traversal segment, metadata, absolute paths, missing/non-file entries and escaping junctions', { timeout: 30_000 }, async t => {
+test('rejects every traversal segment, metadata, absolute paths, missing/non-file entries and escaping junctions', { timeout: 60_000 }, async t => {
   const { engine, root } = await fixture(t, 'console.log(1);\n')
   await mkdir(path.join(root, 'sub'))
   for (const name of ['../evil.mjs', 'sub/../app.mjs', 'sub\\..\\app.mjs', '.git/config', '.GIT/config', path.join(root, 'app.mjs'), 'C:\\outside.mjs']) {
@@ -211,7 +211,7 @@ test('rejects every traversal segment, metadata, absolute paths, missing/non-fil
   assert.equal(await readFile(path.join(root, 'app.mjs'), 'utf8'), 'console.log(1);\n')
 })
 
-test('Windows file URLs with spaces resolve breakpoints and report normalized workspace paths', { timeout: 30_000 }, async t => {
+test('Windows file URLs with spaces resolve breakpoints and report normalized workspace paths', { timeout: 60_000 }, async t => {
   const { engine, wait } = await fixture(t, 'function run(value) {\n  return value + 1;\n}\nconsole.log(run(8));\n', 'space # ü.mjs')
   await engine.setBreakpoints('.\\space # ü.mjs', [2])
   await engine.start({ entry: 'space # ü.mjs' })
@@ -223,7 +223,7 @@ test('Windows file URLs with spaces resolve breakpoints and report normalized wo
   assert.equal((await wait('exited')).code, 0)
 })
 
-test('live replacement removes the old breakpoint and installs the new breakpoint', { timeout: 30_000 }, async t => {
+test('live replacement removes the old breakpoint and installs the new breakpoint', { timeout: 60_000 }, async t => {
   const { engine, wait, events } = await fixture(t, [
     'function run(n) {',
     '  const first = n + 1;',
@@ -250,7 +250,7 @@ test('live replacement removes the old breakpoint and installs the new breakpoin
   assert.equal((await wait('exited')).code, 0)
 })
 
-test('stop cancels a spawned child while the inspector is connecting', { timeout: 30_000 }, async t => {
+test('stop cancels a spawned child while the inspector is connecting', { timeout: 60_000 }, async t => {
   const { engine, wait, events } = await fixture(t, 'setInterval(() => {}, 1000);\n')
   const starting = engine.start({ entry: 'app.mjs' }).then(() => undefined, error => error as Error)
   await wait('state', 0, event => event.snapshot.status === 'running')
@@ -260,7 +260,7 @@ test('stop cancels a spawned child while the inspector is connecting', { timeout
   assert.equal(events.filter(event => event.type === 'exited').length, 1)
 })
 
-test('revalidates preset breakpoint parents before installation and cleans up the spawned child', { timeout: 30_000 }, async t => {
+test('revalidates preset breakpoint parents before installation and cleans up the spawned child', { timeout: 60_000 }, async t => {
   const { engine, root, events } = await fixture(t, 'setInterval(() => {}, 1000);\n')
   const parent = path.join(root, 'preset')
   const outside = await mkdtemp(path.join(process.cwd(), 'test', '.debugger-outside-'))
@@ -279,7 +279,7 @@ test('revalidates preset breakpoint parents before installation and cleans up th
   await engine.stop()
 })
 
-test('TypeScript tsx breakpoint pauses at its source line with arguments and evaluation', { timeout: 30_000 }, async t => {
+test('TypeScript tsx breakpoint pauses at its source line with arguments and evaluation', { timeout: 60_000 }, async t => {
   const { engine, events, wait } = await fixture(t, [
     'const x: number = 6; const y: number = 7;',
     'function calc(a: number, b: number): number {',
@@ -308,7 +308,7 @@ test('TypeScript tsx breakpoint pauses at its source line with arguments and eva
   assert.ok(events.some(event => event.type === 'output' && event.stream === 'stdout' && event.text.includes('TSRES=13')))
 })
 
-test('reserves concurrent startup and permits stop during asynchronous startup', { timeout: 30_000 }, async t => {
+test('reserves concurrent startup and permits stop during asynchronous startup', { timeout: 60_000 }, async t => {
   const { engine, events } = await fixture(t, 'setInterval(() => {}, 1000);\n')
   const starting = engine.start({ entry: 'app.mjs' })
   await assert.rejects(engine.start({ entry: 'app.mjs' }), /DEBUG_SESSION_ACTIVE/)

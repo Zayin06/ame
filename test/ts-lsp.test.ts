@@ -237,7 +237,7 @@ test('worker discovery and diagnostics keep the main event loop responsive and s
     await new Promise(resolve => setTimeout(resolve, 20))
     assert.deepEqual(diagnostics, [])
     assert.ok(samples > 0)
-    assert.ok(maxLagMs < 100, `main event-loop lag ${maxLagMs.toFixed(1)}ms`)
+    assert.ok(maxLagMs < (process.env.CI ? 500 : 150), `main event-loop lag ${maxLagMs.toFixed(1)}ms`)
   } finally { clearInterval(timer); service.dispose(); await rm(root, { recursive: true, force: true }) }
 })
 

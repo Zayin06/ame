@@ -14,7 +14,7 @@ if (!source) {
 }
 if (!source && process.platform === 'win32') source = path.join(os.homedir(), 'AppData', 'Roaming', 'ai.opencode.desktop', 'cli', `${version}-${process.arch}`, 'opencode-cli.exe')
 if (!source || !path.isAbsolute(source)) throw new Error('Set AME_OPENCODE_CLI to an absolute, trusted OpenCode 2.3.2 executable. Runtime is bundled at build time, never downloaded on app launch.')
-const info = await run(source, ['--version'], { timeout: 15000, windowsHide: true })
+const info = await run(source, ['--version'], { timeout: 90000, windowsHide: true })
 if (info.stdout.trim() !== `opencode v${version}`) throw new Error('Runtime must be exactly OpenCode 2.3.2')
 await mkdir(directory, { recursive: true })
 if (path.resolve(source) !== target) await copyFile(source, target)
