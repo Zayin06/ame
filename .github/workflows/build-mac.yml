@@ -1,0 +1,109 @@
+name: Build macOS
+on:
+  push:
+    tags: ['mac-*']
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: macOS target architecture
+        type: choice
+        default: all
+        options:
+          - all
+          - arm64
+          - x64
+
+permissions:
+  contents: read
+concurrency:
+  group: build-mac-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-arm64.zip
+            archive_sha: 31ab5a06a29edc7e49b895f35c2b64ebfe7c7f0437b0f2581b006efcd79fee1a
+          - arch: x64
+            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-x64.zip
+            archive_sha: 1875a6d1106702f04c9468831563c061bd00337f891a1b4a6cd151155e6aaf5c
+    runs-on: macos-latest
+    steps:
+      - name: Check architecture filter
+        id: filter
+        shell: bash
+        run: |
+          selected="${{ inputs.arch }}"
+          if [ -z "$selected" ] || [ "$selected" = "all" ] || [ "$selected" = "${{ matrix.arch }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.filter.outputs.enabled == 'true'
+      - name: Enable x64 execution on Apple Silicon
+        if: steps.filter.outputs.enabled == 'true' && matrix.arch == 'x64'
+        shell: bash
+        run: |
+          if [ "$(uname -m)" = arm64 ]; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.filter.outputs.enabled == 'true'
+        with:
+          node-version: '22'
+          architecture: ${{ matrix.arch }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Verify Node architecture
+        if: steps.filter.outputs.enabled == 'true'
+        shell: bash
+        run: node -e "if (process.arch !== '${{ matrix.arch }}') throw new Error('Target Node architecture is required')"
+      - name: Install dependencies
+        if: steps.filter.outputs.enabled == 'true'
+        run: npm ci
+      - name: Typecheck
+        if: steps.filter.outputs.enabled == 'true'
+        run: npm run typecheck
+      - name: Rebuild native modules for Electron target architecture
+        if: steps.filter.outputs.enabled == 'true'
+        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
+      - name: Download and verify pinned OpenCode 2.3.2 macOS runtime
+        if: steps.filter.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/opencode-runtime.zip"
+          curl -fsSL --retry 3 --max-time 180 "${{ matrix.archive_url }}" -o "$archive"
+          actual="$(shasum -a 256 "$archive" | awk '{print tolower($1)}')"
+          if [ "$actual" != "${{ matrix.archive_sha }}" ]; then
+            echo "Archive SHA-256 mismatch: expected ${{ matrix.archive_sha }}, got $actual" >&2
+            exit 1
+          fi
+          extract_dir="$RUNNER_TEMP/opencode-extracted"
+          rm -rf "$extract_dir" && mkdir -p "$extract_dir"
+          unzip -q "$archive" -d "$extract_dir"
+          chmod 0755 "$extract_dir/opencode"
+          echo "AME_OPENCODE_CLI=$extract_dir/opencode" >> "$GITHUB_ENV"
+      - name: Stage runtime and build Electron app
+        if: steps.filter.outputs.enabled == 'true'
+        run: npm run build
+      - name: Package macOS DMG and ZIP
+        if: steps.filter.outputs.enabled == 'true'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never
+      - uses: actions/upload-artifact@v4
+        if: steps.filter.outputs.enabled == 'true'
+        with:
+          name: ame-ide-mac-${{ matrix.arch }}-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
