@@ -1,10 +1,10 @@
 import test, { after } from "node:test"
 import assert from "node:assert/strict"
-import { link, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { link, lstat, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
-import { createAmeKit, type AmeKitDependencies, type AmeKit } from "../src/index"
+import { createAmeKit, type AmeKitDependencies, type AmeKit, type AmeKitOptions } from "../src/index"
 import { openSessionVault, type Encryption } from "../src/session-vault"
 import { zipSync, unzipSync } from "fflate"
 import { pack, preview, safePath, secretFindings } from "../src/bundle/package"
@@ -15,14 +15,14 @@ import { AiFixError, buildCompactDiff, fixImportFileWithLlm, isFixableTextFile, 
 import { AmeApi } from "../src/api"
 import { assertModel, catalogSchema, MODEL_LEVELS, modelPolicy, parseModelLevel, resolveModelLevel, type ModelLevels } from "../src/model-policy"
 import { parse, stringify } from "yaml"
-import { installed, install, readAndroidTranslationFeature, readBundleFeatures, readCommitEnhanceSkill, uninstall } from "../src/installer"
+import { installed, install, installedGlobal, installGlobal, offlineGlobal, uninstallGlobal, legacyProjectInstalled, cleanLegacyProject, readGlobalCommitEnhanceSkill, readGlobalBundleFeatures, readGlobalAndroidTranslationFeature, readAndroidTranslationFeature, readBuildNotesFeature, readGlobalBuildNotesFeature, readBundleFeatures, readCommitEnhanceSkill, uninstall } from "../src/installer"
 import { buildAndroidTranslationPrompt, createTranslationLockStore, detectAndroidProject } from "../src/android-translation"
 import type { Release } from "../src/api"
 import { dialoguePrompt, localDialogue } from "../src/pet-dialogue"
 import type { PetHostOptions } from "../src/pet-host"
 
 const root = path.resolve("packages", "amekit", "test", `.work-${randomUUID()}`)
-after(async () => { await rm(root, { recursive: true, force: true }) })
+after(async () => { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) })
 const catalog = { version: "fixture", default_model: "default", small_model: "other", models: ["default", "other"].map(id => ({ id, name: id, tool_call: true, vision: false, context: 8000, output: 1000 })) }
 const encryption: Encryption = {
   isEncryptionAvailable: () => true,
@@ -40,7 +40,7 @@ async function bundle(mode: "native" | "raw" = "native", commitEnhanceSkill?: st
   const release: Release = { releaseId: "ef2b4502-3b3f-4ac7-a223-81fdb4b77557", version: "1.2.3", channel: "stable", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"], publishedAt: 1, downloadUrl: "/ignored" }
   return { packed, release, latest: { release, revision: 1, activatedAt: 1 } }
 }
-async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; commitEnhanceSkill?: string; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number } = {}) {
+async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; commitEnhanceSkill?: string; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number; autoSync?: boolean; reloadRuntime?: AmeKitOptions["reloadRuntime"]; onBundleChanged?: AmeKitOptions["onBundleChanged"] } = {}) {
   const folder = await area(), project = path.join(folder, "project"), imported = path.join(folder, "source"), data = path.join(folder, "data")
   await mkdir(project); await mkdir(imported)
   for (const file of input()) { const target = path.join(imported, ...file.path.split("/")); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data) }
@@ -91,14 +91,16 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   const dependencies: AmeKitDependencies = {
     fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs,
     electron: async () => ({ safeStorage: { ...(settings.encryption ?? encryption), encryptString(text: string) { if (failStorage) throw new Error("contains-sensitive-material"); return (settings.encryption ?? encryption).encryptString(text) } }, dialog: { showMessageBox: async (options: { message?: string; detail?: string }) => { dialogs.push(options.detail ?? options.message ?? ""); messages.push(options.message ?? ""); events.push("confirm"); return { response: accepted ? 1 : 0, checkboxChecked: false } } } as never }),
-    discover: settings.discover ?? (async directory => {
-      try { await readFile(path.join(directory, ".opencode", "agents", "helper.md")) } catch { return { agents: [], skills: [] } }
-      return { agents: [{ id: "helper" }], skills: [{ id: "fixture", name: "fixture", path: path.join(directory, ".opencode", "skills", "fixture", "SKILL.md") }] }
+    discover: settings.discover ?? (async (directory, _signal, _expected, options) => {
+      const config = options?.scope === "global" ? directory : path.join(directory, ".opencode")
+      try { await readFile(path.join(config, "agents", "helper.md")) } catch { return { agents: [], skills: [] } }
+      return { agents: [{ id: "helper" }], skills: [{ id: "fixture", name: "fixture", path: path.join(config, "skills", "fixture", "SKILL.md") }] }
     }),
   }
-  const options = { userData: data, endpoint: () => ({ url: "http://127.0.0.1:3210", headers: { authorization: "Basic fixture-owner" } }), project: async (id: string) => { assert.equal(id, "project-id"); return project }, pickImport: async () => { pickerCount++; return pickResponse ? pickResponse() : imported } }
+  const globalConfigDir = path.join(data, "backend", "config", "opencode"), globalManagedDir = path.join(data, "amekit", "global")
+  const options = { userData: data, globalConfigDir, autoSync: settings.autoSync, reloadRuntime: settings.reloadRuntime, onBundleChanged: settings.onBundleChanged, endpoint: () => ({ url: "http://127.0.0.1:3210", headers: { authorization: "Basic fixture-owner" } }), project: async (id: string) => { assert.equal(id, "project-id"); return project }, pickImport: async () => { pickerCount++; return pickResponse ? pickResponse() : imported } }
   const service = createAmeKit(options, dependencies)
-  return { service, folder, project, imported, data, rpc, requests, dialogs, messages, events, options, dependencies, artifact,
+  return { service, folder, project, imported, data, globalConfigDir, globalManagedDir, rpc, requests, dialogs, messages, events, options, dependencies, artifact,
     apiResponse: (value: (url: URL, init?: RequestInit) => Promise<Response | undefined>) => { apiResponse = value },
     role: (value: unknown) => { role = value }, plugin: (value: boolean) => { plugin = value }, confirm: (value: boolean) => { accepted = value }, disable: () => { failAuth = true }, breakStorage: () => { failStorage = true }, pickerCount: () => pickerCount,
     sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
@@ -106,7 +108,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
     pickResponse: (value?: () => Promise<string | null>) => { pickResponse = value },
     dialogueResponse: (value: (signal: AbortSignal) => Promise<Response>) => { dialogueResponse = value },
     fixRequests, fixResponse: (value: (body: Record<string, unknown>, init: RequestInit) => Promise<Response>) => { fixResponse = value },
-    cleanup: async () => { await service.dispose(); await rm(folder, { recursive: true, force: true }) } }
+    cleanup: async () => { await service.dispose(); await rm(folder, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } }
 }
 const login = (service: AmeKit) => service.call("login", { server: "http://localhost:3211", username: "fixture", password: "fixture-password" })
 
@@ -396,6 +398,49 @@ test("usage-prices is read-only, signed-out safe and exposes only validated pric
   } finally { await f.cleanup() }
 })
 
+test("cached account and pricing reads bypass an active operation without unlocking call", async () => {
+  const price = { model_id: "catalog-default", upstream_model_id: "default", provider_route: "amecode", status: "priced",
+    price_kind: "catalog_estimate", currency: "USD", unit: "per_1m_tokens", source: { id: "catalog", source_model_id: "default" },
+    profiles: { standard: { base: { input: "1", output: "2" }, overrides: [] } }, revision: 1 }
+  const f = await fixture({ role: "admin", autoSync: false, catalog: { ...catalog, models: [{ ...catalog.models[0], pricing: price }, catalog.models[1]] } })
+  let release!: () => void, started!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const picking = new Promise<void>(resolve => { started = resolve })
+  let importing: Promise<unknown> | undefined
+  try {
+    const loggedIn = await login(f.service)
+    f.pickResponse(async () => { started(); await gate; return f.imported })
+    importing = f.service.call("import", {})
+    await picking
+    await assert.rejects(f.service.call("status", {}), /OPERATION_BUSY/)
+    await assert.rejects(f.service.call("usage-prices", {}), /OPERATION_BUSY/)
+    const requests = f.requests.length, policies = f.rpc.length
+    const [status, pricing] = await Promise.all([f.service.readStatus!(), f.service.readUsagePrices!()])
+    assert.deepEqual(status, loggedIn, "account and role-aware model policy remain available")
+    assert.deepEqual(JSON.parse(JSON.stringify(pricing)), { origin: "http://localhost:3211", prices: { default: price } })
+    assert.doesNotMatch(JSON.stringify({ status, pricing }), /fixture-(session-token|provider-key|password)/)
+    assert.equal(f.requests.length, requests, "cached reads do not make network requests")
+    assert.equal(f.rpc.length, policies, "cached reads do not update policy")
+    await assert.rejects(f.service.call("status", {}), /OPERATION_BUSY/, "reads do not release the active operation's mutex")
+    release()
+    await importing
+    assert.deepEqual(await f.service.call("status", {}), loggedIn)
+  } finally { release(); await importing?.catch(() => {}); await f.cleanup() }
+})
+
+test("cached account and pricing reads are signed-out safe and reject after disposal", async () => {
+  const f = await fixture()
+  try {
+    assert.equal(await f.service.readStatus!(), null)
+    const pricing = await f.service.readUsagePrices!()
+    assert.equal(pricing.origin, null)
+    assert.deepEqual(Object.keys(pricing.prices), [])
+    await f.service.dispose()
+    await assert.rejects(f.service.readStatus!(), /AMEKIT_DISPOSED/)
+    await assert.rejects(f.service.readUsagePrices!(), /AMEKIT_DISPOSED/)
+  } finally { await f.cleanup() }
+})
+
 test("usage-prices remains available when secure storage is unavailable", async () => {
   const f = await fixture({ encryption: { ...encryption, isEncryptionAvailable: () => false } })
   try {
@@ -526,21 +571,205 @@ test("installed verifies managed bundles larger than 64 MiB", async () => {
   try {
     await login(f.service)
     await f.service.call("sync", { project: "project-id" })
-    const statePath = path.join(f.project, ".opencode", ".amekit-release.json")
+    const statePath = path.join(f.globalConfigDir, ".amekit-release.json")
     const state = JSON.parse(await readFile(statePath, "utf8"))
     const data = encode("Documentation.\n".repeat(Math.ceil(3 * 1024 * 1024 / 15)))
     const hash = await sha256(data)
     for (let i = 0; i < 22; i++) {
       const name = `skills/fixture/guide-${i}.md`
-      await writeFile(path.join(f.project, ".opencode", ...name.split("/")), data)
+      await writeFile(path.join(f.globalConfigDir, ...name.split("/")), data)
       state.files.push({ path: name, sha256: hash })
     }
     assert.ok(data.length * 22 > 64 * 1024 * 1024)
     await writeFile(statePath, JSON.stringify(state))
-    const result = await installed(f.project)
+    const result = await installedGlobal(f.globalConfigDir, f.globalManagedDir)
     assert.equal(result?.files.length, 24)
     assert.equal(result?.verification, "verified-bytes")
   } finally { await f.cleanup() }
+})
+
+test("active-features verifies server archives, reuses current global installs and caches only matching releases", async t => {
+  for (const scenario of ["missing", "current", "stale-id", "stale-hash", "other-origin", "changed-file"]) await t.test(scenario, async () => {
+    const f = await fixture({ role: "admin", commitEnhanceSkill: "fixture" })
+    try {
+      await login(f.service)
+      if (scenario !== "missing") {
+        await f.service.call("sync", {})
+        const statePath = path.join(f.globalConfigDir, ".amekit-release.json")
+        const state = JSON.parse(await readFile(statePath, "utf8"))
+        if (scenario === "stale-id") state.releaseId = randomUUID()
+        if (scenario === "stale-hash") state.sha256 = "0".repeat(64)
+        if (scenario === "other-origin") state.origin = "http://localhost:9999"
+        await writeFile(statePath, JSON.stringify(state))
+        if (scenario === "changed-file") await writeFile(path.join(f.globalConfigDir, "skills", "fixture", "SKILL.md"), "Changed locally.")
+      }
+      f.requests.length = 0
+      const expected = { release: f.artifact.release, revision: 1, skills: ["fixture"], features: { commitEnhanceSkill: "fixture" } }
+      assert.deepEqual(await f.service.call("active-features", {}), expected)
+      assert.deepEqual(await f.service.call("active-features", {}), expected)
+      const downloads = () => f.requests.filter(request => request.endsWith("/download")).length
+      assert.equal(downloads(), scenario === "current" ? 0 : 1)
+      if (scenario === "missing") {
+        await f.service.call("import", {})
+        await f.service.call("active-features", {})
+        assert.equal(downloads(), 2, "resetting the import clears the archive cache")
+        await f.service.call("logout", {}); await login(f.service)
+        await f.service.call("active-features", {})
+        assert.equal(downloads(), 3, "logout clears the archive cache")
+        const release = { ...f.artifact.release, releaseId: randomUUID() }
+        f.apiResponse(async url => url.pathname.endsWith("/latest") ? Response.json({ ...f.artifact.latest, release }) : undefined)
+        assert.deepEqual(await f.service.call("active-features", {}), { ...expected, release })
+        assert.equal(downloads(), 4, "a changed active release invalidates the cache")
+      }
+      assert.equal(f.dialogs.length, 0)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("active-features rejects non-admins, missing active releases and corrupt archives", async t => {
+  for (const scenario of ["non-admin", "no-active", "corrupt"]) await t.test(scenario, async () => {
+    const f = await fixture({ role: scenario === "non-admin" ? "user" : "admin" })
+    try {
+      await login(f.service)
+      f.apiResponse(async url => {
+        if (scenario === "no-active" && url.pathname.endsWith("/latest")) return Response.json({ error: { code: "NO_ACTIVE_RELEASE" } }, { status: 404 })
+        if (scenario === "corrupt" && url.pathname.endsWith("/download")) return new Response(new Uint8Array(f.artifact.release.size))
+      })
+      await assert.rejects(f.service.call("active-features", {}), scenario === "non-admin" ? /FORBIDDEN/ : scenario === "no-active" ? /NO_ACTIVE_RELEASE/ : /HASH_MISMATCH/)
+      assert.equal(f.requests.filter(request => request.endsWith("/download")).length, scenario === "corrupt" ? 1 : 0)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("update-features publishes exact server payload bytes without importing, supports drafts and auto-syncs feature readers", async t => {
+  for (const mode of ["native", "raw"] as const) for (const activate of ["true", "false"] as const) await t.test(`${mode} ${activate}`, async () => {
+    const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+    const f = await fixture({ role: "admin", autoSync: true, onBundleChanged: event => changes.push(event), discover: async (directory, _signal, expected) => ({ agents: (expected?.agents ?? []).map(id => ({ id })), skills: (expected?.skills ?? []).map(id => ({ id, name: id, path: path.join(directory, "skills", id, "SKILL.md") })) }) })
+    try {
+      const files = [
+        ...input(),
+        { path: "agents/nested/remote.md", data: encode(mode === "raw" ? "Remote agent without native metadata.\r\n" : "---\r\ndescription: Remote agent\r\nmode: subagent\r\n---\r\nRemote instructions.\r\n") },
+        { path: "skills/remote/SKILL.md", data: encode("---\r\nname: remote\r\ndescription: Remote skill\r\n---\r\nRemote checks.\r\n") },
+        { path: "skills/remote/assets/data.bin", data: Uint8Array.of(0, 255, 128, 10, 13) },
+      ]
+      const source = preview(files, [], { compatibilityMode: mode })
+      const original = await pack(source, "2.0.0", undefined, { buildNotesSkill: "fixture", buildNotesModel: "default" })
+      const originalRelease: Release = { ...f.artifact.release, releaseId: randomUUID(), version: "2.0.0", sha256: original.sha256, size: original.bytes.length, manifest: original.summary as Release["manifest"] }
+      const features = { commitEnhanceSkill: "remote", commitEnhanceModel: "other", androidTranslationSkill: "remote", androidTranslationModel: "other", buildNotesSkill: "remote", buildNotesModel: "other" }
+      const expected = await pack(source, "2.0.1", undefined, features)
+      const release: Release = { ...originalRelease, releaseId: randomUUID(), version: "2.0.1", sha256: expected.sha256, size: expected.bytes.length,       manifest: expected.summary as Release["manifest"] }
+      let active = originalRelease, activations = 0
+      f.apiResponse(async (url, init) => {
+        if (url.pathname.endsWith("/latest")) return Response.json({ release: active, revision: activations ? 8 : 7, activatedAt: 1 })
+        if (url.pathname.endsWith("/download")) return new Response(Uint8Array.from(url.pathname.includes(originalRelease.releaseId) ? original.bytes : expected.bytes))
+        if (url.pathname === "/v1/amekit/releases" && init?.method !== "POST") return Response.json({ releases: [release, originalRelease], active: { release_id: active.releaseId, revision: 7, activated_at: 1 }, nextCursor: null })
+        if (url.pathname.endsWith("/content")) {
+          const uploaded = unzipSync(init!.body as Uint8Array)
+          assert.deepEqual(Object.keys(uploaded).sort(), [...files.map(file => file.path), "manifest.json"].sort())
+          for (const file of files) assert.deepEqual(uploaded[file.path], file.data, file.path)
+          assert.deepEqual(JSON.parse(new TextDecoder().decode(uploaded["manifest.json"])).features, features)
+          assert.deepEqual(init!.body, expected.bytes)
+        }
+        if (url.pathname === "/v1/amekit/releases" && init?.method === "POST") return Response.json({ release })
+        if (url.pathname.endsWith("/activate")) {
+          activations++; active = release
+          assert.deepEqual(JSON.parse(String(init?.body)), { expectedRevision: 7 })
+          return Response.json({ release, revision: 8, activatedAt: 1 })
+        }
+      })
+      await login(f.service)
+      await f.service.call("installed", {})
+      changes.length = 0; f.events.length = 0
+      const payload = Object.fromEntries(Object.entries(features).map(([key, value]) => [key, ` ${value} `]))
+      const result = await f.service.call("update-features", { version: "2.0.1", activate, ...payload, ignored: "not-a-feature" }) as { packaged: unknown; release: Release; activated: unknown; revision?: number }
+      assert.deepEqual(result.packaged, { summary: expected.summary, size: expected.bytes.length, entries: expected.entries, sha256: expected.sha256 })
+      assert.deepEqual(result.release, release)
+      assert.equal(f.pickerCount(), 0)
+      assert.equal(f.dialogs.length, 1)
+      assert.equal(f.messages[0], activate === "true" ? "Cập nhật cấu hình Skill & Model?" : "Xuất bản nháp cấu hình Skill & Model?")
+      assert.ok(f.dialogs[0].includes("v2.0.1 từ bản máy chủ v2.0.0 (giữ nguyên 2 agents & 2 skills)"))
+      assert.ok(f.events.indexOf("confirm") < f.events.indexOf("POST /v1/amekit/bundles/uploads"))
+      assert.equal(activations, activate === "true" ? 1 : 0)
+      if (activate === "true") {
+        assert.deepEqual(result.activated, { release, revision: 8, activatedAt: 1 })
+        assert.equal(result.revision, 8)
+        await waitUntil(() => changes.length === 1, "updated features did not auto-sync")
+        assert.deepEqual(changes, [{ version: "2.0.1", releaseId: release.releaseId, auto: true, action: "synced" }])
+        const skill = { name: "remote", instructions: "Remote checks." }
+        assert.deepEqual(await f.service.readCommitEnhanceFeature!(), { skill, model: "other" })
+        assert.deepEqual(await f.service.readBuildNotesFeature!(), { skill, model: "other", rawSkillName: "remote" })
+        assert.deepEqual(await f.service.readAndroidTranslationFeature!(), { skill: { ...skill, directory: path.join(f.globalConfigDir, "skills", "remote") }, model: "other", rawSkillName: "remote" })
+        const downloads = f.requests.filter(request => request.endsWith("/download")).length
+        await f.service.call("uninstall", {})
+        const current = await f.service.call("active-features", {}) as { features: unknown; skills: string[] }
+        assert.deepEqual(current.features, features)
+        assert.deepEqual(current.skills, ["fixture", "remote"])
+        assert.equal(f.requests.filter(request => request.endsWith("/download")).length, downloads, "published archive remains cached after activation")
+      } else {
+        assert.equal(result.activated, null)
+        assert.equal(changes.length, 0)
+        assert.equal((await installedGlobal(f.globalConfigDir, f.globalManagedDir))?.releaseId, originalRelease.releaseId)
+        const current = await f.service.call("active-features", {}) as { release: Release; features: unknown }
+        assert.equal(current.release.releaseId, originalRelease.releaseId)
+        assert.deepEqual(current.features, { buildNotesSkill: "fixture", buildNotesModel: "default" })
+      }
+    } finally { await f.cleanup() }
+  })
+})
+
+test("update-features rejects cancellation, invalid selections, non-admins and unverified archives before publishing", async t => {
+  for (const scenario of ["cancel", "skill", "activate", "version", "non-admin", "corrupt", "no-active"]) await t.test(scenario, async () => {
+    const f = await fixture({ role: scenario === "non-admin" ? "user" : "admin", confirm: scenario !== "cancel" })
+    try {
+      await login(f.service)
+      f.apiResponse(async url => {
+        if (scenario === "corrupt" && url.pathname.endsWith("/download")) return new Response(new Uint8Array(f.artifact.release.size))
+        if (scenario === "no-active" && url.pathname.endsWith("/latest")) return Response.json({ error: { code: "NO_ACTIVE_RELEASE" } }, { status: 404 })
+      })
+      const errors = { cancel: /CANCELLED/, skill: /UNKNOWN_BUILD_NOTES_SKILL/, activate: /INVALID_PAYLOAD/, version: /AMEKIT_OPERATION_FAILED/, "non-admin": /FORBIDDEN/, corrupt: /HASH_MISMATCH/, "no-active": /NO_ACTIVE_RELEASE/ }
+      await assert.rejects(f.service.call("update-features", { version: scenario === "version" ? "invalid" : "1.2.4", ...(scenario === "skill" ? { buildNotesSkill: "missing" } : {}), ...(scenario === "activate" ? { activate: "yes" } : {}) }), errors[scenario as keyof typeof errors])
+      assert.equal(f.dialogs.length, scenario === "cancel" ? 1 : 0)
+      assert.equal(f.requests.some(request => request.includes("/uploads") || request.endsWith("/activate")), false)
+      assert.equal(f.pickerCount(), 0)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("update-features retries activation conflicts once and preserves published releases on activation errors", async t => {
+  for (const scenario of ["retry", "conflict", "failure", "history", "auth", "forbidden", "abort"]) await t.test(scenario, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      await login(f.service)
+      let histories = 0, activations = 0
+      f.apiResponse(async (url, init) => {
+        if (url.pathname === "/v1/amekit/releases" && init?.method !== "POST") {
+          histories++
+          if (scenario === "history") return Response.json({ error: { code: "HISTORY_UNAVAILABLE" } }, { status: 500 })
+          return Response.json({ releases: [f.artifact.release], active: { release_id: f.artifact.release.releaseId, revision: 10 + histories, activated_at: 1 }, nextCursor: null })
+        }
+        if (!url.pathname.endsWith("/activate")) return
+        activations++
+        assert.deepEqual(JSON.parse(String(init?.body)), { expectedRevision: 10 + histories })
+        if (scenario === "abort") { void f.service.dispose(); throw new Error("aborted") }
+        if (scenario === "auth" || scenario === "forbidden") return Response.json({ error: { code: scenario === "auth" ? "USER_DISABLED" : "FORBIDDEN" } }, { status: scenario === "auth" ? 401 : 403 })
+        if (scenario === "failure") return Response.json({ error: { code: "ACTIVATION_UNAVAILABLE" } }, { status: 500 })
+        if (activations === 1 || scenario === "conflict") return Response.json({ error: { code: "ACTIVATION_CONFLICT" } }, { status: 409 })
+        return Response.json({ ...f.artifact.latest, revision: 13 })
+      })
+      if (["auth", "forbidden", "abort"].includes(scenario)) {
+        await assert.rejects(f.service.call("update-features", { version: "1.2.4" }), scenario === "auth" ? /USER_DISABLED/ : scenario === "forbidden" ? /FORBIDDEN/ : /CANCELLED/)
+      } else {
+        const result = await f.service.call("update-features", { version: "1.2.4" }) as { release: Release; activated: unknown; revision?: number; activationError?: string }
+        assert.deepEqual(result.release, f.artifact.release)
+        if (scenario === "retry") { assert.equal(result.revision, 13); assert.ok(result.activated); assert.equal(result.activationError, undefined) }
+        else { assert.equal(result.activated, null); assert.equal(result.activationError, scenario === "conflict" ? "ACTIVATION_CONFLICT" : scenario === "history" ? "HISTORY_UNAVAILABLE" : "ACTIVATION_UNAVAILABLE") }
+      }
+      assert.equal(histories, ["retry", "conflict"].includes(scenario) ? 2 : 1)
+      assert.equal(activations, ["retry", "conflict"].includes(scenario) ? 2 : scenario === "history" ? 0 : 1)
+      assert.equal(f.events.filter(event => event === "POST /v1/amekit/releases").length, 1)
+      assert.equal(f.dialogs.length, 1)
+    } finally { await f.cleanup() }
+  })
 })
 
 test("release confirms once, publishes fresh feature overrides and optionally activates using history revision", async t => {
@@ -549,7 +778,7 @@ test("release confirms once, publishes fresh feature overrides and optionally ac
     try {
       await login(f.service); await f.service.call("import", {})
       await f.service.call("package", { version: "1.2.2" })
-      const features = { commitEnhanceSkill: "fixture", commitEnhanceModel: "other", androidTranslationSkill: "fixture", androidTranslationModel: "default" }
+      const features = { commitEnhanceSkill: "fixture", commitEnhanceModel: "other", androidTranslationSkill: "fixture", androidTranslationModel: "default", buildNotesSkill: "fixture", buildNotesModel: "other" }
       const expected = await pack(preview(input()), "1.2.3", undefined, features)
       const release = { ...f.artifact.release, size: expected.bytes.length, sha256: expected.sha256, manifest: expected.summary as Release["manifest"] }
       let historyCalls = 0, activations = 0
@@ -681,7 +910,8 @@ test("commit Enhance facade packages, syncs and reads verified skills without ac
   try {
     const readSkill = f.service.readCommitEnhanceSkill!.bind(f.service)
     assert.equal(await readSkill("project-id"), null)
-    await assert.rejects(readSkill(""), /PROJECT_REQUIRED/)
+    assert.equal(await readSkill(""), null)
+    assert.equal(await readSkill(), null)
     await assert.rejects(readSkill("not-a-project"), /^Error: AMEKIT_OPERATION_FAILED$/)
     await login(f.service)
     const latest = await f.service.call("latest", {}) as { release: Release }
@@ -701,7 +931,7 @@ test("commit Enhance facade packages, syncs and reads verified skills without ac
       const result = await f.service.call(operation, { project: "project-id" }) as { features: unknown }
       assert.deepEqual(result.features, { commitEnhanceSkill: "fixture" })
     }
-    const state = JSON.parse(await readFile(path.join(f.project, ".opencode", ".amekit-release.json"), "utf8"))
+    const state = JSON.parse(await readFile(path.join(f.globalConfigDir, ".amekit-release.json"), "utf8"))
     assert.deepEqual(state.features, { commitEnhanceSkill: "fixture" })
     const entered = new Promise<void>(resolve => {
       f.sessionResponse(() => new Promise(done => { release = () => done(undefined); resolve() }))
@@ -719,9 +949,9 @@ test("commit Enhance facade packages, syncs and reads verified skills without ac
     assert.deepEqual(await readSkill("project-id"), { name: "fixture", instructions: "Run checks." })
     assert.equal(f.requests.length, before)
     const baseline = await bundle()
-    const replaced = await install(f.project, "http://localhost:3211", baseline.release, baseline.packed.bytes, f.dependencies.discover!)
+    const replaced = await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", baseline.release, baseline.packed.bytes, f.dependencies.discover!)
     assert.equal(Object.hasOwn(replaced.state, "features"), false, "syncing an unconfigured bundle clears the old selection")
-    assert.equal(Object.hasOwn(JSON.parse(await readFile(path.join(f.project, ".opencode", ".amekit-release.json"), "utf8")), "features"), false)
+    assert.equal(Object.hasOwn(JSON.parse(await readFile(path.join(f.globalConfigDir, ".amekit-release.json"), "utf8")), "features"), false)
     assert.equal(await readSkill("project-id"), null)
     await f.service.dispose()
     await assert.rejects(readSkill("project-id"), /AMEKIT_DISPOSED/)
@@ -752,8 +982,7 @@ test("commit Enhance reader strips frontmatter, preserves markdown, bounds text 
 test("commit Enhance reader rejects malformed ownership, tampering and linked directories", async () => {
   const f = await fixture({ commitEnhanceSkill: "fixture" })
   try {
-    await login(f.service)
-    await f.service.call("sync", { project: "project-id" })
+    await install(f.project, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
     const statePath = path.join(f.project, ".opencode", ".amekit-release.json")
     const original = JSON.parse(await readFile(statePath, "utf8"))
     for (const features of [null, [], "fixture", true, { commitEnhanceSkill: 42 }, { commitEnhanceSkill: "missing" }]) {
@@ -830,15 +1059,83 @@ test("four bundle features round-trip through API, packaging, install and verifi
   } finally { await f.cleanup() }
 })
 
-test("Android reader bounds verified instructions separately from commit Enhance", async () => {
+test("Build Notes features validate, preserve model-only configuration and reject unknown skills", async () => {
+  const f = await fixture({ role: "admin" })
+  try {
+    await login(f.service); await f.service.call("import", {})
+    for (const features of [{ buildNotesSkill: "fixture", buildNotesModel: "other" }, { buildNotesSkill: "fixture" }, { buildNotesModel: "other" }]) {
+      const packed = await pack(preview(input()), "1.2.3", undefined, features)
+      assert.deepEqual(packed.summary.features, features)
+      assert.deepEqual((await validate(packed.bytes, "1.2.3")).features, features)
+      const requestFeatures = Object.fromEntries(Object.entries(features).map(([key, value]) => [key, ` ${value} `]))
+      const packaged = await f.service.call("package", { version: "1.2.3", ...requestFeatures }) as { summary: Release["manifest"] }
+      assert.deepEqual(packaged.summary.features, features)
+      const released = await f.service.call("release", { version: "1.2.3", activate: "false", ...requestFeatures }) as { packaged: { summary: Release["manifest"] } }
+      assert.deepEqual(released.packaged.summary.features, features)
+    }
+    const packed = await pack(preview(input()), "1.2.3")
+    const entries = unzipSync(packed.bytes), manifest = JSON.parse(new TextDecoder().decode(entries["manifest.json"]))
+    const rewrite = (features: unknown) => zipSync({ ...entries, "manifest.json": encode(JSON.stringify({ ...manifest, features })) })
+    await assert.rejects(pack(preview(input()), "1.2.3", undefined, { buildNotesSkill: "missing" }), /UNKNOWN_BUILD_NOTES_SKILL/)
+    await assert.rejects(validate(rewrite({ buildNotesSkill: "missing" }), "1.2.3"), /UNKNOWN_BUILD_NOTES_SKILL/)
+    await assert.rejects(f.service.call("package", { version: "1.2.3", buildNotesSkill: "missing" }), /UNKNOWN_BUILD_NOTES_SKILL/)
+    for (const buildNotesModel of ["", "a b", "a/b", "a\n", "a\x00b", "e\u0301", "a".repeat(201), 42]) {
+      await assert.rejects(validate(rewrite({ buildNotesModel }), "1.2.3"), { name: "ZodError" })
+    }
+  } finally { await f.cleanup() }
+})
+
+test("Build Notes verified readers prefer global configuration, preserve model-only defaults and reject tampering", async () => {
+  const f = await fixture()
+  const expected = { skill: { name: "fixture", instructions: "Run checks." }, model: "other", rawSkillName: "fixture" }
+  try {
+    assert.deepEqual(await f.service.readBuildNotesFeature!(), { skill: null })
+    assert.deepEqual(await readBuildNotesFeature(f.project), { skill: null })
+    assert.deepEqual(await readGlobalBuildNotesFeature(f.globalConfigDir, f.globalManagedDir), { skill: null })
+    const projectBundle = await pack(preview(input()), "1.2.3", undefined, { buildNotesSkill: "fixture", buildNotesModel: "other" })
+    const releaseOf = (packed: typeof projectBundle) => ({ ...f.artifact.release, sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"] })
+    await install(f.project, "http://localhost:3211", releaseOf(projectBundle), projectBundle.bytes, f.dependencies.discover!)
+    assert.deepEqual(await readBuildNotesFeature(f.project), expected)
+    assert.deepEqual(await f.service.readBuildNotesFeature!("project-id"), expected)
+    for (const features of [{ buildNotesSkill: "fixture", buildNotesModel: "default" }, { buildNotesModel: "default" }, {}]) {
+      const packed = await pack(preview(input()), "1.2.3", undefined, features)
+      await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", releaseOf(packed), packed.bytes, f.dependencies.discover!)
+      const globalExpected = features.buildNotesSkill ? { ...expected, model: "default" } : features.buildNotesModel ? { skill: null, model: "default" } : { skill: null }
+      assert.deepEqual(await readGlobalBuildNotesFeature(f.globalConfigDir, f.globalManagedDir), globalExpected)
+      for (const projectID of [undefined, "", "project-id", "unknown-project"]) assert.deepEqual(await f.service.readBuildNotesFeature!(projectID), globalExpected)
+    }
+    await uninstallGlobal(f.globalConfigDir, f.globalManagedDir)
+    assert.deepEqual(await f.service.readBuildNotesFeature!("project-id"), expected)
+    const statePath = path.join(f.project, ".opencode", ".amekit-release.json"), original = JSON.parse(await readFile(statePath, "utf8"))
+    await writeFile(statePath, JSON.stringify({ ...original, features: { buildNotesSkill: "missing" } }))
+    await assert.rejects(readBuildNotesFeature(f.project), /INVALID_OWNERSHIP_STATE/)
+    await writeFile(statePath, JSON.stringify(original))
+    for (const file of input()) {
+      const target = path.join(f.project, ".opencode", ...file.path.split("/")); await writeFile(target, "manual edit")
+      await assert.rejects(f.service.readBuildNotesFeature!("project-id"), /OWNED_FILE_CHANGED/)
+      await writeFile(target, file.data)
+    }
+    const modelOnly = await pack(preview(input()), "1.2.3", undefined, { buildNotesModel: "other" })
+    await install(f.project, "http://localhost:3211", releaseOf(modelOnly), modelOnly.bytes, f.dependencies.discover!)
+    assert.deepEqual(await readBuildNotesFeature(f.project), { skill: null, model: "other" })
+    assert.deepEqual(await f.service.readBuildNotesFeature!("project-id"), { skill: null, model: "other" })
+    await f.service.dispose()
+    await assert.rejects(f.service.readBuildNotesFeature!(), /AMEKIT_DISPOSED/)
+  } finally { await f.cleanup() }
+})
+
+test("Android reader bounds verified instructions separately from commit Enhance and Build Notes", async () => {
   const f = await fixture()
   try {
     const instructions = Array.from({ length: 1000 }, (_, i) => `Review documentation section ${i} before publishing.\n`).join("").slice(0, 33_000)
     const files = input(); files[1].data = encode("---\nname: fixture\ndescription: Fixture\n---\n" + instructions)
-    const packed = await pack(preview(files), "1.2.3", undefined, { commitEnhanceSkill: "fixture", androidTranslationSkill: "fixture" })
+    const packed = await pack(preview(files), "1.2.3", undefined, { commitEnhanceSkill: "fixture", androidTranslationSkill: "fixture", buildNotesSkill: "fixture" })
     await install(f.project, "http://localhost:3211", { ...f.artifact.release, sha256: packed.sha256, size: packed.bytes.length }, packed.bytes, f.dependencies.discover!)
     assert.equal((await readCommitEnhanceSkill(f.project))!.instructions.length, 16_000)
     assert.equal((await readAndroidTranslationFeature(f.project)).skill!.instructions.length, 32_000)
+    assert.equal((await readBuildNotesFeature(f.project)).skill!.instructions, instructions.slice(0, 16_000))
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", { ...f.artifact.release, sha256: packed.sha256, size: packed.bytes.length }, packed.bytes, f.dependencies.discover!)
+    assert.equal((await readGlobalBuildNotesFeature(f.globalConfigDir, f.globalManagedDir)).skill!.instructions, instructions.slice(0, 16_000))
   } finally { await f.cleanup() }
 })
 
@@ -1040,63 +1337,439 @@ test("Claude adaptation rejects non-raw modes in preview, scan and import payloa
   } finally { await f.cleanup() }
 })
 
-test("native sync preserves personal config, verifies runtime, supports offline and safe uninstall", async () => {
-  const f = await fixture()
+test("native global sync needs no confirmation, preserves personal config and supports offline and confirmed uninstall", async () => {
+  const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+  const f = await fixture({ confirm: false, onBundleChanged: event => changes.push(event) })
   try {
-    await mkdir(path.join(f.project, ".opencode")); await writeFile(path.join(f.project, ".opencode", "personal.json"), "personal")
+    await mkdir(f.globalConfigDir, { recursive: true }); await writeFile(path.join(f.globalConfigDir, "personal.json"), "personal")
     await login(f.service)
-    f.confirm(false)
-    await assert.rejects(f.service.call("sync", { project: "project-id" }), /CANCELLED/)
-    assert.equal(f.requests.some(request => request.endsWith("/download")), false)
-    f.confirm(true)
     type Inventory = { agents: string[]; skills: string[]; fileCount: number; verification: string }
     const checkInventory = (value: Inventory) => {
       assert.deepEqual(value.agents, ["helper"])
       assert.deepEqual(value.skills, ["fixture"])
       assert.equal(value.fileCount, input().length)
     }
-    const result = await f.service.call("sync", { project: "project-id" }) as Inventory & { changed: boolean }
+    const result = await f.service.call("sync", {}) as Inventory & { changed: boolean }
     assert.equal(result.changed, true); assert.equal(result.verification, "runtime-ready")
     checkInventory(result)
-    assert.equal(await readFile(path.join(f.project, ".opencode", "personal.json"), "utf8"), "personal")
-    checkInventory(await f.service.call("installed", { project: "project-id" }) as Inventory)
+    assert.equal(f.dialogs.length, 0)
+    assert.deepEqual(changes, [{ version: "1.2.3", releaseId: f.artifact.release.releaseId, auto: false, action: "synced" }])
+    assert.equal(await readFile(path.join(f.globalConfigDir, "personal.json"), "utf8"), "personal")
+    assert.deepEqual(await readdir(f.project), [], "global sync never creates project configuration")
+    checkInventory(await f.service.call("installed", {}) as Inventory)
+    assert.equal((await f.service.call("sync", {}) as { changed: boolean }).changed, false)
+    assert.equal(changes.length, 1, "unchanged sync emits no duplicate event")
     await f.service.call("logout", {})
     const before = f.requests.length
-    const offline = await f.service.call("offline", { project: "project-id" }) as Inventory
+    const offline = await f.service.call("offline", {}) as Inventory
     assert.equal(offline.verification, "runtime-ready")
     checkInventory(offline)
     assert.equal(f.requests.length, before)
-    f.confirm(false); await assert.rejects(f.service.call("uninstall", { project: "project-id" }), /CANCELLED/)
+    await assert.rejects(f.service.call("uninstall", {}), /CANCELLED/)
+    assert.ok(await f.service.call("installed", {}))
     f.confirm(true)
-    assert.deepEqual(await f.service.call("uninstall", { project: "project-id" }), { changed: true })
-    assert.equal(await installed(f.project), undefined)
-    assert.equal(await readFile(path.join(f.project, ".opencode", "personal.json"), "utf8"), "personal")
+    assert.deepEqual(await f.service.call("uninstall", {}), { changed: true })
+    assert.equal(await f.service.call("installed", {}), null)
+    assert.equal(await readFile(path.join(f.globalConfigDir, "personal.json"), "utf8"), "personal")
+    assert.deepEqual(changes.at(-1), { version: "", releaseId: "", auto: false, action: "uninstalled" })
+    assert.deepEqual(await f.service.call("uninstall", {}), { changed: false })
+    assert.equal(changes.length, 2)
   } finally { await f.cleanup() }
 })
 
-test("native discovery failure rolls back while raw requires consent and never claims runtime-ready", async t => {
+test("changed sync and uninstall reload before restoring policy and notifying, while unchanged operations do not reload", async () => {
+  const order: string[] = []
+  let pluginPolicy: unknown, expectedPolicy: unknown, reloads = 0, reloadFinished = false, failReload = false
+  const f = await fixture({
+    reloadRuntime: async () => {
+      reloads++; order.push("reload"); reloadFinished = false
+      pluginPolicy = null
+      await delay(1)
+      reloadFinished = true; order.push("reloaded")
+      if (failReload) throw new Error("transient reload error")
+    },
+    onBundleChanged: event => {
+      assert.equal(reloadFinished, true)
+      assert.deepEqual(pluginPolicy, expectedPolicy, "policy/auth must be restored before bundle notification")
+      order.push(event.action)
+    },
+  })
+  f.rpcResponse(async () => {
+    pluginPolicy = f.rpc.at(-1)
+    if (reloads && pluginPolicy !== null) { assert.equal(reloadFinished, true); order.push("policy") }
+    return undefined
+  })
+  try {
+    f.expiresAt(Date.now() + 3600_000)
+    await login(f.service)
+    await f.service.authorizeFeatureModel!("other")
+    expectedPolicy = structuredClone(f.rpc.at(-1))
+    assert.deepEqual((expectedPolicy as { featureModels: string[] }).featureModels, ["other"])
+    assert.equal((await f.service.call("sync", {}) as { changed: boolean }).changed, true)
+    assert.deepEqual(order.slice(0, 4), ["reload", "reloaded", "policy", "synced"])
+    const before = reloads
+    assert.equal((await f.service.call("sync", {}) as { changed: boolean }).changed, false)
+    assert.equal(reloads, before)
+    order.length = 0; failReload = true
+    assert.deepEqual(await f.service.call("uninstall", {}), { changed: true })
+    assert.deepEqual(order, ["reload", "reloaded", "policy", "uninstalled"], "uninstall restores policy even when reload rejects and call skips synchronize")
+    assert.deepEqual(await f.service.call("uninstall", {}), { changed: false })
+    assert.equal(reloads, before + 1)
+    await f.service.call("logout", {})
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+    expectedPolicy = null; order.length = 0
+    const rpcCount = f.rpc.length
+    assert.deepEqual(await f.service.call("uninstall", {}), { changed: true })
+    assert.deepEqual(order, ["reload", "reloaded", "uninstalled"])
+    assert.equal(f.rpc.length, rpcCount, "signed-out uninstall must not attempt authenticated policy restoration")
+  } finally { await f.cleanup() }
+})
+
+test("auto sync reloads and restores current policy before notification, and skips unchanged bundles", async t => {
+  for (const concurrentInstall of [false, true]) await t.test(concurrentInstall ? "unchanged during download" : "changed and already current", async () => {
+    const order: string[] = []
+    let pluginPolicy: unknown, expectedPolicy: unknown, active = false, reloadFinished = false
+    const f = await fixture({ autoSync: true,
+      reloadRuntime: async () => {
+        order.push("reload"); pluginPolicy = null; reloadFinished = false
+        await delay(1)
+        reloadFinished = true; order.push("reloaded")
+      },
+      onBundleChanged: event => {
+        assert.equal(reloadFinished, true)
+        assert.deepEqual(pluginPolicy, expectedPolicy)
+        assert.equal(event.auto, true)
+        order.push("notified")
+      },
+    })
+    f.rpcResponse(async () => {
+      pluginPolicy = f.rpc.at(-1)
+      if (reloadFinished && pluginPolicy !== null) order.push("policy")
+      return undefined
+    })
+    f.apiResponse(async url => {
+      if (url.pathname.endsWith("/latest") && !active) return Response.json({ error: { code: "NO_ACTIVE_RELEASE" } }, { status: 404 })
+      if (url.pathname.endsWith("/download") && concurrentInstall) {
+        await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+      }
+      return undefined
+    })
+    try {
+      f.expiresAt(Date.now() + 3600_000)
+      await login(f.service)
+      await f.service.call("installed", {})
+      await f.service.authorizeFeatureModel!("other")
+      expectedPolicy = structuredClone(f.rpc.at(-1)); active = true
+      await f.service.call("refresh", {})
+      await f.service.call("installed", {})
+      assert.ok(await installedGlobal(f.globalConfigDir, f.globalManagedDir))
+      assert.deepEqual(order, concurrentInstall ? [] : ["reload", "reloaded", "policy", "notified"])
+      order.length = 0; reloadFinished = false
+      await f.service.call("refresh", {})
+      await f.service.call("installed", {})
+      assert.deepEqual(order, [], "already-current auto sync must not reload or notify")
+      assert.equal((await f.service.call("status", {}) as { ready: boolean }).ready, true)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("global native discovery failure rolls back while admin-selected raw sync requires no extra consent", async t => {
   await t.test("native discovery mismatch restores previous tree", async () => {
     const f = await fixture({ discover: async () => ({ agents: [], skills: [] }) })
     try {
-      await mkdir(path.join(f.project, ".opencode")); await writeFile(path.join(f.project, ".opencode", "personal.json"), "unchanged")
+      await mkdir(f.globalConfigDir, { recursive: true }); await writeFile(path.join(f.globalConfigDir, "personal.json"), "unchanged")
+      const inode = (await lstat(f.globalConfigDir)).ino
       await login(f.service)
-      await assert.rejects(f.service.call("sync", { project: "project-id" }), /DISCOVERY_MISMATCH/)
-      assert.deepEqual(await readdir(path.join(f.project, ".opencode")), ["personal.json"])
-      assert.equal(await readFile(path.join(f.project, ".opencode", "personal.json"), "utf8"), "unchanged")
+      await assert.rejects(f.service.call("sync", {}), /DISCOVERY_MISMATCH/)
+      assert.deepEqual(await readdir(f.globalConfigDir), ["personal.json"])
+      assert.equal((await lstat(f.globalConfigDir)).ino, inode)
+      assert.equal(await readFile(path.join(f.globalConfigDir, "personal.json"), "utf8"), "unchanged")
+      assert.deepEqual(await readdir(f.globalManagedDir), ["owner"])
     } finally { await f.cleanup() }
   })
-  await t.test("raw consent is not renderer-only", async () => {
-    const f = await fixture({ mode: "raw", discover: async () => { throw new Error("MUST_NOT_RUN") } })
+  await t.test("raw service sync is silent and verified-bytes only", async () => {
+    const f = await fixture({ mode: "raw", confirm: false, discover: async () => { throw new Error("MUST_NOT_RUN") } })
     try {
       await login(f.service)
-      await assert.rejects(f.service.call("sync", { project: "project-id" }), /RAW_INSTALL_CONFIRMATION_REQUIRED/)
-      f.confirm(false)
-      await assert.rejects(f.service.call("sync", { project: "project-id", allowRaw: "true" }), /CANCELLED/)
-      f.confirm(true)
-      const result = await f.service.call("sync", { project: "project-id", allowRaw: "true" }) as { verification: string }
+      const result = await f.service.call("sync", {}) as { verification: string }
       assert.equal(result.verification, "verified-bytes")
-      assert.ok(f.dialogs.some(detail => detail.includes("RAW")))
-      assert.equal((await f.service.call("offline", { project: "project-id" }) as { verification: string }).verification, "verified-bytes")
+      assert.equal(f.dialogs.length, 0)
+      assert.equal((await f.service.call("offline", {}) as { verification: string }).verification, "verified-bytes")
+    } finally { await f.cleanup() }
+  })
+})
+
+test("global installer updates in place, preserves personal files and tolerates concurrent opencode.json writes", async () => {
+  const f = await fixture()
+  try {
+    await mkdir(path.join(f.globalConfigDir, "agents"), { recursive: true })
+    await mkdir(path.join(f.globalConfigDir, "skills", "personal"), { recursive: true })
+    const config = path.join(f.globalConfigDir, "opencode.json")
+    await writeFile(config, '{"personal":1}')
+    await writeFile(path.join(f.globalConfigDir, "agents", "personal.md"), "personal agent")
+    await writeFile(path.join(f.globalConfigDir, "skills", "personal", "SKILL.md"), "personal skill")
+    await mkdir(path.join(f.globalConfigDir, "skills", "personal", "empty"))
+    await mkdir(path.join(f.globalConfigDir, "unrelated", "empty"), { recursive: true })
+    const inode = (await lstat(f.globalConfigDir)).ino
+    let writes = 0
+    const discover: NonNullable<AmeKitDependencies["discover"]> = async (directory, signal, expected, options) => {
+      assert.equal(directory, f.globalConfigDir)
+      assert.equal(options?.scope, "global")
+      await writeFile(config, JSON.stringify({ personal: ++writes }))
+      return f.dependencies.discover!(directory, signal, expected, options)
+    }
+    const first = await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, discover)
+    assert.equal(first.changed, true)
+    assert.equal(writes, 2, "exercise concurrent writes during prepare and post-activation discovery")
+    assert.equal((await lstat(f.globalConfigDir)).ino, inode)
+    assert.equal(await readFile(config, "utf8"), '{"personal":2}')
+    assert.deepEqual(await readdir(f.globalManagedDir), ["owner"])
+    assert.equal(await readFile(path.join(f.globalManagedDir, "owner"), "utf8"), "amekit-poc04\n")
+    assert.equal((await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, discover)).changed, false)
+    assert.equal((await offlineGlobal(f.globalConfigDir, f.globalManagedDir, discover)).verification, "runtime-ready")
+    const files = input().map(file => ({ ...file, path: file.path.replace("agents/helper.md", "agents/replacement.md") }))
+    const packed = await pack(preview(files), "1.2.4")
+    const release = { ...f.artifact.release, releaseId: randomUUID(), version: "1.2.4", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"] }
+    const replacementDiscovery: NonNullable<AmeKitDependencies["discover"]> = async (directory, _signal, expected, options) => {
+      assert.equal(options?.scope, "global")
+      await writeFile(config, '{"personal":"updated concurrently"}')
+      return expected ? { agents: [{ id: "replacement" }], skills: [{ id: "fixture", name: "fixture", path: path.join(directory, "skills", "fixture", "SKILL.md") }] } : { agents: [], skills: [] }
+    }
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", release, packed.bytes, replacementDiscovery)
+    await assert.rejects(readFile(path.join(f.globalConfigDir, "agents", "helper.md")), { code: "ENOENT" })
+    assert.equal((await lstat(f.globalConfigDir)).ino, inode)
+    assert.equal(await uninstallGlobal(f.globalConfigDir, f.globalManagedDir), true)
+    assert.equal(await uninstallGlobal(f.globalConfigDir, f.globalManagedDir), false)
+    assert.equal(await installedGlobal(f.globalConfigDir, f.globalManagedDir), undefined)
+    assert.equal((await lstat(f.globalConfigDir)).ino, inode)
+    assert.equal(await readFile(config, "utf8"), '{"personal":"updated concurrently"}')
+    assert.equal(await readFile(path.join(f.globalConfigDir, "agents", "personal.md"), "utf8"), "personal agent")
+    assert.equal(await readFile(path.join(f.globalConfigDir, "skills", "personal", "SKILL.md"), "utf8"), "personal skill")
+    assert.equal((await lstat(path.join(f.globalConfigDir, "skills", "personal", "empty"))).isDirectory(), true)
+    assert.equal((await lstat(path.join(f.globalConfigDir, "unrelated", "empty"))).isDirectory(), true)
+    await assert.rejects(lstat(path.join(f.globalConfigDir, "skills", "fixture")), { code: "ENOENT" })
+    assert.deepEqual(await readdir(f.globalManagedDir), ["owner"])
+  } finally { await f.cleanup() }
+})
+
+test("global failed upgrade restores exact owned bytes without reverting concurrent personal config", async () => {
+  const f = await fixture()
+  try {
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+    const statePath = path.join(f.globalConfigDir, ".amekit-release.json"), state = await readFile(statePath)
+    const inode = (await lstat(f.globalConfigDir)).ino
+    const files = input(); files[0].data = encode("---\ndescription: Upgraded helper\nmode: subagent\n---\nNew instructions.\n")
+    files.push({ path: "skills/fixture/new/reference.md", data: encode("New reference.\n") })
+    const packed = await pack(preview(files), "1.2.4")
+    const release = { ...f.artifact.release, releaseId: randomUUID(), version: "1.2.4", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"] }
+    await assert.rejects(installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", release, packed.bytes, async (_directory, _signal, expected) => {
+      if (expected) {
+        await writeFile(path.join(f.globalConfigDir, "opencode.json"), '{"external":"keep"}')
+        await writeFile(path.join(f.globalConfigDir, "agents", "personal-added.md"), "concurrent personal agent")
+      }
+      return { agents: [], skills: [] }
+    }), /DISCOVERY_MISMATCH/)
+    assert.deepEqual(await readFile(statePath), state)
+    assert.equal(await readFile(path.join(f.globalConfigDir, "agents", "personal-added.md"), "utf8"), "concurrent personal agent")
+    for (const file of input()) assert.deepEqual(await readFile(path.join(f.globalConfigDir, ...file.path.split("/"))), Buffer.from(file.data))
+    await assert.rejects(lstat(path.join(f.globalConfigDir, "skills", "fixture", "new")), { code: "ENOENT" })
+    assert.equal(await readFile(path.join(f.globalConfigDir, "opencode.json"), "utf8"), '{"external":"keep"}')
+    assert.equal((await lstat(f.globalConfigDir)).ino, inode)
+    assert.equal((await installedGlobal(f.globalConfigDir, f.globalManagedDir))?.releaseId, f.artifact.release.releaseId)
+    assert.deepEqual(await readdir(f.globalManagedDir), ["owner"])
+  } finally { await f.cleanup() }
+})
+
+test("global rollback failure retains journal, lock and backup for recovery instead of erasing evidence", async () => {
+  const f = await fixture()
+  try {
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+    const agent = path.join(f.globalConfigDir, "agents", "helper.md"), inode = (await lstat(f.globalConfigDir)).ino
+    const upgraded = { ...f.artifact.release, releaseId: randomUUID() }
+    await assert.rejects(installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", upgraded, f.artifact.packed.bytes, async (_directory, _signal, expected) => {
+      if (expected) { await rm(agent); await mkdir(agent) }
+      return { agents: [], skills: [] }
+    }), /ROLLBACK_FAILED/)
+    const entries = await readdir(f.globalManagedDir)
+    assert.ok(entries.includes("transaction.json"))
+    assert.ok(entries.includes("lock"))
+    const backup = entries.find(entry => entry.startsWith("previous-"))
+    assert.ok(backup)
+    assert.deepEqual(await readFile(path.join(f.globalManagedDir, backup, "agents", "helper.md")), Buffer.from(input()[0].data))
+    assert.ok(await readFile(path.join(f.globalManagedDir, backup, ".amekit-release.json")))
+    assert.equal((await lstat(f.globalConfigDir)).ino, inode)
+    await assert.rejects(installedGlobal(f.globalConfigDir, f.globalManagedDir), /RECOVERY_REQUIRED/)
+  } finally { await f.cleanup() }
+})
+
+test("global installation rejects personal collisions, ownership changes and unconsented primitive raw installs", async t => {
+  for (const collision of ["file", "directory", "agent", "skill"] as const) await t.test(collision, async () => {
+    const f = await fixture()
+    try {
+      await mkdir(f.globalConfigDir, { recursive: true })
+      if (collision === "file") {
+        await mkdir(path.join(f.globalConfigDir, "agents"))
+        await writeFile(path.join(f.globalConfigDir, "agents", "HELPER.md"), "personal")
+      }
+      if (collision === "directory") await mkdir(path.join(f.globalConfigDir, "agents", "helper.md"), { recursive: true })
+      const discover: NonNullable<AmeKitDependencies["discover"]> = async (_directory, _signal, _expected, options) => {
+        assert.equal(options?.scope, "global")
+        return { agents: collision === "agent" ? [{ id: "HELPER" }] : [], skills: collision === "skill" ? [{ id: "fixture", name: "FIXTURE", path: "personal" }] : [] }
+      }
+      const expected = { file: /PERSONAL_FILE_COLLISION/, directory: /PERSONAL_DIRECTORY_COLLISION/, agent: /PERSONAL_AGENT_COLLISION/, skill: /PERSONAL_SKILL_COLLISION/ }[collision]
+      await assert.rejects(installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, discover), expected)
+      assert.equal(await installedGlobal(f.globalConfigDir, f.globalManagedDir), undefined)
+      if (collision === "file") assert.equal(await readFile(path.join(f.globalConfigDir, "agents", "HELPER.md"), "utf8"), "personal")
+    } finally { await f.cleanup() }
+  })
+  await t.test("tamper and raw opt-in", async () => {
+    const f = await fixture({ mode: "raw" })
+    const discover = async () => { throw new Error("MUST_NOT_DISCOVER_RAW") }
+    try {
+      await assert.rejects(installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, discover), /RAW_INSTALL_CONFIRMATION_REQUIRED/)
+      await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, discover, undefined, { allowRaw: true })
+      await writeFile(path.join(f.globalConfigDir, "agents", "helper.md"), "manual edit")
+      await assert.rejects(installedGlobal(f.globalConfigDir, f.globalManagedDir), /OWNED_FILE_CHANGED/)
+      await assert.rejects(uninstallGlobal(f.globalConfigDir, f.globalManagedDir), /OWNED_FILE_CHANGED/)
+      assert.equal(await readFile(path.join(f.globalConfigDir, "agents", "helper.md"), "utf8"), "manual edit")
+    } finally { await f.cleanup() }
+  })
+})
+
+test("installer tree scans more than 4096 files for global and retained project primitives", async () => {
+  const f = await fixture()
+  try {
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+    await install(f.project, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+    for (const config of [f.globalConfigDir, path.join(f.project, ".opencode")]) {
+      const personal = path.join(config, "personal"); await mkdir(personal, { recursive: true })
+      for (let start = 0; start < 4200; start += 100) await Promise.all(Array.from({ length: 100 }, (_, offset) => writeFile(path.join(personal, `${start + offset}.txt`), "personal")))
+    }
+    assert.equal((await installedGlobal(f.globalConfigDir, f.globalManagedDir))?.files.length, 2)
+    assert.equal((await installed(f.project))?.files.length, 2)
+  } finally { await f.cleanup() }
+})
+
+test("global feature readers work without a project, override legacy settings and reject all owned-file tampering", async () => {
+  const f = await fixture()
+  const features = { commitEnhanceSkill: "fixture", commitEnhanceModel: "other", androidTranslationSkill: "fixture", androidTranslationModel: "default" }
+  try {
+    assert.equal(await f.service.readCommitEnhanceSkill!(), null)
+    assert.deepEqual(await f.service.readCommitEnhanceFeature!(""), { skill: null })
+    assert.deepEqual(await f.service.readAndroidTranslationFeature!(), { skill: null })
+    const packed = await pack(preview(input()), "1.2.3", undefined, features)
+    const release = { ...f.artifact.release, sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"] }
+    await install(f.project, "http://localhost:3211", release, packed.bytes, f.dependencies.discover!)
+    assert.deepEqual(await f.service.readCommitEnhanceSkill!("project-id"), { name: "fixture", instructions: "Run checks." })
+    assert.deepEqual(await f.service.readCommitEnhanceFeature!("project-id"), { skill: { name: "fixture", instructions: "Run checks." }, model: "other" })
+    assert.equal((await f.service.readAndroidTranslationFeature!("project-id")).skill?.directory, path.join(f.project, ".opencode", "skills", "fixture"))
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", release, packed.bytes, f.dependencies.discover!)
+    assert.deepEqual(await readGlobalBundleFeatures(f.globalConfigDir, f.globalManagedDir), features)
+    assert.deepEqual(await readGlobalCommitEnhanceSkill(f.globalConfigDir, f.globalManagedDir), { name: "fixture", instructions: "Run checks." })
+    const android = { skill: { name: "fixture", instructions: "Run checks.", directory: path.join(f.globalConfigDir, "skills", "fixture") }, model: "default", rawSkillName: "fixture" }
+    assert.deepEqual(await readGlobalAndroidTranslationFeature(f.globalConfigDir, f.globalManagedDir), android)
+    for (const projectID of [undefined, "", "project-id", "another-project"]) {
+      assert.deepEqual(await f.service.readCommitEnhanceSkill!(projectID), { name: "fixture", instructions: "Run checks." })
+      assert.deepEqual(await f.service.readCommitEnhanceFeature!(projectID), { skill: { name: "fixture", instructions: "Run checks." }, model: "other" })
+      assert.deepEqual(await f.service.readAndroidTranslationFeature!(projectID), android)
+    }
+    for (const file of input()) {
+      const target = path.join(f.globalConfigDir, ...file.path.split("/")); await writeFile(target, "manual edit")
+      await assert.rejects(f.service.readCommitEnhanceSkill!("project-id"), /OWNED_FILE_CHANGED/)
+      await assert.rejects(f.service.readCommitEnhanceFeature!("project-id"), /OWNED_FILE_CHANGED/)
+      await assert.rejects(f.service.readAndroidTranslationFeature!("project-id"), /OWNED_FILE_CHANGED/)
+      await writeFile(target, file.data)
+    }
+    await installGlobal(f.globalConfigDir, f.globalManagedDir, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+    assert.equal(await f.service.readCommitEnhanceSkill!("project-id"), null, "active global bundle without selection must not revive legacy features")
+    assert.deepEqual(await f.service.readCommitEnhanceFeature!("project-id"), { skill: null })
+    assert.deepEqual(await f.service.readAndroidTranslationFeature!("project-id"), { skill: null })
+    await uninstallGlobal(f.globalConfigDir, f.globalManagedDir)
+    assert.deepEqual(await f.service.readCommitEnhanceFeature!("project-id"), { skill: { name: "fixture", instructions: "Run checks." }, model: "other" })
+  } finally { await f.cleanup() }
+})
+
+test("legacy detection and confirmed cleanup remove only AmeKit files and empty project directories", async t => {
+  for (const personal of [false, true]) await t.test(personal ? "personal files retained" : "empty directories removed", async () => {
+    const f = await fixture({ confirm: false })
+    try {
+      assert.equal(await f.service.call("legacy-installed", { project: "project-id" }), null)
+      await install(f.project, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+      if (personal) {
+        await writeFile(path.join(f.project, ".opencode", "opencode.json"), '{"personal":true}')
+        await mkdir(path.join(f.project, ".opencode", "skills", "personal"))
+        await writeFile(path.join(f.project, ".opencode", "skills", "personal", "SKILL.md"), "personal skill")
+      }
+      const configInode = (await lstat(path.join(f.project, ".opencode"))).ino
+      const expected = { version: "1.2.3", releaseId: f.artifact.release.releaseId, fileCount: 2, hasConfigDir: true, hasManagedDir: true }
+      assert.deepEqual(await legacyProjectInstalled(f.project), expected)
+      assert.deepEqual(await f.service.call("legacy-installed", { project: "project-id" }), { ...expected, projectName: "project" })
+      await assert.rejects(f.service.call("clean-legacy", { project: "project-id" }), /CANCELLED/)
+      assert.ok(await installed(f.project))
+      assert.ok(f.dialogs[0].includes(path.join(f.project, ".opencode")))
+      assert.ok(f.dialogs[0].includes(path.join(f.project, ".amekit")))
+      f.confirm(true)
+      const requests = f.requests.length, policies = f.rpc.length
+      assert.deepEqual(await f.service.call("clean-legacy", { project: "project-id" }), { removedFiles: 3, removedOpencodeDir: !personal, removedManagedDir: true })
+      assert.equal(f.requests.length, requests, "signed-out cleanup performs no account refresh")
+      assert.equal(f.rpc.length, policies)
+      assert.equal(await f.service.call("legacy-installed", { project: "project-id" }), null)
+      await assert.rejects(lstat(path.join(f.project, ".amekit")), { code: "ENOENT" })
+      await assert.rejects(lstat(path.join(f.project, ".opencode", ".amekit-release.json")), { code: "ENOENT" })
+      await assert.rejects(lstat(path.join(f.project, ".opencode", "agents", "helper.md")), { code: "ENOENT" })
+      if (personal) {
+        assert.equal((await lstat(path.join(f.project, ".opencode"))).ino, configInode, "cleanup must not rename or replace .opencode")
+        assert.equal(await readFile(path.join(f.project, ".opencode", "opencode.json"), "utf8"), '{"personal":true}')
+        assert.equal(await readFile(path.join(f.project, ".opencode", "skills", "personal", "SKILL.md"), "utf8"), "personal skill")
+        await assert.rejects(lstat(path.join(f.project, ".opencode", "skills", "fixture")), { code: "ENOENT" })
+      } else await assert.rejects(lstat(path.join(f.project, ".opencode")), { code: "ENOENT" })
+      assert.deepEqual(await cleanLegacyProject(f.project), { removedFiles: 0, removedOpencodeDir: false, removedManagedDir: false })
+    } finally { await f.cleanup() }
+  })
+})
+
+test("legacy cleanup rejects tampering and unsafe managed leftovers without silently deleting personal data", async t => {
+  for (const problem of ["tamper", "state", "lock", "journal", "owner", "personal"] as const) await t.test(problem, async () => {
+    const f = await fixture()
+    try {
+      await install(f.project, "http://localhost:3211", f.artifact.release, f.artifact.packed.bytes, f.dependencies.discover!)
+      const managed = path.join(f.project, ".amekit"), statePath = path.join(f.project, ".opencode", ".amekit-release.json"), agent = path.join(f.project, ".opencode", "agents", "helper.md")
+      const skill = path.join(f.project, ".opencode", "skills", "fixture", "SKILL.md")
+      if (problem === "tamper") await writeFile(skill, "personal edit")
+      if (problem === "state") await writeFile(statePath, '{"schema":9}')
+      if (problem === "lock") await mkdir(path.join(managed, "lock"))
+      if (problem === "journal") await writeFile(path.join(managed, "transaction.json"), "{}")
+      if (problem === "owner") await writeFile(path.join(managed, "owner"), "personal owner")
+      if (problem === "personal") await writeFile(path.join(managed, "personal.txt"), "personal data")
+      const detected = await f.service.call("legacy-installed", { project: "project-id" }) as { modified?: boolean; error?: string; hasManagedDir: boolean }
+      if (["tamper", "state", "lock", "journal"].includes(problem)) {
+        assert.equal(detected.modified, true)
+        assert.match(detected.error!, problem === "tamper" ? /OWNED_FILE_CHANGED/ : problem === "state" ? /INVALID_OWNERSHIP_STATE/ : /RECOVERY_REQUIRED/)
+      }
+      if (problem === "owner") assert.equal(detected.hasManagedDir, false)
+      await assert.rejects(f.service.call("clean-legacy", { project: "project-id" }))
+      if (problem === "tamper") {
+        const stateBefore = await readFile(statePath)
+        await assert.rejects(cleanLegacyProject(f.project), /OWNED_FILE_CHANGED/)
+        assert.equal(await readFile(skill, "utf8"), "personal edit")
+        assert.deepEqual(await readFile(agent), Buffer.from(input()[0].data), "earlier owned files must not be deleted before validating all owned files")
+        assert.deepEqual(await readFile(statePath), stateBefore)
+        assert.deepEqual(await readdir(managed), ["owner"])
+      }
+      if (problem === "personal") assert.equal(await readFile(path.join(managed, "personal.txt"), "utf8"), "personal data")
+      if (problem === "owner") assert.equal(await readFile(path.join(managed, "owner"), "utf8"), "personal owner")
+      assert.ok((await readdir(managed)).includes("owner"))
+    } finally { await f.cleanup() }
+  })
+  await t.test("owner-only leftovers and unrelated personal project", async () => {
+    const f = await fixture()
+    try {
+      await mkdir(path.join(f.project, ".opencode")); await writeFile(path.join(f.project, ".opencode", "personal.json"), "keep")
+      assert.equal(await legacyProjectInstalled(f.project), null)
+      await mkdir(path.join(f.project, ".amekit")); await writeFile(path.join(f.project, ".amekit", "owner"), "amekit-poc04\n")
+      assert.deepEqual(await legacyProjectInstalled(f.project), { fileCount: 0, hasConfigDir: false, hasManagedDir: true })
+      assert.deepEqual(await cleanLegacyProject(f.project), { removedFiles: 0, removedOpencodeDir: false, removedManagedDir: true })
+      assert.equal(await readFile(path.join(f.project, ".opencode", "personal.json"), "utf8"), "keep")
     } finally { await f.cleanup() }
   })
 })
@@ -1136,6 +1809,14 @@ test("encrypted session restore and disposal keep credentials main-only", async 
   } finally { await restored?.dispose(); await f.cleanup() }
 })
 
+async function waitUntil(check: () => boolean | Promise<boolean>, message: string) {
+  const deadline = Date.now() + 5000
+  while (!await check()) {
+    assert.ok(Date.now() < deadline, message)
+    await delay(5)
+  }
+}
+
 async function settledStatus(service: AmeKit) {
   for (let attempt = 0; attempt < 1000; attempt++) {
     try { return await service.call("status", {}) as { ready: boolean; blocker?: string; account?: unknown } }
@@ -1144,6 +1825,248 @@ async function settledStatus(service: AmeKit) {
   }
   throw new Error("AmeKit operation did not settle")
 }
+
+test("auto sync silently installs on login, refresh, heartbeat, activate and activated release", async t => {
+  for (const trigger of ["login", "refresh", "heartbeat", "activate", "release"] as const) await t.test(trigger, async t => {
+    if (trigger === "heartbeat") t.mock.timers.enable({ apis: ["setInterval"] })
+    const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+    const f = await fixture({ autoSync: true, role: "admin", confirm: trigger === "activate" || trigger === "release", refreshIntervalMs: 100, onBundleChanged: event => changes.push(event) })
+    let active = trigger === "login"
+    try {
+      f.apiResponse(async url => url.pathname.endsWith("/latest") && !active ? Response.json({ error: { code: "NO_ACTIVE_RELEASE" } }, { status: 404 }) : undefined)
+      await login(f.service)
+      if (trigger !== "login") {
+        assert.equal(await f.service.call("installed", {}), null)
+        active = true
+        if (trigger === "refresh") await f.service.call("refresh", {})
+        if (trigger === "heartbeat") { t.mock.timers.tick(100); await settledStatus(f.service) }
+        if (trigger === "activate") await f.service.call("activate", { id: f.artifact.release.releaseId, revision: "1" })
+        if (trigger === "release") { await f.service.call("import", {}); await f.service.call("release", { version: "1.2.3" }) }
+      }
+      await waitUntil(() => changes.length === 1, `${trigger} did not auto-install`)
+      assert.deepEqual(changes, [{ version: "1.2.3", releaseId: f.artifact.release.releaseId, auto: true, action: "synced" }])
+      assert.equal(f.dialogs.length, trigger === "activate" || trigger === "release" ? 1 : 0, "auto-install never adds a confirmation to the initiating action")
+      assert.equal((await installedGlobal(f.globalConfigDir, f.globalManagedDir))?.releaseId, f.artifact.release.releaseId)
+      assert.deepEqual(await readdir(f.project), [])
+      assert.equal((await settledStatus(f.service) as { bundleAutoSyncError?: string }).bundleAutoSyncError, undefined)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("auto sync restores a saved session at ready and skips downloads for an already-current global release", async () => {
+  const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+  const f = await fixture({ confirm: false, onBundleChanged: event => changes.push(event) })
+  let restored: AmeKit | undefined
+  try {
+    await login(f.service); await f.service.dispose()
+    assert.equal(f.requests.some(request => request.endsWith("/download")), false, "auto sync remains opt-in")
+    restored = createAmeKit({ ...f.options, autoSync: true }, f.dependencies)
+    assert.equal((await restored.call("status", {}) as { ready: boolean }).ready, true)
+    await waitUntil(() => changes.length === 1, "ready did not restore and auto-install")
+    const downloads = f.requests.filter(request => request.endsWith("/download")).length
+    const latest = f.requests.filter(request => request.endsWith("/latest")).length
+    await restored.call("refresh", {})
+    await restored.call("installed", {})
+    assert.equal(f.requests.filter(request => request.endsWith("/latest")).length, latest + 1)
+    assert.equal(f.requests.filter(request => request.endsWith("/download")).length, downloads)
+    assert.equal(changes.length, 1)
+    assert.equal(f.dialogs.length, 0)
+    await restored.dispose()
+    restored = createAmeKit({ ...f.options, autoSync: true }, f.dependencies)
+    await restored.call("installed", {})
+    assert.equal(f.requests.filter(request => request.endsWith("/download")).length, downloads, "ready with current release also avoids download")
+  } finally { await restored?.dispose(); await f.cleanup() }
+})
+
+test("auto sync is fire-and-forget and feature reads wait only for local writes, not downloads", async () => {
+  let finishDownload: (() => void) | undefined, enteredDownload!: () => void
+  const downloadEntered = new Promise<void>(resolve => { enteredDownload = resolve })
+  const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+  const f = await fixture({ autoSync: true, commitEnhanceSkill: "fixture", onBundleChanged: event => changes.push(event) })
+  try {
+    f.apiResponse(async (url, init) => {
+      if (!url.pathname.endsWith("/download")) return
+      enteredDownload()
+      await new Promise<void>((resolve, reject) => {
+        finishDownload = resolve
+        init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true })
+      })
+      return undefined
+    })
+    let loggedIn = false
+    const loggingIn = login(f.service).then(() => { loggedIn = true })
+    await downloadEntered
+    await waitUntil(() => loggedIn, "login is blocked by the auto download")
+    await loggingIn
+    let read = false
+    const reading = f.service.readCommitEnhanceSkill!().then(value => { assert.equal(value, null); read = true })
+    await waitUntil(() => read, "feature read is blocked by HTTP download")
+    await reading
+    let installedSettled = false
+    const inventory = f.service.call("installed", {}).then(value => { installedSettled = true; return value })
+    await delay(10)
+    assert.equal(installedSettled, false, "disk bundle operations serialize with auto sync")
+    finishDownload!()
+    assert.ok(await inventory)
+    assert.equal(changes.length, 1)
+    assert.deepEqual(await f.service.readCommitEnhanceSkill!(), { name: "fixture", instructions: "Run checks." })
+  } finally { finishDownload?.(); await f.cleanup() }
+})
+
+test("feature readers wait for local auto-install verification rather than exposing a locked or partial bundle", async () => {
+  let releaseDiscovery: (() => void) | undefined, entered!: () => void
+  const verifying = new Promise<void>(resolve => { entered = resolve })
+  const f = await fixture({ autoSync: true, commitEnhanceSkill: "fixture", discover: async (directory, _signal, expected, options) => {
+    assert.equal(options?.scope, "global")
+    if (!expected) return { agents: [], skills: [] }
+    entered()
+    await new Promise<void>(resolve => { releaseDiscovery = resolve })
+    return { agents: [{ id: "helper" }], skills: [{ id: "fixture", name: "fixture", path: path.join(directory, "skills", "fixture", "SKILL.md") }] }
+  } })
+  try {
+    await login(f.service); await verifying
+    let finished = false
+    const reading = Promise.all([f.service.readCommitEnhanceSkill!(), f.service.readCommitEnhanceFeature!(), f.service.readAndroidTranslationFeature!(), f.service.readBuildNotesFeature!()]).finally(() => { finished = true })
+    await delay(10)
+    assert.equal(finished, false)
+    releaseDiscovery!()
+    assert.deepEqual(await reading, [{ name: "fixture", instructions: "Run checks." }, { skill: { name: "fixture", instructions: "Run checks." } }, { skill: null }, { skill: null }])
+  } finally { releaseDiscovery?.(); await f.cleanup() }
+})
+
+test("auto sync keeps no-active and transient latest/download failures quiet and retries on heartbeat", async t => {
+  for (const failure of ["no-active", "latest-network", "latest-503", "latest-429", "download-network", "download-503"] as const) await t.test(failure, async t => {
+    t.mock.timers.enable({ apis: ["setInterval"] })
+    const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+    const f = await fixture({ autoSync: true, confirm: false, refreshIntervalMs: 100, onBundleChanged: event => changes.push(event) })
+    let failing = true, attempts = 0
+    try {
+      f.apiResponse(async url => {
+        if (!failing || !(failure.startsWith("download") ? url.pathname.endsWith("/download") : url.pathname.endsWith("/latest"))) return
+        attempts++
+        if (failure.endsWith("network")) throw new TypeError("fixture network error")
+        return Response.json({ error: { code: failure === "no-active" ? "NO_ACTIVE_RELEASE" : "HTTP_ERROR" } }, { status: failure === "no-active" ? 404 : failure.endsWith("429") ? 429 : 503 })
+      })
+      await login(f.service)
+      assert.equal(await f.service.call("installed", {}), null)
+      for (let i = 0; i < 2; i++) {
+        const status = await settledStatus(f.service) as { ready: boolean; bundleAutoSyncError?: string }
+        assert.equal(status.ready, true)
+        assert.equal(status.bundleAutoSyncError, undefined)
+        t.mock.timers.tick(100); await settledStatus(f.service); await f.service.call("installed", {})
+      }
+      assert.equal(attempts, 3, "transient failures must not throttle subsequent heartbeats")
+      assert.equal(changes.length, 0)
+      failing = false
+      t.mock.timers.tick(100); await settledStatus(f.service)
+      await waitUntil(() => changes.length === 1, "heartbeat did not retry after transient failure")
+      assert.equal(f.dialogs.length, 0)
+      assert.equal((await settledStatus(f.service) as { bundleAutoSyncError?: string }).bundleAutoSyncError, undefined)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("auto sync latest and download authorization failures revoke the session without warnings or further retries", async t => {
+  for (const endpoint of ["latest", "download"] as const) for (const statusCode of [401, 403]) await t.test(`${endpoint} ${statusCode}`, async t => {
+    t.mock.timers.enable({ apis: ["setInterval"] })
+    const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+    const f = await fixture({ autoSync: true, confirm: false, refreshIntervalMs: 100, onBundleChanged: event => changes.push(event) })
+    let attempts = 0
+    try {
+      f.apiResponse(async url => {
+        if (!url.pathname.endsWith(`/${endpoint}`)) return
+        attempts++
+        return Response.json({ error: { code: "USER_DISABLED" } }, { status: statusCode })
+      })
+      await login(f.service)
+      assert.equal(await f.service.call("installed", {}), null)
+      const status = await settledStatus(f.service) as { ready: boolean; bundleAutoSyncError?: string }
+      assert.equal(status.ready, false)
+      assert.equal(status.bundleAutoSyncError, undefined)
+      assert.equal(f.rpc.at(-1), null, "authorization failure revokes model policy")
+      const requests = f.requests.length
+      for (let i = 0; i < 3; i++) { t.mock.timers.tick(100); assert.equal((await settledStatus(f.service)).ready, false) }
+      assert.equal(attempts, 1)
+      assert.equal(f.requests.length, requests, "suspended session must not continue background requests")
+      assert.equal(changes.length, 0)
+      assert.equal(f.dialogs.length, 0)
+      const vault = await openSessionVault(f.data, encryption)
+      assert.equal(await vault.load(), undefined)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("persistent auto-install errors are reported once per release on heartbeats but explicit refresh and new releases retry", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
+  const changes: Parameters<NonNullable<AmeKitOptions["onBundleChanged"]>>[0][] = []
+  const f = await fixture({ autoSync: true, confirm: false, refreshIntervalMs: 100, onBundleChanged: event => changes.push(event) })
+  let release = f.artifact.release
+  try {
+    await mkdir(path.join(f.globalConfigDir, "agents"), { recursive: true })
+    const personal = path.join(f.globalConfigDir, "agents", "helper.md"); await writeFile(personal, "personal collision")
+    f.apiResponse(async url => url.pathname.endsWith("/latest") ? Response.json({ ...f.artifact.latest, release }) : undefined)
+    await login(f.service)
+    assert.equal(await f.service.call("installed", {}), null)
+    const downloadCount = () => f.requests.filter(request => request.endsWith("/download")).length
+    const status = () => settledStatus(f.service) as Promise<{ ready: boolean; bundleAutoSyncError?: string }>
+    assert.equal((await status()).bundleAutoSyncError, "PERSONAL_AGENT_COLLISION")
+    assert.equal(downloadCount(), 1)
+    for (let i = 0; i < 3; i++) { t.mock.timers.tick(100); await status(); await f.service.call("installed", {}) }
+    assert.equal(downloadCount(), 1, "same failed release is not downloaded every heartbeat")
+    assert.equal(await readFile(personal, "utf8"), "personal collision")
+    await f.service.call("refresh", {}); await f.service.call("installed", {})
+    assert.equal(downloadCount(), 2, "explicit refresh may retry the failed release")
+    release = { ...release, releaseId: randomUUID() }
+    t.mock.timers.tick(100); await status(); await f.service.call("installed", {})
+    assert.equal(downloadCount(), 3, "a different release bypasses failure throttling")
+    await rm(personal)
+    await f.service.call("refresh", {})
+    await waitUntil(() => changes.length === 1, "explicit refresh did not recover from collision")
+    assert.equal((await status()).bundleAutoSyncError, undefined)
+    assert.equal((await f.service.call("installed", {}) as { releaseId: string }).releaseId, release.releaseId)
+    assert.equal(f.dialogs.length, 0)
+    await writeFile(personal, "tampered owned file")
+    release = { ...release, releaseId: randomUUID() }
+    await f.service.call("refresh", {})
+    await waitUntil(async () => (await status()).bundleAutoSyncError === "OWNED_FILE_CHANGED", "tamper warning was not recorded")
+    const downloads = downloadCount(), latestCount = f.requests.filter(request => request.endsWith("/latest")).length
+    t.mock.timers.tick(100); await status()
+    await waitUntil(() => f.requests.filter(request => request.endsWith("/latest")).length > latestCount, "heartbeat did not inspect latest")
+    assert.equal(downloadCount(), downloads)
+    await f.service.call("logout", {})
+    assert.equal((await status()).bundleAutoSyncError, undefined)
+  } finally { await f.cleanup() }
+})
+
+test("manual sync clears persistent auto-sync warnings and draft releases never auto-install", async t => {
+  await t.test("manual recovery", async () => {
+    const f = await fixture({ autoSync: true, confirm: false })
+    try {
+      await mkdir(path.join(f.globalConfigDir, "agents"), { recursive: true })
+      const target = path.join(f.globalConfigDir, "agents", "helper.md"); await writeFile(target, "personal")
+      await login(f.service); await f.service.call("installed", {})
+      assert.equal((await settledStatus(f.service) as { bundleAutoSyncError?: string }).bundleAutoSyncError, "PERSONAL_AGENT_COLLISION")
+      await rm(target)
+      await f.service.call("sync", {})
+      assert.equal((await settledStatus(f.service) as { bundleAutoSyncError?: string }).bundleAutoSyncError, undefined)
+      assert.equal(f.dialogs.length, 0)
+    } finally { await f.cleanup() }
+  })
+  await t.test("draft publication", async () => {
+    const f = await fixture({ autoSync: true, role: "admin" })
+    try {
+      f.apiResponse(async url => url.pathname.endsWith("/latest") ? Response.json({ error: { code: "NO_ACTIVE_RELEASE" } }, { status: 404 }) : undefined)
+      await login(f.service); await f.service.call("installed", {})
+      const latest = f.requests.filter(request => request.endsWith("/latest")).length
+      await f.service.call("import", {})
+      await f.service.call("release", { version: "1.2.3", activate: "false" })
+      assert.equal(await f.service.call("installed", {}), null)
+      assert.equal(f.requests.filter(request => request.endsWith("/latest")).length, latest)
+      assert.equal(f.requests.some(request => request.endsWith("/download")), false)
+      assert.equal(f.dialogs.length, 1)
+    } finally { await f.cleanup() }
+  })
+})
 
 const transientResponse = (failure: number | "network") => async () => {
   if (failure === "network") throw new TypeError("fixture network failure")
@@ -1585,6 +2508,19 @@ test("all import fix operations freshly enforce admin role and clear session aft
   } finally { await f.cleanup() }
 })
 
+test("session vault rapidly overwrites credentials without leaving pending files", async () => {
+  const folder = await area()
+  try {
+    const vault = await openSessionVault(folder, encryption)
+    for (let i = 0; i < 25; i++) {
+      await vault.save({ origin: "http://localhost:3211", token: `fixture-session-${i}` })
+    }
+    const reopened = await openSessionVault(folder, encryption)
+    assert.deepEqual(await reopened.load(), { origin: "http://localhost:3211", token: "fixture-session-24" })
+    assert.deepEqual(await readdir(folder), ["amekit-session.enc"])
+  } finally { await rm(folder, { recursive: true, force: true }) }
+})
+
 test("Linux basic_text storage backend is rejected even when encryption reports available", async () => {
   const folder = await area()
   try {
@@ -1833,6 +2769,101 @@ test("AI fix engine uses redacted full-file requests, constrained HTTP settings 
       assert.equal(result.diff.includes(syntheticSecret), false)
     }
   } finally { await f.cleanup() }
+})
+
+test("AI fix includes sanitized YAML diagnostics and applies scalar repairs without leaking body secrets", async t => {
+  for (const newline of ["\n", "\r\n"]) await t.test(newline === "\n" ? "LF" : "BOM and CRLF", async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      const filePath = "skills/fixture/SKILL.md"
+      const description = "Translate strings during feature work: after you add new strings"
+      const text = (newline === "\n" ? "" : "\uFEFF") + `---\nname: fixture\ndescription: ${description}\n---\n` + "Unchanged skill documentation.\n".repeat(60) + originalReference
+      const source = text.replace(/\n/g, newline)
+      const files = input().map(file => file.path === filePath ? { ...file, data: encode(source) } : file)
+      const issues = preview(files).issues.filter(issue => issue.path === filePath)
+      assert.ok(issues.some(issue => issue.reason === "INVALID_FRONTMATTER"))
+      const params = await engineParams(f)
+      const decodedSource = new TextDecoder().decode(encode(source))
+      const fixedText = decodedSource.replace(`description: ${description}`, `description: ${JSON.stringify(description)}`).replace(`api_key="${syntheticSecret}"`, "api_key=process.env.TURNSTILE_SECRET")
+      f.fixResponse(async body => {
+        const messages = body.messages as { content: string }[]
+        assert.match(messages[0].content, /YAML frontmatter: plain scalar values containing/)
+        const payload = JSON.parse(messages[1].content)
+        const yamlIssue = payload.issues.find((reason: string) => /INVALID_FRONTMATTER/i.test(reason))
+        assert.match(yamlIssue, /^INVALID_FRONTMATTER \(Nested mappings are not allowed.*line \d+, column \d+:\)$/)
+        assert.equal(JSON.stringify(body).includes(syntheticSecret), false)
+        assert.equal(JSON.stringify(body).includes("fixture-provider-key"), false)
+        assert.equal(payload.text, redactSecretsForLlm(decodedSource).redactedText)
+        const secretAssignment = /api_key="\[REDACTED_SECRET_\d+\]"/.exec(payload.text)![0]
+        return aiResponse({ summary: "Đã sửa YAML và dùng biến môi trường", edits: [
+          { oldText: `description: ${description}`, newText: `description: ${JSON.stringify(description)}` },
+          { oldText: secretAssignment, newText: "api_key=process.env.TURNSTILE_SECRET" },
+        ] })
+      })
+      const result = await fixImportFileWithLlm({ ...params, filePath, fileBytes: encode(source), issues, availablePaths: files.map(file => file.path),
+        validateCandidate: bytes => {
+          const candidate = preview(files.map(file => file.path === filePath ? { ...file, data: bytes } : file))
+          return { preview: candidate, remainingErrors: candidate.issues.filter(issue => issue.severity === "error" && issue.path === filePath) }
+        },
+      })
+      assert.equal(new TextDecoder("utf-8", { ignoreBOM: true }).decode(result.contentBytes), fixedText)
+      assert.equal(result.redactionCount, 1)
+      assert.equal(result.diff.includes(syntheticSecret), false)
+      assert.equal(f.fixRequests.length, 1)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("medium AI fixes send complete redacted text, prefer targeted edits and accept either response format", async t => {
+  for (const format of ["edits", "content"] as const) await t.test(format, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      const text = "Unchanged reference documentation.\n".repeat(100) + originalReference
+      assert.ok(encode(text).length > 1_500 && encode(text).length <= 24_000)
+      const params = await engineParams(f, text)
+      const fixedText = text.replace(`api_key="${syntheticSecret}"`, "api_key=process.env.TURNSTILE_SECRET")
+      f.fixResponse(async body => {
+        const messages = body.messages as { content: string }[]
+        assert.match(messages[0].content, /Return JSON only: .*"edits":/)
+        assert.doesNotMatch(messages[0].content, /"content":|Only change supplied windows/)
+        const payload = JSON.parse(messages[1].content)
+        assert.equal(payload.text, redactSecretsForLlm(text).redactedText)
+        assert.equal(JSON.stringify(body).includes(syntheticSecret), false)
+        const oldText = /api_key="\[REDACTED_SECRET_\d+\]"/.exec(payload.text)![0]
+        return aiResponse({ summary: "Đã dùng biến môi trường", ...(format === "edits"
+          ? { edits: [{ oldText, newText: "api_key=process.env.TURNSTILE_SECRET" }] }
+          : { content: fixedText }) })
+      })
+      const result = await fixImportFileWithLlm(params)
+      assert.equal(new TextDecoder().decode(result.contentBytes), fixedText)
+      assert.equal(result.redactionCount, 1)
+      assert.equal(f.fixRequests.length, 1)
+      assert.equal(new TextDecoder().decode(params.fileBytes), text)
+    } finally { await f.cleanup() }
+  })
+})
+
+test("AI fix rejects invalid medium-file edits even when valid content is supplied", async t => {
+  for (const kind of ["not an array", "empty", "duplicate", "overlap"] as const) await t.test(kind, async () => {
+    const f = await fixture({ role: "admin" })
+    try {
+      const text = "Unchanged reference documentation.\n".repeat(100) + originalReference
+      const params = await engineParams(f, text)
+      let validated = 0
+      f.fixResponse(async body => {
+        const payload = JSON.parse((body.messages as { content: string }[])[1].content)
+        const oldText = /api_key="\[REDACTED_SECRET_\d+\]"/.exec(payload.text)![0]
+        const edit = { oldText, newText: "api_key=process.env.TURNSTILE_SECRET" }
+        const edits = kind === "not an array" ? {} : kind === "empty" ? [] : kind === "duplicate"
+          ? [{ oldText: "Unchanged reference documentation.", newText: "changed" }] : [edit, edit]
+        return aiResponse({ summary: "Đã sửa", edits, content: text.replace(`api_key="${syntheticSecret}"`, edit.newText) })
+      })
+      await assert.rejects(fixImportFileWithLlm({ ...params, validateCandidate: bytes => { validated++; return params.validateCandidate(bytes) } }), { name: "AiFixError", message: "AI_FIX_INVALID_RESPONSE" })
+      assert.equal(validated, 0)
+      assert.equal(f.fixRequests.length, 1, "invalid edits must not fall back to content or retry")
+      assert.equal(new TextDecoder().decode(params.fileBytes), text)
+    } finally { await f.cleanup() }
+  })
 })
 
 test("AI fix engine requires fresh admin authorization and validates file support before provider access", async t => {

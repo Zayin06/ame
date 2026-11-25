@@ -3,7 +3,7 @@ import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { readFile, readdir, realpath, stat, lstat, writeFile, mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { simpleGit } from 'simple-git'
-import type { Project, FileDocument, FileEntry, GitState, GitBranches, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
+import type { BuildNotesRequest, Project, FileDocument, FileEntry, GitState, GitBranches, GitCommitOptions, GitPushOptions, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
 import * as workspaceFs from './workspace-fs'
 import { searchWorkspace, replaceInWorkspace } from './search'
 import * as gitOps from './git-ops'
@@ -164,6 +164,9 @@ export class Workspaces {
   async stagedDiffSummary(id: string, maxBytes?: number) {
     return gitOps.stagedDiffSummary(this.get(id).directory, maxBytes)
   }
+  async buildNotesSummary(id: string, request: BuildNotesRequest, maxDiffBytes?: number) {
+    return gitOps.buildNotesSummary(this.get(id).directory, request, maxDiffBytes)
+  }
   async stageAll(id: string): Promise<void> {
     await gitOps.stageAll(this.get(id).directory)
     this.changed(id)
@@ -187,6 +190,51 @@ export class Workspaces {
     await gitOps.createBranch(this.get(id).directory, name, checkout)
     this.changed(id)
   }
+  async gitDeleteBranch(id: string, name: string, force?: boolean) {
+    await gitOps.deleteBranch(this.get(id).directory, name, force)
+    this.changed(id)
+  }
+  async gitFetch(id: string) {
+    const result = await gitOps.gitFetch(this.get(id).directory)
+    this.changed(id)
+    return result
+  }
+  async gitPull(id: string) {
+    const result = await gitOps.gitPull(this.get(id).directory)
+    this.changed(id)
+    return result
+  }
+  async gitPush(id: string, options?: GitPushOptions) {
+    const result = await gitOps.gitPush(this.get(id).directory, options)
+    this.changed(id)
+    return result
+  }
+  async gitLog(id: string, limit?: number) {
+    return gitOps.gitLog(this.get(id).directory, limit)
+  }
+  async gitCommitDetail(id: string, hash: string) {
+    return gitOps.gitCommitDetail(this.get(id).directory, hash)
+  }
+  async gitUndoLastCommit(id: string) {
+    const result = await gitOps.gitUndoLastCommit(this.get(id).directory)
+    this.changed(id)
+    return result
+  }
+  async gitStashList(id: string) {
+    return gitOps.gitStashList(this.get(id).directory)
+  }
+  async gitStashPush(id: string, message?: string, includeUntracked?: boolean) {
+    await gitOps.gitStashPush(this.get(id).directory, message, includeUntracked)
+    this.changed(id)
+  }
+  async gitStashApply(id: string, index: number, pop?: boolean) {
+    await gitOps.gitStashApply(this.get(id).directory, index, pop)
+    this.changed(id)
+  }
+  async gitStashDrop(id: string, index: number) {
+    await gitOps.gitStashDrop(this.get(id).directory, index)
+    this.changed(id)
+  }
   private git(id: string) {
     const directory = this.get(id).directory
     if (!existsSync(path.join(directory, '.git'))) throw new Error('GIT_ROOT_REQUIRED: Open the repository root for source control.')
@@ -207,8 +255,13 @@ export class Workspaces {
     return path.relative(root, target).split(path.sep).join('/')
   }
   async status(id: string): Promise<GitState> {
-    const result = await this.git(id).status()
-    return { branch: result.current ?? '(unborn)', changes: result.files.map(f => ({ path: f.path, index: f.index, working: f.working_dir })) }
+    const git = this.git(id)
+    const result = await git.status()
+    const root = this.get(id).directory
+    const gitDir = path.resolve(root, (await git.raw(['rev-parse', '--git-dir'])).trim())
+    const hasRemote = await gitOps.hasRemote(root)
+    const merging = result.conflicted.length > 0 || existsSync(path.join(gitDir, 'MERGE_HEAD')) || existsSync(path.join(gitDir, 'REBASE_HEAD'))
+    return { branch: result.current ?? '(unborn)', changes: result.files.map(f => ({ path: f.path, index: f.index, working: f.working_dir })), tracking: result.tracking ?? null, ahead: result.ahead ?? 0, behind: result.behind ?? 0, hasRemote, merging }
   }
   async diff(id: string, relative: string) {
     const file = await this.gitPath(id, relative)
@@ -230,9 +283,11 @@ export class Workspaces {
     }
     this.changed(id)
   }
-  async commit(id: string, message: string) {
+  async commit(id: string, message: string, options?: GitCommitOptions) {
     if (!message.trim() || message.length > 10000 || message.includes('\0')) throw new Error('INVALID_COMMIT_MESSAGE')
-    await this.git(id).raw(['-c', 'core.hooksPath=', 'commit', '-m', message])
+    this.git(id)
+    const commitGit = simpleGit(this.get(id).directory, { maxConcurrentProcesses: 1, trimmed: false, timeout: { block: 60000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+    await commitGit.raw(['commit', ...(options?.amend ? ['--amend'] : []), ...(options?.noVerify ? ['--no-verify'] : []), '-m', message])
     this.changed(id)
   }
   dispose() {

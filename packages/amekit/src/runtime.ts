@@ -9,9 +9,9 @@ import { privateEnvironment } from "../../opencode-adapter/src/runtime"
 
 export type Catalog = { agents: { id: string }[]; skills: { id: string; name: string; path: string }[] }
 export type Expected = { agents: string[]; skills: string[] }
-export type Discover = (directory: string, signal?: AbortSignal, expected?: Expected) => Promise<Catalog>
+export type Discover = (directory: string, signal?: AbortSignal, expected?: Expected, options?: { scope?: "project" | "global" }) => Promise<Catalog>
 export function runtimeDiscovery(cli: string | undefined, storage: string): Discover {
-  return async (directory, signal, expected) => {
+  return async (directory, signal, expected, options) => {
     signal?.throwIfAborted()
     if (!cli || !path.isAbsolute(cli)) throw new Error("CLI_UNAVAILABLE")
     const version = await promisify(execFile)(cli, ["--version"], { windowsHide: true, timeout: 10_000, maxBuffer: 4096, signal }).catch(() => { throw new Error("CLI_UNAVAILABLE") })
@@ -20,11 +20,13 @@ export function runtimeDiscovery(cli: string | undefined, storage: string): Disc
     await safeDirectory(storage)
     const temporary = await mkdtemp(path.join(storage, "discovery-"))
     await Promise.all(['config/opencode', 'data', 'cache', 'state', 'home'].map(folder => mkdir(path.join(temporary, folder), { recursive: true })))
+    const workspace = options?.scope === "global" ? path.join(temporary, "workspace") : directory
+    if (options?.scope === "global") await mkdir(workspace, { recursive: true })
     const command = [cli]
     const password = randomBytes(32).toString("base64url")
     const child = spawn(command[0], [...command.slice(1), "serve", "--hostname", "127.0.0.1", "--port", "0"], {
-      cwd: directory, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { ...privateEnvironment(temporary, password), OPENCODE_DB: path.join(temporary, "discovery.db"),
+      cwd: workspace, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+      env: { ...privateEnvironment(temporary, password), ...(options?.scope === "global" ? { OPENCODE_CONFIG_DIR: directory } : {}), OPENCODE_DB: path.join(temporary, "discovery.db"),
         OPENCODE_DISABLE_CLAUDE_CODE: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_FILEWATCHER: "1",
         OPENCODE_CONFIG_CONTENT: JSON.stringify({ snapshots: false, warming: false, policies: [
           { action: "plugin.use", resource: "*", effect: "deny" },
@@ -50,7 +52,7 @@ export function runtimeDiscovery(cli: string | undefined, storage: string): Disc
         })
       })
       const get = async (endpoint: string) => {
-        const query = new URLSearchParams({ "location[directory]": directory })
+        const query = new URLSearchParams({ "location[directory]": workspace })
         const response = await fetch(`${url}/api/${endpoint}?${query}`, { headers: { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` }, signal: deadline, redirect: "error" })
         if (!response.ok) throw new Error("DISCOVERY_HTTP_ERROR")
         return response.json() as Promise<{ data: unknown[] }>

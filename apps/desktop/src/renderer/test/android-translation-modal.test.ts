@@ -6,22 +6,24 @@ import { runInNewContext } from 'node:vm'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
-import type { AndroidTranslationInfo, ChatItem, IdeEvent, Permission, Session } from '../../../../../packages/protocol/src/index'
+import type { AndroidTranslationInfo, ChatItem, IdeEvent, Permission, Session, SkillSummary } from '../../../../../packages/protocol/src/index'
 import { projectChatTimeline } from '../chat-timeline'
 import * as modelSelection from '../model-selection'
 import * as amekitUI from '../amekit-ui'
+import { detectComposerTrigger, filterSlashEntries } from '../composer-mentions'
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 const model = { id: 'gemini', modelID: 'gemini', providerID: 'amecode', name: 'Gemini Translation' }
 const baseInfo: AndroidTranslationInfo = { configured: true, isAndroid: true, skill: 'android-strings-translation', effectiveModelID: 'gemini', effectiveModelName: 'Gemini Translation', fallbackToDefault: false, stringsFiles: ['app/src/main/res/values/strings.xml'], translationSessionIDs: [], lockedSessionIDs: [] }
 
-function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 'AndroidTranslationModal' | 'Chat'; props?: Record<string, unknown> } = {}) {
+function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 'AndroidTranslationModal' | 'Chat'; props?: Record<string, unknown>; onSubscribe?: (emit: (event: IdeEvent) => void) => void } = {}) {
   const slots: unknown[] = [], effects: { deps: unknown[]; cleanup?: () => void }[] = [], pending: (() => void)[] = []
   let cursor = 0, effectIndex = 0, writes = 0, tree: ReactNode, closed = 0, activity = 0, focused = 0
   let info = { ...baseInfo, ...options.info }, items: ChatItem[] = [], permissions: Permission[] = [], sessions: Session[] = []
   const calls: { method: string; args: unknown[] }[] = [], listeners = new Map<string, Set<(event: Event) => void>>(), events = new Set<(event: IdeEvent) => void>()
   let promptError = '', lockError = '', nextPrompt: Promise<unknown> | undefined
   let sessionModel: string | undefined
+  let skills: SkillSummary[] = [], skillsLoads = 0
   const hooks = {
     useState(initial: unknown) {
       const index = cursor++
@@ -62,10 +64,10 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     async agentMap(_projectID: string, sessionID: string) { return { nodes: sessionModel ? [{ id: sessionID, model: sessionModel, providerID: 'amecode' }] : [] } },
     async replyPermission(...args: unknown[]) { calls.push({ method: 'permission', args }); permissions = []; return undefined },
     async cancel(...args: unknown[]) { calls.push({ method: 'cancel', args }) },
-    onEvent(fn: (event: IdeEvent) => void) { events.add(fn); return () => events.delete(fn) },
+    onEvent(fn: (event: IdeEvent) => void) { events.add(fn); options.onSubscribe?.(fn); return () => events.delete(fn) },
     async account() { return { account: { role: 'user' }, models: { default_model: 'default' } } },
     async models() { return [{ id: 'default', providerID: 'amecode', name: 'Default' }, model] },
-    async agents() { return [] }, async commands() { return [] }, async skills() { return [] },
+    async agents() { return [] }, async commands() { return [] }, async skills() { skillsLoads++; return skills },
     async prompt(...args: unknown[]) { calls.push({ method: 'regularPrompt', args }) },
   }
   const windowMock = {
@@ -91,8 +93,8 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
       applyComposerCompletion: (text: string) => ({ text, cursor: text.length }),
       composePromptWithAttachments: (text: string) => text,
       filterFileMentions: () => [],
-      filterSlashEntries: () => [],
-      detectComposerTrigger: () => null,
+      filterSlashEntries,
+      detectComposerTrigger,
       WORKSPACE_DRAG_MIME: 'application/x-ame-workspace-path',
       MAX_PROMPT_FILES: 8,
       readBrowserFileAttachment: async () => null,
@@ -125,7 +127,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
   return {
     render, find, button, click, calls, exports,
     async flush() { for (let i = 0; i < 4; i++) { await tick(); render() } return render() },
-    change(text: string) { (find(node => node.type === 'textarea').props.onChange as (e: unknown) => void)({ target: { value: text } }) },
+    change(text: string) { (find(node => node.type === 'textarea').props.onChange as (e: unknown) => void)({ target: { value: text, selectionStart: text.length } }) },
     submit() { (find(node => node.type === 'form').props.onSubmit as (e: unknown) => void)({ preventDefault() {} }) },
     focusInput() { const input = find(node => node.type === 'textarea'); (input.props.ref as { current: unknown }).current = { focus() { focused++ } } },
     emit(event: IdeEvent) { events.forEach(fn => fn(event)) },
@@ -136,12 +138,95 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     updateSessionModel(value: string) { sessionModel = value },
     updateMessages(value: ChatItem[]) { items = value },
     updatePermissions(value: Permission[]) { permissions = value },
+    updateSkills(value: SkillSummary[]) { skills = value },
+    get skillsLoads() { return skillsLoads },
+    get eventListeners() { return events.size },
     failPrompt(value: string) { promptError = value }, failLock(value: string) { lockError = value },
     delayPrompt(value: Promise<unknown>) { nextPrompt = value },
     get closed() { return closed }, get activity() { return activity }, get focused() { return focused },
     unmount() { effects.forEach(effect => effect.cleanup?.()) },
   }
 }
+
+test('Chat shows the responsive Android translation trigger only for Android projects', async () => {
+  for (const isAndroid of [false, true]) {
+    let opened = 0
+    const h = harness({ component: 'Chat', info: { configured: true, isAndroid }, props: { onOpenAndroidTranslation() { opened++ } } })
+    h.render(); const html = await h.flush()
+    if (isAndroid) {
+      assert.match(html, /data-testid="android-translate-trigger" title="Dịch Android"/)
+      assert.match(html, /<span class="pill-btn__label">Dịch Android<\/span>/)
+      h.click('Dịch Android'); assert.equal(opened, 1)
+    } else assert.doesNotMatch(html, /data-testid="android-translate-trigger"/)
+    h.unmount()
+  }
+  const css = readFileSync(new URL('../parity.css', import.meta.url), 'utf8')
+  assert.match(css, /@container chat-header[^\{]*\{\s*\.android-translate-trigger \.pill-btn__label\s*\{[^}]*display:\s*none/)
+})
+
+test('Chat focuses its composer once per positive focusNonce change', async () => {
+  const h = harness({ component: 'Chat', props: { focusNonce: 0 } })
+  h.render(); await h.flush(); h.focusInput()
+  h.render(); assert.equal(h.focused, 0)
+  h.render({ focusNonce: 1 }); assert.equal(h.focused, 1)
+  h.render({ focusNonce: 1 }); assert.equal(h.focused, 1)
+  h.render({ focusNonce: 2 }); assert.equal(h.focused, 2)
+  h.render({ focusNonce: 0 }); assert.equal(h.focused, 2)
+  h.unmount()
+})
+
+test('Chat reloads cold skills on scoped and broadcast catalog updates with an 80ms debounce', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const h = harness({ component: 'Chat' })
+  try {
+    h.render(); await h.flush(); h.change('/'); h.render()
+    assert.equal(h.skillsLoads, 1)
+    assert.match(h.render(), /Không có kết quả/)
+    h.updateSkills([{ id: 'loaded-skill', name: 'Loaded skill', path: 'SKILL.md' }])
+    h.emit({ type: 'catalog', projectID: 'other' })
+    t.mock.timers.tick(100); await h.flush()
+    assert.equal(h.skillsLoads, 1, 'other projects do not invalidate the cold cache')
+    assert.doesNotMatch(h.render(), /Loaded skill/)
+    h.emit({ type: 'catalog', projectID: 'project' })
+    t.mock.timers.tick(40)
+    h.emit({ type: 'catalog', projectID: 'project' })
+    t.mock.timers.tick(79); await h.flush()
+    assert.equal(h.skillsLoads, 1, 'bursts wait until 80ms after the last update')
+    t.mock.timers.tick(1); await h.flush()
+    assert.equal(h.skillsLoads, 2)
+    assert.match(h.render(), /\/Loaded skill/)
+    h.updateSkills([{ id: 'global-skill', name: 'Global skill', path: 'SKILL.md' }])
+    h.emit({ type: 'catalog' })
+    t.mock.timers.tick(79); await h.flush()
+    assert.equal(h.skillsLoads, 2)
+    t.mock.timers.tick(1); await h.flush()
+    assert.equal(h.skillsLoads, 3)
+    assert.match(h.render(), /\/Global skill/)
+    assert.doesNotMatch(h.render(), /Loaded skill/)
+    h.emit({ type: 'catalog', projectID: 'project' })
+  } finally { h.unmount() }
+  assert.equal(h.eventListeners, 0)
+  t.mock.timers.tick(80); await tick()
+  h.emit({ type: 'catalog' }); t.mock.timers.tick(80); await tick()
+  assert.equal(h.skillsLoads, 3, 'unmount cancels pending reloads and subscriptions')
+})
+
+test('Chat accepts a synchronous catalog subscription callback and cancels its pending reload on unmount', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const h = harness({ component: 'Chat', onSubscribe: emit => emit({ type: 'catalog' }) })
+  try {
+    h.render(); await h.flush()
+    assert.equal(h.skillsLoads, 1)
+    h.updateSkills([{ id: 'sync-skill', name: 'Synchronous skill', path: 'SKILL.md' }])
+    t.mock.timers.tick(80); await h.flush()
+    assert.equal(h.skillsLoads, 2)
+    h.change('/'); assert.match(h.render(), /\/Synchronous skill/)
+    h.emit({ type: 'catalog' })
+  } finally { h.unmount() }
+  t.mock.timers.tick(80); await tick()
+  assert.equal(h.skillsLoads, 2)
+  assert.equal(h.eventListeners, 0)
+})
 
 test('wide isolated dialog shows skill, pinned model, detected files and full-width composer styles', async () => {
   const h = harness(); h.render(); const html = await h.flush()

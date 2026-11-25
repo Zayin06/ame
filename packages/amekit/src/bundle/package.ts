@@ -201,6 +201,7 @@ export async function pack(source: Preview, version: string, signal?: AbortSigna
   const features = Features.parse(Object.fromEntries(Object.entries(options).map(([key, value]) => [key, typeof value === "string" ? value.trim() || undefined : value]).filter(([, value]) => value !== undefined)))
   if (features.commitEnhanceSkill && !source.skills.includes(features.commitEnhanceSkill)) throw new Error("UNKNOWN_COMMIT_ENHANCE_SKILL")
   if (features.androidTranslationSkill && !source.skills.includes(features.androidTranslationSkill)) throw new Error("UNKNOWN_ANDROID_TRANSLATION_SKILL")
+  if (features.buildNotesSkill && !source.skills.includes(features.buildNotesSkill)) throw new Error("UNKNOWN_BUILD_NOTES_SKILL")
   const files = [...source.files].sort((a,b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   const inventory = await Promise.all(files.map(async f => ({ path: f.path, size: f.data.length, sha256: await sha256(f.data) })))
   const manifest = { schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: source.compatibilityMode === "raw" ? { mode: "raw", testedOpenCode: [] } : { testedOpenCode: ["2.3.2"] }, agents: source.agents.length, skills: source.skills.length, files: inventory, ...(Object.keys(features).length ? { features } : {}) }

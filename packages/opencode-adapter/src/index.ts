@@ -6,11 +6,38 @@ import type { UsagePrices } from '../../amekit/src/usage-pricing'
 import type { Agent, AgentMapView, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
 import { buildAgentMap, resolveAgentMapFamily } from './agent-map'
 import { MAX_PROMPT_FILES, type ChatAttachment, type PromptFileAttachment } from '../../ide-core/src/dropped-attachments'
+import type { BuildNotesSummary } from '../../ide-core/src/git-ops'
 
 export function localURL(value: string) {
   const url = new URL(value)
   if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('LOCAL_SERVER_REQUIRED: Remote projects are not supported in this slice.')
   return url.origin
+}
+function normalizeToolDiffPath(rawPath: string, projectRoot: string): string {
+  if (!rawPath) return rawPath
+  let file = rawPath
+  if (path.isAbsolute(rawPath)) {
+    const relative = path.relative(projectRoot, rawPath)
+    if (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) file = relative
+  }
+  return file.replace(/\\/g, '/').replace(/^(\.\/)+/, '')
+}
+function extractToolDiffs(message: SessionMessageInfo, projectRoot: string): SessionDiff[] {
+  if (message.type !== 'assistant') return []
+  return message.content.flatMap<SessionDiff>(part => {
+    if (part.type !== 'tool' || part.state.status !== 'completed' || !('metadata' in part.state)) return []
+    const files = part.state.metadata?.files
+    if (!Array.isArray(files)) return []
+    return files.flatMap<SessionDiff>(entry => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.file !== 'string' || !entry.file.trim() || typeof entry.patch !== 'string') return []
+      return [{
+        file: normalizeToolDiffPath(entry.file, projectRoot), patch: entry.patch,
+        additions: typeof entry.additions === 'number' && Number.isFinite(entry.additions) && entry.additions >= 0 ? entry.additions : 0,
+        deletions: typeof entry.deletions === 'number' && Number.isFinite(entry.deletions) && entry.deletions >= 0 ? entry.deletions : 0,
+        status: entry.status === 'added' || entry.status === 'deleted' ? entry.status : 'modified',
+      }]
+    })
+  })
 }
 export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
   let execution: { opener: string; files: Set<string>; startedAt?: number; lastAssistant?: ChatItem } | undefined
@@ -42,6 +69,14 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
     }
     if (message.type !== 'assistant') return []
     message.snapshot?.files?.forEach(file => execution?.files.add(file))
+    for (const part of message.content) {
+      if (part.type !== 'tool' || part.state.status !== 'completed' || !('metadata' in part.state)) continue
+      const files = part.state.metadata?.files
+      if (!Array.isArray(files)) continue
+      for (const entry of files) {
+        if (entry && typeof entry === 'object' && !Array.isArray(entry) && typeof entry.file === 'string' && entry.file.trim()) execution?.files.add(entry.file.replace(/\\/g, '/'))
+      }
+    }
     const items = message.content.map((part, i): ChatItem => {
       const id = `${message.id}:${i}`
       const time = {
@@ -130,6 +165,32 @@ export class OpenCodeAdapter {
     void this.events(client, controller.signal)
     return this.connection()
   }
+  async reload(options?: { maxAttempts?: number; pollMs?: number }): Promise<void> {
+    if (!this.client || !this.state.connected || !this.credentials) return
+    const maxAttempts = options?.maxAttempts ?? 100
+    const pollMs = options?.pollMs ?? 150
+    const client = this.api(), { url, headers } = this.credentials
+    await client.location.reload()
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (this.client !== client || !this.state.connected) return
+      try {
+        const plugins = await client.plugin.list(undefined, { signal: AbortSignal.timeout(5000) })
+        if (!Array.isArray(plugins?.data)) throw new Error('INVALID_PLUGIN_INVENTORY')
+        const plugin = plugins.data.find(plugin => plugin.id === 'amekit-models')
+        if (plugins.data.length > 0 && !plugin) break
+        if (plugin?.state?.status === 'active') {
+          const response = await this.fetcher(new URL('/api/rpc/amekit-models/status', url), {
+            method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+            body: JSON.stringify({ input: null }), redirect: 'error', signal: AbortSignal.timeout(5000),
+          })
+          await response.body?.cancel()
+          if (response.status === 200) break
+        }
+      } catch { /* Plugin setup and RPC registration can briefly be unavailable after reload. */ }
+      if (attempt < maxAttempts - 1) await new Promise(resolve => setTimeout(resolve, pollMs))
+    }
+    if (this.client === client && this.state.connected) this.notify({ type: 'catalog' })
+  }
   private api() { if (!this.client || !this.state.connected) throw new Error('OPENCODE_DISCONNECTED'); return this.client }
   attach(projectID: string, directory: string) { this.projects.set(projectID, directory) }
   detach(projectID: string) { this.projects.delete(projectID) }
@@ -166,7 +227,9 @@ export class OpenCodeAdapter {
     if (!trimmed || trimmed.length > 20000) throw new Error('INVALID_PROMPT')
     if (model) await this.api().session.switchModel({ sessionID, model: { id: model.id, providerID: model.providerID } })
     const result = await this.api().session.generate({ sessionID, prompt: trimmed }, { signal: AbortSignal.timeout(45_000) })
-    return { answer: result.text.trim() }
+    if (result.text.trim()) return { answer: result.text.trim() }
+    const retry = await this.api().session.generate({ sessionID, prompt: `Answer directly in plain text using only the existing conversation context. Do not call any tools; if the information is not present in the conversation, briefly say so.\n\n${trimmed}` }, { signal: AbortSignal.timeout(45_000) })
+    return { answer: retry.text.trim() }
   }
   async artifacts(projectID: string, sessionID?: string): Promise<ArtifactSummary[]> {
     const directory = this.directory(projectID)
@@ -224,6 +287,25 @@ export class OpenCodeAdapter {
     const message = result.text.trim().replace(/^```[^\r\n]*\r?\n([\s\S]*?)```$/, '$1').trim()
     if (!message) throw new Error('EMPTY_COMMIT_MESSAGE')
     return { message, truncated: summary.truncated }
+  }
+  async generateBuildNotes(summary: BuildNotesSummary, model: Model, skill?: { name: string; instructions: string }, note?: string): Promise<{ notes: string; truncated: boolean }> {
+    const prompt = [
+      skill?.instructions
+        ? `Write QC build notes / release notes using the following skill.\n\nSkill: /${skill.name}\n\n${skill.instructions}`
+        : 'Viết ghi chú bản build bằng tiếng Việt cho QC dưới dạng Markdown rõ ràng với các mục: ## Tổng quan bản build, ## Tính năng mới / Cải tiến, ## Sửa lỗi, ## Khu vực QC cần kiểm tra kỹ & Lưu ý.',
+      'Phản ánh chính xác cả thay đổi đã commit và thay đổi cục bộ chưa commit; phân biệt hai nguồn này. Chỉ mô tả những gì có bằng chứng trong ngữ cảnh, không bịa tính năng hoặc khẳng định đã kiểm thử khi chưa có bằng chứng. Diff có thể đã được lọc hoặc rút gọn.',
+      `Branch: ${summary.branch}`,
+      `Commits:\n${summary.commits.map(commit => `${commit.shortHash} ${commit.subject}${commit.body ? `\n${commit.body}` : ''}`).join('\n\n') || '(none)'}`,
+      `Files (source status path +additions -deletions):\n${summary.files.map(file => `${file.source} ${file.status} ${file.path} +${file.additions} -${file.deletions}`).join('\n') || '(none)'}`,
+      `Working files: ${summary.workingFileCount}; additions: ${summary.additions}; deletions: ${summary.deletions}; truncated: ${summary.truncated}`,
+      `Diff:\n${summary.diff}`,
+      ...(note?.trim() ? [`Developer note:\n${note.trim()}`] : []),
+      'Return only the Markdown build notes without conversational preamble or outer triple-backtick wrapping.',
+    ].join('\n\n')
+    const result = await this.api().experimental.generate.text({ prompt, model: { id: model.id, providerID: model.providerID } }, { signal: AbortSignal.timeout(90_000) })
+    const notes = result.text.trim().replace(/^```[^\r\n]*\r?\n([\s\S]*?)```$/, '$1').trim()
+    if (!notes) throw new Error('EMPTY_BUILD_NOTES')
+    return { notes, truncated: summary.truncated }
   }
   async messages(projectID: string, sessionID: string): Promise<ChatItem[]> {
     await this.owned(projectID, sessionID)
@@ -296,14 +378,41 @@ export class OpenCodeAdapter {
   async sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]> {
     await this.owned(projectID, sessionID)
     const options = { signal: AbortSignal.timeout(15000) }
-    if (from) return this.api().session.diff({ sessionID, from }, options)
-    // An unbounded session.diff means the latest turn, not the whole session.
-    const [first, last] = await Promise.all([
-      this.api().message.list({ sessionID, type: 'user', order: 'asc', limit: 1 }, options),
-      this.api().message.list({ sessionID, type: 'user', order: 'desc', limit: 1 }, options),
-    ])
-    if (!first.data[0] || !last.data[0]) return []
-    return this.api().session.diff({ sessionID, from: first.data[0].id, to: last.data[0].id }, options)
+    let diffs: SessionDiff[]
+    if (from) diffs = await this.api().session.diff({ sessionID, from }, options)
+    else {
+      // An unbounded session.diff means the latest turn, not the whole session.
+      const [first, last] = await Promise.all([
+        this.api().message.list({ sessionID, type: 'user', order: 'asc', limit: 1 }, options),
+        this.api().message.list({ sessionID, type: 'user', order: 'desc', limit: 1 }, options),
+      ])
+      if (!first.data[0] || !last.data[0]) return []
+      diffs = await this.api().session.diff({ sessionID, from: first.data[0].id, to: last.data[0].id }, options)
+    }
+    if (diffs.length) return diffs
+    try {
+      const history = await this.api().message.list({ sessionID, order: 'asc', limit: 200 }, options)
+      let messages = history.data
+      if (from) {
+        const start = messages.findIndex(message => message.id === from)
+        if (start === -1) return []
+        messages = messages.slice(start)
+        const end = messages.findIndex(message => message.type === 'idle')
+        if (end !== -1) messages = messages.slice(0, end)
+      }
+      const files = new Map<string, SessionDiff>()
+      for (const message of messages) for (const diff of extractToolDiffs(message, this.directory(projectID))) {
+        const previous = files.get(diff.file)
+        files.set(diff.file, previous ? {
+          file: diff.file,
+          patch: [previous.patch, diff.patch].filter(Boolean).join('\n'),
+          additions: previous.additions + diff.additions,
+          deletions: previous.deletions + diff.deletions,
+          status: previous.status === 'added' && diff.status === 'modified' ? 'added' : diff.status,
+        } : diff)
+      }
+      return [...files.values()]
+    } catch { return [] }
   }
   async models(projectID: string): Promise<Model[]> {
     const list = await this.api().model.list({ location: { directory: this.directory(projectID) }, types: ['chat'] })
@@ -371,6 +480,21 @@ export class OpenCodeAdapter {
       const text = 'delta' in event.data ? (old?.text ?? '') + event.data.delta : event.data.text
       live.set(key, { id: key, role: 'assistant', kind: event.type.includes('reasoning') ? 'reasoning' : 'text', text })
       if (live.size > 1000) live.delete(live.keys().next().value!)
+    }
+    if (event.type === 'model.updated' || event.type === 'agent.updated' || event.type === 'command.updated' || event.type === 'skill.updated') {
+      const target = 'location' in event ? event.location?.directory : undefined
+      let matched = false
+      if (target) {
+        const resolvedTarget = path.resolve(target).toLowerCase()
+        for (const [projectID, root] of this.projects) {
+          if (path.resolve(root).toLowerCase() === resolvedTarget) {
+            matched = true
+            this.notify({ type: 'catalog', projectID })
+          }
+        }
+      }
+      if (!matched) this.notify({ type: 'catalog' })
+      return
     }
     const sessionID = 'data' in event && event.data && typeof event.data === 'object' && 'sessionID' in event.data ? String(event.data.sessionID) : undefined
     const directory = 'location' in event ? event.location?.directory : undefined

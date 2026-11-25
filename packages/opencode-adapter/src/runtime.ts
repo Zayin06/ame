@@ -18,7 +18,7 @@ export function privateEnvironment(profile: string, password: string, inherited 
     XDG_CACHE_HOME: path.join(profile, 'cache'), XDG_STATE_HOME: path.join(profile, 'state'),
     OPENCODE_CONFIG_DIR: path.join(profile, 'config', 'opencode'), OPENCODE_TEST_HOME: path.join(profile, 'home'),
     OPENCODE_DB: path.join(profile, 'data', 'ide.db'), OPENCODE_PASSWORD: password,
-    OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_MODELS_FETCH: '1',
+    OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_MODELS_FETCH: '1', OPENCODE_DISABLE_FILEWATCHER: '1',
     DO_NOT_TRACK: '1' }
 }
 export class PrivateRuntime {

@@ -62,7 +62,9 @@ function harness(component: 'Account' | 'Settings', initialProps: object, accoun
   const code = ts.transpileModule(readFileSync(new URL(`../components/${component}.tsx`, import.meta.url), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
   }).outputText
-  runInNewContext(code, { exports, Event, window: { ame: { account }, localStorage: storage, dispatchEvent() {} }, require: (name: string) => modules[name] ?? nativeRequire(name) })
+  const events = new EventTarget(), dispatched: string[] = []
+  const dispatchEvent = (event: Event) => { dispatched.push(event.type); return events.dispatchEvent(event) }
+  runInNewContext(code, { exports, Event, window: { ame: { account }, localStorage: storage, dispatchEvent, addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events) }, require: (name: string) => modules[name] ?? nativeRequire(name) })
   const Component = exports[component] as (props: object) => ReactNode
   function render(extra: object = {}) {
     props = { ...props, ...extra }
@@ -99,12 +101,12 @@ function harness(component: 'Account' | 'Settings', initialProps: object, accoun
     const element = find(node => node.props['aria-label'] === label || node.props.placeholder === label)
     ;(element.props.onChange as (event: unknown) => void)({ target: { value } })
   }
-  return { render, find, button, click, change, AccountMarker, async flush() { await tick(); return render() }, unmount() { effects.forEach(effect => effect.cleanup?.()) } }
+  return { render, find, button, click, change, AccountMarker, dispatchEvent, dispatched, async flush() { await tick(); return render() }, unmount() { effects.forEach(effect => effect.cleanup?.()) } }
 }
 
 function admin(options: { storage?: Pick<Storage, 'getItem' | 'setItem'>; serverVersion?: string; initial?: ReturnType<typeof preview>; role?: string; features?: { commitEnhanceSkill?: string; commitEnhanceModel?: string; androidTranslationSkill?: string; androidTranslationModel?: string }; models?: { default_model?: string; small_model?: string; model_levels?: Partial<typeof modelLevels>; active_models?: { id: string; name: string; vision?: boolean; reasoning?: boolean }[] } | null } = {}) {
   let imported = options.initial ?? preview(), current = imported, batchFailures: { path: string; code: string; detail?: string }[] = [], failure = '', nextFix: Promise<unknown> | undefined
-  let nextImport: Promise<unknown> | undefined, nextBatch: Promise<unknown> | undefined
+  let nextImport: Promise<unknown> | undefined, nextBatch: Promise<unknown> | undefined, nextHistory: Promise<unknown> | undefined
   let activationError = '', historyError = '', activeID = '', revision = 1, nextRelease: Promise<unknown> | undefined
   let releases = options.serverVersion ? [{ releaseId: 'previous', version: options.serverVersion }] : []
   const calls: { operation: string; payload?: Record<string, string> }[] = []
@@ -114,6 +116,7 @@ function admin(options: { storage?: Pick<Storage, 'getItem' | 'setItem'>; server
     if (operation === 'status' || operation === 'login') return loggedIn
     if (operation === 'logout') return null
     if (operation === 'history') {
+      if (nextHistory) { const value = nextHistory; nextHistory = undefined; return value }
       if (historyError) throw new Error(historyError)
       return { releases, active: { revision, release_id: activeID } }
     }
@@ -166,6 +169,7 @@ function admin(options: { storage?: Pick<Storage, 'getItem' | 'setItem'>; server
     ...h, calls,
     failActivation(value: string) { activationError = value },
     failHistory(value: string) { historyError = value },
+    delayHistory(value: Promise<unknown>) { nextHistory = value },
     delayRelease(value: Promise<unknown>) { nextRelease = value },
     setImport(value: ReturnType<typeof preview>) { imported = value },
     failBatch(value: typeof batchFailures) { batchFailures = value },
@@ -471,7 +475,14 @@ test('Account lists every active API model with capabilities for user accounts',
     { id: 'gemini-active', name: 'Gemini Active', vision: true, reasoning: true },
   ] } })
   h.render(); const html = await h.flush()
-  assert.match(html, /data-testid="amekit-active-models"/)
+  assert.match(html, /<details class="amekit-details amekit-active-models" data-testid="amekit-active-models"><summary>/)
+  const disclosure = h.find(node => node.props['data-testid'] === 'amekit-active-models')
+  assert.equal(disclosure.type, 'details')
+  assert.ok(!disclosure.props.open)
+  for (const action of ['Làm mới phiên', 'Đăng xuất']) {
+    assert.ok(html.indexOf(action) < html.indexOf('Phân cấp Model từ API'))
+    assert.ok(html.indexOf(action) < html.indexOf('amekit-active-models'))
+  }
   assert.ok(html.includes('Tất cả Model đang hoạt động từ API (2)'))
   assert.match(html, /Gemini Active/)
   assert.match(html, /gemini-active/)
@@ -506,6 +517,7 @@ test('Bundle installed and release history summaries retain both feature models'
   const h = harness('Account', { embedded: true, projectID: 'project', close() {} }, async operation => {
     if (operation === 'status') return { account: { name: 'Admin', username: 'admin', role: 'admin' }, models: accountModels, ready: true }
     if (operation === 'installed') return { version: '1.0.0', releaseId: 'installed', features }
+    if (operation === 'legacy-installed') return null
     if (operation === 'latest') return { release: { releaseId: 'latest', version: '2.0.0', manifest: { features } } }
     if (operation === 'history') return { releases: [{ releaseId: 'latest', version: '2.0.0', manifest: { features } }], active: { revision: 1 } }
     throw new Error(`Unexpected operation ${operation}`)
@@ -517,6 +529,291 @@ test('Bundle installed and release history summaries retain both feature models'
   h.click('Quản trị'); h.render(); await h.flush(); h.click('Lịch sử (1)'); html = h.render()
   assert.ok(html.includes('Enhance: /review · commit-active'))
   assert.ok(html.includes('Dịch Android: /android-strings-translation · gemini-active'))
+  h.unmount()
+})
+
+test('Bundle retains installed, latest and same-project legacy state while refreshing on tab reentry', async () => {
+  const refreshInstalled = deferred(), refreshLatest = deferred()
+  let installedCalls = 0, latestCalls = 0
+  const h = harness('Account', { embedded: true, projectID: 'project', close() {} }, async operation => {
+    if (operation === 'status') return { account: { name: 'User', username: 'user' }, ready: true }
+    if (operation === 'installed') return ++installedCalls === 1 ? { version: '1.0.0', releaseId: 'installed' } : refreshInstalled.promise
+    if (operation === 'latest') return ++latestCalls === 1 ? { release: { version: '2.0.0', releaseId: 'latest' } } : refreshLatest.promise
+    if (operation === 'legacy-installed') return { projectName: 'Legacy workspace', fileCount: 2, hasConfigDir: true, hasManagedDir: true }
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Bundle'); h.render(); await h.flush()
+  h.click('Tài khoản'); h.render(); h.click('Bundle')
+  const assertRetained = (html: string) => {
+    assert.match(html, /Đang dùng: v1\.0\.0/)
+    assert.match(html, /Trên máy chủ: v2\.0\.0/)
+    assert.match(html, /Có bản mới v2\.0\.0/)
+    assert.match(html, /Legacy workspace/)
+    assert.doesNotMatch(html, /Ứng dụng chưa đồng bộ bundle nào|Đang kiểm tra trạng thái bundle…|>Đang xử lý…</)
+    assert.equal(h.button('Gỡ bundle').props.disabled, false)
+    assert.equal(h.button('Đồng bộ / Cập nhật ngay').props.disabled, false)
+  }
+  assertRetained(h.render())
+  assertRetained(await h.flush())
+  assert.equal(installedCalls, 2)
+  refreshInstalled.resolve({ version: '1.0.0', releaseId: 'installed' })
+  assertRetained(await h.flush())
+  assert.equal(latestCalls, 2)
+  refreshLatest.resolve({ release: { version: '3.0.0', releaseId: 'new' } })
+  const html = await h.flush()
+  assert.match(html, /Đang dùng: v1\.0\.0/)
+  assert.match(html, /Trên máy chủ: v3\.0\.0/)
+  assert.doesNotMatch(html, /Ứng dụng chưa đồng bộ bundle nào|>Đang xử lý…</)
+  h.unmount()
+})
+
+test('first empty Bundle load shows local progress, ignores canceled results and preserves no-release state on refresh', async () => {
+  const canceled = deferred(), installed = deferred(), latest = deferred(), refresh = deferred()
+  let installedCalls = 0, latestCalls = 0
+  const h = harness('Account', { embedded: true, close() {} }, async operation => {
+    if (operation === 'status') return { account: { name: 'User', username: 'user' }, ready: true }
+    if (operation === 'installed') return [canceled.promise, installed.promise, refresh.promise][installedCalls++]
+    if (operation === 'latest') {
+      latestCalls++
+      if (latestCalls === 1) await latest.promise
+      throw new Error('NO_ACTIVE_RELEASE')
+    }
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Bundle')
+  const assertLoading = (html: string) => {
+    assert.match(html, /role="status">Đang kiểm tra trạng thái bundle…</)
+    assert.doesNotMatch(html, /Ứng dụng chưa đồng bộ bundle nào|>Đang xử lý…</)
+  }
+  assertLoading(h.render()); assertLoading(await h.flush())
+  h.click('Tài khoản')
+  assert.doesNotMatch(h.render(), /Đang kiểm tra trạng thái bundle…|>Đang xử lý…</)
+  h.click('Bundle'); assertLoading(h.render())
+  canceled.resolve({ version: 'stale', releaseId: 'stale' })
+  let html = await h.flush()
+  assertLoading(html)
+  assert.doesNotMatch(html, /Đang dùng: vstale/)
+  assert.equal(installedCalls, 2)
+  installed.resolve(null); assertLoading(await h.flush())
+  latest.resolve(null); html = await h.flush()
+  assert.match(html, /Ứng dụng chưa đồng bộ bundle nào/)
+  assert.match(html, /Máy chủ chưa có bản phát hành nào được kích hoạt/)
+  assert.doesNotMatch(html, /Đang kiểm tra trạng thái bundle…|>Đang xử lý…</)
+  assert.equal(h.button('Đồng bộ / Cập nhật ngay').props.disabled, true)
+  h.click('Tài khoản'); h.render(); h.click('Bundle'); html = h.render()
+  assert.match(html, /Ứng dụng chưa đồng bộ bundle nào/)
+  assert.match(html, /Máy chủ chưa có bản phát hành nào được kích hoạt/)
+  assert.doesNotMatch(html, /Đang kiểm tra trạng thái bundle…|>Đang xử lý…</)
+  assert.equal(h.button('Đồng bộ / Cập nhật ngay').props.disabled, true)
+  refresh.resolve(null); await h.flush()
+  h.unmount()
+})
+
+test('Admin numbers visible steps consecutively and keeps controls enabled during background history loads', async () => {
+  const h = admin({ initial: preview([agent], []) }), history = deferred(), refresh = deferred()
+  h.delayHistory(history.promise)
+  h.render(); await h.flush(); h.click('Quản trị')
+  let html = h.render()
+  assert.match(html, /<h3>2\. Phát hành cho team<\/h3>/)
+  assert.doesNotMatch(html, /Tính năng tích hợp|3\. Phát hành cho team|>Đang xử lý…</)
+  for (const label of ['Chọn thư mục & nhập', 'Sửa phiên bản']) assert.equal(h.button(label).props.disabled, false)
+  assert.equal(h.find(node => node.props['aria-label'] === 'Chế độ tương thích').props.disabled, false)
+  h.click('Sửa phiên bản'); h.render()
+  assert.equal(h.find(node => node.props['aria-label'] === 'Phiên bản').props.disabled, false)
+  h.click('Lịch sử (0)'); html = await h.flush()
+  assert.match(html, /role="status">Đang tải lịch sử phát hành…</)
+  assert.doesNotMatch(html, /Chưa có bản phát hành nào trên máy chủ|>Đang xử lý…</)
+  assert.equal(h.button('Làm mới').props.disabled, false)
+  history.resolve({ releases: [] }); html = await h.flush()
+  assert.match(html, /Chưa có bản phát hành nào trên máy chủ/)
+  assert.doesNotMatch(html, /Đang tải lịch sử phát hành…|>Đang xử lý…</)
+  h.click('Phát hành mới'); h.render(); h.click('Chọn thư mục & nhập'); html = await h.flush()
+  assert.match(html, /<h3>2\. Tính năng tích hợp \(tùy chọn\)<\/h3>/)
+  assert.match(html, /<h3>3\. Phát hành cho team<\/h3>/)
+  assert.doesNotMatch(html, /<h3>2\. Phát hành cho team<\/h3>/)
+  h.click('Tài khoản'); h.render(); h.delayHistory(refresh.promise); h.click('Quản trị'); html = h.render()
+  assert.match(html, /<h3>3\. Phát hành cho team<\/h3>/)
+  assert.equal(h.button('Đổi thư mục').props.disabled, false)
+  assert.equal(h.button('Chỉ đóng gói thử').props.disabled, false)
+  h.click('Lịch sử (0)'); html = await h.flush()
+  assert.match(html, /Chưa có bản phát hành nào trên máy chủ/)
+  assert.doesNotMatch(html, /Đang tải lịch sử phát hành…|>Đang xử lý…</)
+  refresh.resolve({ releases: [{ releaseId: 'new', version: '1.0.0' }] }); html = await h.flush()
+  assert.match(html, /Lịch sử \(1\)/)
+  assert.match(html, /<strong>v1\.0\.0<\/strong>/)
+  h.unmount()
+})
+
+test('Global Bundle sync and uninstall use app-wide payloads without a project and clear notices on tab changes', async () => {
+  const calls: { operation: string; payload?: Record<string, string> }[] = []
+  const bundle = { version: '2.0.0', releaseId: 'active', verification: 'runtime-ready', agents: ['helper'], skills: ['review'], fileCount: 3 }
+  let installed: typeof bundle | null = null, synced = false
+  const sync = deferred()
+  const h = harness('Account', { embedded: true, projectID: undefined, close() {} }, async (operation, payload) => {
+    calls.push({ operation, payload: payload && { ...payload } })
+    if (operation === 'status') return { account: { name: 'User', username: 'user' }, ready: true, bundleAutoSyncError: synced ? undefined : 'NETWORK_ERROR' }
+    if (operation === 'installed') return installed
+    if (operation === 'latest') return { release: { releaseId: 'active', version: '2.0.0' } }
+    if (operation === 'sync') { await sync.promise; synced = true; return installed = bundle }
+    if (operation === 'uninstall') { installed = null; return {} }
+    if (operation === 'logout') return null
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Bundle'); h.render()
+  let html = await h.flush()
+  assert.match(html, /data-testid="amekit-global-bundle"/)
+  assert.match(html, /Ứng dụng chưa đồng bộ bundle nào/)
+  assert.match(html, /Tự đồng bộ nền chưa thể áp dụng bundle/)
+  assert.doesNotMatch(html, /Chọn dự án trước|Cho phép raw compatibility|Kiểm tra tệp đã cài \(offline\)|Bản mới nhất|Kiểm tra đã cài|type="checkbox"|>Gỡ bundle</)
+  assert.deepEqual(calls.filter(call => call.operation === 'installed'), [{ operation: 'installed', payload: {} }])
+  assert.equal(calls.some(call => call.operation === 'legacy-installed'), false)
+  assert.equal(h.button('Đồng bộ / Cập nhật ngay').props.disabled, false)
+  h.click('Đồng bộ / Cập nhật ngay'); h.render(); await tick()
+  assert.equal(h.button('Đang đồng bộ…').props.disabled, true)
+  sync.resolve(bundle); html = await h.flush()
+  assert.deepEqual(calls.find(call => call.operation === 'sync')?.payload, {})
+  assert.match(html, /Đã đồng bộ AmeKit v2\.0\.0 toàn ứng dụng\./)
+  assert.match(html, /Sẵn sàng OpenCode · 1 agents · 1 skills · 3 tệp/)
+  assert.match(html, /<details class="amekit-details"><summary>Danh sách Agents \(1\) &amp; Skills \(1\)/)
+  assert.doesNotMatch(html, /Tự đồng bộ nền chưa thể áp dụng bundle|amekit-server-release/)
+  h.click('Gỡ bundle'); html = await h.flush()
+  assert.deepEqual(calls.find(call => call.operation === 'uninstall')?.payload, {})
+  assert.deepEqual(calls.filter(call => call.operation === 'installed').map(call => call.payload), [{}, {}])
+  assert.match(html, /Đã gỡ bundle khỏi cấu hình toàn ứng dụng\./)
+  assert.doesNotMatch(html, /Đang dùng:|>Gỡ bundle</)
+  h.click('Tài khoản'); h.render(); h.click('Bundle'); h.render(); html = await h.flush()
+  assert.doesNotMatch(html, /Đã gỡ bundle khỏi/)
+  h.click('Tài khoản'); h.render(); h.click('Đăng xuất'); html = await h.flush()
+  assert.match(html, />Đăng nhập</)
+  assert.doesNotMatch(html, /Đã đồng bộ AmeKit|Đã gỡ bundle/)
+  h.unmount()
+})
+
+test('Global Bundle suppresses matching server summaries but preserves changed versions or feature settings', async () => {
+  const features = { commitEnhanceModel: 'commit-model' }
+  for (const [version, serverFeatures, differs] of [
+    ['1.0.0', features, false], ['1.0.1', features, true], ['1.0.0', { commitEnhanceModel: 'new-model' }, true],
+  ] as const) {
+    const h = harness('Account', { embedded: true, close() {} }, async operation => {
+      if (operation === 'status') return { account: { name: 'User', username: 'user' } }
+      if (operation === 'installed') return { version: '1.0.0', releaseId: 'same', features }
+      if (operation === 'latest') return { release: { releaseId: 'same', version, manifest: { features: serverFeatures } } }
+      throw new Error(`Unexpected operation ${operation}`)
+    })
+    h.render(); await h.flush(); h.click('Bundle'); h.render(); const html = await h.flush()
+    assert.equal(html.includes('amekit-server-release'), differs)
+    assert.match(html, /Đang dùng: v1\.0\.0/)
+    h.unmount()
+  }
+})
+
+test('Bundle listens for background updates only while open and recovers from no active release silently', async () => {
+  const calls: string[] = []
+  let active = false, failure = false
+  const h = harness('Account', { embedded: true, close() {} }, async operation => {
+    calls.push(operation)
+    if (operation === 'status') return { account: { name: 'User', username: 'user' } }
+    if (operation === 'installed') {
+      if (failure) throw new Error('NETWORK_ERROR')
+      return active ? { version: '2.0.0', releaseId: 'new' } : null
+    }
+    if (operation === 'latest') {
+      if (failure) throw new Error('NETWORK_ERROR')
+      if (!active) throw new Error('NO_ACTIVE_RELEASE')
+      return { release: { version: '2.0.0', releaseId: 'new' } }
+    }
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Bundle'); h.render()
+  assert.match(await h.flush(), /Máy chủ chưa có bản phát hành nào được kích hoạt/)
+  assert.equal(h.button('Đồng bộ / Cập nhật ngay').props.disabled, true)
+  active = true; h.dispatchEvent(new Event('ame-bundle-updated'))
+  let html = await h.flush()
+  assert.match(html, /Đang dùng: v2\.0\.0/)
+  assert.match(html, /Đã mới nhất/)
+  assert.equal(h.button('Đồng bộ / Cập nhật ngay').props.disabled, false)
+  failure = true; h.dispatchEvent(new Event('ame-bundle-updated')); html = await h.flush()
+  assert.match(html, /Đang dùng: v2\.0\.0/)
+  assert.doesNotMatch(html, /role="alert"/)
+  h.click('Tài khoản'); h.render()
+  const count = calls.length
+  h.dispatchEvent(new Event('ame-bundle-updated')); await h.flush()
+  assert.equal(calls.length, count)
+  h.unmount()
+  h.dispatchEvent(new Event('ame-bundle-updated')); await tick()
+  assert.equal(calls.length, count)
+})
+
+test('Legacy cleanup is project-specific, clears its card on completion and dispatches the cleanup event', async () => {
+  const calls: { operation: string; payload?: Record<string, string> }[] = []
+  const cleanup = deferred()
+  const h = harness('Account', { embedded: true, projectID: 'project', close() {} }, async (operation, payload) => {
+    calls.push({ operation, payload: payload && { ...payload } })
+    if (operation === 'status') return { account: { name: 'User', username: 'user' } }
+    if (operation === 'installed') return null
+    if (operation === 'latest') return { release: { releaseId: 'active', version: '1.0.0' } }
+    if (operation === 'legacy-installed') return { projectName: 'Legacy workspace', fileCount: 4, hasConfigDir: true, hasManagedDir: true, modified: true, error: 'OWNED_FILE_CHANGED' }
+    if (operation === 'clean-legacy') return cleanup.promise
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Bundle'); h.render()
+  let html = await h.flush()
+  assert.match(html, /data-testid="amekit-legacy-cleanup"/)
+  assert.match(html, /Phát hiện bundle cũ trong dự án Legacy workspace/)
+  assert.match(html, /4 tệp cấu hình cũ/)
+  assert.match(html, /có thay đổi cục bộ hoặc trạng thái cần kiểm tra/)
+  assert.ok(html.includes(amekitUI.formatAmeKitError('OWNED_FILE_CHANGED').title))
+  assert.deepEqual(calls.filter(call => call.operation === 'installed').map(call => call.payload), [{}])
+  assert.deepEqual(calls.find(call => call.operation === 'legacy-installed')?.payload, { project: 'project' })
+  h.click('Dọn bundle cũ khỏi dự án'); h.render(); await tick()
+  assert.equal(h.button('Đang dọn…').props.disabled, true)
+  assert.deepEqual(calls.find(call => call.operation === 'clean-legacy')?.payload, { project: 'project' })
+  cleanup.resolve({ removedFiles: 3 }); html = await h.flush()
+  assert.doesNotMatch(html, /data-testid="amekit-legacy-cleanup"/)
+  assert.match(html, /Đã dọn 3 tệp AmeKit cũ khỏi dự án\./)
+  assert.equal(h.dispatched.filter(type => type === 'ame-legacy-cleaned').length, 1)
+  h.unmount()
+})
+
+test('Legacy detection hides absent or canceled results without replacing global errors', async () => {
+  for (const canceled of [false, true]) {
+    const h = harness('Account', { embedded: true, projectID: 'project', close() {} }, async operation => {
+      if (operation === 'status') return { account: { name: 'User', username: 'user' } }
+      if (operation === 'installed') throw new Error('NETWORK_ERROR')
+      if (operation === 'latest') return { release: { releaseId: 'active' } }
+      if (operation === 'legacy-installed') { if (canceled) throw new Error('CANCELLED'); return null }
+      throw new Error(`Unexpected operation ${operation}`)
+    })
+    h.render(); await h.flush(); h.click('Bundle'); h.render(); const html = await h.flush()
+    assert.doesNotMatch(html, /amekit-legacy-cleanup|đã hủy hộp thoại/)
+    assert.match(html, /role="alert"/)
+    assert.ok(html.includes(amekitUI.formatAmeKitError('NETWORK_ERROR').title))
+    h.unmount()
+  }
+})
+
+test('Changing projects discards stale legacy results and clearing the project removes the cleanup card', async () => {
+  const stale = deferred(), calls: string[] = []
+  const h = harness('Account', { embedded: true, projectID: 'old', close() {} }, async (operation, payload) => {
+    if (operation === 'status') return { account: { name: 'User', username: 'user' } }
+    if (operation === 'installed') return { releaseId: 'global', version: '1.0.0' }
+    if (operation === 'latest') return { release: { releaseId: 'global', version: '1.0.0' } }
+    if (operation === 'legacy-installed') {
+      calls.push(payload!.project)
+      if (payload?.project === 'old') return stale.promise
+      return null
+    }
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Bundle'); h.render(); await h.flush()
+  h.render({ projectID: 'new' })
+  stale.resolve({ projectName: 'Old project', fileCount: 2, hasConfigDir: true, hasManagedDir: true })
+  let html = await h.flush()
+  assert.deepEqual(calls, ['old', 'new'])
+  assert.doesNotMatch(html, /amekit-legacy-cleanup|Old project/)
+  html = h.render({ projectID: undefined }); html = await h.flush()
+  assert.doesNotMatch(html, /amekit-legacy-cleanup/)
+  assert.equal(h.button('Đồng bộ / Cập nhật ngay').props.disabled, false)
   h.unmount()
 })
 

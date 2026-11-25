@@ -12,6 +12,7 @@ test('private profile ignores inherited OpenCode overrides and keeps tool enviro
   assert.equal(env.OPENCODE_SERVER_PASSWORD, undefined)
   assert.equal(env.NODE_OPTIONS, undefined)
   assert.equal(env.OPENCODE_PASSWORD, 'private-secret')
+  assert.equal(env.OPENCODE_DISABLE_FILEWATCHER, '1')
   assert.equal(env.XDG_CONFIG_HOME, path.join('C:\\private', 'config'))
   assert.equal(env.PATH, 'tools')
   assert.equal(env.HOME, 'original')

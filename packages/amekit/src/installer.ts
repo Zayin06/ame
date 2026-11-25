@@ -1,10 +1,10 @@
 // Adapted from opencode-amekit/src/installer.ts; see ../docs/amekit.md for provenance.
-import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import path from "node:path"
 import type { BundleFeatures, Release } from "./api"
 import { Features, sha256 } from "./bundle/manifest"
-import { MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES } from "./bundle/limits"
+import { MAX_EXPANDED, MAX_FILE, MAX_PAYLOAD_FILES, MAX_SCAN_ENTRIES } from "./bundle/limits"
 import { preview, safePath, verifiedFiles, type InputFile } from "./bundle/package"
 import type { Discover } from "./runtime"
 
@@ -31,7 +31,7 @@ async function tree(root: string) {
   await safeDirectory(root)
   async function walk(directory: string, prefix: string) {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
-      if (++count > 4096) throw new Error("PERSONAL_CONFIG_TOO_LARGE")
+      if (++count > MAX_SCAN_ENTRIES) throw new Error("PERSONAL_CONFIG_TOO_LARGE")
       const target = path.join(directory, entry.name), name = prefix + entry.name
       const stat = await lstat(target)
       if (stat.isSymbolicLink() || (await realpath(target)).toLowerCase() !== target.toLowerCase()) throw new Error("REPARSE_CONFIG_REJECTED")
@@ -54,7 +54,7 @@ function stateOf(files: InputFile[]) {
   if (state.compatibilityMode !== undefined && state.compatibilityMode !== "native" && state.compatibilityMode !== "raw") throw new Error("INVALID_OWNERSHIP_STATE")
   if (state.features !== undefined) {
     const parsed = Features.safeParse(state.features)
-    if (!parsed.success || [parsed.data.commitEnhanceSkill, parsed.data.androidTranslationSkill].some(name => name !== undefined && !state.skills.includes(name))) throw new Error("INVALID_OWNERSHIP_STATE")
+    if (!parsed.success || [parsed.data.commitEnhanceSkill, parsed.data.androidTranslationSkill, parsed.data.buildNotesSkill].some(name => name !== undefined && !state.skills.includes(name))) throw new Error("INVALID_OWNERSHIP_STATE")
   }
   const paths = new Set<string>()
   for (const file of state.files) { safePath(file.path); const key = file.path.toLowerCase(); if (paths.has(key)) throw new Error("INVALID_OWNERSHIP_STATE"); paths.add(key) }
@@ -67,11 +67,12 @@ async function checkOwned(files: InputFile[], state: State) {
     if (!file || await sha256(file.data) !== owned.sha256) throw new Error("OWNED_FILE_CHANGED")
   }
 }
-async function discovered(project: string, state: State, discover: Discover, signal?: AbortSignal) {
+async function discovered(targetDir: string, state: State, discover: Discover, signal?: AbortSignal, scope: "project" | "global" = "project") {
   signal?.throwIfAborted()
   if (state.compatibilityMode === "raw") return
-  const catalog = await discover(project, signal, state)
-  if (!state.agents.every(id => catalog.agents.some(a => a.id === id)) || !state.skills.every(id => catalog.skills.some(s => s.name === id && path.resolve(s.path).toLowerCase() === path.join(project, ".opencode", "skills", id, "SKILL.md").toLowerCase()))) throw new Error("DISCOVERY_MISMATCH")
+  const catalog = await discover(targetDir, signal, state, { scope })
+  const configDir = scope === "global" ? targetDir : path.join(targetDir, ".opencode")
+  if (!state.agents.every(id => catalog.agents.some(a => a.id === id)) || !state.skills.every(id => catalog.skills.some(s => s.name === id && path.resolve(s.path).toLowerCase() === path.join(configDir, "skills", id, "SKILL.md").toLowerCase()))) throw new Error("DISCOVERY_MISMATCH")
 }
 export async function installed(project: string) {
   await safeDirectory(project)
@@ -87,11 +88,11 @@ export async function installed(project: string) {
   }
   return undefined
 }
-async function readVerifiedFeatureSkill(project: string, name: string | undefined, state: Awaited<ReturnType<typeof installed>>, limit: number) {
+async function readVerifiedFeatureSkill(project: string, name: string | undefined, state: Awaited<ReturnType<typeof installed>>, limit: number, scope: "project" | "global" = "project") {
   if (!name || !state) return null
   const owned = state.files.find(file => file.path === `skills/${name}/SKILL.md`)
   if (!owned) return null
-  const target = path.join(project, ".opencode", "skills", name, "SKILL.md")
+  const target = path.join(scope === "global" ? project : path.join(project, ".opencode"), "skills", name, "SKILL.md")
   await safeDirectory(path.dirname(target))
   const stat = await lstat(target)
   if (!stat.isFile() || stat.isSymbolicLink() || (await realpath(target)).toLowerCase() !== target.toLowerCase()) throw new Error("REPARSE_CONFIG_REJECTED")
@@ -113,6 +114,11 @@ export async function readAndroidTranslationFeature(project: string): Promise<{ 
   const state = await installed(project), features = state?.features
   const skill = await readVerifiedFeatureSkill(project, features?.androidTranslationSkill, state, 32_000)
   return { skill, ...(features?.androidTranslationModel ? { model: features.androidTranslationModel } : {}), ...(features?.androidTranslationSkill ? { rawSkillName: features.androidTranslationSkill } : {}) }
+}
+export async function readBuildNotesFeature(project: string): Promise<{ skill: { name: string; instructions: string } | null; model?: string; rawSkillName?: string }> {
+  const state = await installed(project), features = state?.features
+  const skill = await readVerifiedFeatureSkill(project, features?.buildNotesSkill, state, 16_000)
+  return { skill: skill ? { name: skill.name, instructions: skill.instructions } : null, ...(features?.buildNotesModel ? { model: features.buildNotesModel } : {}), ...(features?.buildNotesSkill ? { rawSkillName: features.buildNotesSkill } : {}) }
 }
 async function managedDirectory(project: string) {
   await safeDirectory(project)
@@ -214,4 +220,286 @@ export async function offline(project: string, discover: Discover, signal?: Abor
   if (!state) throw new Error("NO_LAST_KNOWN_GOOD")
   await discovered(project, state, discover, signal)
   return { ...state, verification: state.compatibilityMode === "raw" ? "verified-bytes" as const : "runtime-ready" as const }
+}
+
+async function retryFs<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn() } catch (error) {
+      if (attempt >= 5 || !["EBUSY", "EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
+      await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)))
+    }
+  }
+}
+async function managedDirectoryAt(managedDir: string) {
+  await mkdir(managedDir, { recursive: true })
+  await safeDirectory(managedDir)
+  const marker = path.join(managedDir, "owner")
+  try { await writeFile(marker, "amekit-poc04\n", { flag: "wx" }) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+  }
+  const stat = await lstat(marker)
+  if (!stat.isFile() || stat.isSymbolicLink() || (await realpath(marker)).toLowerCase() !== marker.toLowerCase() || await readFile(marker, "utf8") !== "amekit-poc04\n") throw new Error("MANAGED_DIRECTORY_COLLISION")
+}
+function ownedParentDirs(relPaths: Iterable<string>) {
+  const dirs = new Set<string>()
+  for (const name of relPaths) {
+    if (!/^(agents|skills)\//.test(name)) continue
+    safePath(name)
+    const parts = name.split("/")
+    while (parts.length > 1) { parts.pop(); dirs.add(parts.join("/")) }
+  }
+  return dirs
+}
+async function removeEmptyDirectory(directory: string) {
+  // fs.rm({ recursive: false }) rejects directories on Node, including empty ones.
+  await retryFs(() => rmdir(directory))
+}
+async function pruneEmptyOwnedDirs(configDir: string, relPaths: Iterable<string>, preserve = new Set<string>()) {
+  const dirs = [...ownedParentDirs(relPaths)].sort((a, b) => b.split("/").length - a.split("/").length)
+  for (const dir of dirs) {
+    if (preserve.has(dir)) continue
+    const target = path.join(configDir, ...dir.split("/"))
+    try { await safeDirectory(target); await removeEmptyDirectory(target) } catch (error) {
+      if (!["ENOENT", "ENOTEMPTY", "EEXIST", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
+    }
+  }
+}
+function isManagedRelativePath(relPath: string) { return relPath === stateName || /^(agents|skills)\//.test(relPath) }
+async function managedFingerprint(files: InputFile[] & { directories?: string[] }) {
+  return fingerprint(Object.assign(files.filter(file => isManagedRelativePath(file.path)), { directories: files.directories?.filter(isManagedRelativePath) ?? [] }))
+}
+type InPlaceNext = { ownedFiles: InputFile[]; state?: State }
+async function transactionInPlace(configDir: string, managedDir: string, prepare: (before: Awaited<ReturnType<typeof tree>>) => Promise<InPlaceNext | undefined>, verify: () => Promise<void>, signal?: AbortSignal) {
+  if (!path.isAbsolute(configDir) || !path.isAbsolute(managedDir)) throw new Error("ABSOLUTE_PROJECT_REQUIRED")
+  const relativeManaged = path.relative(configDir, managedDir), relativeConfig = path.relative(managedDir, configDir)
+  if (!relativeManaged || (!relativeManaged.startsWith(".." + path.sep) && relativeManaged !== ".." && !path.isAbsolute(relativeManaged)) || (!relativeConfig.startsWith(".." + path.sep) && relativeConfig !== ".." && !path.isAbsolute(relativeConfig))) throw new Error("MANAGED_DIRECTORY_COLLISION")
+  await mkdir(configDir, { recursive: true }); await safeDirectory(configDir)
+  await managedDirectoryAt(managedDir)
+  const lock = path.join(managedDir, "lock"), backup = path.join(managedDir, "previous-" + randomUUID())
+  await mkdir(lock)
+  let journaled = false, settled = false, backupCreated = false
+  let before: Awaited<ReturnType<typeof tree>> | undefined
+  const backupEntries: InputFile[] = [], touched = new Set<string>()
+  let nextOwned: InputFile[] = []
+  try {
+    if (await exists(path.join(managedDir, "transaction.json"))) throw new Error("RECOVERY_REQUIRED")
+    signal?.throwIfAborted()
+    before = await tree(configDir)
+    const next = await prepare(before)
+    if (!next) return false
+    const old = stateOf(before), oldOwnedPaths = [...(old?.files.map(file => file.path) ?? []), ...(old ? [stateName] : [])]
+    const oldPathSet = new Set(oldOwnedPaths)
+    backupEntries.push(...before.filter(file => oldPathSet.has(file.path)))
+    if (backupEntries.length) {
+      await mkdir(backup); backupCreated = true
+      for (const file of backupEntries) {
+        const target = path.join(backup, ...file.path.split("/"))
+        await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data, { flag: "wx" })
+      }
+    }
+    nextOwned = next.ownedFiles
+    const nextFiles = [...nextOwned, ...(next.state ? [{ path: stateName, data: new TextEncoder().encode(JSON.stringify(next.state)) }] : [])]
+    const nextPathSet = new Set(nextFiles.map(file => file.path))
+    const obsoleteDirs = ownedParentDirs(oldOwnedPaths)
+    const preservedDirs = new Set(before.directories.filter(dir => !obsoleteDirs.has(dir)))
+    const expectedFiles = [...before.filter(file => !oldPathSet.has(file.path)), ...nextFiles]
+    const expectedDirs = new Set(preservedDirs)
+    // Personal files and empty personal directories remain part of the expected tree.
+    for (const name of [...expectedFiles.map(file => file.path), ...[...preservedDirs].map(dir => dir + "/entry")]) {
+      const parts = name.split("/")
+      while (parts.length > 1) { parts.pop(); expectedDirs.add(parts.join("/")) }
+    }
+    const expectedFingerprint = await managedFingerprint(Object.assign(expectedFiles, { directories: [...expectedDirs] }))
+    if (await managedFingerprint(before) !== await managedFingerprint(await tree(configDir))) throw new Error("CONFIG_CHANGED_DURING_SYNC")
+    signal?.throwIfAborted()
+    await journal(managedDir, { schema: 1, mode: "in-place", backup: path.basename(backup) }); journaled = true
+    for (const oldPath of oldOwnedPaths) {
+      if (nextPathSet.has(oldPath)) continue
+      signal?.throwIfAborted()
+      touched.add(oldPath)
+      await retryFs(() => rm(path.join(configDir, ...oldPath.split("/")), { force: true }))
+    }
+    for (const file of nextFiles) {
+      signal?.throwIfAborted()
+      const target = path.join(configDir, ...file.path.split("/"))
+      await retryFs(() => mkdir(path.dirname(target), { recursive: true })); await safeDirectory(path.dirname(target))
+      touched.add(file.path)
+      await retryFs(() => writeFile(target, file.data))
+    }
+    await pruneEmptyOwnedDirs(configDir, [...oldOwnedPaths, ...nextOwned.map(file => file.path)], preservedDirs)
+    await verify()
+    signal?.throwIfAborted()
+    const afterTree = await tree(configDir)
+    if (next.state) await checkOwned(afterTree, next.state)
+    if (await managedFingerprint(afterTree) !== expectedFingerprint) throw new Error("CONFIG_CHANGED_AFTER_ACTIVATION")
+    settled = true
+    return true
+  } catch (error) {
+    if (journaled && before) {
+      const failures: unknown[] = []
+      const restore = async (fn: () => Promise<unknown>) => { try { await fn() } catch (failure) { failures.push(failure) } }
+      const backupPaths = new Set(backupEntries.map(file => file.path))
+      for (const name of touched) if (!backupPaths.has(name)) await restore(() => retryFs(() => rm(path.join(configDir, ...name.split("/")), { force: true })))
+      await restore(() => pruneEmptyOwnedDirs(configDir, nextOwned.map(file => file.path), new Set(before!.directories)))
+      const affectedDirs = ownedParentDirs([...backupPaths, ...nextOwned.map(file => file.path)])
+      for (const dir of before.directories) if (affectedDirs.has(dir)) await restore(() => retryFs(() => mkdir(path.join(configDir, ...dir.split("/")), { recursive: true })))
+      for (const file of [...backupEntries.filter(file => file.path !== stateName), ...backupEntries.filter(file => file.path === stateName)]) await restore(async () => {
+        const target = path.join(configDir, ...file.path.split("/"))
+        await retryFs(() => mkdir(path.dirname(target), { recursive: true })); await safeDirectory(path.dirname(target))
+        await retryFs(() => writeFile(target, file.data))
+      })
+      await restore(async () => {
+        const restored = await tree(configDir)
+        const restoredFiles = new Map(restored.map(file => [file.path, file]))
+        for (const file of backupEntries) {
+          const actual = restoredFiles.get(file.path)
+          if (!actual || await sha256(actual.data) !== await sha256(file.data)) throw new Error("ROLLBACK_INCOMPLETE")
+        }
+        for (const name of touched) if (!backupPaths.has(name) && restoredFiles.has(name)) throw new Error("ROLLBACK_INCOMPLETE")
+      })
+      if (failures.length) throw new AggregateError([error, ...failures], "ROLLBACK_FAILED", { cause: error })
+      settled = true
+    }
+    throw error
+  } finally {
+    // Failed restoration retains the journal, lock and backup for explicit recovery.
+    if (settled || !journaled) {
+      if (backupCreated) await retryFs(() => rm(backup, { recursive: true, force: true }))
+      if (journaled) await retryFs(() => rm(path.join(managedDir, "transaction.json"), { force: true }))
+      await retryFs(() => rm(lock, { recursive: true, force: true }))
+    }
+  }
+}
+
+export async function installedGlobal(configDir: string, managedDir: string) {
+  if (!path.isAbsolute(configDir) || !path.isAbsolute(managedDir)) throw new Error("ABSOLUTE_PROJECT_REQUIRED")
+  if (await exists(managedDir)) {
+    await safeDirectory(managedDir)
+    if (await exists(path.join(managedDir, "transaction.json")) || await exists(path.join(managedDir, "lock"))) throw new Error("RECOVERY_REQUIRED")
+  }
+  const files = await tree(configDir), state = stateOf(files)
+  if (!state) return undefined
+  await checkOwned(files, state)
+  return { ...state, ...verification(state, files.filter(file => state.files.some(owned => owned.path === file.path))) }
+}
+export async function installGlobal(configDir: string, managedDir: string, origin: string, release: Release, bytes: Uint8Array, discover: Discover, signal?: AbortSignal, options: { allowRaw?: boolean } = {}) {
+  const verified = await verifiedFiles(bytes, release.version, release.sha256)
+  const compatibilityMode = verified.summary.compatibility.mode ?? "native"
+  if (compatibilityMode === "raw" && options.allowRaw !== true) throw new Error("RAW_INSTALL_CONFIRMATION_REQUIRED")
+  const content = preview(verified.files, [], { compatibilityMode })
+  if (content.issues.some(issue => issue.severity === "error" || issue.severity === "excluded")) throw new Error("INSTALL_COMPATIBILITY_BLOCKED")
+  let state: State
+  const changed = await transactionInPlace(configDir, managedDir, async before => {
+    const old = stateOf(before)
+    if (old) { if (old.origin !== origin) throw new Error("SERVER_OWNERSHIP_MISMATCH"); await checkOwned(before, old) }
+    if (old?.sha256 === release.sha256 && old.releaseId === release.releaseId) { state = old; await discovered(configDir, old, discover, signal, "global"); return undefined }
+    const oldPaths = new Set(old?.files.map(file => file.path)), personal = before.filter(file => file.path !== stateName && !oldPaths.has(file.path))
+    const catalog = compatibilityMode === "raw" ? { agents: [], skills: [] } : await discover(configDir, signal, undefined, { scope: "global" })
+    for (const id of content.agents) if (!old?.agents.includes(id) && catalog.agents.some(agent => agent.id.toLowerCase() === id.toLowerCase())) throw new Error("PERSONAL_AGENT_COLLISION")
+    for (const id of content.skills) if (!old?.skills.includes(id) && catalog.skills.some(skill => skill.name.toLowerCase() === id.toLowerCase())) throw new Error("PERSONAL_SKILL_COLLISION")
+    for (const file of verified.files) {
+      const key = file.path.toLowerCase()
+      if (personal.some(personalFile => { const name = personalFile.path.toLowerCase(); return name === key || name.startsWith(key + "/") || key.startsWith(name + "/") })) throw new Error("PERSONAL_FILE_COLLISION")
+      if (before.directories.some(dir => dir.toLowerCase() === key || dir.toLowerCase().startsWith(key + "/"))) throw new Error("PERSONAL_DIRECTORY_COLLISION")
+    }
+    state = { schema: 1, releaseId: release.releaseId, version: release.version, sha256: release.sha256, origin, files: await inventory(verified.files), agents: content.agents, skills: content.skills, ...(verified.summary.features ? { features: verified.summary.features } : {}), ...(compatibilityMode === "raw" ? { compatibilityMode } : {}) }
+    return { ownedFiles: verified.files, state }
+  }, () => discovered(configDir, state!, discover, signal, "global"), signal)
+  return { state: { ...state!, ...verification(state!, verified.files, true) }, changed }
+}
+export async function uninstallGlobal(configDir: string, managedDir: string, signal?: AbortSignal) {
+  return transactionInPlace(configDir, managedDir, async before => {
+    const old = stateOf(before)
+    if (!old) return undefined
+    await checkOwned(before, old)
+    return { ownedFiles: [] }
+  }, async () => {}, signal)
+}
+export async function offlineGlobal(configDir: string, managedDir: string, discover: Discover, signal?: AbortSignal) {
+  const state = await installedGlobal(configDir, managedDir)
+  if (!state) throw new Error("NO_LAST_KNOWN_GOOD")
+  await discovered(configDir, state, discover, signal, "global")
+  return { ...state, verification: state.compatibilityMode === "raw" ? "verified-bytes" as const : "runtime-ready" as const }
+}
+export async function readGlobalCommitEnhanceSkill(configDir: string, managedDir: string): Promise<{ name: string; instructions: string } | null> {
+  const state = await installedGlobal(configDir, managedDir)
+  const skill = await readVerifiedFeatureSkill(configDir, state?.features?.commitEnhanceSkill, state, 16_000, "global")
+  return skill ? { name: skill.name, instructions: skill.instructions } : null
+}
+export async function readGlobalBundleFeatures(configDir: string, managedDir: string): Promise<BundleFeatures | undefined> {
+  return (await installedGlobal(configDir, managedDir))?.features
+}
+export async function readGlobalAndroidTranslationFeature(configDir: string, managedDir: string): Promise<{ skill: { name: string; instructions: string; directory: string } | null; model?: string; rawSkillName?: string }> {
+  const state = await installedGlobal(configDir, managedDir), features = state?.features
+  const skill = await readVerifiedFeatureSkill(configDir, features?.androidTranslationSkill, state, 32_000, "global")
+  return { skill, ...(features?.androidTranslationModel ? { model: features.androidTranslationModel } : {}), ...(features?.androidTranslationSkill ? { rawSkillName: features.androidTranslationSkill } : {}) }
+}
+
+export async function readGlobalBuildNotesFeature(configDir: string, managedDir: string): Promise<{ skill: { name: string; instructions: string } | null; model?: string; rawSkillName?: string }> {
+  const state = await installedGlobal(configDir, managedDir), features = state?.features
+  const skill = await readVerifiedFeatureSkill(configDir, features?.buildNotesSkill, state, 16_000, "global")
+  return { skill: skill ? { name: skill.name, instructions: skill.instructions } : null, ...(features?.buildNotesModel ? { model: features.buildNotesModel } : {}), ...(features?.buildNotesSkill ? { rawSkillName: features.buildNotesSkill } : {}) }
+}
+
+export type LegacyProjectBundle = { version?: string; releaseId?: string; fileCount: number; hasConfigDir: boolean; hasManagedDir: boolean; modified?: boolean; error?: string }
+async function hasManagedOwner(managedDir: string) {
+  await safeDirectory(managedDir)
+  const marker = path.join(managedDir, "owner"), stat = await lstat(marker)
+  return stat.isFile() && !stat.isSymbolicLink() && (await realpath(marker)).toLowerCase() === marker.toLowerCase() && await readFile(marker, "utf8") === "amekit-poc04\n"
+}
+export async function legacyProjectInstalled(project: string): Promise<LegacyProjectBundle | null> {
+  await safeDirectory(project)
+  const configDir = path.join(project, ".opencode"), managedDir = path.join(project, ".amekit")
+  const hasState = await exists(path.join(configDir, stateName))
+  const hasManagedDir = await exists(path.join(managedDir, "owner")) && await hasManagedOwner(managedDir).catch(() => false)
+  if (!hasState && !hasManagedDir) return null
+  let state: State | undefined
+  try {
+    if (hasState) {
+      const files = await tree(configDir)
+      state = stateOf(files)
+      if (!state) throw new Error("INVALID_OWNERSHIP_STATE")
+      await checkOwned(files, state)
+    }
+    if (await exists(managedDir)) {
+      await safeDirectory(managedDir)
+      if (await exists(path.join(managedDir, "transaction.json")) || await exists(path.join(managedDir, "lock"))) throw new Error("RECOVERY_REQUIRED")
+    }
+    return { ...(state ? { version: state.version, releaseId: state.releaseId } : {}), fileCount: state?.files.length ?? 0, hasConfigDir: hasState, hasManagedDir }
+  } catch (error) {
+    return { ...(state ? { version: state.version, releaseId: state.releaseId } : {}), fileCount: state?.files.length ?? 0, hasConfigDir: hasState, hasManagedDir, modified: true, error: error instanceof Error ? error.message : "LEGACY_INSPECTION_FAILED" }
+  }
+}
+async function validateLegacyManaged(managedDir: string) {
+  if (!await hasManagedOwner(managedDir)) throw new Error("MANAGED_DIRECTORY_COLLISION")
+  if (await exists(path.join(managedDir, "transaction.json")) || await exists(path.join(managedDir, "lock"))) throw new Error("RECOVERY_REQUIRED")
+  if ((await readdir(managedDir)).some(name => name !== "owner" && !/^(previous|stage)-[0-9a-f-]+$/.test(name))) throw new Error("MANAGED_DIRECTORY_COLLISION")
+  // Reject reparse points in old backups before recursively deleting the managed tree.
+  await tree(managedDir)
+}
+export async function cleanLegacyProject(project: string, signal?: AbortSignal): Promise<{ removedFiles: number; removedOpencodeDir: boolean; removedManagedDir: boolean }> {
+  await safeDirectory(project)
+  const configDir = path.join(project, ".opencode"), managedDir = path.join(project, ".amekit")
+  let removedFiles = 0, removedOpencodeDir = false, removedManagedDir = false
+  if (await exists(managedDir)) await validateLegacyManaged(managedDir)
+  if (await exists(path.join(configDir, stateName))) {
+    const before = await tree(configDir), old = stateOf(before)
+    signal?.throwIfAborted()
+    await transactionInPlace(configDir, managedDir, async before => {
+      const oldState = stateOf(before)
+      if (!oldState) return undefined
+      await checkOwned(before, oldState)
+      return { ownedFiles: [] }
+    }, async () => {}, signal)
+    if (old) removedFiles = old.files.length + 1
+    const ownedDirs = ownedParentDirs(old?.files.map(file => file.path) ?? [])
+    await pruneEmptyOwnedDirs(configDir, old?.files.map(file => file.path) ?? [], new Set(before.directories.filter(dir => !ownedDirs.has(dir))))
+    if (await exists(configDir) && (await readdir(configDir)).length === 0) { await removeEmptyDirectory(configDir); removedOpencodeDir = true }
+  }
+  signal?.throwIfAborted()
+  if (await exists(managedDir)) {
+    await validateLegacyManaged(managedDir)
+    await retryFs(() => rm(managedDir, { recursive: true, force: true })); removedManagedDir = true
+  }
+  return { removedFiles, removedOpencodeDir, removedManagedDir }
 }

@@ -8,6 +8,14 @@ on:
         description: Build unsigned artifacts without signing or notarization
         type: boolean
         default: true
+      platform:
+        description: Target platform to package (all, mac, win)
+        type: choice
+        default: all
+        options:
+          - all
+          - mac
+          - win
 
 permissions:
   contents: read
@@ -20,6 +28,7 @@ concurrency:
 # SHA-256. Each runtime must be OpenCode 2.3.2 for the indicated architecture.
 jobs:
   package:
+    if: inputs.platform == '' || inputs.platform == 'all' || inputs.platform == matrix.platform
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +40,8 @@ jobs:
             runtime_path: AME_OPENCODE_CLI_WIN32_X64
             runtime_url: AME_OPENCODE_URL_WIN32_X64
             runtime_sha: AME_OPENCODE_SHA256_WIN32_X64
+            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-windows-x64.zip
+            archive_sha: 8ad59f1992a0594d8bd72b5ed3be1f5bfffcd9d1756853eec7e5d3141c25be1f
           - os: macos-latest
             platform: mac
             arch: x64
@@ -38,6 +49,8 @@ jobs:
             runtime_path: AME_OPENCODE_CLI_DARWIN_X64
             runtime_url: AME_OPENCODE_URL_DARWIN_X64
             runtime_sha: AME_OPENCODE_SHA256_DARWIN_X64
+            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-x64.zip
+            archive_sha: 1875a6d1106702f04c9468831563c061bd00337f891a1b4a6cd151155e6aaf5c
           - os: macos-latest
             platform: mac
             arch: arm64
@@ -45,6 +58,8 @@ jobs:
             runtime_path: AME_OPENCODE_CLI_DARWIN_ARM64
             runtime_url: AME_OPENCODE_URL_DARWIN_ARM64
             runtime_sha: AME_OPENCODE_SHA256_DARWIN_ARM64
+            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-arm64.zip
+            archive_sha: 31ab5a06a29edc7e49b895f35c2b64ebfe7c7f0437b0f2581b006efcd79fee1a
     runs-on: ${{ matrix.os }}
     env:
       AME_OPENCODE_CLI: ${{ secrets[matrix.runtime_path] || vars[matrix.runtime_path] || secrets.AME_OPENCODE_CLI || vars.AME_OPENCODE_CLI }}
@@ -57,7 +72,7 @@ jobs:
         shell: bash
         run: |
           if [ "$(uname -m)" = arm64 ]; then
-            softwareupdate --install-rosetta --agree-to-license
+            sudo softwareupdate --install-rosetta --agree-to-license
           fi
       - uses: actions/setup-node@v4
         with:
@@ -74,6 +89,30 @@ jobs:
       # Node-based tests must finish before switching node-pty to Electron's ABI.
       - name: Rebuild node-pty for target Electron architecture
         run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
+      - name: Provision pinned OpenCode 2.3.2 archive when no custom runtime is configured
+        if: env.AME_OPENCODE_CLI == '' && env.AME_OPENCODE_URL == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/opencode-runtime.zip"
+          curl -fsSL --retry 3 --max-time 180 "${{ matrix.archive_url }}" -o "$archive"
+          actual="$( (sha256sum "$archive" 2>/dev/null || shasum -a 256 "$archive") | awk '{print tolower($1)}' )"
+          if [ "$actual" != "${{ matrix.archive_sha }}" ]; then
+            echo "Archive SHA-256 mismatch: expected ${{ matrix.archive_sha }}, got $actual" >&2
+            exit 1
+          fi
+          extract_dir="$RUNNER_TEMP/opencode-extracted"
+          rm -rf "$extract_dir" && mkdir -p "$extract_dir"
+          unzip -q "$archive" -d "$extract_dir"
+          bin_name="opencode"
+          if [ "${{ matrix.platform }}" = "win" ]; then bin_name="opencode.exe"; fi
+          bin_path="$extract_dir/$bin_name"
+          if [ ! -f "$bin_path" ]; then
+            echo "Expected runtime binary not found at $bin_path" >&2
+            exit 1
+          fi
+          if [ "${{ matrix.platform }}" != "win" ]; then chmod 0755 "$bin_path"; fi
+          echo "AME_OPENCODE_CLI=$bin_path" >> "$GITHUB_ENV"
       - name: Acquire pinned runtime if no trusted local path is configured
         shell: bash
         run: |

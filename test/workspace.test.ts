@@ -16,6 +16,58 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, changed?: (p
   t.after(async () => { workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   return { root, directory, workspaces, project }
 }
+test('build notes workspace delegate is read-only and emits no change notifications', async t => {
+  const notifications: string[] = []
+  const { directory, workspaces, project } = await fixture(t, id => notifications.push(id))
+  workspaces.dispose()
+  const git = simpleGit(directory)
+  await git.raw(['init', '--initial-branch=main'])
+  await git.addConfig('user.name', 'Ame Test'); await git.addConfig('user.email', 'test@example.invalid')
+  await git.addConfig('commit.gpgSign', 'false'); await git.addConfig('core.autocrlf', 'false')
+  await writeFile(path.join(directory, 'tracked.txt'), 'initial\n')
+  await git.raw(['add', '--', 'tracked.txt']); await git.raw(['-c', 'core.hooksPath=', 'commit', '-m', 'initial'])
+  await writeFile(path.join(directory, 'tracked.txt'), 'working\n')
+  const before = notifications.length
+  const summary = await workspaces.buildNotesSummary(project.id, { mode: 'commits', includeWorking: true })
+  assert.equal(summary.branch, 'main'); assert.equal(summary.workingFileCount, 1)
+  assert.match(summary.diff, /\+working/)
+  const limited = await workspaces.buildNotesSummary(project.id, { mode: 'range', includeWorking: true }, 12)
+  assert.ok(Buffer.byteLength(limited.diff) <= 12); assert.equal(limited.truncated, true)
+  assert.equal(notifications.length, before)
+  await assert.rejects(workspaces.buildNotesSummary('missing', { mode: 'range', includeWorking: true }), /UNKNOWN_PROJECT/)
+})
+
+test('preload build notes methods forward scope requests and preserve IPC rejections', async () => {
+  const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'preload', 'index.ts'), 'utf8')
+  const calls: { method: string; args: unknown[] }[] = []
+  let api: Pick<import('../packages/protocol/src/index').DesktopApi, 'buildNotesPreview' | 'generateBuildNotes'> | undefined
+  let fail = false
+  const response = { notes: 'notes' }
+  const context = {
+    exports: {},
+    require: (name: string) => {
+      assert.equal(name, 'electron')
+      return {
+        contextBridge: { exposeInMainWorld: (_: string, value: typeof api) => { api = value } },
+        ipcRenderer: { invoke: async (channel: string, method: string, args: unknown[]) => {
+          assert.equal(channel, 'ame:call'); calls.push({ method, args: Array.from(args) })
+          if (fail) throw new Error('INVALID_BUILD_BASE_COMMIT')
+          return response
+        } }
+      }
+    }
+  }
+  runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, context)
+  assert.ok(api)
+  const request = { mode: 'range' as const, baseCommit: '1234567', includeWorking: true, note: 'QC' }
+  assert.equal(await api.buildNotesPreview('project', request), response)
+  assert.equal(await api.generateBuildNotes('project', request), response)
+  assert.deepEqual(calls, [{ method: 'buildNotesPreview', args: ['project', request] }, { method: 'generateBuildNotes', args: ['project', request] }])
+  fail = true
+  await assert.rejects(api.buildNotesPreview('project', request), /INVALID_BUILD_BASE_COMMIT/)
+  await assert.rejects(api.generateBuildNotes('project', request), /INVALID_BUILD_BASE_COMMIT/)
+})
+
 test('project persistence, UTF-8 edit/save, stale buffer conflict and serialized saves', async t => {
   const { root, directory, workspaces, project } = await fixture(t)
   await writeFile(path.join(directory, 'hello.ts'), 'export const lời = "chào"\r\n')
@@ -182,6 +234,79 @@ test('real Git HEAD diff, stage/unstage, commit and deleted file diff', async t 
   assert.equal((await workspaces.status(project.id)).changes.length, 0)
   await rm(path.join(directory, 'file with space.ts'))
   assert.deepEqual(await workspaces.diff(project.id, 'file with space.ts'), { original: 'after\n', modified: '' })
+})
+
+test('Git status, hooks, amend, history, undo and stash delegates report changes without read notifications', async t => {
+  const changes: string[] = []
+  const { root, directory, workspaces, project } = await fixture(t, id => changes.push(id))
+  workspaces.dispose()
+  const id = project.id, git = simpleGit(directory)
+  await git.raw(['init', '--initial-branch=main'])
+  await git.addConfig('user.name', 'Ame Test'); await git.addConfig('user.email', 'test@example.invalid')
+  await git.addConfig('commit.gpgSign', 'false'); await git.addConfig('core.autocrlf', 'false')
+  const check = async <T>(operation: () => Promise<T>, count: number): Promise<T> => {
+    const before = changes.length
+    const result = await operation()
+    assert.deepEqual(changes.slice(before), Array(count).fill(id))
+    return result
+  }
+  const status = await check(() => workspaces.status(id), 0)
+  assert.equal(status.hasRemote, false); assert.equal(status.ahead, 0); assert.equal(status.behind, 0)
+  assert.equal(status.tracking, null); assert.equal(status.merging, false)
+  await writeFile(path.join(directory, 'file.txt'), 'initial\n'); await workspaces.stageAll(id)
+  const hooks = path.join(directory, '.git', 'test-hooks'); await mkdir(hooks)
+  await writeFile(path.join(hooks, 'pre-commit'), '#!/bin/sh\necho hook-rejected >&2\nexit 1\n', { mode: 0o755 })
+  await git.addConfig('core.hooksPath', hooks)
+  const before = changes.length
+  await assert.rejects(workspaces.commit(id, 'blocked'), /hook-rejected/)
+  assert.equal(changes.length, before)
+  await check(() => workspaces.commit(id, 'initial', { noVerify: true }), 1)
+  await check(() => workspaces.commit(id, 'amended', { amend: true, noVerify: true }), 1)
+  const log = await check(() => workspaces.gitLog(id), 0)
+  assert.equal(log.length, 1); assert.equal(log[0].subject, 'amended')
+  assert.equal((await check(() => workspaces.gitCommitDetail(id, log[0].hash), 0)).files[0].path, 'file.txt')
+  for (const message of ['', ' ', 'bad\0message', 'x'.repeat(10001)]) await assert.rejects(workspaces.commit(id, message), /INVALID_COMMIT_MESSAGE/)
+  await writeFile(path.join(directory, 'file.txt'), 'changed\n')
+  await check(() => workspaces.gitStashPush(id, 'saved'), 1)
+  assert.equal((await check(() => workspaces.gitStashList(id), 0))[0].message, 'saved')
+  await check(() => workspaces.gitStashApply(id, 0), 1)
+  await git.raw(['reset', '--hard'])
+  await check(() => workspaces.gitStashApply(id, 0, true), 1)
+  await check(() => workspaces.gitStashPush(id), 1)
+  await check(() => workspaces.gitStashDrop(id, 0), 1)
+  await workspaces.createBranch(id, 'delete-me', false)
+  await check(() => workspaces.gitDeleteBranch(id, 'delete-me'), 1)
+  await writeFile(path.join(directory, '.git', 'MERGE_HEAD'), log[0].hash + '\n')
+  assert.equal((await workspaces.status(id)).merging, true)
+  await rm(path.join(directory, '.git', 'MERGE_HEAD'))
+  await writeFile(path.join(directory, '.git', 'REBASE_HEAD'), log[0].hash + '\n')
+  assert.equal((await workspaces.status(id)).merging, true)
+  await rm(path.join(directory, '.git', 'REBASE_HEAD'))
+  const remote = path.join(root, 'remote.git'); await mkdir(remote)
+  await simpleGit(remote).raw(['init', '--bare', '--initial-branch=main'])
+  await git.raw(['remote', 'add', 'origin', remote])
+  assert.equal((await workspaces.status(id)).hasRemote, true)
+  await check(() => workspaces.gitPush(id), 1)
+  assert.equal((await workspaces.status(id)).tracking, 'origin/main')
+  await writeFile(path.join(directory, 'local.txt'), 'local\n'); await workspaces.stageAll(id)
+  await workspaces.commit(id, 'local', { noVerify: true })
+  assert.equal((await workspaces.status(id)).ahead, 1)
+  await check(() => workspaces.gitPush(id), 1)
+  assert.equal((await workspaces.status(id)).ahead, 0)
+  const peerDirectory = path.join(root, 'peer'); await simpleGit().clone(remote, peerDirectory)
+  const peer = simpleGit(peerDirectory)
+  await peer.addConfig('user.name', 'Peer'); await peer.addConfig('user.email', 'peer@example.invalid'); await peer.addConfig('commit.gpgSign', 'false')
+  await writeFile(path.join(peerDirectory, 'peer.txt'), 'peer\n'); await peer.add('.'); await peer.commit('peer'); await peer.push()
+  await check(() => workspaces.gitFetch(id), 1)
+  assert.equal((await workspaces.status(id)).behind, 1)
+  await check(() => workspaces.gitPull(id), 1)
+  assert.equal((await workspaces.status(id)).behind, 0)
+  assert.deepEqual(await check(() => workspaces.gitUndoLastCommit(id), 1), { message: 'peer' })
+  assert.ok((await workspaces.status(id)).changes.some(file => file.path === 'peer.txt' && file.index === 'A'))
+  const failedBefore = changes.length
+  await assert.rejects(workspaces.gitStashDrop(id, -1), /INVALID_STASH_INDEX/)
+  await assert.rejects(workspaces.gitDeleteBranch(id, 'main'), /CANNOT_DELETE_CURRENT_BRANCH/)
+  assert.equal(changes.length, failedBefore)
 })
 
 test('Explorer and search delegates persist mutations and notify only after actual writes', async t => {

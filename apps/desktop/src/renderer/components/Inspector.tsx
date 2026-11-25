@@ -5,16 +5,22 @@ import { Empty, errorText, IconButton } from './Primitives'
 import { ProjectSearch } from './ProjectSearch'
 import { canCommit, commitShortcut } from '../scm-commit'
 import { gitStatusMeta, splitFilePath } from '../scm-display'
+import { formatGitError, syncBadgeSummary } from '../git-ui'
 import { FileTypeIcon } from '../components/FileTypeIcon'
 import { WORKSPACE_DRAG_MIME } from '../composer-mentions'
 
-type Mutate = <T>(action: () => Promise<T>, success?: (result: T) => void, refreshAfter?: boolean) => Promise<void>
+type Mutate = <T>(action: () => Promise<T>, success?: (result: T) => void, refreshAfter?: boolean, onError?: (error: unknown) => void) => Promise<void>
 type Naming = { kind: 'file' | 'directory' | 'rename'; parent: string; entry?: FileEntry }
 type InspectorProps = {
   projectID?: string; name?: string; connected?: boolean; tab: 'files' | 'search' | 'git'; setTab: (tab: 'files' | 'search' | 'git') => void; generation: number;
   git?: GitState; gitError: string; refresh: () => void; onOpen: (path: string, line?: number, column?: number) => void;
   onRename: (from: string, to: string) => void; onDelete: (path: string) => void;
   onDiff: (path: string) => void; onHide: () => void; report: (error: unknown) => void
+  commitMessage?: string
+  onCommitMessageChange?: (value: string) => void
+  gitWorkspaceOpen?: boolean
+  onOpenGitWorkspace?: (tab?: 'commit' | 'history' | 'stash' | 'build-notes') => void
+  onCommitEnhanceSkillChange?: (skill: string) => void
 }
 
 const parentPath = (path: string) => path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
@@ -130,8 +136,16 @@ export function Inspector(props: InspectorProps) {
   return <ProjectInspector key={props.projectID || ''} {...props} />
 }
 
-function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report }: InspectorProps) {
-  const [message, setMessage] = useState('')
+function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report, commitMessage, onCommitMessageChange, gitWorkspaceOpen, onOpenGitWorkspace, onCommitEnhanceSkillChange }: InspectorProps) {
+  const [localMessage, setLocalMessage] = useState('')
+  const message = commitMessage ?? localMessage
+  const setMessage = (next: string) => {
+    if (onCommitMessageChange) onCommitMessageChange(next)
+    else setLocalMessage(next)
+  }
+  const [enhancing, setEnhancing] = useState(false)
+  const [commitError, setCommitError] = useState('')
+  useEffect(() => { setCommitError('') }, [projectID, tab])
   const [busy, setBusy] = useState(false)
   const pending = useRef(false)
   const alive = useRef(true)
@@ -140,19 +154,27 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
   const [branchLoading, setBranchLoading] = useState(false)
   const [branchRevision, setBranchRevision] = useState(0)
   const [newBranch, setNewBranch] = useState(false)
+  const [deleteBranch, setDeleteBranch] = useState(false)
+  const [targetBranch, setTargetBranch] = useState('')
   const [commitEnhanceSkill, setCommitEnhanceSkill] = useState('')
+  const skillChange = useRef(onCommitEnhanceSkillChange)
+  skillChange.current = onCommitEnhanceSkillChange
   const [foldedSections, setFoldedSections] = useState({ staged: false, working: false })
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   useEffect(() => {
     if (!projectID || tab !== 'git') return
     let current = true, revision = 0
+    const updateSkill = (skill: string) => {
+      setCommitEnhanceSkill(skill)
+      skillChange.current?.(skill)
+    }
     const load = async () => {
       const request = ++revision
-      setCommitEnhanceSkill('')
+      updateSkill('')
       try {
-        const value = await window.ame?.account?.('installed', { project: projectID })
-        if (current && request === revision) setCommitEnhanceSkill((value as { features?: { commitEnhanceSkill?: string } } | null)?.features?.commitEnhanceSkill || '')
-      } catch { if (current && request === revision) setCommitEnhanceSkill('') }
+        const value = await window.ame?.account?.('installed', {})
+        if (current && request === revision) updateSkill((value as { features?: { commitEnhanceSkill?: string } } | null)?.features?.commitEnhanceSkill || '')
+      } catch { if (current && request === revision) updateSkill('') }
     }
     void load()
     window.addEventListener('ame-account-changed', load)
@@ -166,36 +188,79 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
     void window.ame.gitBranches(projectID).then(result => { if (current) setBranches(result) }).catch(error => { if (current) { setBranches(undefined); if (!cancelled(error)) setBranchError(errorText(error)) } }).finally(() => { if (current) setBranchLoading(false) })
     return () => { current = false }
   }, [projectID, generation, tab, branchRevision])
-  const mutate: Mutate = async (action, success, refreshAfter = true) => {
+  const mutate: Mutate = async (action, success, refreshAfter = true, onError = report) => {
     if (pending.current || !alive.current) return
     pending.current = true
     setBusy(true)
     try {
       const result = await action()
       if (alive.current) {
+        setCommitError('')
         success?.(result)
         if (refreshAfter) { setBranchRevision(value => value + 1); refresh() }
       }
-    } catch (error) { if (alive.current && !cancelled(error)) report(error) }
+    } catch (error) { if (alive.current && !cancelled(error)) onError(error) }
     finally { pending.current = false; if (alive.current) setBusy(false) }
   }
   const changes = git?.changes || []
   const stagedChanges = changes.filter(change => !!change.index.trim() && !['?', '!'].includes(change.index))
   const enhanceTitle = !connected ? 'Chưa kết nối OpenCode' : !stagedChanges.length ? 'Stage ít nhất một tệp để tạo thông điệp commit' : busy ? 'Đang xử lý…' : commitEnhanceSkill ? `Tạo thông điệp commit bằng AI (Skill /${commitEnhanceSkill})` : 'Tạo thông điệp commit bằng AI từ thay đổi đã stage'
   const commitState = { busy, message, changes }
+  const showGitError = (error: unknown) => {
+    const { title, detail } = formatGitError(error)
+    setCommitError(detail ? `${title}: ${detail}` : title)
+  }
+  const sync = syncBadgeSummary(git)
+  const syncRemote = (action: 'fetch' | 'pull' | 'push') => {
+    if (!projectID || !sync.canSync) return
+    void mutate(() => {
+      setCommitError('')
+      return action === 'fetch' ? window.ame.gitFetch(projectID) : action === 'pull' ? window.ame.gitPull(projectID) : window.ame.gitPush(projectID, sync.needsPublish ? { setUpstream: true } : undefined)
+    }, undefined, true, showGitError)
+  }
   const submitCommit = () => {
     if (!projectID || !canCommit(commitState)) return
-    void mutate(() => window.ame.commit(projectID, message.trim()), () => setMessage(''))
+    void mutate(() => {
+      setCommitError('')
+      return window.ame.commit(projectID, message.trim())
+    }, () => setMessage(''), true, showGitError)
+  }
+  const enhanceCommit = () => {
+    if (!projectID || !connected || !stagedChanges.length) return
+    void mutate(async () => {
+      setEnhancing(true)
+      setCommitError('')
+      try { return await window.ame.generateCommitMessage(projectID) }
+      finally { if (alive.current) setEnhancing(false) }
+    }, result => setMessage(result.message), false, error => setCommitError(errorText(error)))
   }
   const branch = branches?.current ?? git?.branch ?? ''
+  const deletableBranches = branches?.branches.filter(item => item.name !== branch && !item.current) ?? []
+  const canDeleteBranch = deletableBranches.some(item => item.name === targetBranch)
   return <aside data-testid="inspector" className="inspector-pane" data-region="Project Inspector">
     <header className="inspector-pane__header"><span className="inspector-pane__title" title={name}><Icon name="folder" /><span className="truncate">{name || 'Project Inspector'}</span>{git?.branch && <span className="branch-tag">{git.branch}</span>}</span><IconButton label="Đóng Inspector (ẩn cố định)" onClick={onHide}><Icon name="left" /></IconButton></header>
     <nav className="inspector-mode-bar" aria-label="Inspector">{(['files', 'search', 'git'] as const).map(mode => <button key={mode} className={`inspector-mode-btn ${tab === mode ? 'is-active' : ''}`} title={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-label={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-pressed={tab === mode} onClick={() => setTab(mode)}><Icon name={mode === 'files' ? 'folder' : mode === 'search' ? 'search' : 'git'} />{mode === 'git' && changes.length > 0 && <span className="diff-dot" />}</button>)}</nav>
     <div className="inspector-pane__body">{!projectID ? <Empty>Mở một thư mục để bắt đầu.</Empty> : tab === 'files' ? <Explorer projectID={projectID} name={name} generation={generation} onOpen={onOpen} onRename={onRename} onDelete={onDelete} busy={busy} mutate={mutate} /> : tab === 'search' ? <ProjectSearch key={projectID} projectID={projectID} generation={generation} refresh={refresh} onOpen={onOpen} /> : <>
       <div className="scm-branch-controls"><label htmlFor="inspector-branch">Branch</label><select id="inspector-branch" aria-label="Git branch" title={branch || 'Chọn nhánh'} value={branch} disabled={busy || branchLoading || !branches} onChange={event => { const next = event.target.value; if (next !== branch) void mutate(() => window.ame.checkoutBranch(projectID, next)) }}>
         {!branches?.branches.some(item => item.name === branch) && <option value={branch}>{branch || (branchLoading ? 'Đang đọc…' : 'Chưa có nhánh')}</option>}
-        {branches?.branches.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
-      </select><IconButton label="New Branch" disabled={busy} onClick={() => setNewBranch(value => !value)}><Icon name="plus" /></IconButton></div>
+        <optgroup label="Nhánh cục bộ">{branches?.branches.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}</optgroup>
+        {!!branches?.remoteBranches?.length && <optgroup label="Nhánh từ xa (Remote)">{branches.remoteBranches.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}</optgroup>}
+      </select><IconButton label="New Branch" disabled={busy} onClick={() => setNewBranch(value => !value)}><Icon name="plus" /></IconButton><IconButton label="Xóa nhánh" disabled={busy || (branches?.branches.length ?? 0) <= 1} onClick={() => { setDeleteBranch(value => !value); setTargetBranch('') }}><Icon name="trash" /></IconButton></div>
+      <div className="scm-sync-bar" data-testid="scm-sync-bar" role="group" aria-label="Đồng bộ remote">
+        <button type="button" data-testid="scm-fetch-btn" disabled={!sync.canSync || busy} title="Fetch từ remote" onClick={() => syncRemote('fetch')}>Fetch</button>
+        <button type="button" data-testid="scm-pull-btn" disabled={!sync.canSync || busy} onClick={() => syncRemote('pull')}>{sync.pullLabel}</button>
+        <button type="button" data-testid="scm-push-btn" disabled={!sync.canSync || busy} onClick={() => syncRemote('push')}>{sync.pushLabel}</button>
+        <IconButton label="Lịch sử commit" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('history')}><Icon name="history" /></IconButton>
+        <IconButton label="Quản lý Stash" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('stash')}><Icon name="stash" /></IconButton>
+        <IconButton label="Mô tả bản build (QC)" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('build-notes')}><Icon name="notes" /></IconButton>
+      </div>
+      {deleteBranch && <form className="insp-inline-name" aria-label="Xóa nhánh cục bộ" onSubmit={event => {
+        event.preventDefault()
+        if (!canDeleteBranch) return
+        void mutate(() => window.ame.gitDeleteBranch(projectID, targetBranch), () => { setDeleteBranch(false); setTargetBranch('') }, true, showGitError)
+      }}><div><select aria-label="Nhánh cần xóa" value={canDeleteBranch ? targetBranch : ''} disabled={busy} onChange={event => setTargetBranch(event.target.value)}>
+        <option value="">Chọn nhánh cần xóa</option>{deletableBranches.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
+      </select><button type="submit" title="Xác nhận xóa nhánh" aria-label="Xác nhận xóa nhánh" disabled={busy || !canDeleteBranch}><Icon name="check" /></button><button type="button" title="Hủy xóa nhánh" aria-label="Hủy xóa nhánh" disabled={busy} onClick={() => setDeleteBranch(false)}><Icon name="close" /></button></div></form>}
       {newBranch && <InlineName label="Tên nhánh mới" busy={busy} submit={value => void mutate(() => window.ame.createBranch(projectID, value, true), () => setNewBranch(false))} cancel={() => setNewBranch(false)} />}
       {branchError && <div className="inline-error" role="alert">{branchError}</div>}
       {gitError ? <div className="inline-error">{gitError}</div> : !git ? <Empty>Đang đọc trạng thái Git…</Empty> : !changes.length ? <Empty>Không có thay đổi. Cây làm việc sạch.</Empty> : (['staged', 'working'] as const).map(group => {
@@ -231,7 +296,7 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
         </section> : null
       })}
     </>}</div>
-    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => setMessage(e.target.value)} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><button type="button" className="scm-enhance-icon-btn" disabled={!connected || busy || !stagedChanges.length} title={enhanceTitle} aria-label={enhanceTitle} data-testid="scm-enhance-btn" onClick={() => void mutate(() => window.ame.generateCommitMessage(projectID), result => setMessage(result.message), false)}><Icon name="wand" /></button></div></div><button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : <><Icon name="check" /> Commit</>}</button></form>}
+    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => { setMessage(e.target.value); setCommitError('') }} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><button type="button" className={`scm-enhance-icon-btn${enhancing ? ' is-loading' : ''}`} aria-busy={enhancing || undefined} disabled={!connected || busy || !stagedChanges.length} title={enhancing ? 'Đang tạo thông điệp commit…' : enhanceTitle} aria-label={enhancing ? 'Đang tạo thông điệp commit…' : enhanceTitle} data-testid="scm-enhance-btn" onClick={enhanceCommit}>{enhancing ? <span className="amekit-spinner" aria-hidden="true" /> : <Icon name="wand" />}</button><button type="button" className="scm-expand-icon-btn" data-testid="scm-expand-commit-btn" aria-pressed={gitWorkspaceOpen || undefined} title={gitWorkspaceOpen ? 'Thu gọn về thanh bên' : 'Mở rộng khu soạn commit ra vùng giữa'} aria-label={gitWorkspaceOpen ? 'Thu gọn khu soạn commit' : 'Mở rộng khu soạn commit'} onClick={() => onOpenGitWorkspace?.('commit')}><Icon name="expand" /></button></div></div>{commitError && <div className="inline-error scm-commit-error" data-testid="scm-commit-error" role="alert">{commitError}</div>}<button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : <><Icon name="check" /> Commit</>}</button></form>}
     <footer className="inspector-pane__footer"><span>{tab === 'git' ? `${changes.length} changes` : tab === 'search' ? 'Project Search' : 'Explorer'}</span><IconButton label="Làm mới dự án" onClick={refresh}><Icon name="refresh" /></IconButton></footer>
   </aside>
 }

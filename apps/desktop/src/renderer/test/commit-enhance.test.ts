@@ -11,6 +11,10 @@ import { Icon } from '../components/Icon'
 import * as primitives from '../components/Primitives'
 import * as amekitUI from '../amekit-ui'
 import * as scm from '../scm-commit'
+import * as gitUI from '../git-ui'
+import * as scmDisplay from '../scm-display'
+import { FileTypeIcon } from '../components/FileTypeIcon'
+import { WORKSPACE_DRAG_MIME } from '../composer-mentions'
 
 const inspectorProps = {
   projectID: 'project', connected: true, tab: 'git' as const, generation: 0,
@@ -58,7 +62,7 @@ function harness(component: 'Inspector' | 'Account', initialProps: object, api: 
   const exports: Record<string, unknown> = {}, nativeRequire = createRequire(import.meta.url)
   const source = readFileSync(new URL(`../components/${component}.tsx`, import.meta.url), 'utf8')
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText
-  const modules: Record<string, unknown> = { react: hooks, './Icon': { Icon }, './Primitives': primitives, './ProjectSearch': { ProjectSearch: () => null }, '../scm-commit': scm, '../amekit-ui': amekitUI }
+  const modules: Record<string, unknown> = { react: hooks, './Icon': { Icon }, './Primitives': primitives, './ProjectSearch': { ProjectSearch: () => null }, '../scm-commit': scm, '../amekit-ui': amekitUI, '../git-ui': gitUI, '../scm-display': scmDisplay, '../components/FileTypeIcon': { FileTypeIcon }, '../composer-mentions': { WORKSPACE_DRAG_MIME } }
   runInNewContext(code, { exports, Event, window, require: (name: string) => modules[name] ?? nativeRequire(name) })
   const Component = exports[component] as (props: object) => ReactNode
   function render(extra: object = {}) {
@@ -122,7 +126,7 @@ test('Inspector installed lookup updates dynamic title, refreshes on account cha
   })
   assert.ok(h.render().includes(`title="${defaultTitle}"`))
   assert.equal(requests.length, 1)
-  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['installed', { project: 'project' }]])
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['installed', {}]])
   requests[0].resolve(installedSkill('team-commit'))
   const html = await h.flush()
   assert.ok(html.includes(`title="${skillTitle('team-commit')}"`))
@@ -171,6 +175,201 @@ test('Inspector ignores stale installed responses, silently handles failures, an
   }
 })
 
+test('Enhance shows an icon-only spinner, guards concurrent mutations and restores the wand on success', async () => {
+  const request = deferred()
+  let generated = 0, committed = 0
+  const h = harness('Inspector', inspectorProps, {
+    generateCommitMessage() { generated++; return request.promise },
+    async commit() { committed++ },
+  })
+  h.render(); await h.flush()
+  h.change('Thông điệp commit', 'draft'); h.render()
+  const enhance = h.find(node => node.props['data-testid'] === 'scm-enhance-btn').props.onClick as () => void
+  enhance(); enhance()
+  const html = h.render()
+  assert.equal(generated, 1)
+  const button = h.find(node => node.props['data-testid'] === 'scm-enhance-btn')
+  assert.equal(button.props['aria-busy'], true)
+  assert.equal(button.props.title, 'Đang tạo thông điệp commit…')
+  assert.equal(button.props['aria-label'], button.props.title)
+  assert.equal(button.props.className, 'scm-enhance-icon-btn is-loading')
+  assert.equal(button.props.disabled, true)
+  assert.match(renderToStaticMarkup(button), /<span class="amekit-spinner" aria-hidden="true"><\/span>/)
+  const bar = html.match(/<div class="scm-commit-input-bar">([\s\S]*?)<\/div>/)![1]
+  assert.equal(bar.replace(/<[^>]*>/g, '').trim(), '')
+  const form = h.find(node => node.type === 'form')
+  ;(form.props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+  assert.equal(committed, 0)
+  request.resolve({ message: 'feat: generated' })
+  const completed = await h.flush()
+  assert.doesNotMatch(completed, /amekit-spinner|aria-busy="true"/)
+  assert.match(completed, /feat: generated/)
+  assert.equal(h.find(node => node.props['data-testid'] === 'scm-enhance-btn').props.className, 'scm-enhance-icon-btn')
+  h.unmount()
+})
+
+test('Enhance and Commit failures stay in the commit dock and clear on edit, retry or tab change', async () => {
+  for (const operation of ['enhance', 'commit']) {
+    let reports = 0
+    const requests: ReturnType<typeof deferred>[] = []
+    const action = () => { const request = deferred(); requests.push(request); return request.promise }
+    const h = harness('Inspector', { ...inspectorProps, report() { reports++ } }, {
+      generateCommitMessage: action, commit: action,
+    })
+    h.render(); await h.flush()
+    const submit = () => {
+      if (operation === 'enhance') (h.find(node => node.props['data-testid'] === 'scm-enhance-btn').props.onClick as () => void)()
+      else (h.find(node => node.type === 'form').props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+    }
+    h.change('Thông điệp commit', 'draft'); h.render(); submit()
+    requests[0].reject(new Error(`${operation} failed`))
+    let html = await h.flush()
+    assert.equal(reports, 0)
+    assert.match(html, /class="scm-commit-dock is-visible"[\s\S]*data-testid="scm-commit-error" role="alert"/)
+    assert.equal(h.find(node => node.props['data-testid'] === 'scm-commit-error').props.children, `${operation} failed`)
+    assert.doesNotMatch(html, /amekit-spinner|aria-busy="true"/)
+    h.change('Thông điệp commit', 'edited')
+    assert.doesNotMatch(h.render(), /data-testid="scm-commit-error"/)
+    submit(); requests[1].reject(new Error('retry failed')); await h.flush()
+    submit(); assert.doesNotMatch(h.render(), /data-testid="scm-commit-error"/)
+    requests[2].reject(new Error('another failure')); await h.flush()
+    h.render({ tab: 'search' }); h.render({ tab: 'git' })
+    assert.doesNotMatch(h.render(), /data-testid="scm-commit-error"/)
+    assert.equal(reports, 0)
+    h.unmount()
+  }
+})
+
+test('Inspector controlled drafts, Enhance, commits and workspace shortcuts notify the parent', async () => {
+  const drafts: string[] = [], tabs: string[] = [], commits: string[] = [], skills: string[] = []
+  const h = harness('Inspector', {
+    ...inspectorProps, commitMessage: 'parent draft',
+    onCommitMessageChange(value: string) { drafts.push(value) },
+    onOpenGitWorkspace(tab: string) { tabs.push(tab) },
+    onCommitEnhanceSkillChange(skill: string) { skills.push(skill) },
+  }, {
+    async account() { return installedSkill('team-commit') },
+    async generateCommitMessage() { return { message: 'feat: generated' } },
+    async commit(project: string, message: string) { assert.equal(project, 'project'); commits.push(message) },
+  })
+  assert.match(h.render(), /parent draft/)
+  await h.flush()
+  assert.deepEqual(skills, ['', 'team-commit'])
+  h.change('Thông điệp commit', 'typed draft')
+  assert.deepEqual(drafts, ['typed draft'])
+  assert.match(h.render(), /parent draft/)
+  assert.match(h.render({ commitMessage: 'typed draft' }), /typed draft/)
+  ;(h.find(node => node.props['data-testid'] === 'scm-enhance-btn').props.onClick as () => void)()
+  await h.flush()
+  assert.equal(drafts.at(-1), 'feat: generated')
+  h.render({ commitMessage: '  feat: generated  ' })
+  ;(h.find(node => node.type === 'form').props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+  await h.flush()
+  assert.deepEqual(commits, ['feat: generated'])
+  assert.equal(drafts.at(-1), '')
+  for (const label of ['scm-expand-commit-btn', 'Lịch sử commit', 'Quản lý Stash', 'Mô tả bản build (QC)']) {
+    const button = h.find(node => node.props['data-testid'] === label || node.props.label === label)
+    ;(button.props.onClick as () => void)()
+  }
+  assert.deepEqual(tabs, ['commit', 'history', 'stash', 'build-notes'])
+  const syncBar = renderToStaticMarkup(h.find(node => node.props['data-testid'] === 'scm-sync-bar'))
+  assert.match(syncBar, /aria-label="Mô tả bản build \(QC\)"/)
+  const commitBar = h.render().match(/<div class="scm-commit-input-bar">([\s\S]*?)<\/div>/)![1]
+  assert.doesNotMatch(commitBar, /Mô tả bản build/)
+  assert.equal((commitBar.match(/<button/g) ?? []).length, 2)
+  assert.equal(commitBar.replace(/<[^>]*>/g, '').trim(), '')
+  h.render({ gitWorkspaceOpen: true, connected: false, git: { branch: 'main', changes: [] } })
+  const expand = h.find(node => node.props['data-testid'] === 'scm-expand-commit-btn')
+  assert.equal(expand.props['aria-pressed'], true)
+  assert.equal(expand.props['aria-label'], 'Thu gọn khu soạn commit')
+  assert.notEqual(expand.props.disabled, true)
+  h.unmount()
+})
+
+test('Inspector sync guards pending operations, formats failures, refreshes and publishes with upstream', async () => {
+  const requests: ReturnType<typeof deferred>[] = [], calls: unknown[][] = []
+  let refreshed = 0, reports = 0
+  const action = (...args: unknown[]) => { calls.push(args); const request = deferred(); requests.push(request); return request.promise }
+  const h = harness('Inspector', {
+    ...inspectorProps, git: { ...inspectorProps.git, hasRemote: true, tracking: 'origin/main', ahead: 2, behind: 3 },
+    refresh() { refreshed++ }, report() { reports++ },
+  }, {
+    gitFetch: (project: string) => action('fetch', project),
+    gitPull: (project: string) => action('pull', project),
+    gitPush: (project: string, options: unknown) => action('push', project, options),
+    async commit() { throw new Error('GIT_CONFLICT') },
+  })
+  h.render(); await h.flush()
+  const press = (id: string) => (h.find(node => node.props['data-testid'] === `scm-${id}-btn`).props.onClick as () => void)()
+  press('fetch'); press('pull')
+  h.render()
+  assert.equal(calls.length, 1)
+  for (const id of ['fetch', 'pull', 'push']) assert.equal(h.find(node => node.props['data-testid'] === `scm-${id}-btn`).props.disabled, true)
+  requests[0].reject(new Error('NO_REMOTE_CONFIGURED'))
+  await h.flush()
+  assert.equal(h.find(node => node.props['data-testid'] === 'scm-commit-error').props.children, 'Chưa cấu hình remote Git: Thêm remote origin hoặc mở Terminal để gắn repository từ xa.')
+  press('pull'); requests[1].resolve({ summary: 'pulled' })
+  assert.doesNotMatch(await h.flush(), /data-testid="scm-commit-error"/)
+  assert.equal(refreshed, 1)
+  press('push'); requests[2].reject(new Error('GIT_PUSH_REJECTED_NON_FF'))
+  assert.match(await h.flush(), /Push bị từ chối do remote có commit mới: Hãy Pull về trước rồi thử Push lại\./)
+  h.render({ git: { ...inspectorProps.git, hasRemote: true } })
+  press('push'); requests[3].resolve({ summary: 'published' }); await h.flush()
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['fetch', 'project'], ['pull', 'project'], ['push', 'project', null], ['push', 'project', { setUpstream: true }]])
+  assert.equal(refreshed, 2)
+  h.change('Thông điệp commit', 'draft'); h.render()
+  ;(h.find(node => node.type === 'form').props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+  assert.match(await h.flush(), /Phát sinh xung đột \(merge conflict\)/)
+  h.render({ git: { ...inspectorProps.git, hasRemote: false } })
+  press('fetch'); assert.equal(calls.length, 4)
+  assert.equal(reports, 0)
+  h.unmount()
+})
+
+test('Inspector renders remote branches, checks them out and deletes only a selected non-current local branch', async () => {
+  const checkedOut: string[][] = [], deleted: string[][] = []
+  const request = deferred()
+  const branches = {
+    current: 'main', branches: [{ name: 'main', current: true }, { name: 'feature', current: false }],
+    remoteBranches: [{ name: 'origin/remote-feature', current: false }],
+  }
+  const h = harness('Inspector', inspectorProps, {
+    async gitBranches() { return branches },
+    async checkoutBranch(...args: string[]) { checkedOut.push(args) },
+    gitDeleteBranch(...args: string[]) { deleted.push(args); return request.promise },
+  })
+  h.render()
+  const html = await h.flush()
+  assert.match(html, /<optgroup label="Nhánh cục bộ">/)
+  assert.match(html, /<optgroup label="Nhánh từ xa \(Remote\)"><option value="origin\/remote-feature">origin\/remote-feature<\/option><\/optgroup>/)
+  h.change('Git branch', 'origin/remote-feature'); await h.flush()
+  assert.deepEqual(checkedOut, [['project', 'origin/remote-feature']])
+  ;(h.find(node => node.props.label === 'Xóa nhánh').props.onClick as () => void)()
+  h.render()
+  const selector = () => h.find(node => node.props['aria-label'] === 'Nhánh cần xóa')
+  const cancel = h.find(node => node.props['aria-label'] === 'Hủy xóa nhánh')
+  assert.equal(cancel.props.type, 'button')
+  ;(cancel.props.onClick as () => void)()
+  assert.doesNotMatch(h.render(), /aria-label="Nhánh cần xóa"/)
+  assert.equal(deleted.length, 0)
+  ;(h.find(node => node.props.label === 'Xóa nhánh').props.onClick as () => void)()
+  h.render()
+  assert.doesNotMatch(renderToStaticMarkup(selector()), /value="main"|origin\/remote-feature/)
+  const submit = () => (h.find(node => node.props['aria-label'] === 'Xóa nhánh cục bộ').props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+  h.change('Nhánh cần xóa', 'main'); h.render(); submit()
+  assert.equal(deleted.length, 0)
+  h.change('Nhánh cần xóa', 'feature'); h.render(); submit(); submit()
+  h.render()
+  assert.deepEqual(deleted, [['project', 'feature']])
+  assert.equal(selector().props.disabled, true)
+  request.resolve(undefined)
+  assert.doesNotMatch(await h.flush(), /aria-label="Nhánh cần xóa"/)
+  branches.branches = [branches.branches[0]]
+  h.render({ generation: 1 }); await h.flush()
+  assert.equal(h.find(node => node.props.label === 'Xóa nhánh').props.disabled, true)
+  h.unmount()
+})
+
 function accountHarness() {
   let skills = ['team-commit', 'review'], latestSkill = 'team-commit', latestError = ''
   const calls: { operation: string; payload?: Record<string, string> }[] = []
@@ -182,6 +381,7 @@ function accountHarness() {
       if (operation === 'history') return { releases: [release()], active: { release_id: 'release', revision: 1 } }
       if (operation === 'latest') { if (latestError) throw new Error(latestError); return { release: release(), revision: 1 } }
       if (operation === 'installed') return { version: '1.0.0', agents: [], skills, ...installedSkill('installed-commit') }
+      if (operation === 'legacy-installed') return null
       if (operation === 'import') return { folderName: 'bundle', agents: [], skills, files: [], issues: [], compatibilityMode: 'native' }
       if (operation === 'package') return { summary: { version: payload?.version, ...(payload?.commitEnhanceSkill ? installedSkill(payload.commitEnhanceSkill) : {}) }, size: 42, entries: 2, sha256: 'abc' }
       if (operation === 'logout') return null
@@ -262,7 +462,7 @@ test('Account installed bundle displays synced Enhance skill independently of la
   const h = accountHarness()
   h.render(); await h.flush(); h.click('Bundle'); h.render()
   const html = await h.flush()
-  assert.match(html, /Bundle đang cài trong dự án[\s\S]*Enhance: \/installed-commit/)
-  assert.match(html, /Bản phát hành trên máy chủ[\s\S]*Enhance: \/team-commit/)
+  assert.match(html, /Đang dùng:[\s\S]*Enhance: \/installed-commit/)
+  assert.match(html, /Trên máy chủ:[\s\S]*Enhance: \/team-commit/)
   h.unmount()
 })

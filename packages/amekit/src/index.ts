@@ -4,31 +4,41 @@ import { constants } from "node:fs"
 import { AmeApi, ClientError, isTransientError } from "./api"
 import { assertModel, managedProvider, modelPolicy, providerURL } from "./model-policy"
 import { openSessionVault, type Encryption } from "./session-vault"
-import { pack, preview, safePath, type ImportOptions, type InputFile, type Issue, type Preview } from "./bundle/package"
+import { pack, preview, safePath, verifiedFiles, type ImportOptions, type InputFile, type Issue, type Preview } from "./bundle/package"
 import { scanWithSource } from "./bundle/scan"
 import { AiFixError, fixImportFileWithLlm, isFixableTextFile } from "./bundle/ai-fix"
 import * as installer from "./installer"
 import { runtimeDiscovery, type Discover } from "./runtime"
-import { readUsagePrices } from "./usage-pricing"
+import { readUsagePrices, type UsagePrices } from "./usage-pricing"
 import { generatePetDialogue as generateDialogue } from "./pet-generation"
 import type { DialogueSet } from "./pet-dialogue"
 export type { BundleFeatures } from "./api"
 export { detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore } from "./android-translation"
 
+export type AmeKitBundleEvent = { version: string; releaseId: string; auto: boolean; action: "synced" | "uninstalled" }
 export type AmeKitOptions = {
   userData: string
   endpoint: () => { url: string; headers: Record<string, string> } | undefined
   project: (id: string) => Promise<string>
   pickImport: () => Promise<string | null>
   cli?: string
+  globalConfigDir?: string
+  autoSync?: boolean
+  reloadRuntime?: () => Promise<void>
+  onBundleChanged?: (event: AmeKitBundleEvent) => void
 }
 export type AmeKit = {
   call(operation: string, payload: Record<string, string>): Promise<unknown>
+  /** Main-process only; reads cached account/model snapshot without taking the account mutex. */
+  readStatus?(): Promise<unknown>
+  /** Main-process only; reads cached usage pricing map without taking the account mutex. */
+  readUsagePrices?(): Promise<{ origin: string | null; prices: UsagePrices }>
   /** Main-process only; reads verified installed instructions without taking the account mutex. */
-  readCommitEnhanceSkill?(projectID: string): Promise<{ name: string; instructions: string } | null>
+  readCommitEnhanceSkill?(projectID?: string): Promise<{ name: string; instructions: string } | null>
   /** Main-process only; reads verified feature configuration independently of account locking. */
-  readCommitEnhanceFeature?(projectID: string): Promise<{ skill: { name: string; instructions: string } | null; model?: string }>
-  readAndroidTranslationFeature?(projectID: string): Promise<{ skill: { name: string; instructions: string; directory: string } | null; model?: string; rawSkillName?: string }>
+  readCommitEnhanceFeature?(projectID?: string): Promise<{ skill: { name: string; instructions: string } | null; model?: string }>
+  readBuildNotesFeature?(projectID?: string): Promise<{ skill: { name: string; instructions: string } | null; model?: string; rawSkillName?: string }>
+  readAndroidTranslationFeature?(projectID?: string): Promise<{ skill: { name: string; instructions: string; directory: string } | null; model?: string; rawSkillName?: string }>
   /** Main-process only; enables an active concrete model for an explicit feature, never regular Chat or Pet. */
   authorizeFeatureModel?(modelID: string): Promise<string | null>
   /** Main-process only; retain categorized dialogue for createPetHost. */
@@ -51,6 +61,8 @@ type ElectronMain = { safeStorage: Encryption; dialog: Pick<typeof import("elect
 export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number }
 
 export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDependencies = {}): AmeKit {
+  const globalConfigDir = options.globalConfigDir ?? path.join(options.userData, "backend", "config", "opencode")
+  const globalManagedDir = path.join(options.userData, "amekit", "global")
   const fetcher = dependencies.fetch ?? fetch
   const electron = dependencies.electron ?? (() => import("electron"))
   const lifetime = new AbortController()
@@ -59,11 +71,50 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   let vault: Awaited<ReturnType<typeof openSessionVault>> | undefined
   let storageError: string | undefined, blocker: string | undefined, policyReady = false, disposed = false, busy = false
   let inFlight: Promise<unknown> | undefined, backgroundInFlight: Promise<void> | undefined, disposal: Promise<void> | undefined
+  let localBundleWriteInFlight: Promise<unknown> | undefined, autoSyncInFlight: Promise<void> | undefined
+  let lastAutoSyncError: string | undefined, lastAutoSyncFailedReleaseId: string | undefined
+  const trackLocalWrite = async <T>(write: () => Promise<T>): Promise<T> => {
+    while (localBundleWriteInFlight) await localBundleWriteInFlight.catch(() => {})
+    const task = write()
+    localBundleWriteInFlight = task
+    try { return await task } finally { if (localBundleWriteInFlight === task) localBundleWriteInFlight = undefined }
+  }
+  const clearAutoSyncError = () => { lastAutoSyncError = undefined; lastAutoSyncFailedReleaseId = undefined }
   let transientFailures = 0
   const authorizedFeatureModels = new Set<string>()
   const code = (error: unknown) => error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "AMEKIT_OPERATION_FAILED"
+  type CachedServerArchive = {
+    origin: string
+    releaseId: string
+    sha256: string
+    compatibilityMode: "native" | "raw"
+    files: InputFile[]
+    agents: string[]
+    skills: string[]
+  }
+  let activeArchiveCache: CachedServerArchive | undefined
   let importSession: ImportSession | undefined
-  const resetImport = () => { source = undefined; packed = undefined; importSession = undefined }
+  const resetImport = () => { source = undefined; packed = undefined; importSession = undefined; activeArchiveCache = undefined }
+  const loadActiveServerArchive = async (needFiles: boolean) => {
+    const latest = await api!.latest(signal)
+    if (!needFiles) {
+      const installed = await installer.installedGlobal(globalConfigDir, globalManagedDir).catch(() => undefined)
+      if (installed && installed.origin === api!.origin && installed.releaseId === latest.release.releaseId && installed.sha256 === latest.release.sha256) {
+        return { latest, skills: [...installed.skills].sort(), agents: [...installed.agents].sort(), compatibilityMode: (installed.compatibilityMode === "raw" ? "raw" : "native") as "native" | "raw", files: undefined }
+      }
+    }
+    if (activeArchiveCache && activeArchiveCache.origin === api!.origin && activeArchiveCache.releaseId === latest.release.releaseId && activeArchiveCache.sha256 === latest.release.sha256) {
+      return { latest, ...activeArchiveCache }
+    }
+    const bytes = await api!.download(latest.release, signal)
+    const { summary, files } = await verifiedFiles(bytes, latest.release.version, latest.release.sha256)
+    const paths = files.map(file => file.path)
+    const agents = paths.flatMap(filePath => /^agents\/(.+)\.md$/.exec(filePath)?.[1] ?? []).sort()
+    const skills = paths.flatMap(filePath => /^skills\/([^/]+)\/SKILL\.md$/.exec(filePath)?.[1] ?? []).sort()
+    const compatibilityMode = summary.compatibility.mode === "raw" ? "raw" : "native"
+    activeArchiveCache = { origin: api!.origin, releaseId: latest.release.releaseId, sha256: latest.release.sha256, compatibilityMode, files: files.map(file => ({ path: file.path, data: file.data.slice() })), agents, skills }
+    return { latest, ...activeArchiveCache }
+  }
   const importFiles = (session: ImportSession, replacement?: InputFile): InputFile[] => [...session.workingFiles]
     .map(([filePath, data]) => ({ path: filePath, data: (replacement?.path === filePath ? replacement.data : data).slice() }))
     .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
@@ -139,13 +190,20 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       throw error
     }
   }
+  const reloadAndRestorePolicy = async () => {
+    if (!options.reloadRuntime) return
+    await options.reloadRuntime().catch(() => {})
+    // Reload clears plugin memory; use current account state, never a pre-reload auth snapshot.
+    if (!disposed && api?.account) await synchronize()
+  }
+  const bundleWarning = () => lastAutoSyncError ? { bundleAutoSyncError: lastAutoSyncError } : {}
   const view = () => {
     if (api?.account && api.expires <= Date.now()) { api.suspend(); resetImport(); policyReady = false; blocker = "AMECODE_LOGIN_REQUIRED" }
     if (api?.account) {
       const models = modelPolicy(api.account.role, api.provider?.catalog, { featureModels: [...authorizedFeatureModels] })
-      return { origin: api.origin, account: { ...api.account }, models: { ...models, small_model: api.account.role === "user" ? models.default_model : models.small_model }, ready: policyReady, ...(blocker ? { blocker } : {}) }
+      return { origin: api.origin, account: { ...api.account }, models: { ...models, small_model: api.account.role === "user" ? models.default_model : models.small_model }, ready: policyReady, ...bundleWarning(), ...(blocker ? { blocker } : {}) }
     }
-    return api?.credential ? { origin: api.origin, reconnecting: true, ready: false, blocker: storageError ?? blocker ?? "ACCOUNT_REFRESH_REQUIRED" } : null
+    return api?.credential ? { origin: api.origin, reconnecting: true, ready: false, ...bundleWarning(), blocker: storageError ?? blocker ?? "ACCOUNT_REFRESH_REQUIRED" } : null
   }
   const ready = (async () => {
     try {
@@ -155,6 +213,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         api = new AmeApi(credential.origin, fetcher)
         await api.resume(credential.token, signal)
         await synchronize()
+        scheduleAutoSync("ready")
       } else if (!disposed) await rpc(null)
     } catch (error) {
       blocker = code(error)
@@ -194,6 +253,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     if (operation === "status") return { ...viewOrEmpty(), ...(storageError ? { ready: false, blocker: storageError } : {}) }
     if (operation === "usage-prices") return { origin: api?.account ? api.origin : null, prices: readUsagePrices(api?.provider?.catalog) }
     if (operation === "logout") {
+      activeArchiveCache = undefined
+      clearAutoSyncError()
       authorizedFeatureModels.clear()
       api?.suspend(); resetImport(); await revoke()
       try { if (!vault) throw new Error(); await vault.save(undefined); storageError = undefined }
@@ -203,12 +264,25 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       finally { api?.clear(); api = undefined; blocker = undefined }
       return null
     }
-    if (["installed", "offline", "uninstall"].includes(operation)) {
+    if (operation === "legacy-installed" || operation === "clean-legacy") {
       const directory = await project(payload.project)
-      if (operation === "installed") { const state = await installer.installed(directory); return state ? installView(state) : null }
-      if (operation === "offline") { const state = await installer.offline(directory, discover, signal); return { ...installView(state), changed: false } }
-      await confirm("Uninstall managed AmeKit bundle?", `Remove only unmodified AmeKit-owned files from ${directory}. Personal files are preserved.`)
-      return { changed: await installer.uninstall(directory, signal) }
+      if (operation === "legacy-installed") {
+        const legacy = await installer.legacyProjectInstalled(directory)
+        return legacy ? { ...legacy, projectName: path.basename(directory) } : null
+      }
+      await confirm("Dọn bundle AmeKit cũ khỏi dự án?", `Xóa các tệp agent và skill do AmeKit cài trước đây trong ${path.join(directory, ".opencode")} và ${path.join(directory, ".amekit")}. Các tệp cá nhân và tệp của dự án được giữ nguyên.`)
+      return installer.cleanLegacyProject(directory, signal)
+    }
+    if (["installed", "offline", "uninstall"].includes(operation)) {
+      if (operation === "installed") { const state = await installer.installedGlobal(globalConfigDir, globalManagedDir); return state ? installView(state) : null }
+      if (operation === "offline") { const state = await installer.offlineGlobal(globalConfigDir, globalManagedDir, discover, signal); return { ...installView(state), changed: false } }
+      await confirm("Gỡ AmeKit bundle khỏi ứng dụng?", "Xóa các tệp agent và skill do AmeKit cài đặt trong cấu hình toàn cục của ứng dụng. Tệp cá nhân và cấu hình dự án được giữ nguyên.")
+      const changed = await trackLocalWrite(() => installer.uninstallGlobal(globalConfigDir, globalManagedDir, signal))
+      if (changed) {
+        await reloadAndRestorePolicy()
+        options.onBundleChanged?.({ version: "", releaseId: "", auto: false, action: "uninstalled" })
+      }
+      return { changed }
     }
     if (storageError) throw new Error(storageError)
     if (operation === "login") {
@@ -217,11 +291,12 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       api = new AmeApi(payload.server || undefined, fetcher)
       await api.login(payload.username, payload.password, signal)
       await synchronize()
+      scheduleAutoSync("login")
       return view()
     }
     if (!api) throw new Error("SIGNED_OUT")
     switch (operation) {
-      case "refresh": await api.refresh(signal); await synchronize(); return view()
+      case "refresh": await api.refresh(signal); await synchronize(); scheduleAutoSync("refresh"); return view()
       case "assert-ready":
       case "assert-model": {
         await api.refresh(signal); await synchronize()
@@ -231,12 +306,54 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         return { providerID, modelID }
       }
       case "latest": return api.latest(signal)
+      case "active-features": {
+        await api.guard(true, signal)
+        const active = await loadActiveServerArchive(false)
+        return { release: active.latest.release, revision: active.latest.revision, skills: active.skills, features: active.latest.release.manifest.features ?? {} }
+      }
+      case "update-features": {
+        await api.guard(true, signal); await synchronize()
+        if (payload.activate !== undefined && !["true", "false"].includes(payload.activate)) throw new Error("INVALID_PAYLOAD")
+        const activateNow = payload.activate !== "false"
+        const active = await loadActiveServerArchive(true)
+        const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel", "buildNotesSkill", "buildNotesModel"]
+          .filter(key => typeof payload[key] === "string" && payload[key].trim())
+          .map(key => [key, payload[key].trim()]))
+        const serverSource: Preview = { files: active.files!.map(file => ({ path: file.path, data: file.data.slice() })), issues: [], agents: active.agents, skills: active.skills, compatibilityMode: active.compatibilityMode }
+        const nextPacked = await pack(serverSource, payload.version, signal, features)
+        if (activateNow) {
+          await confirm("Cập nhật cấu hình Skill & Model?", `Đóng gói v${nextPacked.summary.version} từ bản máy chủ v${active.latest.release.version} (giữ nguyên ${nextPacked.summary.agents} agents & ${nextPacked.summary.skills} skills), xuất bản và kích hoạt ngay cho toàn bộ team.`)
+        } else {
+          await confirm("Xuất bản nháp cấu hình Skill & Model?", `Đóng gói v${nextPacked.summary.version} từ bản máy chủ v${active.latest.release.version} (giữ nguyên ${nextPacked.summary.agents} agents & ${nextPacked.summary.skills} skills) chưa kích hoạt.`)
+        }
+        const release = await api.publish(nextPacked.bytes, nextPacked.summary.version, nextPacked.sha256, () => {}, signal)
+        activeArchiveCache = { origin: api.origin, releaseId: release.releaseId, sha256: release.sha256, compatibilityMode: active.compatibilityMode, files: serverSource.files, agents: active.agents, skills: active.skills }
+        const packaged = { summary: nextPacked.summary, size: nextPacked.bytes.length, entries: nextPacked.entries, sha256: nextPacked.sha256 }
+        if (!activateNow) return { packaged, release, activated: null }
+        try {
+          let history = await api.history(undefined, signal)
+          let activated
+          try { activated = await api.activate(release.releaseId, history.active.revision, signal) }
+          catch (error) {
+            if (!(error instanceof ClientError) || error.code !== "ACTIVATION_CONFLICT") throw error
+            history = await api.history(undefined, signal)
+            activated = await api.activate(release.releaseId, history.active.revision, signal)
+          }
+          scheduleAutoSync("release")
+          return { packaged, release, activated, revision: activated.revision }
+        } catch (error) {
+          if (signal.aborted || !api?.account || error instanceof ClientError && (error.status === 401 || error.status === 403)) throw error
+          return { packaged, release, activated: null, activationError: code(error) }
+        }
+      }
       case "history": return api.history(payload.cursor || undefined, signal)
       case "activate": {
         if (!/^[0-9a-f-]{36}$/i.test(payload.id) || !/^\d+$/.test(payload.revision) || !Number.isSafeInteger(Number(payload.revision))) throw new Error("INVALID_ACTIVATION")
         await api.guard(true, signal); await synchronize()
         await confirm("Activate AmeKit release?", `Release ${payload.id} becomes the stable bundle for the team. Expected revision: ${payload.revision}.`)
-        return api.activate(payload.id, Number(payload.revision), signal)
+        const activated = await api.activate(payload.id, Number(payload.revision), signal)
+        scheduleAutoSync("activate")
+        return activated
       }
       case "import": {
         if (payload.compatibilityMode && !["native", "raw"].includes(payload.compatibilityMode)) throw new Error("INVALID_COMPATIBILITY_MODE")
@@ -332,7 +449,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         await api.guard(true, signal)
         if (!source) throw new Error("IMPORT_REQUIRED")
         packed = undefined
-        const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel"]
+        const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel", "buildNotesSkill", "buildNotesModel"]
           .filter(key => typeof payload[key] === "string" && payload[key].trim())
           .map(key => [key, payload[key]]))
         packed = await pack(source, payload.version, signal, features)
@@ -350,7 +467,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         if (!source) throw new Error("IMPORT_REQUIRED")
         if (payload.activate !== undefined && !["true", "false"].includes(payload.activate)) throw new Error("INVALID_PAYLOAD")
         const activateNow = payload.activate !== "false"
-        const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel"]
+        const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel", "buildNotesSkill", "buildNotesModel"]
           .filter(key => typeof payload[key] === "string" && payload[key].trim())
           .map(key => [key, payload[key]]))
         const nextPacked = await pack(source, payload.version, signal, features)
@@ -372,6 +489,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
             history = await api.history(undefined, signal)
             activated = await api.activate(release.releaseId, history.active.revision, signal)
           }
+          scheduleAutoSync("release")
           return { packaged, release, activated, revision: activated.revision }
         } catch (error) {
           if (signal.aborted || !api?.account || error instanceof ClientError && (error.status === 401 || error.status === 403)) throw error
@@ -379,19 +497,60 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         }
       }
       case "sync": {
-        const directory = await project(payload.project)
         const latest = await api.latest(signal); await synchronize()
-        const raw = latest.release.manifest.compatibility.mode === "raw"
-        if (raw && payload.allowRaw !== "true") throw new Error("RAW_INSTALL_CONFIRMATION_REQUIRED")
-        await confirm("Install AmeKit bundle?", `Install ${latest.release.version} into ${directory}. ${raw ? "RAW: exact bytes only; runtime compatibility is NOT verified." : "Native agent and skill discovery must pass or the install rolls back."}`)
         const bytes = await api.download(latest.release, signal)
-        const result = await installer.install(directory, api.origin, latest.release, bytes, discover, signal, { allowRaw: raw })
+        const result = await trackLocalWrite(() => installer.installGlobal(globalConfigDir, globalManagedDir, api!.origin, latest.release, bytes, discover, signal, { allowRaw: true }))
+        clearAutoSyncError()
+        if (result.changed) {
+          await reloadAndRestorePolicy()
+          options.onBundleChanged?.({ version: result.state.version, releaseId: result.state.releaseId, auto: false, action: "synced" })
+        }
         return { ...installView(result.state), changed: result.changed }
       }
       default: throw new Error("UNKNOWN_OPERATION")
     }
   }
-  const viewOrEmpty = () => view() ?? { ready: false, ...(blocker ? { blocker } : {}) }
+  const viewOrEmpty = () => view() ?? { ready: false, ...bundleWarning(), ...(blocker ? { blocker } : {}) }
+  function scheduleAutoSync(reason: string) {
+    if (options.autoSync !== true || disposed || storageError || !api?.account || !policyReady || autoSyncInFlight) return
+    const accountApi = api, initiatingCall = ["ready", "heartbeat"].includes(reason) ? undefined : inFlight
+    const active = () => !disposed && api === accountApi && !!accountApi.account && policyReady
+    const stopOnAuthFailure = async (error: unknown) => {
+      if (!(error instanceof ClientError) || error.status !== 401 && error.status !== 403) return false
+      if (api === accountApi && !disposed) {
+        accountApi.suspend(); resetImport(); blocker = code(error)
+        await revoke(); await persist().catch(() => {})
+      }
+      return true
+    }
+    const task = (async () => {
+      await ready
+      await initiatingCall?.catch(() => {})
+      if (!active()) return
+      let latest: Awaited<ReturnType<AmeApi["latest"]>>
+      try { latest = await accountApi.latest(signal) }
+      catch (error) { await stopOnAuthFailure(error); return }
+      if (!active()) return
+      const current = await installer.installedGlobal(globalConfigDir, globalManagedDir).catch(() => undefined)
+      if (current?.releaseId === latest.release.releaseId && current.sha256 === latest.release.sha256) { clearAutoSyncError(); return }
+      if (lastAutoSyncFailedReleaseId === latest.release.releaseId && reason === "heartbeat") return
+      try {
+        const bytes = await accountApi.download(latest.release, signal)
+        if (!active()) return
+        const result = await trackLocalWrite(() => installer.installGlobal(globalConfigDir, globalManagedDir, accountApi.origin, latest.release, bytes, discover, signal, { allowRaw: true }))
+        clearAutoSyncError()
+        if (result.changed) {
+          await reloadAndRestorePolicy()
+          options.onBundleChanged?.({ version: result.state.version, releaseId: result.state.releaseId, auto: true, action: "synced" })
+        }
+      } catch (error) {
+        if (await stopOnAuthFailure(error) || !active() || signal.aborted || isTransientError(error)) return
+        lastAutoSyncError = code(error); lastAutoSyncFailedReleaseId = latest.release.releaseId
+      }
+    })().finally(() => { if (autoSyncInFlight === task) autoSyncInFlight = undefined })
+    autoSyncInFlight = task
+    void task.catch(() => {})
+  }
   const call: AmeKit["call"] = (operation, payload) => {
     if (disposed) return Promise.reject(new Error("AMEKIT_DISPOSED"))
     if (busy) return Promise.reject(new Error("OPERATION_BUSY"))
@@ -400,10 +559,12 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       let result: unknown, failure: unknown
       try {
         if (backgroundInFlight) await backgroundInFlight.catch(() => {})
+        await ready
+        if (["installed", "offline", "sync", "uninstall"].includes(operation) && autoSyncInFlight) await autoSyncInFlight.catch(() => {})
         result = await execute(operation, payload)
       }
       catch (error) { failure = error }
-      if (!["status", "usage-prices", "installed", "offline", "uninstall", "logout"].includes(operation)) {
+      if (!["status", "usage-prices", "installed", "offline", "uninstall", "logout", "legacy-installed", "clean-legacy"].includes(operation)) {
         if (failure && (["login", "refresh", "assert-ready", "assert-model"].includes(operation) || !api?.account)) {
           api?.suspend(); resetImport(); blocker = code(failure); await revoke()
         } else if (!["login", "refresh", "assert-ready", "assert-model"].includes(operation)) {
@@ -426,6 +587,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         await api!.refresh(signal, { preserveOnTransient: true })
         await synchronize()
         await persist()
+        scheduleAutoSync("heartbeat")
       } catch (error) {
         blocker = code(error)
         if (isTransientError(error) && api?.account && api.expires > Date.now() && transientFailures < 2) {
@@ -443,24 +605,51 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   timer.unref?.()
   return {
     call,
+    async readStatus() {
+      await ready
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      return view()
+    },
+    async readUsagePrices() {
+      await ready
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      return { origin: api?.account ? api.origin : null, prices: readUsagePrices(api?.provider?.catalog) }
+    },
     async readCommitEnhanceSkill(projectID) {
       if (disposed) throw new Error("AMEKIT_DISPOSED")
-      try { return await installer.readCommitEnhanceSkill(await project(projectID)) }
-      catch (error) { throw new Error(code(error)) }
+      try {
+        await localBundleWriteInFlight?.catch(() => {})
+        if (await installer.installedGlobal(globalConfigDir, globalManagedDir)) return await installer.readGlobalCommitEnhanceSkill(globalConfigDir, globalManagedDir)
+        return projectID ? await installer.readCommitEnhanceSkill(await project(projectID)) : null
+      } catch (error) { throw new Error(code(error)) }
     },
     async readCommitEnhanceFeature(projectID) {
       if (disposed) throw new Error("AMEKIT_DISPOSED")
       try {
-        const directory = await project(projectID)
-        const features = await installer.readBundleFeatures(directory)
-        const skill = await installer.readCommitEnhanceSkill(directory)
+        await localBundleWriteInFlight?.catch(() => {})
+        const globalInstalled = await installer.installedGlobal(globalConfigDir, globalManagedDir)
+        if (!globalInstalled && !projectID) return { skill: null }
+        const directory = globalInstalled ? undefined : await project(projectID!)
+        const features = globalInstalled ? await installer.readGlobalBundleFeatures(globalConfigDir, globalManagedDir) : await installer.readBundleFeatures(directory!)
+        const skill = globalInstalled ? await installer.readGlobalCommitEnhanceSkill(globalConfigDir, globalManagedDir) : await installer.readCommitEnhanceSkill(directory!)
         return { skill, ...(features?.commitEnhanceModel ? { model: features.commitEnhanceModel } : {}) }
+      } catch (error) { throw new Error(code(error)) }
+    },
+    async readBuildNotesFeature(projectID) {
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      try {
+        await localBundleWriteInFlight?.catch(() => {})
+        if (await installer.installedGlobal(globalConfigDir, globalManagedDir)) return await installer.readGlobalBuildNotesFeature(globalConfigDir, globalManagedDir)
+        return projectID ? await installer.readBuildNotesFeature(await project(projectID)) : { skill: null }
       } catch (error) { throw new Error(code(error)) }
     },
     async readAndroidTranslationFeature(projectID) {
       if (disposed) throw new Error("AMEKIT_DISPOSED")
-      try { return await installer.readAndroidTranslationFeature(await project(projectID)) }
-      catch (error) { throw new Error(code(error)) }
+      try {
+        await localBundleWriteInFlight?.catch(() => {})
+        if (await installer.installedGlobal(globalConfigDir, globalManagedDir)) return await installer.readGlobalAndroidTranslationFeature(globalConfigDir, globalManagedDir)
+        return projectID ? await installer.readAndroidTranslationFeature(await project(projectID)) : { skill: null }
+      } catch (error) { throw new Error(code(error)) }
     },
     async authorizeFeatureModel(modelID) {
       await ready
@@ -493,8 +682,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     },
     dispose() {
       return disposal ??= (async () => {
-        disposed = true; clearInterval(timer); lifetime.abort()
-        await ready; await Promise.all([inFlight?.catch(() => {}), backgroundInFlight?.catch(() => {})])
+        disposed = true; activeArchiveCache = undefined; clearInterval(timer); lifetime.abort()
+        await ready; await Promise.all([inFlight?.catch(() => {}), backgroundInFlight?.catch(() => {}), autoSyncInFlight?.catch(() => {})])
         authorizedFeatureModels.clear(); api?.clear(); resetImport(); await revoke(true)
       })()
     },

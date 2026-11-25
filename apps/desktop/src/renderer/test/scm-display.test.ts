@@ -103,6 +103,36 @@ test('Inspector uses group-specific status and omits directory suffix for root f
   assert.doesNotMatch(html, /class="scm-file-dir"/)
 })
 
+test('Inspector sync bar displays remote counts and publish state without depending on OpenCode', () => {
+  const props = {
+    projectID: 'project', connected: false, tab: 'git' as const, generation: 0, gitError: '',
+    setTab() {}, refresh() {}, onOpen() {}, onRename() {}, onDelete() {}, onDiff() {}, onHide() {}, report() {},
+  }
+  for (const [git, pull, push, disabled] of [
+    [undefined, 'Pull', 'Push', true],
+    [{ branch: 'main', changes: [], hasRemote: false }, 'Pull', 'Push', true],
+    [{ branch: 'main', changes: [], hasRemote: true, tracking: 'origin/main', ahead: 2, behind: 3 }, 'Pull ↓3', 'Push ↑2', false],
+    [{ branch: 'main', changes: [], hasRemote: true, tracking: 'origin/main' }, 'Pull', 'Push', false],
+    [{ branch: 'main', changes: [], hasRemote: true }, 'Pull', 'Publish', false],
+  ] satisfies [Parameters<typeof Inspector>[0]['git'], string, string, boolean][]) {
+    const html = renderToStaticMarkup(createElement(Inspector, { ...props, git }))
+    assert.match(html, /data-testid="scm-sync-bar"/)
+    for (const [id, text] of [['fetch', 'Fetch'], ['pull', pull], ['push', push]]) {
+      const button = html.match(new RegExp(`<button[^>]*data-testid="scm-${id}-btn"([^>]*)>([^<]*)<\\/button>`))!
+      assert.ok(button)
+      assert.equal(button[1].includes('disabled=""'), disabled)
+      assert.equal(button[2], text)
+    }
+    assert.match(html, /title="Fetch từ remote"/)
+    assert.match(html, /aria-label="Lịch sử commit"/)
+    assert.match(html, /aria-label="Quản lý Stash"/)
+    assert.match(html, /data-testid="scm-expand-commit-btn"/)
+  }
+  for (const extra of [{ projectID: undefined }, { tab: 'files' as const }, { tab: 'search' as const }]) {
+    assert.doesNotMatch(renderToStaticMarkup(createElement(Inspector, { ...props, ...extra })), /data-testid="scm-sync-bar"/)
+  }
+})
+
 test('FileTypeIcon renders crisp decorative SVG icons and escaped typographic marks', () => {
   for (const [path, kind] of [['README.md', 'md'], ['image.png', 'image'], ['unknown.bin', 'file']]) {
     const html = renderToStaticMarkup(createElement(FileTypeIcon, { path }))

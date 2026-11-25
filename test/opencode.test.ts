@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import path from 'node:path'
 import { OpenCodeAdapter, localURL, normalizeMessages } from '../packages/opencode-adapter/src/index'
 import type { IdeEvent } from '../packages/protocol/src/index'
+import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
 import type { SessionInfo, SessionMessageInfo } from '@opencode/client'
 import { aggregateUsageTree, emptyTokens } from '../packages/amekit/src/usage'
 import type { UsagePrices } from '../packages/amekit/src/usage-pricing'
@@ -13,6 +15,63 @@ test('only local origins accepted; unsupported server does not attach', async ()
   const adapter = new OpenCodeAdapter(() => {}, async () => json({ version: '1.0.0' }))
   await assert.rejects(adapter.connect('http://localhost:4096'), /UNSUPPORTED_SERVER_VERSION/)
   assert.equal(adapter.connection().connected, false)
+})
+test('reload waits for plugin activation and RPC readiness, tolerates absent plugins and bounds retries', async t => {
+  for (const scenario of ['ready', 'reinitializing', 'absent', 'stalled'] as const) await t.test(scenario, async () => {
+    const events: IdeEvent[] = [], calls: string[] = []
+    let polls = 0, statuses = 0
+    const adapter = new OpenCodeAdapter(event => events.push(event), async (input, init = {}) => {
+      const url = new URL(String(input)); calls.push(url.pathname)
+      if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+      if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+        init.signal?.addEventListener('abort', () => controller.close())
+      } }), { headers: { 'content-type': 'text/event-stream' } })
+      assert.equal(new Headers(init.headers).get('authorization'), 'Basic ' + Buffer.from('opencode:reload-secret').toString('base64'))
+      if (url.pathname === '/api/location/reload') {
+        assert.equal(init.method, 'POST')
+        return new Response(null, { status: 204 })
+      }
+      assert.equal(calls.includes('/api/location/reload'), true)
+      assert.equal(events.some(event => event.type === 'catalog'), false, 'catalog must wait for polling')
+      if (url.pathname === '/api/plugin') {
+        polls++
+        if (scenario === 'absent') return json({ data: [{ id: 'other-plugin', state: { status: 'active' } }] })
+        if (scenario === 'reinitializing' && polls <= 3) return json({ data: [] })
+        if (scenario === 'stalled' || polls === 1) return json({ data: [{ id: 'amekit-models', state: { status: 'loading' } }] })
+        if (polls === 2) throw new TypeError('transient plugin transport failure')
+        if (polls === 3) return json({ invalid: true })
+        return json({ data: [{ id: 'amekit-models', state: { status: 'active' } }] })
+      }
+      if (url.pathname === '/api/rpc/amekit-models/status') {
+        assert.equal(init.method, 'POST')
+        assert.deepEqual(JSON.parse(String(init.body)), { input: null })
+        assert.ok(polls >= 4, 'RPC registration alone is insufficient before plugin activation')
+        statuses++
+        if (statuses === 1) throw new TypeError('transient RPC transport failure')
+        return json({ output: { authenticated: false } }, statuses === 2 ? (scenario === 'reinitializing' ? 400 : 503) : 200)
+      }
+      throw new Error('Unexpected ' + url.pathname)
+    })
+    try {
+      await adapter.connect('http://localhost:4096', 'opencode', 'reload-secret')
+      events.length = 0
+      await adapter.reload(scenario === 'stalled' ? { maxAttempts: 40, pollMs: 1 } : { pollMs: 1 })
+      assert.deepEqual(events, [{ type: 'catalog' }])
+      assert.equal(calls.filter(route => route === '/api/location/reload').length, 1)
+      assert.equal(polls, scenario === 'ready' || scenario === 'reinitializing' ? 6 : scenario === 'absent' ? 1 : 40)
+      assert.equal(statuses, scenario === 'ready' || scenario === 'reinitializing' ? 3 : 0)
+    } finally { adapter.dispose() }
+  })
+})
+test('reload is a no-op before connecting and after disconnecting or disposing', async () => {
+  let requests = 0
+  const adapter = new OpenCodeAdapter(() => {}, async () => { requests++; throw new Error('Unexpected request') })
+  await adapter.reload()
+  adapter.disconnected('offline')
+  await adapter.reload()
+  adapter.dispose()
+  await adapter.reload()
+  assert.equal(requests, 0)
 })
 test('real SDK requests use location, main-only auth, session binding, prompt and permissions', async () => {
   const calls: { url: URL; init: RequestInit }[] = []
@@ -102,6 +161,37 @@ test('detaching a project rejects its API access and stops its event routing wit
   } finally { adapter.dispose() }
 })
 
+test('catalog SSE updates target normalized attached directories and broadcast unmatched or missing locations', async () => {
+  const notifications: IdeEvent[] = [], directory = process.cwd()
+  let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+  const adapter = new OpenCodeAdapter(event => notifications.push(event), async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      stream = controller
+      init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('project', directory); adapter.attach('alias', directory); adapter.attach('other', directory + '-other')
+  const send = (type: string, location?: { directory: string }) => stream!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, location, data: {} })}\n\n`))
+  try {
+    await adapter.connect('http://localhost:4096'); await waitFor(() => !!stream)
+    notifications.length = 0
+    for (const type of ['skill.updated', 'agent.updated', 'model.updated', 'command.updated']) {
+      const normalized = directory.toUpperCase() + (process.platform === 'win32' ? '\\.' : '/.')
+      send(type, { directory: normalized })
+      send(type, { directory: directory + '-global-workspace' })
+      send(type)
+      await waitFor(() => notifications.length >= 4)
+      assert.deepEqual(notifications.splice(0), [
+        { type: 'catalog', projectID: 'project' }, { type: 'catalog', projectID: 'alias' },
+        { type: 'catalog' }, { type: 'catalog' },
+      ], type)
+    }
+  } finally { adapter.dispose() }
+})
+
 test('SSE deltas render before persistence and reconnect resyncs history', async () => {
   const notifications: IdeEvent[] = []; let connections = 0
   const directory = process.cwd()
@@ -165,6 +255,105 @@ test('session changes use snapshot ranges, not the latest-turn default or Git', 
     empty = false; rejected = true
     await assert.rejects(adapter.sessionDiff('p', 's1'))
   } finally { adapter.dispose() }
+})
+
+test('empty snapshot diffs fall back to completed tool files within whole-session and idle-bounded turn ranges', async () => {
+  const directory = process.cwd(), calls: URL[] = []
+  const firstPatch = '--- /dev/null\n+++ b/src/new.ts\n@@ -0,0 +1 @@\n+first\n'
+  const secondPatch = '--- a/src/new.ts\n+++ b/src/new.ts\n@@ -1 +1 @@\n-first\n+second\n'
+  const outside = path.resolve(directory + '-other', 'outside.ts')
+  const tool = (name: string, files: unknown, status = 'completed') => ({ type: 'tool', name, state: { status, metadata: { files } } })
+  const history = [
+    { id: 'u1', type: 'user', text: 'create' },
+    { id: 'a1', type: 'assistant', content: [tool('patch', [
+      { file: path.join(directory, 'src', 'new.ts'), patch: firstPatch, status: 'added', additions: 1, deletions: 0 },
+      null, {}, { file: ' ', patch: '' }, { file: 'missing-patch.ts' }, { file: 'bad-patch.ts', patch: 1 },
+      { file: outside, patch: '', status: 'unknown', additions: -1, deletions: '2' },
+      { file: './defaults.ts', patch: '', additions: Infinity, deletions: NaN },
+    ])] },
+    { id: 'steer', type: 'user', text: 'modify' },
+    { id: 'a2', type: 'assistant', content: [
+      tool('edit', [{ file: '.\\src\\new.ts', patch: secondPatch, status: 'modified', additions: 2, deletions: 1 }]),
+      tool('patch', [{ file: 'unfinished.ts', patch: 'ignored' }], 'running'),
+      tool('patch', [{ file: 'failed.ts', patch: 'ignored' }], 'error'),
+      tool('read', { file: 'not-array.ts' }),
+      { type: 'tool', name: 'read', state: { status: 'completed' } },
+    ] },
+    { id: 'idle1', type: 'idle' },
+    { id: 'u2', type: 'user', text: 'delete' },
+    { id: 'a3', type: 'assistant', content: [tool('patch', [{ file: 'src/new.ts', patch: 'delete patch', status: 'deleted', additions: 0, deletions: 1 }])] },
+    { id: 'idle2', type: 'idle' },
+    { id: 'u3', type: 'user', text: 'running' },
+    { id: 'a4', type: 'assistant', content: [tool('write', [{ file: './running.ts', patch: 'running patch', status: 'added', additions: 4, deletions: 0 }])] },
+  ]
+  let failHistory = false, rejectDiff = false, primary: unknown[] = []
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push(url)
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session/s1') return json({ data: { location: { directory } } })
+    if (url.pathname.endsWith('/diff')) return rejectDiff ? json({ name: 'TurnRangeError', message: 'location changed' }, 400) : json({ data: primary })
+    if (url.pathname.endsWith('/message')) {
+      if (url.searchParams.get('type') === 'user') return json({ data: [history[url.searchParams.get('order') === 'asc' ? 0 : 8]], cursor: {} })
+      assert.equal(url.searchParams.get('order'), 'asc')
+      assert.equal(url.searchParams.get('limit'), '200')
+      if (failHistory) throw new TypeError('History unavailable')
+      return json({ data: history, cursor: {} })
+    }
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    const firstTurn = [
+      { file: 'src/new.ts', patch: firstPatch + '\n' + secondPatch, additions: 3, deletions: 1, status: 'added' },
+      { file: outside.replace(/\\/g, '/'), patch: '', additions: 0, deletions: 0, status: 'modified' },
+      { file: 'defaults.ts', patch: '', additions: 0, deletions: 0, status: 'modified' },
+    ]
+    const running = { file: 'running.ts', patch: 'running patch', additions: 4, deletions: 0, status: 'added' }
+    assert.deepEqual(await adapter.sessionDiff('p', 's1'), [
+      { ...firstTurn[0], patch: firstTurn[0].patch + '\ndelete patch', deletions: 2, status: 'deleted' },
+      ...firstTurn.slice(1), running,
+    ])
+    assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u1'), firstTurn)
+    assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u2'), [{ file: 'src/new.ts', patch: 'delete patch', additions: 0, deletions: 1, status: 'deleted' }])
+    assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u3'), [running])
+    assert.deepEqual(await adapter.sessionDiff('p', 's1', 'missing'), [])
+    failHistory = true
+    assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u1'), [])
+    primary = [{ file: 'snapshot.ts', patch: 'snapshot patch', additions: 1, deletions: 0, status: 'modified' }]
+    calls.length = 0
+    assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u1'), primary)
+    assert.equal(calls.some(url => url.pathname.endsWith('/message')), false)
+    primary = []; rejectDiff = true; calls.length = 0
+    await assert.rejects(adapter.sessionDiff('p', 's1', 'u1'))
+    assert.equal(calls.some(url => url.pathname.endsWith('/message')), false, 'diff errors must not trigger fallback')
+  } finally { adapter.dispose() }
+})
+
+test('completed tool metadata emits turn changes without snapshots and preserves existing snapshot paths', () => {
+  const items = normalizeMessages([
+    { id: 'u1', type: 'user', text: 'edit' },
+    { id: 'a1', type: 'assistant', content: [
+      { type: 'tool', name: 'patch', state: { status: 'completed', metadata: { files: [
+        { file: 'src\\new.ts' }, { file: 'src/new.ts' }, null, {}, { file: '' }, { file: ' ' }, { file: 12 },
+      ] } } },
+      { type: 'tool', name: 'edit', state: { status: 'running', metadata: { files: [{ file: 'running.ts' }] } } },
+      { type: 'tool', name: 'write', state: { status: 'error', metadata: { files: [{ file: 'failed.ts' }] } } },
+      { type: 'tool', name: 'read', state: { status: 'completed', metadata: { files: 'not-array' } } },
+      { type: 'tool', name: 'read', state: { status: 'completed' } },
+    ] },
+    { id: 'idle1', type: 'idle' },
+    { id: 'u2', type: 'user', text: 'edit more' },
+    { id: 'a2', type: 'assistant', snapshot: { files: ['snapshot\\original.ts'] }, content: [
+      { type: 'tool', name: 'edit', state: { status: 'completed', metadata: { files: [{ file: 'other\\file.ts' }] } } },
+    ] },
+    { id: 'idle2', type: 'idle' },
+  ] as unknown as SessionMessageInfo[])
+  assert.deepEqual(items.filter(item => item.kind === 'changes'), [
+    { id: 'idle1:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u1', files: ['src/new.ts'] } },
+    { id: 'idle2:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u2', files: ['other/file.ts', 'snapshot\\original.ts'] } },
+  ])
 })
 
 test('user file parts preserve inline base64 and URI references without changing text-only history', () => {
@@ -470,6 +659,72 @@ test('commit generation sends staged context and selected model, strips fences, 
   } finally { adapter.dispose() }
 })
 
+test('build notes generation includes committed and working context, skill and note, with a 90s timeout', async t => {
+  const calls: { url: URL; init: RequestInit }[] = [], timeouts: number[] = []
+  const timeout = AbortSignal.timeout.bind(AbortSignal)
+  t.mock.method(AbortSignal, 'timeout', (milliseconds: number) => { timeouts.push(milliseconds); return timeout(milliseconds) })
+  let output = '  ```markdown\n## Tổng quan bản build\n\nCải thiện công cụ.\n```  '
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push({ url, init })
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/experimental/generate/text') return json({ data: { text: output } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  const model = { id: 'server-model', modelID: 'catalog-model', providerID: 'amecode', name: 'Model' }
+  const summary: BuildNotesSummary = {
+    branch: 'feature/qc',
+    commits: [
+      { hash: 'abcdef123456789', shortHash: 'abcdef1', subject: 'Improve tools', body: 'Preserve metadata\nHandle retries', author: 'Dev', date: '2026-11-24', refs: [] },
+      { hash: '123456789abcdef', shortHash: '1234567', subject: 'Fix login', body: '', author: 'Dev', date: '2026-11-23', refs: [] },
+    ],
+    files: [
+      { source: 'committed', status: 'M', path: 'a.ts', additions: 2, deletions: 1 },
+      { source: 'working', status: 'U', path: 'local.ts', additions: 3, deletions: 0 },
+      { source: 'both', status: 'M', path: 'shared.ts', additions: 4, deletions: 2 },
+    ],
+    workingFileCount: 2, additions: 9, deletions: 3, diff: '+local change\n+committed change', truncated: true,
+  }
+  const snapshot = structuredClone(summary)
+  const lastCall = () => calls.filter(call => call.url.pathname === '/api/experimental/generate/text').at(-1)!
+  const lastPrompt = (): string => JSON.parse(String(lastCall().init.body)).prompt
+  try {
+    await adapter.connect('http://localhost:4096')
+    calls.length = 0; timeouts.length = 0
+    assert.deepEqual(await adapter.generateBuildNotes(summary, model), { notes: '## Tổng quan bản build\n\nCải thiện công cụ.', truncated: true })
+    assert.deepEqual(calls.map(call => call.url.pathname), ['/api/experimental/generate/text'])
+    assert.equal(lastCall().init.method, 'POST')
+    assert.deepEqual(JSON.parse(String(lastCall().init.body)).model, { id: 'server-model', providerID: 'amecode' })
+    assert.deepEqual(timeouts, [90_000])
+    assert.ok(lastCall().init.signal instanceof AbortSignal)
+    assert.equal(lastCall().init.signal?.aborted, false)
+    const defaultPrompt = lastPrompt()
+    for (const expected of [
+      'tiếng Việt', '## Tổng quan bản build', '## Tính năng mới / Cải tiến', '## Sửa lỗi', '## Khu vực QC cần kiểm tra kỹ & Lưu ý',
+      'đã commit', 'chưa commit', 'không bịa', 'Branch: feature/qc',
+      'abcdef1 Improve tools\nPreserve metadata\nHandle retries', '1234567 Fix login',
+      'committed M a.ts +2 -1', 'working U local.ts +3 -0', 'both M shared.ts +4 -2', summary.diff,
+      'Return only the Markdown build notes without conversational preamble or outer triple-backtick wrapping.',
+    ]) assert.ok(defaultPrompt.includes(expected), expected)
+    assert.equal(defaultPrompt.includes('Developer note:'), false)
+    await adapter.generateBuildNotes(summary, model, { name: 'empty', instructions: '' }, ' \n ')
+    assert.equal(lastPrompt(), defaultPrompt)
+    const skill = { name: 'qc-release', instructions: 'Use team sections and flag risky changes.' }
+    output = '```md\r\n## Team notes\r\nLocal changes need QC.\r\n```'
+    assert.deepEqual(await adapter.generateBuildNotes({ ...summary, truncated: false }, model, skill, '  Check offline mode.\nKeep staged changes.  '), { notes: '## Team notes\r\nLocal changes need QC.', truncated: false })
+    const custom = lastPrompt()
+    assert.ok(custom.startsWith(`Write QC build notes / release notes using the following skill.\n\nSkill: /${skill.name}\n\n${skill.instructions}`))
+    assert.equal(custom.includes('Viết ghi chú bản build'), false)
+    for (const expected of ['Branch: feature/qc', 'abcdef1 Improve tools', 'working U local.ts +3 -0', summary.diff, 'Developer note:\nCheck offline mode.\nKeep staged changes.', 'Return only the Markdown build notes']) assert.ok(custom.includes(expected), expected)
+    output = '  ## Plain Markdown\n\n```ts\nconst x = 1\n```  '
+    assert.deepEqual(await adapter.generateBuildNotes(summary, model, undefined, '  Default note  '), { notes: output.trim(), truncated: true })
+    assert.ok(lastPrompt().includes('Developer note:\nDefault note'))
+    assert.ok(lastPrompt().includes('## Tổng quan bản build'))
+    for (output of ['  \n ', '```\n\n```', '```markdown\n```']) await assert.rejects(adapter.generateBuildNotes(summary, model), /EMPTY_BUILD_NOTES/)
+    assert.deepEqual(summary, snapshot)
+  } finally { adapter.dispose() }
+})
+
 test('artifacts use project location, map native summaries and files, validate ids and enforce session ownership', async () => {
   const directory = process.cwd(), other = directory + '-other'
   const calls: { url: URL; init: RequestInit }[] = []
@@ -583,6 +838,43 @@ test('btwAsk validates owned trimmed questions, switches selected model and gene
     failModel = false; failGenerate = true
     await assert.rejects(adapter.btwAsk('p', 's1', 'Question', model))
   } finally { adapter.dispose() }
+})
+
+test('btwAsk retries empty answers once with a plain-text no-tool prompt and a fresh timeout', async t => {
+  for (const [first, second, expected] of [
+    ['', ' \n Recovered answer \n ', 'Recovered answer'],
+    [' \n\t ', 'Context is missing.', 'Context is missing.'],
+    ['', ' \n ', ''],
+    [' Direct answer ', 'must not be used', 'Direct answer'],
+  ]) await t.test(JSON.stringify([first, second]), async t => {
+    const directory = process.cwd(), prompts: unknown[] = [], signals: AbortSignal[] = [], timeouts: number[] = []
+    const timeout = AbortSignal.timeout.bind(AbortSignal)
+    t.mock.method(AbortSignal, 'timeout', (ms: number) => { timeouts.push(ms); return timeout(ms) })
+    const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+      if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+      if (url.pathname === '/api/session/s1') return json({ data: { location: { directory } } })
+      if (url.pathname.endsWith('/generate')) {
+        prompts.push(JSON.parse(String(init.body)))
+        assert.ok(init.signal instanceof AbortSignal)
+        signals.push(init.signal)
+        return json({ data: { text: prompts.length === 1 ? first : second, tokens: emptyTokens(), cost: 0 } })
+      }
+      throw new Error('Unexpected ' + url.pathname)
+    })
+    adapter.attach('p', directory)
+    try {
+      await adapter.connect('http://localhost:4096'); timeouts.length = 0
+      assert.deepEqual(await adapter.btwAsk('p', 's1', ' \n What is the package name? \n '), { answer: expected })
+      assert.deepEqual(prompts, [
+        { prompt: 'What is the package name?' },
+        ...(!first.trim() ? [{ prompt: 'Answer directly in plain text using only the existing conversation context. Do not call any tools; if the information is not present in the conversation, briefly say so.\n\nWhat is the package name?' }] : []),
+      ])
+      assert.deepEqual(timeouts, first.trim() ? [45000] : [45000, 45000])
+      if (!first.trim()) assert.notEqual(signals[0], signals[1])
+    } finally { adapter.dispose() }
+  })
 })
 
 test('forkSession checks ownership and maps native session activity, parent, agent and fallback title', async () => {

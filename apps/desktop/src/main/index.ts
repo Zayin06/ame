@@ -18,7 +18,7 @@ import { detectAndroidProject, buildAndroidTranslationPrompt, createTranslationL
 import { createPetHost } from '../../../../packages/amekit/src/pet-host'
 import { loadPetSprite } from '../../../../packages/amekit/src/pet'
 import type { UsagePrices } from '../../../../packages/amekit/src/usage-pricing'
-import type { AndroidTranslationInfo, AndroidTranslationPromptResult, IdeEvent, Model, SessionLockState } from '../../../../packages/protocol/src/index'
+import type { AndroidTranslationInfo, AndroidTranslationPromptResult, BuildNotesPreview, BuildNotesResult, IdeEvent, Model, SessionLockState } from '../../../../packages/protocol/src/index'
 
 if (!app.isPackaged && process.env.AME_IDE_TEST_DATA) app.setPath('userData', path.resolve(process.env.AME_IDE_TEST_DATA))
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -68,6 +68,15 @@ const id = z.string().min(1).max(512)
 const relative = z.string().max(4096)
 const workspacePath = relative.min(1).refine(value => !value.includes('\0'))
 const branchName = z.string().min(1).max(512).refine(value => !value.includes('\0'))
+const commitOptionsSchema = z.object({ amend: z.boolean().optional(), noVerify: z.boolean().optional() }).strict()
+const commitHashSchema = z.string().regex(/^[a-f0-9]{7,40}$/i)
+const buildNotesRequestSchema = z.object({
+  mode: z.enum(['range', 'commits']),
+  baseCommit: commitHashSchema.optional(),
+  commitHashes: z.array(commitHashSchema).max(50).optional(),
+  includeWorking: z.boolean(),
+  note: z.string().max(2000).refine(value => !value.includes('\0')).optional(),
+}).strict()
 const sessionTitle = z.string().min(1).max(500).refine(value => !!value.trim() && !value.includes('\0'))
 const modelSchema = z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).strict()
 const promptFileSchema = z.object({
@@ -152,11 +161,22 @@ const schema = {
   searchProject: z.tuple([id, searchQuery]), replaceInProject: z.tuple([id, replaceOptions]),
   stageAll: z.tuple([id]), unstageAll: z.tuple([id]), discardFile: z.tuple([id, workspacePath]),
   gitBranches: z.tuple([id]), checkoutBranch: z.tuple([id, branchName]), createBranch: z.tuple([id, branchName, z.boolean().optional()]),
-  git: z.tuple([id]), diff: z.tuple([id, relative]), stage: z.tuple([id, relative, z.boolean()]), commit: z.tuple([id, z.string().min(1).max(10000)]),
+  git: z.tuple([id]), diff: z.tuple([id, relative]), stage: z.tuple([id, relative, z.boolean()]), commit: z.tuple([id, z.string().min(1).max(10000).refine(value => !!value.trim() && !value.includes('\0')), commitOptionsSchema.optional()]),
+  gitDeleteBranch: z.tuple([id, branchName, z.boolean().optional()]),
+  gitFetch: z.tuple([id]), gitPull: z.tuple([id]),
+  gitPush: z.tuple([id, z.object({ setUpstream: z.boolean().optional() }).strict().optional()]),
+  gitLog: z.tuple([id, z.number().int().min(1).max(200).optional()]),
+  gitCommitDetail: z.tuple([id, z.string().regex(/^[a-f0-9]{7,40}$/i)]),
+  gitUndoLastCommit: z.tuple([id]), gitStashList: z.tuple([id]),
+  gitStashPush: z.tuple([id, z.string().max(500).refine(value => !value.includes('\0')).optional(), z.boolean().optional()]),
+  gitStashApply: z.tuple([id, z.number().int().min(0).max(10000), z.boolean().optional()]),
+  gitStashDrop: z.tuple([id, z.number().int().min(0).max(10000)]),
   connection: z.tuple([]), startBackend: z.tuple([]), discover: z.tuple([]), connect: z.tuple([z.string().max(2048), z.string().max(512).optional(), z.string().max(8192).optional()]),
   sessions: z.tuple([id]), createSession: z.tuple([id]), messages: z.tuple([id, id]), sessionDiff: z.tuple([id, id, id.optional()]), models: z.tuple([id]), agents: z.tuple([id]),
   renameSession: z.tuple([id, id, sessionTitle]), archiveSession: z.tuple([id, id, z.boolean()]), deleteSession: z.tuple([id, id]),
   commands: z.tuple([id]), skills: z.tuple([id]), generateCommitMessage: z.tuple([id, modelSchema.optional()]),
+  buildNotesPreview: z.tuple([id, buildNotesRequestSchema]),
+  generateBuildNotes: z.tuple([id, buildNotesRequestSchema]),
   androidTranslationInfo: z.tuple([boundedID]),
   androidTranslationPrompt: z.tuple([boundedID, boundedID.optional(), text.min(1).refine(value => !!value.trim() && !value.includes('\0')), z.enum(['update', 'full', 'scan', 'custom']).optional()]),
   androidTranslationLock: z.tuple([boundedID, boundedID]),
@@ -354,7 +374,22 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'checkoutBranch': return workspace.checkoutBranch(a, b)
     case 'createBranch': return workspace.createBranch(a, b, c)
     case 'stage': return workspace.stage(a, b, c)
-    case 'commit': await confirmation(`Commit các thay đổi đã stage?\n${b}`); return workspace.commit(a, b)
+    case 'commit': return workspace.commit(a, b, c)
+    case 'gitDeleteBranch':
+      await confirmation(`Xóa nhánh ${b}?`)
+      return workspace.gitDeleteBranch(a, b, c)
+    case 'gitFetch': return workspace.gitFetch(a)
+    case 'gitPull': return workspace.gitPull(a)
+    case 'gitPush': return workspace.gitPush(a, b)
+    case 'gitLog': return workspace.gitLog(a, b)
+    case 'gitCommitDetail': return workspace.gitCommitDetail(a, b)
+    case 'gitUndoLastCommit': return workspace.gitUndoLastCommit(a)
+    case 'gitStashList': return workspace.gitStashList(a)
+    case 'gitStashPush': return workspace.gitStashPush(a, b, c)
+    case 'gitStashApply': return workspace.gitStashApply(a, b, c)
+    case 'gitStashDrop':
+      await confirmation(`Xóa stash@{${b}}? Hành động này không thể hoàn tác.`)
+      return workspace.gitStashDrop(a, b)
     case 'connection': return adapter.connection()
     case 'startBackend': return startBackend()
     case 'connect':
@@ -393,12 +428,56 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       const skill = feature?.skill ? { name: feature.skill.name, instructions: feature.skill.instructions } : null
       return skill ? adapter.generateCommitMessage(summary, model, skill) : adapter.generateCommitMessage(summary, model)
     }
+    case 'buildNotesPreview': {
+      const [summary, feature, status] = await Promise.all([
+        workspace.buildNotesSummary(a, b, 56_000),
+        account.readBuildNotesFeature?.(a).catch(() => null),
+        (account.readStatus ? account.readStatus() : account.call('status', {})).catch(() => null),
+      ])
+      const catalog = (status as { models?: { default_model?: string; active_models?: { id: string }[]; models?: { id: string }[] } } | null)?.models
+      const active = catalog?.active_models ?? catalog?.models ?? []
+      const configured = feature?.model && active.find(model => model.id === feature.model)
+      const effective = configured || active.find(model => model.id === catalog?.default_model)
+      const skillName = feature?.skill?.name ?? feature?.rawSkillName
+      return {
+        branch: summary.branch,
+        commitCount: summary.commits.length,
+        commits: summary.commits,
+        files: summary.files,
+        workingFileCount: summary.workingFileCount,
+        additions: summary.additions,
+        deletions: summary.deletions,
+        truncated: summary.truncated,
+        ...(skillName ? { skill: skillName } : {}),
+        ...(feature?.model ? { configuredModelID: feature.model } : {}),
+        ...(effective?.id ? { effectiveModelID: effective.id } : {}),
+        fallbackToDefault: !configured,
+      } satisfies BuildNotesPreview
+    }
+    case 'generateBuildNotes': {
+      const selected = await resolveModel(a)
+      const summary = await workspace.buildNotesSummary(a, b, 56_000)
+      if (summary.commits.length === 0 && summary.files.length === 0) throw new Error('NO_BUILD_CHANGES')
+      const feature = await account.readBuildNotesFeature?.(a).catch(() => null)
+      const model = await resolveFeatureModel(a, selected, feature?.model)
+      const skill = feature?.skill ? { name: feature.skill.name, instructions: feature.skill.instructions } : undefined
+      const generated = await adapter.generateBuildNotes(summary, model, skill, b.note?.trim() || undefined)
+      return {
+        notes: generated.notes,
+        truncated: generated.truncated,
+        commitCount: summary.commits.length,
+        fileCount: summary.files.length,
+        workingFileCount: summary.workingFileCount,
+        modelID: model.modelID ?? model.id,
+        ...(skill ? { skill: skill.name } : {}),
+      } satisfies BuildNotesResult
+    }
     case 'androidTranslationInfo': {
       const { directory } = workspace.get(a)
       const [detected, feature, status] = await Promise.all([
         detectAndroidProject(directory),
         account.readAndroidTranslationFeature?.(a),
-        account.call('status', {}).catch(() => null)
+        (account.readStatus ? account.readStatus() : account.call('status', {})).catch(() => null)
       ])
       const catalog = (status as { models?: { default_model?: string; active_models?: { id: string; name?: string }[]; models?: { id: string; name?: string }[] } } | null)?.models
       const active = catalog?.active_models ?? catalog?.models ?? []
@@ -446,7 +525,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'agentMap': return adapter.agentMap(a, b)
     case 'sessionDiff': return adapter.sessionDiff(a, b, c)
     case 'sessionUsage': {
-      const pricing = await account.call('usage-prices', {}).catch(() => ({ origin: null, prices: {} })) as { origin: string | null; prices: UsagePrices }
+      const pricing = await (account.readUsagePrices ? account.readUsagePrices() : account.call('usage-prices', {})).catch(() => ({ origin: null, prices: {} })) as { origin: string | null; prices: UsagePrices }
       return adapter.sessionUsage(a, b, pricing.prices, pricing.origin)
     }
     case 'models': return adapter.models(a)
@@ -484,7 +563,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
 }
 let authority: Promise<unknown> = Promise.resolve()
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'androidTranslationPrompt', 'androidTranslationLock', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
+  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
   // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
@@ -536,7 +615,20 @@ void app.whenReady().then(async () => {
     if (managed && !shuttingDown) { void pairing?.stop(); adapter.disconnected('OpenCode tích hợp đã dừng. Mở Cài đặt để thử lại.') }
   } })
   pairing = new RemotePairing(new PairingHost(() => managed ? adapter.endpoint() : undefined), automaticTunnel(path.join(app.getPath('userData'), 'remote-access')))
-  account = createAmeKit({ userData: app.getPath('userData'), endpoint: () => adapter.endpoint(), project: async projectID => workspace.get(projectID).directory, pickImport, cli: runtime.executable() })
+  account = createAmeKit({
+    userData: app.getPath('userData'),
+    globalConfigDir: path.join(app.getPath('userData'), 'backend', 'config', 'opencode'),
+    autoSync: true,
+    reloadRuntime: async () => { if (managed && !shuttingDown) await adapter.reload().catch(() => {}) },
+    onBundleChanged: event => {
+      const timer = setTimeout(() => { if (!shuttingDown) notify({ type: 'amekit-bundle', ...event, projectID: '' }) }, 500)
+      timer.unref?.()
+    },
+    endpoint: () => adapter.endpoint(),
+    project: async projectID => workspace.get(projectID).directory,
+    pickImport,
+    cli: runtime.executable()
+  })
   await petHost.init()
   ipcMain.handle('ame:call', async (event, method: unknown, args: unknown) => {
     if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame) throw new Error('UNTRUSTED_CALLER')

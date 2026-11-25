@@ -19,9 +19,21 @@ export type Project = { id: string; name: string; directory: string }
 export type FileEntry = { path: string; name: string; directory: boolean }
 export type FileDocument = { path: string; content: string; revision: string }
 export type Change = { path: string; index: string; working: string }
-export type GitState = { branch: string; changes: Change[] }
-export type GitBranch = { name: string; current: boolean; commit: string }
-export type GitBranches = { current: string; branches: GitBranch[] }
+export type GitState = { branch: string; changes: Change[]; tracking?: string | null; ahead?: number; behind?: number; hasRemote?: boolean; merging?: boolean }
+export type GitBranch = { name: string; current: boolean; commit: string; upstream?: string; remote?: boolean }
+export type GitBranches = { current: string; branches: GitBranch[]; remoteBranches?: GitBranch[] }
+export type GitCommitOptions = { amend?: boolean; noVerify?: boolean }
+export type GitPushOptions = { setUpstream?: boolean }
+export type GitSyncResult = { summary: string; filesChanged?: number; conflicts?: string[]; branch?: string; remote?: string }
+export type GitCommitSummary = { hash: string; shortHash: string; subject: string; body: string; author: string; date: string; refs: string[] }
+export type GitCommitFile = { path: string; status: 'A' | 'M' | 'D' | 'R' | 'C' | 'T'; additions: number; deletions: number }
+export type GitCommitDetail = GitCommitSummary & { files: GitCommitFile[]; patch: string }
+export type GitStashEntry = { index: number; ref: string; branch: string; message: string; date: string }
+export type BuildNotesMode = 'range' | 'commits'
+export type BuildNotesRequest = { mode: BuildNotesMode; baseCommit?: string; commitHashes?: string[]; includeWorking: boolean; note?: string }
+export type BuildNotesFileStat = { path: string; status: 'A' | 'M' | 'D' | 'R' | 'C' | 'T' | 'U'; additions: number; deletions: number; source: 'committed' | 'working' | 'both' }
+export type BuildNotesPreview = { branch: string; commitCount: number; commits: GitCommitSummary[]; files: BuildNotesFileStat[]; workingFileCount: number; additions: number; deletions: number; truncated: boolean; skill?: string; configuredModelID?: string; effectiveModelID?: string; fallbackToDefault?: boolean }
+export type BuildNotesResult = { notes: string; truncated: boolean; commitCount: number; fileCount: number; workingFileCount: number; modelID: string; skill?: string }
 export type SearchQuery = {
   query: string
   caseSensitive?: boolean
@@ -92,7 +104,9 @@ export type TerminalProfile = { id: string; name: string; executable: string; ar
 export type TerminalInfo = { id: string; projectID: string; title: string; cols: number; rows: number; exitCode?: number }
 export type TerminalSnapshot = TerminalInfo & { output: string; sequence: number }
 export type TerminalEvent = { type: 'terminal'; projectID: string; terminalID: string; sequence: number; data?: string; exitCode?: number }
-export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState } | { type: 'debug'; projectID: string; event: DebugEvent }
+export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'catalog'; projectID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState } | { type: 'debug'; projectID: string; event: DebugEvent }
+  // Empty scope keeps legacy file-event consumers from treating a global update as a project change.
+  | { type: 'amekit-bundle'; version: string; releaseId: string; auto: boolean; action: 'synced' | 'uninstalled'; projectID: '' }
 export type AgentMapTokens = {
   input: number
   output: number
@@ -207,7 +221,20 @@ export interface DesktopApi {
   git(projectID: string): Promise<GitState>
   diff(projectID: string, relative: string): Promise<{ original: string; modified: string }>
   stage(projectID: string, relative: string, staged: boolean): Promise<void>
-  commit(projectID: string, message: string): Promise<void>
+  commit(projectID: string, message: string, options?: GitCommitOptions): Promise<void>
+  gitDeleteBranch(projectID: string, name: string, force?: boolean): Promise<void>
+  gitFetch(projectID: string): Promise<GitSyncResult>
+  gitPull(projectID: string): Promise<GitSyncResult>
+  gitPush(projectID: string, options?: GitPushOptions): Promise<GitSyncResult>
+  buildNotesPreview(projectID: string, request: BuildNotesRequest): Promise<BuildNotesPreview>
+  generateBuildNotes(projectID: string, request: BuildNotesRequest): Promise<BuildNotesResult>
+  gitLog(projectID: string, limit?: number): Promise<GitCommitSummary[]>
+  gitCommitDetail(projectID: string, hash: string): Promise<GitCommitDetail>
+  gitUndoLastCommit(projectID: string): Promise<{ message: string }>
+  gitStashList(projectID: string): Promise<GitStashEntry[]>
+  gitStashPush(projectID: string, message?: string, includeUntracked?: boolean): Promise<void>
+  gitStashApply(projectID: string, index: number, pop?: boolean): Promise<void>
+  gitStashDrop(projectID: string, index: number): Promise<void>
   connection(): Promise<Connection>
   startBackend(): Promise<Connection>
   pairingStatus(): Promise<PairingSettings>

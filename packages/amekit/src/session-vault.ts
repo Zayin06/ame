@@ -1,6 +1,7 @@
 import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
+import { setTimeout as delay } from "node:timers/promises"
 import { serverURL } from "./api"
 import { safeDirectory } from "./installer"
 
@@ -8,6 +9,16 @@ export type Credential = { origin: string; token: string }
 export type Encryption = Pick<typeof import("electron")["safeStorage"], "isEncryptionAvailable" | "encryptString" | "decryptString"> & {
   getSelectedStorageBackend?: () => string
 }
+async function renameWithRetry(from: string, to: string) {
+  for (let attempt = 0; ; attempt++) {
+    try { await rename(from, to); return }
+    catch (error) {
+      if (attempt >= 4 || !["EPERM", "EBUSY", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
+      await delay(30 * (attempt + 1))
+    }
+  }
+}
+
 export async function openSessionVault(userData: string, encryption: Encryption) {
   if (!path.isAbsolute(userData)) throw new Error("ABSOLUTE_USER_DATA_REQUIRED")
   await mkdir(userData, { recursive: true })
@@ -44,7 +55,7 @@ export async function openSessionVault(userData: string, encryption: Encryption)
       const pending = path.join(userData, `amekit-session-${randomUUID()}.pending`)
       try {
         await writeFile(pending, encrypted, { mode: 0o600, flag: "wx" })
-        await rename(pending, file)
+        await renameWithRetry(pending, file)
       } finally { await rm(pending, { force: true }) }
     },
   }

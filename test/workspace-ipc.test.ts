@@ -19,7 +19,8 @@ import { projectChatTimeline } from '../apps/desktop/src/renderer/chat-timeline'
 import { familySummaryFromSessions } from '../apps/desktop/src/renderer/agent-map-model'
 import { z } from 'zod'
 import { validateWorkspacePath } from '../packages/ide-core/src/workspace-fs'
-import type { DesktopApi } from '../packages/protocol/src/index'
+import type { BuildNotesRequest, DesktopApi } from '../packages/protocol/src/index'
+import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
 import type { AmeKit } from '../packages/amekit/src/index'
 import { buildAndroidTranslationPrompt, createTranslationLockStore } from '../packages/amekit/src/android-translation'
 
@@ -41,6 +42,18 @@ const examples: Invocation[] = [
   { method: 'gitBranches', args: ['p'] },
   { method: 'checkoutBranch', args: ['p', 'feature/test'] },
   { method: 'createBranch', args: ['p', 'feature/test', false] },
+  { method: 'commit', args: ['p', 'commit message', { amend: true, noVerify: true }] },
+  { method: 'gitDeleteBranch', args: ['p', 'feature/test', false] },
+  { method: 'gitFetch', args: ['p'] },
+  { method: 'gitPull', args: ['p'] },
+  { method: 'gitPush', args: ['p', { setUpstream: true }] },
+  { method: 'gitLog', args: ['p', 40] },
+  { method: 'gitCommitDetail', args: ['p', 'abcdef0123456789'] },
+  { method: 'gitUndoLastCommit', args: ['p'] },
+  { method: 'gitStashList', args: ['p'] },
+  { method: 'gitStashPush', args: ['p', 'work in progress', true] },
+  { method: 'gitStashApply', args: ['p', 0, true] },
+  { method: 'gitStashDrop', args: ['p', 0] },
   { method: 'renameSession', args: ['p', 's', 'New title'] },
   { method: 'archiveSession', args: ['p', 's', true] },
   { method: 'deleteSession', args: ['p', 's'] },
@@ -48,6 +61,20 @@ const examples: Invocation[] = [
   { method: 'skills', args: ['p'] },
   { method: 'generateCommitMessage', args: ['p', { id: 'model', name: 'Model', providerID: 'amecode' }] }
 ]
+
+const buildNotesRequest: BuildNotesRequest = { mode: 'range', baseCommit: 'abcdef0', includeWorking: true }
+const buildNotesExamples: Invocation[] = [
+  { method: 'buildNotesPreview', args: ['p', buildNotesRequest] },
+  { method: 'generateBuildNotes', args: ['p', { mode: 'commits', commitHashes: ['ABCDEF0'], includeWorking: false, note: 'Release highlights' }] },
+  { method: 'buildNotesPreview', args: ['p', { mode: 'range', includeWorking: false }] },
+  { method: 'generateBuildNotes', args: ['p', { mode: 'range', includeWorking: true }] },
+]
+const buildNotesSummary: BuildNotesSummary = {
+  branch: 'main',
+  commits: [{ hash: 'abcdef0'.padEnd(40, '1'), shortHash: 'abcdef0', subject: 'Add feature', body: '', author: 'Dev', date: '2026-11-24', refs: [] }],
+  files: [{ path: 'new.txt', status: 'A', additions: 3, deletions: 1, source: 'both' }],
+  workingFileCount: 1, additions: 3, deletions: 1, diff: '+private diff', truncated: true,
+}
 
 const translationExamples: Invocation[] = [
   { method: 'androidTranslationInfo', args: ['p'] },
@@ -122,12 +149,19 @@ async function harness(directory = 'workspace') {
   let pricing = { origin: 'https://usage.example', prices: { model: { revision: 1 } } }
   let policyError = ''
   let policyGate: Promise<void> | undefined
+  let notesSummary = buildNotesSummary
+  workspace.buildNotesSummary = async (...args: unknown[]) => { calls.push({ method: 'buildNotesSummary', args }); return notesSummary }
   workspace.stagedDiffSummary = async (...args: unknown[]) => { calls.push({ method: 'stagedDiffSummary', args }); return summary }
   const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt', 'cancel'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args })
     if (operationGate) await operationGate
     return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
   }]))
+  adapter.generateBuildNotes = async (...args: unknown[]) => {
+    calls.push({ method: 'generateBuildNotes', args })
+    if (operationGate) await operationGate
+    return { notes: '# Build notes', truncated: notesSummary.truncated }
+  }
   const petState = { preferences: { enabled: false, scale: 0.25, position: null }, activity: 'idle', error: '', speech: { enabled: true, sound: true }, generating: false, dialogueModel: '', generatedAt: 0 }
   const petHost = {
     state: () => petState,
@@ -141,7 +175,7 @@ async function harness(directory = 'workspace') {
     }]))
   }
   adapter.models = async (...args: unknown[]) => { calls.push({ method: 'models', args }); return models }
-  const account: Pick<AmeKit, 'readCommitEnhanceSkill' | 'readCommitEnhanceFeature' | 'readAndroidTranslationFeature' | 'authorizeFeatureModel'> & { call: (...args: unknown[]) => Promise<unknown> } = { call: async (...args: unknown[]) => {
+  const account: Pick<AmeKit, 'readCommitEnhanceSkill' | 'readCommitEnhanceFeature' | 'readBuildNotesFeature' | 'readStatus' | 'readAndroidTranslationFeature' | 'authorizeFeatureModel'> & { call: (...args: unknown[]) => Promise<unknown> } = { call: async (...args: unknown[]) => {
     calls.push({ method: 'account', args })
     if (policyGate && args[0] !== 'status') await policyGate
     if (policyError && args[0] !== 'status') throw new Error(policyError)
@@ -216,6 +250,9 @@ async function harness(directory = 'workspace') {
     setPicked: (value: typeof picked) => { picked = value },
     setCommitEnhanceReader: (reader: NonNullable<typeof account.readCommitEnhanceSkill>) => { account.readCommitEnhanceSkill = reader },
     setCommitEnhanceFeatureReader: (reader: NonNullable<typeof account.readCommitEnhanceFeature>) => { account.readCommitEnhanceFeature = reader },
+    setBuildNotesFeatureReader: (reader: NonNullable<typeof account.readBuildNotesFeature>) => { account.readBuildNotesFeature = reader },
+    setBuildNotesSummary: (value: BuildNotesSummary) => { notesSummary = value },
+    setReadStatus: (reader: NonNullable<typeof account.readStatus>) => { account.readStatus = reader },
     setAndroidTranslationReader: (reader: NonNullable<typeof account.readAndroidTranslationFeature>) => { account.readAndroidTranslationFeature = reader },
     setFeatureAuthorizer: (authorize: NonNullable<typeof account.authorizeFeatureModel>) => { account.authorizeFeatureModel = authorize },
     setDetected: (value: typeof detected) => { detected = value },
@@ -950,7 +987,8 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
   const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'main', 'index.ts'), 'utf8')
   for (const platform of ['darwin', 'win32']) {
     const events = new Map<string, (...args: any[]) => any>(), sequence: string[] = [], windows: any[] = []
-    let boot!: Promise<void>, options: any, spritePath = '', release!: () => void
+    let boot!: Promise<void>, options: any, accountOptions: any, spritePath = '', release!: () => void
+    const bundleTimers: (() => void)[] = [], bundleEvents: unknown[] = []
     const pending = new Promise<void>(resolve => { release = resolve })
     let onFiles!: (projectID: string) => void, releaseDebugger!: () => void
     const debugPending = new Promise<void>(resolve => { releaseDebugger = resolve })
@@ -986,10 +1024,11 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
       OpenCodeAdapter: class { dispose() { sequence.push('adapter:dispose') } },
       PrivateRuntime: class { constructor() { sequence.push('runtime:create') } executable() { return 'opencode' } async stop() { sequence.push('runtime:stop') } },
       PairingHost: class {}, RemotePairing: class { async stop() { sequence.push('pairing:stop') } }, automaticTunnel: () => ({}),
-      createAmeKit: () => ({ generatePetDialogue: (model: string, signal: AbortSignal) => ({ model, signal }), dispose: async () => { sequence.push('account:dispose') } }),
+      createAmeKit: (value: any) => { accountOptions = value; return { generatePetDialogue: (model: string, signal: AbortSignal) => ({ model, signal }), dispose: async () => { sequence.push('account:dispose') } } },
+      setTimeout: (callback: () => void, ms: number) => { assert.equal(ms, 500); bundleTimers.push(callback); return { unref() {} } },
       loadPetSprite: async (value: string) => { spritePath = value; throw new Error('missing sprite') },
       createPetHost: (value: any) => { options = value; sequence.push('pet:create'); return pet },
-      notify: (event: any) => { sequence.push(`notify:${event.type}:${event.projectID}`) }, pickImport: () => {}, ipcMain: { handle: () => {} }, schema: {},
+      notify: (event: any) => { sequence.push(`notify:${event.type}:${event.projectID}`); if (event.type === 'amekit-bundle') bundleEvents.push(plain(event)) }, pickImport: () => {}, ipcMain: { handle: () => {} }, schema: {},
       dispatch: async () => { sequence.push('backend:start') },
       readFile: async () => { throw new Error('no saved pairing') }, screenActive: () => {},
       dialog: { showErrorBox: () => { assert.fail('startup failed') } }
@@ -997,6 +1036,19 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     runInNewContext(ts.transpileModule(source.slice(source.indexOf('async function openWindow()')), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
     await boot
     await new Promise(resolve => setImmediate(resolve))
+    assert.equal(accountOptions.globalConfigDir, path.join('userData', 'backend', 'config', 'opencode'))
+    assert.equal(accountOptions.autoSync, true)
+    accountOptions.onBundleChanged({ version: '1.2.3', releaseId: 'fixture', auto: true, action: 'synced' })
+    assert.equal(bundleTimers.length, 1)
+    assert.equal(sequence.some(item => item.startsWith('notify:amekit-bundle')), false)
+    bundleTimers.shift()!()
+    assert.equal(sequence.at(-1), 'notify:amekit-bundle:')
+    assert.deepEqual(bundleEvents, [{ type: 'amekit-bundle', version: '1.2.3', releaseId: 'fixture', auto: true, action: 'synced', projectID: '' }])
+    accountOptions.onBundleChanged({ version: '', releaseId: '', auto: false, action: 'uninstalled' })
+    context.shuttingDown = true
+    bundleTimers.shift()!()
+    assert.equal(bundleEvents.length, 1)
+    context.shuttingDown = false
     assert.equal(options.defaultEnabled, false)
     assert.equal(options.sprite, '')
     assert.equal(options.electron.screen, context.screen)
@@ -1072,6 +1124,19 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
     { method: 'checkoutBranch', args: ['p', 'x'.repeat(513)] },
     { method: 'createBranch', args: ['p', '', true] },
     { method: 'createBranch', args: ['p', 'feature', 'true'] },
+    ...['', ' ', 'bad\0message', 'x'.repeat(10001)].map(message => ({ method: 'commit', args: ['p', message] })),
+    ...[{ amend: 'true' }, { noVerify: 1 }, { unknown: true }].map(options => ({ method: 'commit', args: ['p', 'message', options] })),
+    { method: 'gitDeleteBranch', args: ['p', 'main', 'true'] },
+    ...[{ setUpstream: 'true' }, { force: true }].map(options => ({ method: 'gitPush', args: ['p', options] })),
+    ...[0, -1, 1.5, 201, Infinity, '40'].map(limit => ({ method: 'gitLog', args: ['p', limit] })),
+    ...['HEAD', '-abcdef0', 'abc', 'g'.repeat(40), 'a'.repeat(41)].map(hash => ({ method: 'gitCommitDetail', args: ['p', hash] })),
+    ...[-1, 1.5, 10001, Infinity, '0'].flatMap(index => [
+      { method: 'gitStashApply', args: ['p', index] }, { method: 'gitStashDrop', args: ['p', index] }
+    ]),
+    { method: 'gitStashPush', args: ['p', 'bad\0message'] },
+    { method: 'gitStashPush', args: ['p', 'x'.repeat(501)] },
+    { method: 'gitStashPush', args: ['p', 'message', 'true'] },
+    { method: 'gitStashApply', args: ['p', 0, 'true'] },
     ...['', '   ', 'bad\0title', 'a'.repeat(501), 42].map(title => ({ method: 'renameSession', args: ['p', 's', title] })),
     { method: 'archiveSession', args: ['p', 's', 'true'] },
     { method: 'deleteSession', args: ['p', ''] },
@@ -1102,7 +1167,7 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
 
 test('new IPC dispatch preserves arguments and optional defaults without stage or dry-run dialogs', async () => {
   const { dispatch, calls, messages } = await harness()
-  for (const { method, args } of examples.filter(({ method }) => !['deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage', 'sessionUsage'].includes(method))) {
+  for (const { method, args } of examples.filter(({ method }) => !['deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage', 'sessionUsage', 'gitDeleteBranch', 'gitStashDrop'].includes(method))) {
     calls.length = 0
     const result = await dispatch(method, args)
     assert.deepEqual(plain(calls), [{ method, args }])
@@ -1110,7 +1175,9 @@ test('new IPC dispatch preserves arguments and optional defaults without stage o
   }
   for (const [method, args] of [
     ['createFile', ['p', 'new.txt']], ['createBranch', ['p', 'feature']],
-    ['stage', ['p', 'new.txt', true]], ['stage', ['p', 'new.txt', false]]
+    ['stage', ['p', 'new.txt', true]], ['stage', ['p', 'new.txt', false]],
+    ['commit', ['p', 'message']], ['gitPush', ['p']], ['gitLog', ['p']],
+    ['gitStashPush', ['p']], ['gitStashApply', ['p', 0]]
   ] as [string, unknown[]][]) {
     calls.length = 0
     await dispatch(method, args)
@@ -1158,6 +1225,186 @@ test('delete and discard require approval before mutation and propagate cancella
   }
 })
 
+test('build notes IPC validates strict bounded requests before any service access', async () => {
+  const h = await harness()
+  const invalid = [
+    null, {}, { ...buildNotesRequest, mode: 'all' }, { mode: 'range' },
+    { ...buildNotesRequest, includeWorking: 'true' }, { ...buildNotesRequest, extra: true },
+    ...['', 'abcdef', 'a'.repeat(41), 'ggggggg', 'HEAD', 'abcdef0\0', '--all'].flatMap(hash => [
+      { ...buildNotesRequest, baseCommit: hash }, { ...buildNotesRequest, commitHashes: [hash] },
+    ]),
+    { ...buildNotesRequest, commitHashes: Array(51).fill('abcdef0') },
+    { ...buildNotesRequest, commitHashes: 'abcdef0' },
+    { ...buildNotesRequest, note: 'x'.repeat(2001) }, { ...buildNotesRequest, note: 'bad\0note' },
+    { ...buildNotesRequest, note: 42 },
+  ]
+  for (const method of ['buildNotesPreview', 'generateBuildNotes']) {
+    for (const request of invalid) await assert.rejects(h.dispatch(method, ['p', request]), method)
+    for (const args of [[], ['p'], ['', buildNotesRequest], ['p', buildNotesRequest, 'extra']]) {
+      await assert.rejects(h.dispatch(method, args), method)
+    }
+  }
+  assert.equal(h.calls.length, 0)
+  for (const method of ['buildNotesPreview', 'generateBuildNotes']) {
+    for (const request of [
+      { mode: 'range', includeWorking: false },
+      { mode: 'commits', commitHashes: [], includeWorking: true },
+      { ...buildNotesRequest, baseCommit: 'A'.repeat(40), commitHashes: Array(50).fill('ABCDEF0'), note: 'x'.repeat(2000) },
+    ]) {
+      await h.dispatch(method, ['p', request])
+      assert.deepEqual(plain([...h.calls].reverse().find(call => call.method === 'buildNotesSummary')!.args), ['p', request, 56_000])
+    }
+  }
+  assert.deepEqual(h.messages, [])
+})
+
+test('build notes preview omits diff bytes and reports skill and active or fallback model metadata', async () => {
+  const h = await harness()
+  h.setBuildNotesFeatureReader(async projectID => {
+    assert.equal(projectID, 'p')
+    return { skill: { name: 'release-notes', instructions: 'Private instructions' }, rawSkillName: 'raw-name', model: 'pinned' }
+  })
+  h.setStatus({ models: { default_model: 'server-model', models: [{ id: 'server-model' }], active_models: [{ id: 'pinned' }, { id: 'server-model' }] } })
+  const { diff: _diff, ...metadata } = buildNotesSummary
+  assert.deepEqual(plain(await h.dispatch('buildNotesPreview', ['p', buildNotesRequest])), {
+    ...metadata, commitCount: 1, skill: 'release-notes', configuredModelID: 'pinned', effectiveModelID: 'pinned', fallbackToDefault: false,
+  })
+  h.setBuildNotesFeatureReader(async () => ({ skill: null, rawSkillName: 'raw-name', model: 'pinned' }))
+  h.setStatus({ models: { default_model: 'server-model', models: [{ id: 'pinned' }], active_models: [{ id: 'server-model' }] } })
+  assert.deepEqual(plain(await h.dispatch('buildNotesPreview', ['p', buildNotesRequest])), {
+    ...metadata, commitCount: 1, skill: 'raw-name', configuredModelID: 'pinned', effectiveModelID: 'server-model', fallbackToDefault: true,
+  })
+  h.setBuildNotesFeatureReader(async () => ({ skill: null }))
+  h.setStatus({ models: { default_model: 'server-model', models: [{ id: 'server-model' }] } })
+  assert.deepEqual(plain(await h.dispatch('buildNotesPreview', ['p', buildNotesRequest])), {
+    ...metadata, commitCount: 1, effectiveModelID: 'server-model', fallbackToDefault: true,
+  })
+  h.setBuildNotesFeatureReader(async () => { throw new Error('OWNED_FILE_CHANGED') })
+  h.setReadStatus(async () => { throw new Error('SIGNED_OUT') })
+  assert.deepEqual(plain(await h.dispatch('buildNotesPreview', ['p', buildNotesRequest])), {
+    ...metadata, commitCount: 1, fallbackToDefault: true,
+  })
+  assert.equal(h.calls.some(call => ['models', 'generateBuildNotes', 'authorizeFeatureModel', 'confirm'].includes(call.method)), false)
+  assert.deepEqual(h.messages, [])
+})
+
+test('build notes preview bypasses pending authority operations using read-only cached status', { timeout: 5000 }, async () => {
+  const h = await harness()
+  let release!: () => void
+  h.gatePolicy(new Promise<void>(resolve => { release = resolve }))
+  const pending = h.dispatch('account', ['logout', {}])
+  await new Promise(resolve => setImmediate(resolve))
+  h.setReadStatus(async () => {
+    h.calls.push({ method: 'readStatus', args: [] })
+    return { models: { default_model: 'server-model', active_models: [{ id: 'server-model' }] } }
+  })
+  h.setBuildNotesFeatureReader(async () => ({ skill: null }))
+  try {
+    const preview = await h.dispatch('buildNotesPreview', ['p', buildNotesRequest]) as any
+    assert.equal(preview.effectiveModelID, 'server-model')
+    assert.equal('diff' in preview, false)
+    assert.deepEqual(h.calls.map(call => call.method), ['account', 'buildNotesSummary', 'readStatus'])
+  } finally { release(); await pending }
+})
+
+test('build notes generation authorizes the pinned bundle model and forwards skill and trimmed note without confirmation', async () => {
+  const h = await harness()
+  const defaultModel = { ...selectedModel, modelID: 'server-model' }
+  const pinned = { id: 'pinned-ui', modelID: 'pinned', name: 'Pinned', providerID: 'amecode' }
+  const skill = { name: 'release-notes', instructions: 'Use team headings' }
+  h.setStatus({ account: { role: 'user' }, models: { default_model: 'server-model', models: [{ id: 'server-model' }] } })
+  h.setBuildNotesFeatureReader(async projectID => {
+    h.calls.push({ method: 'readBuildNotesFeature', args: [projectID] })
+    return { model: 'pinned', skill }
+  })
+  h.setFeatureAuthorizer(async modelID => {
+    h.calls.push({ method: 'authorizeFeatureModel', args: [modelID] })
+    h.setModels([defaultModel, { ...pinned, providerID: 'external' }, pinned])
+    return modelID
+  })
+  h.cancel()
+  assert.deepEqual(plain(await h.dispatch('generateBuildNotes', ['p', { ...buildNotesRequest, note: '  Highlights  ' }])), {
+    notes: '# Build notes', truncated: true, commitCount: 1, fileCount: 1, workingFileCount: 1, modelID: 'pinned', skill: 'release-notes',
+  })
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'buildNotesSummary', 'readBuildNotesFeature', 'authorizeFeatureModel', 'models', 'generateBuildNotes'])
+  assert.deepEqual(plain(h.calls.at(-1)!.args), [buildNotesSummary, pinned, skill, 'Highlights'])
+  assert.deepEqual(h.messages, [])
+})
+
+test('build notes generation falls back gracefully and uses default prompt mode without a skill', async () => {
+  for (const mode of ['inactive', 'missing-runtime', 'missing-authorizer', 'default', 'unset', 'unreadable', 'missing-reader'] as const) {
+    const h = await harness()
+    if (mode !== 'missing-reader') h.setBuildNotesFeatureReader(async () => {
+      if (mode === 'unreadable') throw new Error('OWNED_FILE_CHANGED')
+      return { skill: null, model: mode === 'unset' ? undefined : mode === 'default' ? 'server-model' : 'pinned' }
+    })
+    if (mode !== 'missing-authorizer') h.setFeatureAuthorizer(async modelID => {
+      h.calls.push({ method: 'authorizeFeatureModel', args: [modelID] })
+      return mode === 'inactive' ? null : modelID
+    })
+    const result = await h.dispatch('generateBuildNotes', ['p', { ...buildNotesRequest, note: ' \n ' }]) as any
+    assert.deepEqual(plain(result), { notes: '# Build notes', truncated: true, commitCount: 1, fileCount: 1, workingFileCount: 1, modelID: 'server-model' })
+    const args = h.calls.at(-1)!.args
+    assert.deepEqual(plain(args.slice(0, 2)), [buildNotesSummary, { ...selectedModel, modelID: 'server-model' }])
+    assert.equal(args[2], undefined); assert.equal(args[3], undefined)
+    assert.equal(h.calls.some(call => call.method === 'authorizeFeatureModel'), mode === 'inactive' || mode === 'missing-runtime')
+    assert.deepEqual(h.messages, [])
+  }
+})
+
+test('build notes generation rejects empty changes before feature or provider generation and accepts commits-only or working-only changes', async () => {
+  const h = await harness()
+  h.setBuildNotesSummary({ ...buildNotesSummary, commits: [], files: [], workingFileCount: 0, diff: '' })
+  h.setBuildNotesFeatureReader(async () => { assert.fail('No feature access for empty changes') })
+  await assert.rejects(h.dispatch('generateBuildNotes', ['p', buildNotesRequest]), /NO_BUILD_CHANGES/)
+  assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'buildNotesSummary'])
+  h.setBuildNotesFeatureReader(async () => ({ skill: null }))
+  for (const summary of [
+    { ...buildNotesSummary, files: [], workingFileCount: 0 },
+    { ...buildNotesSummary, commits: [] },
+  ]) {
+    h.setBuildNotesSummary(summary)
+    const result = await h.dispatch('generateBuildNotes', ['p', buildNotesRequest]) as any
+    assert.equal(result.commitCount, summary.commits.length)
+    assert.equal(result.fileCount, summary.files.length)
+    assert.equal(result.workingFileCount, summary.workingFileCount)
+  }
+  h.failPolicy('USER_DISABLED'); h.calls.length = 0
+  await assert.rejects(h.dispatch('generateBuildNotes', ['p', buildNotesRequest]), /USER_DISABLED/)
+  assert.equal(h.calls.some(call => call.method === 'generateBuildNotes' || call.method === 'buildNotesSummary'), false)
+})
+
+test('build notes generation holds authority through policy, feature reads, authorization and provider completion', async () => {
+  for (const stage of ['policy', 'feature', 'authorization', 'generation'] as const) {
+    const h = await harness()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    if (stage === 'policy') h.gatePolicy(gate)
+    if (stage === 'generation') h.gateOperation(gate)
+    h.setBuildNotesFeatureReader(async () => {
+      if (stage === 'feature') await gate
+      return { skill: null, model: 'pinned' }
+    })
+    h.setFeatureAuthorizer(async () => { if (stage === 'authorization') await gate; return null })
+    const generation = h.dispatch('generateBuildNotes', ['p', buildNotesRequest])
+    await new Promise(resolve => setImmediate(resolve))
+    const following = h.dispatch('account', ['logout', {}])
+    try {
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(h.calls.some(call => call.args[0] === 'logout'), false, stage)
+      assert.equal(h.calls.some(call => call.method === 'generateBuildNotes'), stage === 'generation', stage)
+    } finally { release(); await Promise.all([generation, following]) }
+    assert.deepEqual(plain(h.calls.at(-1)), { method: 'account', args: ['logout', {}] })
+  }
+  const h = await harness()
+  h.setBuildNotesFeatureReader(async () => ({ skill: null, model: 'pinned' }))
+  h.setFeatureAuthorizer(async () => { throw new Error('POLICY_RELOAD_FAILED') })
+  await assert.rejects(h.dispatch('generateBuildNotes', ['p', buildNotesRequest]), /POLICY_RELOAD_FAILED/)
+  assert.equal(h.calls.some(call => call.method === 'generateBuildNotes'), false)
+  await h.dispatch('account', ['logout', {}])
+  assert.deepEqual(plain(h.calls.at(-1)), { method: 'account', args: ['logout', {}] })
+})
+
 test('AI commit uses a fresh authorized model and bounded staged summary without mutating git', async () => {
   const h = await harness()
   const selected = { id: 'second', modelID: 'canonical', name: 'Second', providerID: 'amecode' }
@@ -1183,6 +1430,7 @@ test('AI commit forwards the synced skill and silently falls back to the two-arg
     h.calls.length = 0
     const projects: string[] = []
     h.setCommitEnhanceReader(async projectID => {
+      assert.ok(projectID)
       projects.push(projectID)
       if (mode === 'unreadable') throw new Error('OWNED_FILE_CHANGED')
       return mode === 'configured' ? skill : null
@@ -1568,16 +1816,30 @@ test('replacement previews before confirmation, cancels without writes, and skip
   assert.deepEqual(h.messages, [])
 })
 
-test('commit and enabling pairing retain their existing native confirmations', async () => {
+test('commit skips confirmation while pairing, branch deletion and stash drop retain native confirmations', async () => {
   const h = await harness()
   h.cancel()
-  await assert.rejects(h.dispatch('commit', ['p', 'commit message']), /CANCELLED/)
-  await assert.rejects(h.dispatch('pairingConfigure', [{ enabled: true, keepScreenActive: false }]), /CANCELLED/)
-  assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'confirm'])
-  h.approve(); h.calls.length = 0
   await h.dispatch('commit', ['p', 'commit message'])
-  await h.dispatch('pairingConfigure', [{ enabled: true, keepScreenActive: false }])
-  assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'commit', 'confirm', 'configurePairing'])
+  assert.deepEqual(h.calls.map(call => call.method), ['commit'])
+  assert.deepEqual(h.messages, [])
+  const destructive: Invocation[] = [
+    { method: 'pairingConfigure', args: [{ enabled: true, keepScreenActive: false }] },
+    { method: 'gitDeleteBranch', args: ['p', 'feature/test', true] },
+    { method: 'gitStashDrop', args: ['p', 2] }
+  ]
+  for (const { method, args } of destructive) {
+    h.calls.length = 0
+    await assert.rejects(h.dispatch(method, args), /CANCELLED/)
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm'])
+  }
+  assert.deepEqual(h.messages.slice(-2), ['Xóa nhánh feature/test?', 'Xóa stash@{2}? Hành động này không thể hoàn tác.'])
+  h.approve()
+  for (const { method, args } of destructive) {
+    h.calls.length = 0
+    await h.dispatch(method, args)
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm', method === 'pairingConfigure' ? 'configurePairing' : method])
+    assert.deepEqual(plain(h.calls.at(-1)!.args), args)
+  }
 })
 
 test('shell reveal validates the actual workspace path including root, metadata, escapes and junctions', async t => {
@@ -1666,7 +1928,7 @@ test('preload forwards all new methods, optional arguments, return values and re
   runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, context)
   assert.ok(api)
   const methods = api as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
-  for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples,
+  for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples, ...buildNotesExamples,
     { method: 'resolveDroppedPaths', args: ['p', ['C:\\images\\shot.png']] },
     { method: 'pickAttachmentFiles', args: ['p'] },
     { method: 'prompt', args: ['p', 's', '', selectedModel, undefined, [{ uri: 'data:image/png;base64,YQ==', name: 'shot.png', source: { type: 'inline' } }]] }

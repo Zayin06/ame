@@ -18,6 +18,7 @@ export const ModelId = z.string().min(1).max(200).refine(s => s === s.normalize(
 export const Features = z.object({
   commitEnhanceSkill: SkillId.optional(), commitEnhanceModel: ModelId.optional(),
   androidTranslationSkill: SkillId.optional(), androidTranslationModel: ModelId.optional(),
+  buildNotesSkill: SkillId.optional(), buildNotesModel: ModelId.optional(),
 }).strict()
 export type BundleFeatures = z.infer<typeof Features>
 const File = z.object({ path: z.string().min(1).max(240), size: z.number().int().min(0).max(MAX_FILE), sha256: Hash }).strict()
@@ -73,6 +74,7 @@ export async function validate(bytes: Uint8Array, version: string) {
   const features = manifest.features
   if (features?.commitEnhanceSkill && !skills.has(features.commitEnhanceSkill)) throw new Error("UNKNOWN_COMMIT_ENHANCE_SKILL")
   if (features?.androidTranslationSkill && !skills.has(features.androidTranslationSkill)) throw new Error("UNKNOWN_ANDROID_TRANSLATION_SKILL")
+  if (features?.buildNotesSkill && !skills.has(features.buildNotesSkill)) throw new Error("UNKNOWN_BUILD_NOTES_SKILL")
   return {
     schemaVersion: 1, target: "opencode", version, channel: "stable", compatibility: manifest.compatibility,
     ...(features && Object.values(features).some(value => value !== undefined) ? { features: Object.fromEntries(Object.entries(features).filter(([, value]) => value !== undefined)) as BundleFeatures } : {}),

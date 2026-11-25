@@ -44,7 +44,7 @@ function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
   })
 }
 
-export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, ready, files = [], activeFile, onRequestFiles }: { timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, ready, files = [], activeFile, onRequestFiles }: { focusNonce?: number; timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
   const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
   const initialCatalog = cached?.key === connectionUrl ? cached : undefined
   const [messages, setMessages] = useState<ChatItem[]>([])
@@ -113,6 +113,9 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   useEffect(() => { setAgentMapOpen(false) }, [projectID])
   const [menu, setMenu] = useState(false)
   const input = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    if (focusNonce) input.current?.focus()
+  }, [focusNonce])
   const currentSession = useRef(sessionID); currentSession.current = sessionID
   const currentProject = useRef(projectID); currentProject.current = projectID
   const createdSession = useRef<string | undefined>(undefined)
@@ -179,6 +182,7 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
   }, [connected, accountRole, defaultModelID, modelLevels])
   useEffect(() => {
     let alive = true, generation = 0
+    let catalogTimer: ReturnType<typeof setTimeout> | undefined
     const hydrate = (catalog?: ProjectCatalog) => {
       const allowed = chatModelsForPolicy(catalog?.models ?? [], modelPolicy.current.role, modelPolicy.current.defaultModelID)
       setModels(catalog?.models ?? []); setAgents(catalog?.agents ?? [])
@@ -216,7 +220,14 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
     if (!catalog || Date.now() - catalog.fetchedAt >= 30_000) void load()
     const accountChanged = () => { clearProjectCatalogs(); void load() }
     window.addEventListener('ame-account-changed', accountChanged)
-    return () => { alive = false; window.removeEventListener('ame-account-changed', accountChanged) }
+    const unsubscribeCatalog = window.ame?.onEvent?.(event => {
+      if (event.type !== 'catalog' || (event.projectID && event.projectID !== projectID)) return
+      if (event.projectID) projectCatalogCache.delete(event.projectID)
+      else clearProjectCatalogs()
+      clearTimeout(catalogTimer)
+      catalogTimer = setTimeout(() => { if (alive) void load() }, 80)
+    })
+    return () => { alive = false; clearTimeout(catalogTimer); unsubscribeCatalog?.(); window.removeEventListener('ame-account-changed', accountChanged) }
   }, [projectID, connected, connectionUrl, report])
   useEffect(() => {
     if (!role || !models.length) userPickedModel.current = false
@@ -421,7 +432,7 @@ export function Chat({ timelineDetail = 'compact', projectID, projectDirectory, 
         Promise.all(browserFiles.map(readBrowserFileAttachment)),
       ])).flat())
     }}>
-    <header className="chat-pane__header"><div className="chat-title-group"><span className="status-dot status-dot--active" /><span className="chat-title-text truncate">{title || 'Cuộc trò chuyện'}</span></div><div className="chat-header-actions">{(androidInfo?.configured || androidInfo?.isAndroid) && <button type="button" className="pill-btn android-translate-trigger" data-testid="android-translate-trigger" aria-label="Dịch Android" onClick={() => onOpenAndroidTranslation?.()}><Icon name="globe" /><span>Dịch Android</span></button>}{(['artifacts', 'agents', 'btw'] as const).map(tab => <button key={tab} data-chat-drawer={tab} className={`pill-btn ${drawer === tab ? 'is-active' : ''}`} title={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} aria-label={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} onClick={() => { if (drawer !== tab) { setTrigger(null); setAttachmentPicker(false) } setDrawer(value => value === tab ? null : tab) }}><Icon name={tab === 'artifacts' ? 'layers' : tab === 'agents' ? 'agents' : 'message'} /><span className="pill-btn__label">{tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'}</span></button>)}<IconButton label="Tùy chọn hội thoại" active={menu} onClick={() => setMenu(value => !value)}><Icon name="more" /></IconButton></div></header>
+    <header className="chat-pane__header"><div className="chat-title-group"><span className="status-dot status-dot--active" /><span className="chat-title-text truncate">{title || 'Cuộc trò chuyện'}</span></div><div className="chat-header-actions">{androidInfo?.isAndroid && <button type="button" className="pill-btn android-translate-trigger" data-testid="android-translate-trigger" title="Dịch Android" aria-label="Dịch Android" onClick={() => onOpenAndroidTranslation?.()}><Icon name="globe" /><span className="pill-btn__label">Dịch Android</span></button>}{(['artifacts', 'agents', 'btw'] as const).map(tab => <button key={tab} data-chat-drawer={tab} className={`pill-btn ${drawer === tab ? 'is-active' : ''}`} title={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} aria-label={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} onClick={() => { if (drawer !== tab) { setTrigger(null); setAttachmentPicker(false) } setDrawer(value => value === tab ? null : tab) }}><Icon name={tab === 'artifacts' ? 'layers' : tab === 'agents' ? 'agents' : 'message'} /><span className="pill-btn__label">{tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'}</span></button>)}<IconButton label="Tùy chọn hội thoại" active={menu} onClick={() => setMenu(value => !value)}><Icon name="more" /></IconButton></div></header>
     {!connected && <div className="warning">Đang kết nối OpenCode. Có thể thử lại trong Cài đặt.</div>}
     {error && <div className="inline-error" role="status">{error}</div>}
     <div className="chat-pane__body">{menu && <div className="chat-corner-drawer is-open" role="menu"><button className="chat-drawer__row" role="menuitem" onClick={() => { onCreate(); setMenu(false) }}>Cuộc trò chuyện mới</button><button className="chat-drawer__row" role="menuitem" onClick={() => { void navigator.clipboard.writeText(messages.map(item => `${item.role}: ${item.text}`).join('\n\n')).catch(report); setMenu(false) }}>Copy conversation</button></div>}
