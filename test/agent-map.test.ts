@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createServer } from 'node:http'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { OpenCode, type SessionInfo, type SessionMessageInfo } from '@opencode/client'
 import { buildAgentMap, resolveAgentMapFamily, summarizeAgentMapNode, truncateSafe } from '../packages/opencode-adapter/src/agent-map'
@@ -317,8 +317,12 @@ test('adapter agentMap propagates history deadline cancellation using the 15-sec
   } finally { adapter.dispose() }
 })
 
+const runtimeBin = path.resolve('resources', 'opencode', `${process.platform}-${process.arch}`, process.platform === 'win32' ? 'opencode.exe' : 'opencode')
+const serverJs = path.resolve('resources', 'amekit-models', 'server.js')
+const prepared = await Promise.all([access(runtimeBin), access(serverJs)]).then(() => true, () => false)
+
 // Local scripted inference drives the actual bundled scheduler; no external model or credentials.
-test('bundled OpenCode 2.3.2 agentMap exposes real nested prompts, output, tokens and tools from deepest child', { timeout: 90000 }, async () => {
+test('bundled OpenCode 2.3.2 agentMap exposes real nested prompts, output, tokens and tools from deepest child', { skip: !prepared, timeout: 90000 }, async () => {
   const root = await mkdtemp(path.join(process.cwd(), '.agent-map-native-'))
   const project = path.join(root, 'project')
   let runtime: PrivateRuntime | undefined

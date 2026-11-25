@@ -2,14 +2,18 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createServer } from 'node:http'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { OpenCode, type SessionMessageInfo } from '@opencode/client'
 import { OpenCodeAdapter, normalizeMessages } from '../packages/opencode-adapter/src/index'
 import { PrivateRuntime } from '../packages/opencode-adapter/src/runtime'
 
-test('native snapshot API isolates whole-session and per-turn edits from pre-existing Git changes', { timeout: 90000 }, async () => {
+const runtimeBin = path.resolve('resources', 'opencode', `${process.platform}-${process.arch}`, process.platform === 'win32' ? 'opencode.exe' : 'opencode')
+const serverJs = path.resolve('resources', 'amekit-models', 'server.js')
+const prepared = await Promise.all([access(runtimeBin), access(serverJs)]).then(() => true, () => false)
+
+test('native snapshot API isolates whole-session and per-turn edits from pre-existing Git changes', { skip: !prepared, timeout: 90000 }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-session-diff-'))
   const project = path.join(root, 'project')
   await mkdir(path.join(project, '.opencode', 'agents'), { recursive: true })

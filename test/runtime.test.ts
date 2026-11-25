@@ -31,7 +31,7 @@ test('missing bundled executable fails closed and stop during preparation cannot
 
 const resources = path.resolve('resources')
 const executable = path.join(resources, 'opencode', `${process.platform}-${process.arch}`, process.platform === 'win32' ? 'opencode.exe' : 'opencode')
-const prepared = await access(executable).then(() => true, () => false)
+const prepared = await Promise.all([access(executable), access(path.join(resources, 'amekit-models', 'server.js'))]).then(() => true, () => false)
 
 test('start waits for plugin setup to finish after its status RPC becomes callable', { skip: !prepared, timeout: 90000 }, async () => {
   const root = await mkdtemp(path.resolve('.runtime-delayed-'))

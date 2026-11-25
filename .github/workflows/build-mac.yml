@@ -29,8 +29,8 @@ jobs:
             archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-arm64.zip
             archive_sha: 31ab5a06a29edc7e49b895f35c2b64ebfe7c7f0437b0f2581b006efcd79fee1a
           - arch: x64
-            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-x64.zip
-            archive_sha: 1875a6d1106702f04c9468831563c061bd00337f891a1b4a6cd151155e6aaf5c
+            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-x64-baseline.zip
+            archive_sha: 6dc5deb4554df035d27dbb3a4663d96954969a33079aeb6b01dd9de2d9092545
     runs-on: macos-latest
     steps:
       - name: Check architecture filter

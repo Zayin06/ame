@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createServer } from 'node:http'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { OpenCode, type SessionMessageInfo } from '@opencode/client'
 import { PrivateRuntime } from '../packages/opencode-adapter/src/runtime'
 
+const runtimeBin = path.resolve('resources', 'opencode', `${process.platform}-${process.arch}`, process.platform === 'win32' ? 'opencode.exe' : 'opencode')
+const serverJs = path.resolve('resources', 'amekit-models', 'server.js')
+const prepared = await Promise.all([access(runtimeBin), access(serverJs)]).then(() => true, () => false)
+
 // A local scripted model exercises the bundled scheduler, tools and completion inbox without external inference.
-test('bundled native subagent runs depths 0–3, rejects depth 4 and delivers final results through every parent', { timeout: 90000 }, async () => {
+test('bundled native subagent runs depths 0–3, rejects depth 4 and delivers final results through every parent', { skip: !prepared, timeout: 90000 }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-native-nesting-'))
   const project = path.join(root, 'project')
   await mkdir(path.join(project, '.opencode', 'agents'), { recursive: true })
