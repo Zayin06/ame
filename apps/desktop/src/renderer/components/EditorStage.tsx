@@ -7,9 +7,10 @@ import HtmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker'
 import TsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
 import { useEffect, useRef, useState } from 'react'
 import type { LspDiagnostic, LspRange } from '../../../../../packages/ide-core/src/ts-lsp'
-import { dirty, languageFor, tabID, tabIsDirty, type Buffer, type Tab } from '../state'
+import { dirty, languageFor, tabID, tabTitle, tabIsDirty, type Buffer, type Tab } from '../state'
 import { Empty, IconButton } from './Primitives'
 import { navigationPosition, type NavigationTarget } from '../workspace-paths'
+import { modelUri, synchronizeCleanFileModel } from '../editor-model-lifecycle'
 
 self.MonacoEnvironment = { getWorker(_moduleID: string, label: string) {
   if (label === 'json') return new JsonWorker()
@@ -22,7 +23,6 @@ loader.config({ monaco })
 monaco.typescript.typescriptDefaults.setDiagnosticsOptions({ noSemanticValidation: true, noSyntaxValidation: true })
 monaco.typescript.javascriptDefaults.setDiagnosticsOptions({ noSemanticValidation: true, noSyntaxValidation: true })
 
-const modelUri = (projectID: string, path: string, mode = 'file') => `ame://${encodeURIComponent(projectID)}/${mode}/${path.split(/[\\/]/).map(encodeURIComponent).join('/')}`
 function fileLocation(uri: monaco.Uri) {
   if (uri.scheme !== 'ame' || !uri.path.startsWith('/file/') || uri.query || uri.fragment) return null
   // Monaco parses percent escapes already; decode the serialized components exactly once.
@@ -123,6 +123,7 @@ export function EditorStage({ projectID, tabs, active, buffer, loadError, diff, 
   onSelect: (tab: Tab) => void; onClose: (tab: Tab) => void; onChange: (text: string) => void; onSave: () => void; onReload: () => void; onToggleSplit: () => void; isSplit: boolean; onStatus: (status: EditorStatus) => void
 }) {
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null)
+  const bufferRef = useRef(buffer); bufferRef.current = buffer
   const navigationRef = useRef({ projectID, active, onNavigateLocation, onToggleBreakpoint })
   navigationRef.current = { projectID, active, onNavigateLocation, onToggleBreakpoint }
   useEffect(() => retainLspProviders((source, project, path, line, column) => {
@@ -211,9 +212,12 @@ export function EditorStage({ projectID, tabs, active, buffer, loadError, diff, 
   const uri = (path: string, mode = 'file') => modelUri(projectID, path, mode)
   return <section data-testid="editor" className="stage" data-region="File & Diff">
 
-    <div className="editor-tabs" role="tablist" aria-label="Tệp đang mở">{tabs.map(tab => <div className={`editor-tab ${active && tabID(active) === tabID(tab) ? 'selected' : ''}`} key={tabID(tab)}><button role="tab" aria-selected={!!active && tabID(active) === tabID(tab)} onClick={() => onSelect(tab)} title={tab.path}>{tab.mode === 'diff' ? '± ' : ''}{tab.path.split(/[\\/]/).pop()}{tabIsDirty(tab, dirtyPaths) ? ' ●' : ''}</button><IconButton label={`Đóng ${tab.path}`} onClick={() => onClose(tab)}>×</IconButton></div>)}</div>
+    <div className="editor-tabs" role="tablist" aria-label="Tệp đang mở">{tabs.map(tab => <div className={`editor-tab ${active && tabID(active) === tabID(tab) ? 'selected' : ''}`} key={tabID(tab)}><button role="tab" aria-selected={!!active && tabID(active) === tabID(tab)} onClick={() => onSelect(tab)} title={`${tab.path} · ${tabTitle(tab)}`}>{tab.mode === 'diff' ? '± ' : ''}{tabTitle(tab)}{tabIsDirty(tab, dirtyPaths) ? ' ●' : ''}</button><IconButton label={`Đóng ${tabTitle(tab)}`} onClick={() => onClose(tab)}>×</IconButton></div>)}</div>
     {active ? <><div className="editor-toolbar"><span className="truncate" title={active.path}>{active.path}</span>{active.mode === 'file' && <><button onClick={onSave} disabled={!buffer || !dirty(buffer)}>Lưu</button><button onClick={onReload} disabled={!buffer}>Nạp lại</button><button onClick={onToggleSplit}>{isSplit ? 'Gộp' : 'Chia đôi'}</button></>}{active.mode === 'diff' && <button aria-label="Chế độ diff" aria-pressed={split} title="Chuyển Split / Inline" onClick={() => setSplit(value => !value)}>{split ? 'Split' : 'Inline'}</button>}</div>
       {buffer?.conflict && active.mode === 'file' && <div className="warning" role="alert">Tệp trên đĩa đã thay đổi. Bản sửa được giữ lại; nạp lại để bỏ bản sửa và lấy phiên bản mới. Không ghi đè tự động.</div>}
-      <div className="editor-surface">{active.mode === 'diff' ? diff ? <DiffEditor key={uri(active.path, 'diff')} keepCurrentOriginalModel keepCurrentModifiedModel original={diff.original} modified={diff.modified} originalModelPath={uri(active.path, 'head')} modifiedModelPath={uri(active.path, 'working')} language={languageFor(active.path)} theme={theme === 'dark' ? 'vs-dark' : 'light'} options={{ ...options, readOnly: true, originalEditable: false, renderSideBySide: split, useInlineViewWhenSpaceIsLimited: false }} loading={<Empty>Đang tải Monaco…</Empty>} /> : <Empty>Đang tải diff với HEAD…</Empty> : buffer ? <Editor key={uri(active.path)} path={uri(active.path)} value={buffer.text} language={languageFor(active.path)} theme={theme === 'dark' ? 'vs-dark' : 'light'} options={{ ...options, glyphMargin: true }} onMount={instance => { editor.current = instance; instance.onDidDispose(() => { if (editor.current === instance) editor.current = null }); setMounted(value => value + 1) }} onChange={value => onChange(value ?? '')} keepCurrentModel saveViewState loading={<Empty>Đang tải Monaco…</Empty>} /> : loadError ? <div className="editor-load-error" role="alert"><strong>Không thể mở tệp</strong><p>{loadError}</p><div className="button-row"><button type="button" onClick={onReload}>Thử lại</button><button type="button" onClick={() => onClose(active)}>Đóng tab</button></div></div> : <Empty>Đang đọc tệp…</Empty>}</div></> : <Empty><strong>Không có tệp đang mở</strong><p>Chọn tệp trong Explorer hoặc thay đổi trong Git.</p></Empty>}
+      <div className="editor-surface">{active.mode === 'diff' ? diff ? <DiffEditor key={uri(tabID(active), 'diff')} keepCurrentOriginalModel keepCurrentModifiedModel original={diff.original} modified={diff.modified} originalModelPath={uri(tabID(active), 'original')} modifiedModelPath={uri(tabID(active), 'modified')} language={languageFor(active.path)} theme={theme === 'dark' ? 'vs-dark' : 'light'} options={{ ...options, readOnly: true, originalEditable: false, renderSideBySide: split, useInlineViewWhenSpaceIsLimited: false }} loading={<Empty>Đang tải Monaco…</Empty>} /> : <Empty>Đang tải diff…</Empty> : buffer ? <Editor key={uri(active.path)} path={uri(active.path)} value={buffer.text} language={languageFor(active.path)} theme={theme === 'dark' ? 'vs-dark' : 'light'} options={{ ...options, glyphMargin: true }} beforeMount={api => {
+        const current = bufferRef.current
+        if (current) synchronizeCleanFileModel(api.editor.getModel(api.Uri.parse(modelUri(current.projectID, current.path))), current)
+      }} onMount={instance => { editor.current = instance; instance.onDidDispose(() => { if (editor.current === instance) editor.current = null }); setMounted(value => value + 1) }} onChange={value => onChange(value ?? '')} keepCurrentModel saveViewState loading={<Empty>Đang tải Monaco…</Empty>} /> : loadError ? <div className="editor-load-error" role="alert"><strong>Không thể mở tệp</strong><p>{loadError}</p><div className="button-row"><button type="button" onClick={onReload}>Thử lại</button><button type="button" onClick={() => onClose(active)}>Đóng tab</button></div></div> : <Empty>Đang đọc tệp…</Empty>}</div></> : <Empty><strong>Không có tệp đang mở</strong><p>Chọn tệp trong Explorer hoặc thay đổi trong Git.</p></Empty>}
   </section>
 }

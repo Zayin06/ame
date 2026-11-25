@@ -7,13 +7,16 @@ import type { BuildNotesRequest, Project, FileDocument, FileEntry, GitState, Git
 import * as workspaceFs from './workspace-fs'
 import { searchWorkspace, replaceInWorkspace } from './search'
 import * as gitOps from './git-ops'
+import type { DiffTarget } from '../../protocol/src/index'
 
 const revision = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
+const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf])
 export class Workspaces {
   private projects = new Map<string, Project>()
   private watchers = new Map<string, FSWatcher>()
   private watchTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private saves = new Map<string, Promise<unknown>>()
+  private fileBoms = new Map<string, Map<string, boolean>>()
   constructor(private storage: string, private changed: (projectID: string) => void = () => {}) {}
   async load() {
     let stored: unknown
@@ -57,6 +60,7 @@ export class Workspaces {
     this.watchers.get(id)?.close()
     this.watchers.delete(id)
     this.projects.delete(id)
+    this.fileBoms.delete(id)
     await mkdir(path.dirname(this.storage), { recursive: true })
     await writeFile(this.storage, JSON.stringify(this.list()), 'utf8')
   }
@@ -116,7 +120,11 @@ export class Workspaces {
     const bytes = await readFile(target)
     if (bytes.includes(0)) throw new Error('BINARY_FILE')
     const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-    return { path: relative, content, revision: revision(bytes) }
+    const fileRevision = revision(bytes)
+    let metadata = this.fileBoms.get(id)
+    if (!metadata) { metadata = new Map(); this.fileBoms.set(id, metadata) }
+    metadata.set(JSON.stringify([relative, fileRevision]), bytes.subarray(0, 3).equals(utf8Bom))
+    return { path: relative, content, revision: fileRevision }
   }
   async save(id: string, relative: string, content: string, expected: string): Promise<FileDocument> {
     if (Buffer.byteLength(content) > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
@@ -126,7 +134,10 @@ export class Workspaces {
       const target = await this.resolve(id, relative)
       const current = await readFile(target)
       if (revision(current) !== expected) throw new Error('FILE_CONFLICT: File changed on disk. Reload before saving.')
-      await writeFile(target, content, 'utf8')
+      const hasBom = this.fileBoms.get(id)?.get(JSON.stringify([relative, expected])) ?? current.subarray(0, 3).equals(utf8Bom)
+      const bytes = Buffer.from(hasBom && !content.startsWith('\uFEFF') ? '\uFEFF' + content : content, 'utf8')
+      if (bytes.length > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
+      await writeFile(target, bytes)
       this.changed(id)
       return this.read(id, relative)
     })
@@ -156,8 +167,8 @@ export class Workspaces {
   async searchProject(id: string, query: SearchQuery): Promise<SearchResponse> {
     return searchWorkspace(this.get(id).directory, query)
   }
-  async replaceInProject(id: string, options: ReplaceOptions): Promise<ReplaceResult> {
-    const result = await replaceInWorkspace(this.get(id).directory, options)
+  async replaceInProject(id: string, options: ReplaceOptions, plan?: ReplaceResult['previews']): Promise<ReplaceResult> {
+    const result = await replaceInWorkspace(this.get(id).directory, options, plan)
     if (options.dryRun !== true && result.filesChanged > 0) this.changed(id)
     return result
   }
@@ -263,23 +274,43 @@ export class Workspaces {
     const merging = result.conflicted.length > 0 || existsSync(path.join(gitDir, 'MERGE_HEAD')) || existsSync(path.join(gitDir, 'REBASE_HEAD'))
     return { branch: result.current ?? '(unborn)', changes: result.files.map(f => ({ path: f.path, index: f.index, working: f.working_dir })), tracking: result.tracking ?? null, ahead: result.ahead ?? 0, behind: result.behind ?? 0, hasRemote, merging }
   }
-  async diff(id: string, relative: string) {
+  async diff(id: string, relative: string, target?: DiffTarget) {
     const file = await this.gitPath(id, relative)
-    let original = ''
-    try { original = await this.git(id).show([`HEAD:./${file}`]) } catch {
-      const tracked = await this.git(id).raw(['ls-tree', '-r', '--name-only', 'HEAD', '--', file]).catch(() => '')
-      if (tracked.trim()) throw new Error('GIT_DIFF_READ_FAILED')
+    const git = this.git(id)
+    if (target && (!['staged', 'working', 'commit'].includes(target.kind) || (target.kind === 'commit' && !/^[a-f0-9]{7,40}$/i.test(target.commit)))) throw new Error('INVALID_DIFF_TARGET')
+    // A missing path is an empty side; a failed read of an existing blob is not.
+    const blob = async (ref: string) => {
+      try { return await git.raw(['cat-file', 'blob', `${ref}:./${file}`]) } catch {
+        const tracked = await git.raw(ref === ''
+          ? ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', file]
+          : ['--literal-pathspecs', 'ls-tree', '-r', '--name-only', '-z', ref, '--', file])
+        if (tracked) throw new Error('GIT_DIFF_READ_FAILED')
+        return ''
+      }
     }
+    if (target?.kind === 'commit') {
+      // Resolve once, validating existence and distinguishing root commits from read errors.
+      const hash = (await git.raw(['rev-parse', '--verify', `${target.commit}^{commit}`])).trim()
+      const parents = (await git.raw(['rev-list', '--parents', '-n', '1', hash])).trim().split(/\s+/)
+      return { original: parents[1] ? await blob(`${hash}^`) : '', modified: await blob(hash) }
+    }
+    const head = async () => {
+      const exists = await git.raw(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false)
+      return exists ? blob('HEAD') : ''
+    }
+    if (target?.kind === 'staged') return { original: await head(), modified: await blob('') }
+    const original = target?.kind === 'working' ? await blob('') : await head()
     let modified = ''
     try { modified = (await this.read(id, relative)).content } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
     return { original, modified }
   }
   async stage(id: string, relative: string, staged: boolean) {
     const file = await this.gitPath(id, relative)
-    if (staged) await this.git(id).raw(['add', '--', file])
+    const spec = `:(literal)${file}`
+    if (staged) await this.git(id).raw(['add', '--', spec])
     else {
       const head = await this.git(id).raw(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false)
-      await this.git(id).raw(head ? ['reset', 'HEAD', '--', file] : ['rm', '--cached', '--', file])
+      await this.git(id).raw(head ? ['reset', 'HEAD', '--', spec] : ['rm', '--cached', '--', spec])
     }
     this.changed(id)
   }
@@ -295,5 +326,6 @@ export class Workspaces {
     this.watchTimers.clear()
     for (const watcher of this.watchers.values()) watcher.close()
     this.watchers.clear()
+    this.fileBoms.clear()
   }
 }

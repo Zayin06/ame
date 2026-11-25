@@ -5,23 +5,49 @@ import { normalize } from '../opencode-session-diff'
 import type { SessionChangesState } from '../session-changes'
 import { Empty, errorText } from './Primitives'
 
-function Patch({ file, theme }: { file: SessionDiff; theme: 'dark' | 'light' }) {
+function RawPatchFallback({ patch }: { patch: string }) {
+  const lines = useMemo(() => patch.replace(/\r\n/g, '\n').split('\n'), [patch])
+  return <pre className="session-change-raw" data-testid="session-change-raw"><code>{lines.map((line, index) => {
+    const kind = line.startsWith('+') && !line.startsWith('+++') ? 'is-add'
+      : line.startsWith('-') && !line.startsWith('---') ? 'is-del'
+        : line.startsWith('@@') ? 'is-hunk' : ''
+    return <span key={index} className={kind ? `session-change-raw__line ${kind}` : 'session-change-raw__line'}>{line}{'\n'}</span>
+  })}</code></pre>
+}
+
+function ChangeFileItem({ file, theme }: { file: SessionDiff; theme: 'dark' | 'light' }) {
+  const [open, setOpen] = useState(false)
   const parsed = useMemo(() => {
-    try { return { diff: normalize(file).fileDiff } }
+    try { return { view: normalize(file) } }
     catch (error) { return { error: errorText(error) } }
   }, [file])
-  if (!parsed.diff) return <div role="alert">{parsed.error}</div>
-  return <FileDiff fileDiff={parsed.diff} options={{ themeType: theme, diffStyle: 'unified', overflow: 'scroll', disableFileHeader: true }} />
+  const additions = parsed.view ? parsed.view.additions : file.additions
+  const deletions = parsed.view ? parsed.view.deletions : file.deletions
+  const statusLabel = parsed.view?.eolOnly ? 'EOL only' : parsed.view?.eolNormalized ? `${file.status} · CRLF↔LF` : file.status
+
+  return <details className="session-change-file" onToggle={event => setOpen(event.currentTarget.open)}>
+    <summary>
+      <span className="truncate" title={file.file}>{file.file}</span>
+      <span>{statusLabel} · <b className="session-change-added">+{additions}</b> <b className="session-change-deleted">−{deletions}</b></span>
+    </summary>
+    {open && <>
+      {file.more && <p className="muted session-change-note">OpenCode đã giới hạn nội dung patch.</p>}
+      {!file.patch ? <p className="muted session-change-note">OpenCode không cung cấp patch văn bản cho tệp này.</p>
+        : parsed.error ? <><div role="alert" className="session-change-note">{parsed.error}</div><RawPatchFallback patch={file.patch} /></>
+          : parsed.view?.eolOnly ? <p className="muted session-change-note">Tệp này chỉ thay đổi ký tự xuống dòng (CRLF ↔ LF), không có thay đổi nội dung.</p>
+            : parsed.view?.parseFailed || !parsed.view?.fileDiff.hunks.length ? <RawPatchFallback patch={file.patch} />
+              : <>
+                {parsed.view.eolNormalized && <p className="muted session-change-note">Đã ẩn các dòng chỉ khác ký tự xuống dòng (CRLF/LF).</p>}
+                <FileDiff fileDiff={parsed.view.fileDiff} options={{ themeType: theme, diffStyle: 'unified', overflow: 'scroll', disableFileHeader: true }} />
+              </>}
+    </>}
+  </details>
 }
 
 export function SessionChanges({ state, theme, turn = false, onRetry }: { state: SessionChangesState; theme: 'dark' | 'light'; turn?: boolean; onRetry?: () => void }) {
   return <section className="session-changes" data-testid="session-changes" aria-label={turn ? 'Thay đổi của lượt chat' : 'Thay đổi của session'}>
     <h3>{turn ? 'Lượt chat' : 'Session'} · {state.status === 'ready' ? `${state.files.length} files changed` : 'File changes'}</h3>
-    {state.status === 'loading' ? <Empty>Đang tải thay đổi từ OpenCode…</Empty> : state.status === 'error' ? <div className="inline-error" role="alert">{state.error}{onRetry && <button onClick={onRetry}>Thử lại</button>}</div> : !state.files.length ? <Empty>Không có thay đổi trong {turn ? 'lượt chat' : 'session'} này.</Empty> : state.files.map(file => <details className="session-change-file" key={file.file}>
-      <summary><span className="truncate" title={file.file}>{file.file}</span><span>{file.status} · <b className="session-change-added">+{file.additions}</b> <b className="session-change-deleted">−{file.deletions}</b></span></summary>
-      {file.more && <p className="muted">OpenCode đã giới hạn nội dung patch.</p>}
-      {file.patch ? <Patch file={file} theme={theme} /> : <p className="muted">OpenCode không cung cấp patch văn bản cho tệp này.</p>}
-    </details>)}
+    {state.status === 'loading' ? <Empty>Đang tải thay đổi từ OpenCode…</Empty> : state.status === 'error' ? <div className="inline-error" role="alert">{state.error}{onRetry && <button onClick={onRetry}>Thử lại</button>}</div> : !state.files.length ? <Empty>Không có thay đổi trong {turn ? 'lượt chat' : 'session'} này.</Empty> : state.files.map(file => <ChangeFileItem key={file.file} file={file} theme={theme} />)}
   </section>
 }
 

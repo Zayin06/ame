@@ -94,3 +94,12 @@ test('active tools expose running command, concise error and live status with es
   assert.match(status, /turn-live-status__dot/)
   assert.match(status, /Đang đọc &lt;manifest&gt;…/)
 })
+
+test('pending question rows never duplicate raw question JSON above the response form', () => {
+  for (const status of ['running', 'streaming']) {
+    const question = tool('q', 'question', '', { status, input: { questions: [{ question: 'RAW_QUESTION_PAYLOAD', options: Array(50).fill({ label: 'RAW_OPTION' }) }] } })
+    const html = renderToStaticMarkup(createElement(ActiveToolsView, { items: [question] }))
+    assert.match(html, /Trả lời trong biểu mẫu bên dưới/)
+    assert.doesNotMatch(html, /RAW_QUESTION_PAYLOAD|RAW_OPTION|<pre/)
+  }
+})

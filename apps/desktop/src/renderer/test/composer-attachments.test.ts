@@ -8,6 +8,9 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
 import { ComposerAttachmentStrip, ComposerDropOverlay, MessageAttachmentList } from '../components/ComposerAttachments'
 import { classifyBrowserFile, composePromptWithAttachments, MAX_EXTERNAL_TEXT_BYTES, MAX_MEDIA_BYTES, MAX_PROMPT_FILES, readBrowserFileAttachment, splitComposerAttachments, WORKSPACE_DRAG_MIME, type ComposerAttachment } from '../composer-mentions'
+import { composerAttachmentSizeError } from '../composer-mentions'
+import { attachmentBatchSizeError, encodedAttachmentBytes, MAX_ATTACHMENT_ENCODED_BYTES } from '../../../../../packages/ide-core/src/dropped-attachments'
+import { humanizeIdeError } from '../components/Primitives'
 
 const media = (id = 'image', extra: Partial<Extract<ComposerAttachment, { dataUrl: string }>> = {}): ComposerAttachment => ({
   id, kind: 'media', name: 'image (1).png', mime: 'image/png', dataUrl: 'data:image/png;base64,YQ==', size: 1, ...extra
@@ -51,7 +54,7 @@ test('browser classification accepts supported media by MIME or extension and kn
     assert.deepEqual(classifyBrowserFile({ name, size: MAX_EXTERNAL_TEXT_BYTES }), { ok: true, kind: 'external-text', mime: 'text/plain' })
   }
   for (const [name, type, size, reason] of [
-    ['empty.png', 'image/png', 0, /rỗng/], ['large.png', '', MAX_MEDIA_BYTES + 1, /10 MiB/],
+    ['empty.png', 'image/png', 0, /rỗng/], ['large.pdf', '', MAX_MEDIA_BYTES + 1, /6 MiB/],
     ['large.ts', '', MAX_EXTERNAL_TEXT_BYTES + 1, /512 KiB/], ['archive.zip', 'application/zip', 1, /Không hỗ trợ/],
     ['file.constructor', '', 1, /Không hỗ trợ/], ['file.bmp', 'image/bmp', 1, /Không hỗ trợ/]
   ] as const) {
@@ -84,13 +87,51 @@ test('browser reads reject empty, oversized, NUL and invalid UTF-8 files and rec
     assert.ok(!result.ok); assert.match(result.reason, reason)
   }
   let reads = 0
-  const oversized = { name: 'large.png', type: 'image/png', size: MAX_MEDIA_BYTES + 1, async arrayBuffer() { reads++; return new ArrayBuffer(0) } } as File
+  const oversized = { name: 'large.png', type: 'image/png', size: 7 * 1024 * 1024, async arrayBuffer() { reads++; return new ArrayBuffer(0) } } as File
   assert.equal((await readBrowserFileAttachment(oversized)).ok, false)
   assert.equal(reads, 0)
   const failed = await readBrowserFileAttachment({ name: 'bad.txt', size: 1, arrayBuffer: async () => { throw new Error('unreadable') } } as unknown as File)
   assert.ok(!failed.ok); assert.match(failed.reason, /Không thể đọc/)
   const growing = await readBrowserFileAttachment({ ...browserFile('growing.txt', new Uint8Array(MAX_EXTERNAL_TEXT_BYTES + 1)), size: 1 } as File)
   assert.ok(!growing.ok); assert.match(growing.reason, /512 KiB/)
+})
+
+test('7 MiB image is rejected before reading with its name and the actual encoded limit', async () => {
+  const file = { name: 'ảnh lớn.png', type: 'image/png', size: 7 * 1024 * 1024, arrayBuffer() { throw new Error('must not read') } } as unknown as File
+  const result = await readBrowserFileAttachment(file)
+  assert.ok(!result.ok)
+  assert.equal(result.name, file.name)
+  assert.match(result.reason, /ảnh lớn\.png/)
+  assert.match(result.reason, /6 MiB sau base64/)
+  assert.match(result.reason, /4\.50 MiB/)
+})
+
+test('base64 budget includes padding and MIME prefix and accepts the exact boundary', () => {
+  assert.equal(encodedAttachmentBytes(1, 'image/png'), 'data:image/png;base64,'.length + 4)
+  assert.equal(encodedAttachmentBytes(3, 'image/png'), encodedAttachmentBytes(1, 'image/png'))
+  assert.equal(encodedAttachmentBytes(4, 'image/png'), 'data:image/png;base64,'.length + 8)
+  const mime = 'image/jpeg' // 23-byte prefix
+  const size = Math.floor((MAX_ATTACHMENT_ENCODED_BYTES - encodedAttachmentBytes(0, mime)) / 4) * 3
+  assert.equal(attachmentBatchSizeError([{ mime, size }]), undefined)
+  assert.match(attachmentBatchSizeError([{ mime, size: size + 1 }])!, /Tổng dung lượng/)
+})
+
+test('whole draft validation catches several small images across batches without mutating attachments', () => {
+  const draft = Object.freeze([media('1', { name: 'one.png', size: 2 * 1024 * 1024 }), media('2', { name: 'two.png', size: 2 * 1024 * 1024 })])
+  assert.equal(composerAttachmentSizeError(draft), undefined)
+  const combined = Object.freeze([...draft, media('3', { name: 'three.png', size: 2 * 1024 * 1024 })])
+  const error = composerAttachmentSizeError(combined)
+  assert.match(error!, /Tổng dung lượng.*vượt mức 6 MiB/)
+  assert.match(error!, /bỏ bớt tệp trên bản nháp/)
+  assert.equal(combined.length, 3)
+  assert.equal(draft.length, 2)
+  assert.equal(composerAttachmentSizeError([draft[0], { ...draft[0], id: 'duplicate' }]), undefined)
+})
+
+test('gateway payload error is explained in Vietnamese, including base64, history and how to retry', () => {
+  const text = humanizeIdeError(new Error('HTTP 413 {"error":{"code":"AMECODE_REQUEST_TOO_LARGE"}}'))
+  for (const detail of ['base64', '8 MiB', 'JSON', 'lịch sử', 'bỏ bớt tệp trên bản nháp', 'gửi lại']) assert.ok(text.includes(detail), detail)
+  assert.doesNotMatch(text, /403|đăng nhập|quyền truy cập/)
 })
 
 test('attachment strip SSR renders image/file/selection/PDF/text chips and removal handlers', () => {

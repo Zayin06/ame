@@ -4,6 +4,7 @@ import { constants } from "node:fs"
 import { AmeApi, ClientError, isTransientError } from "./api"
 import { assertModel, managedProvider, modelPolicy, providerURL } from "./model-policy"
 import { openSessionVault, type Encryption } from "./session-vault"
+import { bundlePreferences, type BundleAccount } from "./bundle-preferences"
 import { pack, preview, safePath, verifiedFiles, type ImportOptions, type InputFile, type Issue, type Preview } from "./bundle/package"
 import { scanWithSource } from "./bundle/scan"
 import { AiFixError, fixImportFileWithLlm, isFixableTextFile } from "./bundle/ai-fix"
@@ -63,6 +64,9 @@ export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promis
 export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDependencies = {}): AmeKit {
   const globalConfigDir = options.globalConfigDir ?? path.join(options.userData, "backend", "config", "opencode")
   const globalManagedDir = path.join(options.userData, "amekit", "global")
+  const preferences = bundlePreferences(options.userData)
+  let lastBundleAccount: BundleAccount | undefined
+  const bundleAccount = (): BundleAccount | undefined => api?.account ? { origin: api.origin, accountId: api.account.id } : lastBundleAccount
   const fetcher = dependencies.fetch ?? fetch
   const electron = dependencies.electron ?? (() => import("electron"))
   const lifetime = new AbortController()
@@ -184,6 +188,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       if (api.expires <= Date.now()) throw new Error("AMECODE_LOGIN_REQUIRED")
       await persist()
       await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires, featureModels: [...authorizedFeatureModels] })
+      lastBundleAccount = { origin: api.origin, accountId: api.account.id }
       policyReady = true; blocker = undefined; transientFailures = 0
     } catch (error) {
       blocker = code(error); api?.suspend(); resetImport(); await revoke()
@@ -276,8 +281,15 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     if (["installed", "offline", "uninstall"].includes(operation)) {
       if (operation === "installed") { const state = await installer.installedGlobal(globalConfigDir, globalManagedDir); return state ? installView(state) : null }
       if (operation === "offline") { const state = await installer.offlineGlobal(globalConfigDir, globalManagedDir, discover, signal); return { ...installView(state), changed: false } }
-      await confirm("Gỡ AmeKit bundle khỏi ứng dụng?", "Xóa các tệp agent và skill do AmeKit cài đặt trong cấu hình toàn cục của ứng dụng. Tệp cá nhân và cấu hình dự án được giữ nguyên.")
-      const changed = await trackLocalWrite(() => installer.uninstallGlobal(globalConfigDir, globalManagedDir, signal))
+      await confirm("Gỡ AmeKit bundle khỏi ứng dụng?", "Xóa các tệp agent và skill do AmeKit cài đặt trong cấu hình toàn cục của ứng dụng và tắt tự đồng bộ bundle cho tài khoản/máy chủ này. Đồng bộ thủ công để bật lại. Tệp cá nhân và cấu hình dự án được giữ nguyên.")
+      const changed = await trackLocalWrite(async () => {
+        const account = bundleAccount()
+        const current = await installer.installedGlobal(globalConfigDir, globalManagedDir)
+        // Persist before removal so a restart or a queued heartbeat cannot undo it.
+        if (account) await preferences.disable(account, current?.releaseId)
+        return installer.uninstallGlobal(globalConfigDir, globalManagedDir, signal)
+      })
+      clearAutoSyncError()
       if (changed) {
         await reloadAndRestorePolicy()
         options.onBundleChanged?.({ version: "", releaseId: "", auto: false, action: "uninstalled" })
@@ -496,10 +508,12 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
           return { packaged, release, activated: null, activationError: code(error) }
         }
       }
+      case "install":
       case "sync": {
         const latest = await api.latest(signal); await synchronize()
         const bytes = await api.download(latest.release, signal)
         const result = await trackLocalWrite(() => installer.installGlobal(globalConfigDir, globalManagedDir, api!.origin, latest.release, bytes, discover, signal, { allowRaw: true }))
+        await preferences.enable({ origin: api.origin, accountId: api.account!.id })
         clearAutoSyncError()
         if (result.changed) {
           await reloadAndRestorePolicy()
@@ -527,6 +541,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       await ready
       await initiatingCall?.catch(() => {})
       if (!active()) return
+      const account = { origin: accountApi.origin, accountId: accountApi.account!.id }
+      if (await preferences.optedOut(account) || !active()) return
       let latest: Awaited<ReturnType<AmeApi["latest"]>>
       try { latest = await accountApi.latest(signal) }
       catch (error) { await stopOnAuthFailure(error); return }
@@ -537,7 +553,11 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       try {
         const bytes = await accountApi.download(latest.release, signal)
         if (!active()) return
-        const result = await trackLocalWrite(() => installer.installGlobal(globalConfigDir, globalManagedDir, accountApi.origin, latest.release, bytes, discover, signal, { allowRaw: true }))
+        const result = await trackLocalWrite(async () => {
+          if (!active() || await preferences.optedOut(account)) return undefined
+          return installer.installGlobal(globalConfigDir, globalManagedDir, accountApi.origin, latest.release, bytes, discover, signal, { allowRaw: true })
+        })
+        if (!result) return
         clearAutoSyncError()
         if (result.changed) {
           await reloadAndRestorePolicy()
@@ -560,7 +580,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       try {
         if (backgroundInFlight) await backgroundInFlight.catch(() => {})
         await ready
-        if (["installed", "offline", "sync", "uninstall"].includes(operation) && autoSyncInFlight) await autoSyncInFlight.catch(() => {})
+        if (["installed", "offline", "sync", "install", "uninstall"].includes(operation) && autoSyncInFlight) await autoSyncInFlight.catch(() => {})
         result = await execute(operation, payload)
       }
       catch (error) { failure = error }

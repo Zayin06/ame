@@ -20,6 +20,22 @@ const blockItems = (blocks: TimelineBlock[]) => blocks.flatMap(block => {
   return 'item' in block ? [block.item.id] : []
 })
 
+test('a finished error does not strand later completed tools outside the live work group', () => {
+  const items = [user(), tool('missing', 'read', { status: 'error', error: 'File not found' }), ...Array.from({ length: 8 }, (_, i) => tool(`read-${i}`, 'read')), tool('running', 'shell', { status: 'running' })]
+  const blocks = compact(items, true)[0].blocks
+  const group = work(blocks[0])
+  assert.deepEqual(group.items.map(item => item.id), items.slice(1, -1).map(item => item.id))
+  assert.equal(group.summary.errorCount, 1)
+  assert.equal(blocks.filter(block => block.kind === 'tool').length, 0)
+  assert.equal(blocks[1].kind, 'active-tools')
+})
+
+test('question tools and pending forms announce that user input is required', () => {
+  for (const blocks of [compact([user(), tool('q', 'question', { status: 'running' })], true)[0].blocks, projectChatTimeline([user(), text('wait')], { running: false, mode: 'compact', pendingForms: true })[0].blocks]) {
+    assert.deepEqual(blocks.at(-1), { kind: 'live-status', id: 'user:status', label: 'Đang chờ bạn trả lời câu hỏi…' })
+  }
+})
+
 test('classifies every specified alias, normalizes names, and hides only todowrite', () => {
   const cases = [
     ['explore', 'read', ['read', 'read_file', 'view_file']],

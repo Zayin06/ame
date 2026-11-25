@@ -6,6 +6,7 @@ import { defaultPetPreferences, PetActivity, petBounds, petHtml, petLabels, petR
 import { defaultPetPalette, petPalette, petPaletteScript, petBubbleBounds, type PetPalette } from "./pet-appearance"
 import { localDialogue, parseDialogue, PetSpeech, petBubbleHtml, type DialogueSet } from "./pet-dialogue"
 import { petChime } from "./pet-chime"
+import { PetInteraction } from "./pet-interaction"
 
 export type PetHostState = {
   preferences: PetPreferences
@@ -22,6 +23,8 @@ export type PetHostOptions = {
   sprite: string
   defaultEnabled?: boolean
   hasMainWindow: () => boolean
+  interactionPreload?: string
+  onActivate?: () => void
   onStateChanged?: (state: PetHostState) => void
   generateDialogue?: (model: string, signal: AbortSignal) => Promise<DialogueSet>
 }
@@ -155,8 +158,19 @@ export function createPetHost(options: PetHostOptions) {
     if (window && !window.isDestroyed()) { place(); return }
     try {
       validatePetSprite(options.sprite)
-      const current = new electron.BrowserWindow({ ...windowOptions, ...bounds(), title: "AmeKit Pet" })
+      const current = new electron.BrowserWindow({ ...windowOptions, ...bounds(), title: "AmeKit Pet",
+        webPreferences: { ...windowOptions.webPreferences, preload: options.interactionPreload } })
       window = current; secure(current)
+      const interaction = new PetInteraction()
+      current.webContents.on("ipc-message", (event, channel, ...args: unknown[]) => {
+        if (disposed || !ready || window !== current || current.isDestroyed() || event.senderFrame !== current.webContents.mainFrame) return
+        if (channel !== "ame:pet-pointer" || args.length !== 1) return
+        const phase = args[0]
+        if (phase !== "down" && phase !== "move" && phase !== "up" && phase !== "cancel") return
+        const result = interaction.update(phase, electron.screen.getCursorScreenPoint(), current.getBounds(), Date.now())
+        if (result.position) current.setPosition(result.position.x, result.position.y)
+        if (result.activate && options.hasMainWindow()) options.onActivate?.()
+      })
       current.webContents.on("render-process-gone", () => { if (window === current) fail() })
       current.on("closed", () => {
         if (window !== current) return

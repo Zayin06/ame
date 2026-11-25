@@ -76,10 +76,6 @@ jobs:
         run: node -e "if (process.arch !== '${{ matrix.arch }}') throw new Error('Target Node architecture is required')"
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
-      # Node-based tests must finish before switching node-pty to Electron's ABI.
-      - name: Rebuild node-pty for target Electron architecture
-        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
       - name: Provision pinned OpenCode 2.3.2 archive when no custom runtime is configured
         if: env.AME_OPENCODE_CLI == '' && env.AME_OPENCODE_URL == ''
         shell: bash
@@ -127,6 +123,15 @@ jobs:
           NODE
       - name: Stage and verify exact OpenCode 2.3.2 for target architecture
         run: npm run runtime:prepare
+      - name: Build backend plugin before real runtime tests
+        run: npm run build:server
+      - name: Test with required real backend coverage
+        env:
+          AME_REQUIRE_BACKEND_TESTS: '1'
+        run: npm test
+      # Node-based tests must finish before switching node-pty to Electron's ABI.
+      - name: Rebuild node-pty for target Electron architecture
+        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
       - run: npm run build
         env:
           NODE_OPTIONS: --max-old-space-size=6144

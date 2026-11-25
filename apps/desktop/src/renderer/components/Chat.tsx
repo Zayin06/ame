@@ -1,15 +1,18 @@
 import { useEffect, useId, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react'
-import type { Agent, AndroidTranslationInfo, ChatItem, Model, Permission, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
+import type { Agent, AndroidTranslationInfo, ChatItem, Model, Permission, PermissionMode, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
 import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
 import { type Preferences, type Tab, type TimelineDetailMode } from '../state'
 import { projectChatTimeline } from '../chat-timeline'
+import type { SessionForm } from '../../../../../packages/protocol/src/index'
+import { SessionFormCard } from './SessionFormCard'
 import { ActiveToolsView, LiveTurnStatus, TurnWorkGroup } from './TurnWorkGroup'
 import { AgentList } from './AgentList'
 import { AgentMap } from './AgentMap'
 import { familySummaryFromSessions } from '../agent-map-model'
 import { Empty, errorText, IconButton } from './Primitives'
 import { chatSubmit } from '../chat-submit'
+import { createChatRefresh } from '../chat-refresh'
 import { formatModelOptionLabel, modelKey, resolvePreferredModel, type ModelLevels } from '../model-selection'
 import { TurnChanges } from './SessionChanges'
 import { ToolCard } from './ToolCard'
@@ -19,6 +22,13 @@ import { ComposerAttachmentStrip, ComposerDropOverlay, MessageAttachmentList } f
 
 type ProjectCatalog = { key: string; fetchedAt: number; models: Model[]; agents: Agent[]; commands: SlashCommand[]; skills: SkillSummary[] }
 const projectCatalogCache = new Map<string, ProjectCatalog>()
+const draftPermissionModes = new Map<string, PermissionMode>()
+export const permissionModeOptions: { value: PermissionMode; label: string; description: string }[] = [
+  { value: 'default', label: 'Mặc định', description: 'Dùng chính sách quyền mặc định của OpenCode.' },
+  { value: 'ask', label: 'Hỏi trước', description: 'Hỏi trước khi sửa tệp, chạy shell hoặc truy cập ngoài workspace.' },
+  { value: 'readonly', label: 'Chỉ đọc', description: 'Chỉ cho phép đọc và tìm kiếm; chặn sửa tệp, shell và công cụ khác.' },
+  { value: 'full', label: 'Tự động cho phép', description: 'Cảnh báo: cho phép mọi thao tác, gồm sửa/xóa tệp, chạy lệnh và truy cập ngoài workspace mà không hỏi xác nhận. Chính sách tổ chức vẫn có thể chặn.' },
+]
 let catalogRevision = 0
 const clearProjectCatalogs = () => { projectCatalogCache.clear(); catalogRevision++ }
 
@@ -44,14 +54,14 @@ function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
   })
 }
 
-export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, ready, files = [], activeFile, onRequestFiles }: { focusNonce?: number; timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, ready, files = [], activeFile, onRequestFiles }: { draftID?: number; focusNonce?: number; timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
   const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
   const initialCatalog = cached?.key === connectionUrl ? cached : undefined
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
+  const [forms, setForms] = useState<SessionForm[]>([])
   const [catalogModels, setModels] = useState<Model[]>(() => initialCatalog?.models ?? [])
   const [modelProject, setModelProject] = useState<string | undefined>(() => initialCatalog ? projectID : undefined)
-  const [agents, setAgents] = useState<Agent[]>(() => initialCatalog?.agents ?? [])
   const [fallbackRole, setFallbackRole] = useState<string>()
   const [fallbackDefaultModel, setFallbackDefaultModel] = useState<string>()
   const [fallbackModelLevels, setFallbackModelLevels] = useState<Partial<ModelLevels>>()
@@ -88,7 +98,43 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
   const [model, setModel] = useState(() => resolvePreferredModel({ models: chatModelsForPolicy(initialCatalog?.models ?? [], role, effectiveDefaultModel), currentValue: '', defaultModelID: effectiveDefaultModel, role }))
   const modelPolicy = useRef({ role, defaultModelID: effectiveDefaultModel })
   modelPolicy.current = { role, defaultModelID: effectiveDefaultModel }
-  const [agent, setAgent] = useState('')
+  const permissionScope = JSON.stringify([connectionUrl, projectID, sessionID || draftID])
+  const [modeState, setModeState] = useState<{ scope: string; mode: PermissionMode; loading: boolean }>(() => ({ scope: permissionScope, mode: 'default', loading: !!sessionID }))
+  const permissionMode = modeState.scope === permissionScope ? modeState.mode : !sessionID ? draftPermissionModes.get(permissionScope) ?? 'default' : 'default'
+  const permissionLoading = !!sessionID && (modeState.scope !== permissionScope || modeState.loading)
+  const [updatingPermission, setUpdatingPermission] = useState(false)
+  const permissionRequest = useRef(0)
+  const permissionPending = useRef(false)
+  const currentPermissionScope = useRef(permissionScope); currentPermissionScope.current = permissionScope
+  const listedPermissionMode = sessions.find(session => session.id === sessionID)?.permissionMode
+  useEffect(() => {
+    let alive = true
+    const request = ++permissionRequest.current
+    if (!sessionID) {
+      setModeState({ scope: permissionScope, mode: draftPermissionModes.get(permissionScope) ?? 'default', loading: false })
+      return
+    }
+    if (!projectID || !connected) return
+    setModeState({ scope: permissionScope, mode: 'default', loading: true })
+    void window.ame.sessionPermissionMode(projectID, sessionID).then(mode => {
+      if (alive && request === permissionRequest.current) setModeState({ scope: permissionScope, mode, loading: false })
+    }).catch(e => { if (alive) report(e) })
+    return () => { alive = false }
+  }, [permissionScope, connected, projectID, sessionID, listedPermissionMode])
+  const changePermissionMode = async (mode: PermissionMode) => {
+    if (!projectID || permissionPending.current || busy || permissionLoading) return
+    if (!sessionID) {
+      draftPermissionModes.set(permissionScope, mode)
+      setModeState({ scope: permissionScope, mode, loading: false })
+      return
+    }
+    permissionPending.current = true; setUpdatingPermission(true)
+    try {
+      const saved = await window.ame.updateSessionPermissionMode(projectID, sessionID, mode)
+      if (currentPermissionScope.current === permissionScope) setModeState({ scope: permissionScope, mode: saved, loading: false })
+    } catch (e) { report(e) }
+    finally { permissionPending.current = false; setUpdatingPermission(false) }
+  }
   const [text, setText] = useState('')
   const [commands, setCommands] = useState<SlashCommand[]>(() => initialCatalog?.commands ?? [])
   const [skills, setSkills] = useState<SkillSummary[]>(() => initialCatalog?.skills ?? [])
@@ -143,7 +189,7 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
     if (previousProject.current !== projectID) createdSession.current = undefined
     previousSession.current = sessionID; previousProject.current = projectID
     setTrigger(null); setAttachmentPicker(false)
-    setMessages([]); setPermissions([]); setLoaded(false)
+    setMessages([]); setPermissions([]); setForms([]); setLoaded(false)
   }, [projectID, sessionID])
   useEffect(() => {
     const open = (event: Event) => { setTrigger(null); setAttachmentPicker(false); setDrawer((event as CustomEvent).detail || 'artifacts') }
@@ -157,9 +203,9 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
   const timeline = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   const refresh = useRef<() => void>(() => {})
-  const running = sessions.some(session => session.id === sessionID && session.status === 'running')
+  const running = forms.length > 0 || sessions.some(session => session.id === sessionID && session.status === 'running')
   const runningRef = useRef(running); runningRef.current = running
-  const permissionsCountRef = useRef(permissions.length); permissionsCountRef.current = permissions.length
+  const permissionsCountRef = useRef(permissions.length + forms.length); permissionsCountRef.current = permissions.length + forms.length
   const fallbackTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   useEffect(() => {
     if (accountRole !== undefined && defaultModelID !== undefined && modelLevels !== undefined) return
@@ -185,7 +231,7 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
     let catalogTimer: ReturnType<typeof setTimeout> | undefined
     const hydrate = (catalog?: ProjectCatalog) => {
       const allowed = chatModelsForPolicy(catalog?.models ?? [], modelPolicy.current.role, modelPolicy.current.defaultModelID)
-      setModels(catalog?.models ?? []); setAgents(catalog?.agents ?? [])
+      setModels(catalog?.models ?? [])
       setCommands(catalog?.commands ?? []); setSkills(catalog?.skills ?? [])
       setModelProject(catalog ? projectID : undefined)
       if (!allowed.length) userPickedModel.current = false
@@ -234,45 +280,40 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
     setModel(currentValue => resolvePreferredModel({ models, currentValue, defaultModelID: effectiveDefaultModel, role, userPicked: userPickedModel.current }))
   }, [role, catalogModels, effectiveDefaultModel])
   const activeModel = projectID && connected && modelProject === projectID ? models.find(item => modelKey(item) === model) : undefined
-  const activeAgent = agents.find(a => a.id === agent)
   useEffect(() => { onModelChange?.(ready ? activeModel : undefined) }, [activeModel, onModelChange, connected, ready, projectID])
   useEffect(() => {
     if (!projectID || !sessionID || !connected) return
-    let alive = true, loading = false, queued = false
-    let timer: ReturnType<typeof setTimeout> | undefined
+    let alive = true
     const load = async () => {
       if (!alive) return
-      if (loading) { queued = true; return }
-      loading = true
-      clearTimeout(timer); clearTimeout(fallbackTimer.current)
+      clearTimeout(fallbackTimer.current)
       try {
-        const [items, pending] = await Promise.all([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID)])
-        if (alive) { permissionsCountRef.current = pending.length; setMessages(old => sameChatItems(old, items) ? old : items); setPermissions(pending); setLoaded(true); setError('') }
+        const [items, pending, pendingForms] = await Promise.all([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID), window.ame.forms(projectID, sessionID)])
+        if (alive) { permissionsCountRef.current = pending.length + pendingForms.length; setMessages(old => sameChatItems(old, items) ? old : items); setPermissions(pending); setForms(pendingForms); setLoaded(true); setError('') }
       } catch (e) { if (alive) setError(errorText(e)) }
       finally {
-        loading = false
         if (alive) {
-          if (queued) { queued = false; timer = setTimeout(() => void load(), 120) }
-          else if (runningRef.current || permissionsCountRef.current > 0) {
-            fallbackTimer.current = setTimeout(() => { if (runningRef.current || permissionsCountRef.current > 0) void load() }, 2000)
+          if (runningRef.current || permissionsCountRef.current > 0) {
+            fallbackTimer.current = setTimeout(() => { if (runningRef.current || permissionsCountRef.current > 0) scheduler.request(true) }, 2000)
           }
         }
       }
     }
-    const request = () => {
-      if (loading) queued = true
-      else { clearTimeout(timer); clearTimeout(fallbackTimer.current); timer = setTimeout(() => void load(), 120) }
-    }
-    refresh.current = request
+    const scheduler = createChatRefresh(load)
+    const request = () => { clearTimeout(fallbackTimer.current); scheduler.request() }
+    refresh.current = () => { clearTimeout(fallbackTimer.current); scheduler.request(true) }
     const unsubscribe = window.ame.onEvent(event => { if (event.type === 'opencode' && event.projectID === projectID && (!event.sessionID || event.sessionID === sessionID)) request() })
-    void load()
-    return () => { alive = false; clearTimeout(timer); clearTimeout(fallbackTimer.current); unsubscribe(); refresh.current = () => {} }
+    scheduler.request(true)
+    return () => { alive = false; scheduler.dispose(); clearTimeout(fallbackTimer.current); unsubscribe(); refresh.current = () => {} }
   }, [projectID, sessionID, connected])
   useEffect(() => {
-    if (running && projectID && sessionID && connected) refresh.current()
-    else if (permissionsCountRef.current === 0) clearTimeout(fallbackTimer.current)
+    // Both edges matter: the idle edge must fetch final text and turn metadata.
+    if (projectID && sessionID && connected) refresh.current()
+    if (!running && permissionsCountRef.current === 0) clearTimeout(fallbackTimer.current)
   }, [running, projectID, sessionID, connected])
-  useEffect(() => { if (follow.current) timeline.current?.scrollTo({ top: timeline.current.scrollHeight }) }, [messages, permissions])
+  useEffect(() => { if (follow.current) timeline.current?.scrollTo({ top: timeline.current.scrollHeight }) }, [messages, permissions, forms])
+  const formIDs = forms.map(form => form.id).join(',')
+  useEffect(() => { if (forms.length) { follow.current = true; timeline.current?.scrollTo({ top: timeline.current.scrollHeight }) } }, [formIDs])
   const recentPaths = [...new Set([...(activeFile ? [activeFile] : []), ...tabs.map(tab => tab.path)])]
   const fileChoices = [...new Set([...files, ...recentPaths])]
   const choices = attachmentPicker
@@ -377,12 +418,12 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
   const send = async () => {
     const selectedModel = activeModel
     const { text: prompt, files } = splitComposerAttachments(text, attachments)
-    if (!projectID || (!prompt.trim() && !files.length) || busy || !connected || !ready || !selectedModel || translationSession || lockedTranslation || composing.current) return
+    if (!projectID || (!prompt.trim() && !files.length) || busy || permissionPending.current || permissionLoading || !connected || !ready || !selectedModel || translationSession || lockedTranslation || composing.current) return
     const submitted = text, submittedSession = sessionID, submittedProject = projectID, submittedAttachments = attachments
     const submittedIDs = new Set(submittedAttachments.map(item => item.id))
     setBusy(true)
     try {
-      if (!await submit.current!(projectID, sessionID, prompt, selectedModel, agent || undefined, files.length ? files : undefined)) return
+      if (!await submit.current!(projectID, sessionID, prompt, selectedModel, undefined, files.length ? files : undefined, draftID, permissionMode)) return
       if (currentProject.current === submittedProject && (currentSession.current === submittedSession || (!submittedSession && currentSession.current === createdSession.current))) {
         setText(current => current === submitted ? '' : current)
         setAttachments(current => current.filter(item => !submittedIDs.has(item.id)))
@@ -444,11 +485,13 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
                    const actions = { projectDirectory, onOpenFile, onOpenAgentMap: () => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) } }
                    if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
                    if (block.kind === 'active-tools') return <ActiveToolsView key={block.id} items={block.items} {...actions} />
-                   if (block.kind === 'live-status') return <LiveTurnStatus key={block.id} label={block.label} />
+                   if (block.kind === 'live-status') return <LiveTurnStatus key={block.id} label={forms.length ? 'Đang chờ bạn trả lời câu hỏi…' : block.label} />
                    const item = block.item
+                   if (block.kind === 'tool' && item.tool?.name === 'question' && (item.tool.status === 'running' || item.tool.status === 'streaming')) return <ActiveToolsView key={block.id} items={[item]} {...actions} />
                    return <article key={block.id} className="msg-agent">{block.kind === 'tool' && item.tool ? <ToolCard call={item.tool} onOpenFile={onOpenFile} projectDirectory={projectDirectory} /> : block.kind === 'changes' && item.turn && projectID && sessionID ? <TurnChanges key={`${sessionID}:${item.id}`} projectID={projectID} sessionID={sessionID} from={item.turn.from} files={item.turn.files} theme={theme} /> : block.kind === 'tool' ? <details className="tool-card"><summary><Icon name="terminal" /> Công cụ</summary><pre>{item.text || 'Đang cập nhật công cụ…'}</pre></details> : block.kind === 'reasoning' ? <details className="thought-block"><summary>Suy nghĩ</summary><div className="thought-block__content"><MessageContent text={item.text || '…'} onOpenFile={onOpenFile} /></div></details> : <MessageContent text={item.text || '…'} onOpenFile={onOpenFile} />}</article>
                  })}</div>
                </section>)}
+        {forms.map(form => <SessionFormCard key={`${projectID}:${sessionID}:${form.id}`} projectID={projectID!} form={form} disabled={!connected || lockedTranslation} onResolved={id => { setForms(current => current.filter(form => form.id !== id)); refresh.current() }} />)}
         {permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
       {lockedTranslation || translationSession ? <div className="translation-locked-banner" role="status" data-testid="translation-locked-banner"><Icon name="lock" /><p>{lockedTranslation ? 'Phiên dịch Android này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Dịch Android riêng. Mở Dịch Android để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p>{!lockedTranslation && <button type="button" onClick={() => onOpenAndroidTranslation?.()}>Dịch Android</button>}<button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <div className="composer-dock"><div className="composer-dock__inner">{(projectName || sessionID) && <div className="composer-context-strip">{sessionID ? <button className="ctx-strip-chip" onClick={() => onOpenPanel('changes')} title="Thay đổi của toàn bộ session, từ OpenCode snapshots"><Icon name="diff" /><span>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files changed`}</span>{changesStatus === 'ready' && projectName && <span className="ctx-strip-chip__meta">· {projectName}</span>}</button> : <span>Project: <strong>{projectName}</strong>{branch ? ` (${branch})` : ''}</span>}{sessionID && <button type="button" className="agent-map-trigger" data-testid="agent-map-trigger" title="Mở Agent map (sơ đồ subagents, skill, prompt và output)" onClick={() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }}><span className={`agent-map-dot ${agentFamily.runningCount > 0 ? 'agent-map-dot--running' : agentFamily.subagentCount > 0 ? 'agent-map-dot--succeeded' : 'agent-map-dot--idle'}`} aria-hidden="true" /><span>{agentFamily.subagentCount > 0 ? `${agentFamily.subagentCount} subagent` : 'Agent map'}</span></button>}</div>}      <form className="composer-card" onSubmit={e => { e.preventDefault(); void send() }} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) { setTrigger(null); setAttachmentPicker(false) } }}>
@@ -470,9 +513,9 @@ export function Chat({ focusNonce, timelineDetail = 'compact', projectID, projec
         </span> : <label className="composer-picker composer-picker--model" title={activeModel ? `Model: ${formatModelOptionLabel(activeModel, effectiveModelLevels)}` : 'Chọn model'}>
           <span className="composer-picker__face" aria-hidden="true"><Icon name="sparkles" /><span className="composer-picker__label">{activeModel?.name || 'Chọn model'}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Mô hình" value={model} onChange={e => { userPickedModel.current = true; setModel(e.target.value) }} disabled={!connected || busy}><option value="">Chọn model</option>{models.map(m => <option key={modelKey(m)} value={modelKey(m)}>{formatModelOptionLabel(m, effectiveModelLevels)}</option>)}</select>
-        </label>}</div><div className="composer-toolbar__right"><label className="composer-picker composer-picker--agent" title={`Agent: ${activeAgent?.name || 'Default'} (policy quyền do OpenCode quản lý)`}>
-          <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{activeAgent?.name || 'Default'}</span><Icon name="down" /></span>
-          <select className="composer-picker__native" aria-label="Agent" value={agent} onChange={e => setAgent(e.target.value)} disabled={!connected || busy}><option value="">Default</option>{agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select>
+        </label>}</div><div className="composer-toolbar__right"><label className={`composer-picker composer-picker--permission${permissionMode === 'full' ? ' is-full' : ''}`} title={permissionModeOptions.find(option => option.value === permissionMode)?.description}>
+          <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{permissionLoading || updatingPermission ? 'Đang tải quyền…' : permissionModeOptions.find(option => option.value === permissionMode)?.label}</span><Icon name="down" /></span>
+          <select className="composer-picker__native" aria-label="Quyền thực thi" value={permissionMode} onChange={e => void changePermissionMode(e.target.value as PermissionMode)} disabled={!projectID || !connected || busy || permissionLoading || updatingPermission}>{permissionModeOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
         </label>{running && <button className="icon-btn" type="button" disabled={!sessionID || !connected} title="Dừng phản hồi" onClick={() => { if (projectID && sessionID) void window.ame.cancel(projectID, sessionID).then(() => refresh.current()).catch(report) }}><Icon name="stop" /></button>}<button className="send-btn" aria-label="Gửi yêu cầu" disabled={!projectID || !connected || !ready || busy || (!text.trim() && !attachments.length) || !activeModel}><Icon name="send" /></button></div></div>
       </form></div></div>}
     </div>

@@ -49,6 +49,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   let apiResponse: ((url: URL, init?: RequestInit) => Promise<Response | undefined>) | undefined
   let role: unknown = settings.role ?? "user", plugin = settings.plugin !== false, accepted = settings.confirm !== false, failAuth = false, failStorage = false, pickerCount = 0
   let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
+  let accountId = "1", username = "fixture"
   let pickResponse: (() => Promise<string | null>) | undefined
   let rpcResponse: (() => Promise<Response | undefined>) | undefined
   let dialogueResponse: ((signal: AbortSignal) => Promise<Response>) | undefined
@@ -86,7 +87,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
     if (url.pathname.endsWith("/activate")) return Response.json(artifact.latest)
     if (url.pathname === "/v1/amekit/bundles/uploads") return Response.json({ uploadId: artifact.release.releaseId })
     if (url.pathname === "/v1/amekit/releases" && init?.method === "POST") return Response.json({ release: artifact.release })
-    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: "1", name: "Fixture", username: "fixture", role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog: settings.catalog ?? catalog, registry: {} })
+    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: accountId, name: "Fixture", username, role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog: settings.catalog ?? catalog, registry: {} })
   }
   const dependencies: AmeKitDependencies = {
     fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs,
@@ -104,6 +105,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
     apiResponse: (value: (url: URL, init?: RequestInit) => Promise<Response | undefined>) => { apiResponse = value },
     role: (value: unknown) => { role = value }, plugin: (value: boolean) => { plugin = value }, confirm: (value: boolean) => { accepted = value }, disable: () => { failAuth = true }, breakStorage: () => { failStorage = true }, pickerCount: () => pickerCount,
     sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
+    account: (id: string, name = "fixture") => { accountId = id; username = name },
     rpcResponse: (value?: () => Promise<Response | undefined>) => { rpcResponse = value },
     pickResponse: (value?: () => Promise<string | null>) => { pickResponse = value },
     dialogueResponse: (value: (signal: AbortSignal) => Promise<Response>) => { dialogueResponse = value },
@@ -1850,6 +1852,69 @@ test("auto sync silently installs on login, refresh, heartbeat, activate and act
       assert.deepEqual(await readdir(f.project), [])
       assert.equal((await settledStatus(f.service) as { bundleAutoSyncError?: string }).bundleAutoSyncError, undefined)
     } finally { await f.cleanup() }
+  })
+})
+
+test("uninstall opt-out survives heartbeats, refresh, login, new releases and application restart until manual sync or install", async t => {
+  for (const operation of ["sync", "install"]) await t.test(operation, async t => {
+    t.mock.timers.enable({ apis: ["setInterval"] })
+    const f = await fixture({ autoSync: true, refreshIntervalMs: 100 })
+    let service = f.service
+    const downloads = () => f.requests.filter(request => request.endsWith("/download")).length
+    const absent = async () => assert.equal(await service.call("installed", {}), null)
+    const heartbeat = async () => { t.mock.timers.tick(100); await settledStatus(service); await absent() }
+    try {
+      await login(service)
+      assert.ok(await service.call("installed", {}))
+      f.confirm(false)
+      await assert.rejects(service.call("uninstall", {}), /CANCELLED/)
+      assert.ok(await service.call("installed", {}))
+      f.confirm(true)
+      assert.deepEqual(await service.call("uninstall", {}), { changed: true })
+      const count = downloads()
+      await heartbeat(); await heartbeat()
+      await service.call("refresh", {}); await absent()
+      await service.call("logout", {}); await login(service); await absent()
+      f.apiResponse(async url => url.pathname.endsWith("/latest") ? Response.json({ ...f.artifact.latest, release: { ...f.artifact.release, releaseId: "dd7c6208-b91c-4360-b6ce-68aa65599ebe" } }) : undefined)
+      await heartbeat()
+      await service.dispose()
+      service = createAmeKit(f.options, f.dependencies)
+      await absent() // Wait for ready and its scheduled auto-sync.
+      await heartbeat(); await heartbeat()
+      assert.equal(downloads(), count, "opt-out prevents every automatic download")
+      assert.ok(await service.call(operation, {}), "explicit installation enables the bundle again")
+      // Simulate missing files without an explicit opt-out; automatic repair is enabled again.
+      await uninstallGlobal(f.globalConfigDir, f.globalManagedDir)
+      await service.call("refresh", {})
+      assert.ok(await service.call("installed", {}))
+      await service.dispose()
+      service = createAmeKit(f.options, f.dependencies)
+      assert.ok(await service.call("installed", {}), "manual opt-in persists across restart")
+    } finally { await service.dispose(); await f.cleanup() }
+  })
+})
+
+test("bundle opt-out is isolated by account ID and API origin, and another account's sync cannot clear it", async t => {
+  for (const boundary of ["account", "origin"]) await t.test(boundary, async () => {
+    const f = await fixture({ autoSync: true })
+    let other: AmeKit | undefined, restored: AmeKit | undefined
+    try {
+      await login(f.service); assert.ok(await f.service.call("installed", {}))
+      await f.service.call("uninstall", {})
+      await f.service.dispose()
+      if (boundary === "account") f.account("2", "fixture-b")
+      const dependencies = boundary === "origin" ? { ...f.dependencies, fetch: (async (request, init) => f.dependencies.fetch!(String(request).replace("http://localhost:3213", "http://localhost:3211"), init)) as typeof fetch } : f.dependencies
+      other = createAmeKit(f.options, dependencies)
+      await other.call("login", { server: boundary === "origin" ? "http://localhost:3213" : "http://localhost:3211", username: "fixture-b", password: "fixture-password" })
+      assert.ok(await other.call("installed", {}), "another account or endpoint still auto-installs")
+      await other.call("sync", {})
+      await other.dispose()
+      await uninstallGlobal(f.globalConfigDir, f.globalManagedDir)
+      f.account("1", "renamed-fixture") // Stable ID, not display name or token, owns the preference.
+      restored = createAmeKit(f.options, f.dependencies)
+      await login(restored)
+      assert.equal(await restored.call("installed", {}), null, "A's opt-out survives B's explicit sync")
+    } finally { await other?.dispose(); await restored?.dispose(); await f.cleanup() }
   })
 })
 

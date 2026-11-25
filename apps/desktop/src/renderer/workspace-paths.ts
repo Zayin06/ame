@@ -31,7 +31,7 @@ export function sanitizeProjectView(view: ProjectView, projectDirectory?: string
     if (tab.mode !== 'file' && tab.mode !== 'diff') continue
     const file = resolveWorkspaceFilePath(tab.path, projectDirectory)
     if (!file) continue
-    const resolved = { path: file.path, mode: tab.mode }
+    const resolved = { ...tab, path: file.path }
     const key = tabID(resolved)
     mapped.set(tabID(tab), resolved)
     if (!seen.has(key)) { tabs.push(resolved); seen.add(key) }

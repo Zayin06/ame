@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
-import type { AndroidTranslationInfo, ChatItem, IdeEvent, Permission, Session, SkillSummary } from '../../../../../packages/protocol/src/index'
+import type { AndroidTranslationInfo, ChatItem, IdeEvent, Permission, Session, SessionForm, SkillSummary } from '../../../../../packages/protocol/src/index'
 import { projectChatTimeline } from '../chat-timeline'
 import * as modelSelection from '../model-selection'
 import * as amekitUI from '../amekit-ui'
@@ -23,6 +23,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
   const calls: { method: string; args: unknown[] }[] = [], listeners = new Map<string, Set<(event: Event) => void>>(), events = new Set<(event: IdeEvent) => void>()
   let promptError = '', lockError = '', nextPrompt: Promise<unknown> | undefined
   let sessionModel: string | undefined
+  let forms: SessionForm[] = []
   let skills: SkillSummary[] = [], skillsLoads = 0
   const hooks = {
     useState(initial: unknown) {
@@ -60,6 +61,8 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     },
     async messages() { return items },
     async permissions() { return permissions },
+    async forms() { return forms },
+    async sessionPermissionMode() { return 'default' },
     async sessions() { return sessions },
     async agentMap(_projectID: string, sessionID: string) { return { nodes: sessionModel ? [{ id: sessionID, model: sessionModel, providerID: 'amecode' }] : [] } },
     async replyPermission(...args: unknown[]) { calls.push({ method: 'permission', args }); permissions = []; return undefined },
@@ -82,6 +85,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     './Icon': { Icon: marker }, './MessageContent': { MessageContent: ({ text }: { text: string }) => text },
     './Primitives': { errorText: (e: unknown) => String(e).replace(/^Error: /, ''), IconButton: marker, Empty: marker },
     './SessionChanges': { TurnChanges: marker }, './ToolCard': { ToolCard: marker },
+    './SessionFormCard': { SessionFormCard: ({ form }: { form: SessionForm }) => `Pending form: ${form.title}` },
     './TurnWorkGroup': { TurnWorkGroup: marker, ActiveToolsView: marker, LiveTurnStatus: marker },
     '../chat-timeline': { projectChatTimeline }, '../model-selection': modelSelection, '../amekit-ui': amekitUI,
     './AgentList': { AgentList: marker }, './AgentMap': { AgentMap: marker },
@@ -138,6 +142,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     updateSessionModel(value: string) { sessionModel = value },
     updateMessages(value: ChatItem[]) { items = value },
     updatePermissions(value: Permission[]) { permissions = value },
+    updateForms(value: SessionForm[]) { forms = value },
     updateSkills(value: SkillSummary[]) { skills = value },
     get skillsLoads() { return skillsLoads },
     get eventListeners() { return events.size },
@@ -293,6 +298,17 @@ test('fallback and missing configuration are visible; disconnected and unconfigu
   h.unmount()
   const offline = harness({ props: { connected: false } }); offline.render(); offline.change('Dịch'); offline.render(); offline.submit(); await offline.flush()
   assert.equal(offline.calls.length, 0); assert.match(offline.render(), /Chưa kết nối OpenCode/); offline.unmount()
+})
+
+test('pending session forms are rendered by Chat and translation and prevent finishing translation', async () => {
+  for (const component of ['AndroidTranslationModal', 'Chat'] as const) {
+    const h = harness({ component, info: { translationSessionIDs: ['translation-form'] }, props: component === 'Chat' ? { sessionID: 'translation-form' } : {} })
+    h.updateForms([{ id: 'f', sessionID: 'translation-form', title: 'Chọn locale', fields: [{ key: 'locale', type: 'string' }] }])
+    h.render(); const html = await h.flush()
+    assert.match(html, /Pending form: Chọn locale/)
+    if (component === 'AndroidTranslationModal') assert.equal(h.button('✓ Hoàn tất').props.disabled, true)
+    h.unmount()
+  }
 })
 
 test('lock failures do not close, and server locked rejection switches to read-only', async () => {

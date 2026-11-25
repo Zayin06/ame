@@ -6,6 +6,7 @@ export const errorText = (error: unknown) => (error instanceof Error ? error.mes
 export function humanizeIdeError(error: unknown): string {
   const text = errorText(error).trim()
   const messages: [RegExp, string][] = [
+    [/\bAMECODE_REQUEST_TOO_LARGE\b/, 'Tổng yêu cầu sau mã hóa base64 (gồm tệp đính kèm, JSON, prompt và lịch sử trò chuyện) vượt giới hạn 8 MiB của gateway. Hãy bỏ bớt tệp trên bản nháp hoặc rút ngắn nội dung/lịch sử rồi gửi lại.'],
     [/\b(?:IS_DIRECTORY|EISDIR)\b/, 'Không thể mở thư mục như tệp văn bản.'],
     [/\bBINARY_FILE\b/, 'Không thể xem trước tệp nhị phân trong trình soạn thảo.'],
     [/\bFILE_TOO_LARGE\b/, 'Tệp vượt quá giới hạn 4 MiB để mở trong trình soạn thảo.'],

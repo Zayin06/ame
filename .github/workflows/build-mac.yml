@@ -97,19 +97,16 @@ jobs:
         env:
           NODE_OPTIONS: --max-old-space-size=6144
         run: npm run build:server && npx electron-vite build
-      - name: Package macOS DMG and ZIP
+      - name: Package macOS DMG only
         if: steps.filter.outputs.enabled == 'true'
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
           NODE_OPTIONS: --max-old-space-size=6144
-        run: npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never
+        run: npx electron-builder --mac dmg --${{ matrix.arch }} --publish never
       - uses: actions/upload-artifact@v4
         if: steps.filter.outputs.enabled == 'true'
         with:
           name: ame-ide-mac-${{ matrix.arch }}-${{ github.run_id }}
           if-no-files-found: error
-          path: |
-            release/*.dmg
-            release/*.zip
-            release/*.blockmap
-            release/latest*.yml
+          compression-level: 0
+          path: release/*.dmg

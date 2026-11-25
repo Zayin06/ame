@@ -187,7 +187,8 @@
 .ctx-strip-chip svg { width: 12px; height: 12px; color: var(--text-muted); flex-shrink: 0; }
 .composer-picker { position: relative; display: inline-flex; align-items: center; min-width: 0; max-width: 100%; border-radius: var(--radius-sm); }
 .composer-picker--model { flex: 0 1 auto; min-width: 0; max-width: 165px; }
-.composer-picker--agent { flex: 0 1 auto; min-width: 0; max-width: 118px; }
+.composer-picker--permission { flex: 0 1 auto; min-width: 0; max-width: 174px; }
+.composer-picker--permission.is-full { color: var(--text-warning, #d99a38); }
 .composer-picker__face { display: inline-flex; align-items: center; gap: 4px; height: 26px; min-width: 0; max-width: 100%; padding: 0 6px; border-radius: var(--radius-sm); color: var(--text-secondary); font-size: 12px; transition: background var(--dur-fast) ease, color var(--dur-fast) ease; }
 .composer-picker:not(.composer-picker--locked):hover .composer-picker__face { background: var(--bg-hover); color: var(--text-primary); }
 .composer-picker:has(:focus-visible) .composer-picker__face { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -200,8 +201,8 @@
 .composer-picker__native:disabled { cursor: default; }
 .composer-picker__native option { background: var(--bg-elevated); color: var(--text-primary); }
 @container composer (max-width: 375px) {
-  .composer-picker--agent .composer-picker__label { display: none; }
-  .composer-picker--agent .composer-picker__face { padding: 0 5px; gap: 2px; }
+  .composer-picker--permission { max-width: 124px; }
+  .composer-picker--permission .composer-picker__face { padding: 0 5px; gap: 2px; }
 }
 @container composer (max-width: 340px) { .ctx-strip-chip__meta { display: none; } }
 @container composer (max-width: 320px) {
@@ -605,13 +606,21 @@ button:focus:not(:focus-visible) { outline: none; }
 .session-changes { min-width: 0; padding: 12px; overflow: auto; }
 .session-changes h3 { font-size: 13px; margin: 0 0 12px; }
 .session-change-file, .turn-changes { min-width: 0; border: 1px solid var(--border-default); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
-.session-change-file > summary { display: flex; justify-content: space-between; gap: 12px; }
+.session-change-file > summary { display: flex; justify-content: space-between; align-items: center; gap: 12px; list-style: none; }
+.session-change-file > summary::-webkit-details-marker { display: none; }
+.session-change-file > summary > .truncate::before { content: '▸'; display: inline-block; margin-right: 6px; color: var(--text-muted); }
+.session-change-file[open] > summary > .truncate::before { content: '▾'; }
 .session-change-file > summary, .turn-changes > summary { cursor: pointer; padding: 10px; font-size: 12px; background: var(--bg-elevated); }
 .session-change-file > summary > :last-child { flex-shrink: 0; }
-.session-change-file > p { padding: 0 10px; }
+.session-change-file > p, .session-change-note { margin: 0; padding: 8px 10px; font-size: 12px; }
 .session-change-added { color: var(--status-success, #42b883); }
 .session-change-deleted { color: var(--status-error, #e56565); }
 .session-change-file diffs-container { display: block; font-size: 12px; }
+.session-change-raw { margin: 0; padding: 8px 0; max-height: 460px; overflow: auto; font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; line-height: 1.5; background: var(--bg-canvas); }
+.session-change-raw__line { display: block; padding: 0 12px; white-space: pre; }
+.session-change-raw__line.is-add { background: rgba(66, 184, 131, 0.14); color: var(--status-success, #42b883); }
+.session-change-raw__line.is-del { background: rgba(229, 101, 101, 0.14); color: var(--status-error, #e56565); }
+.session-change-raw__line.is-hunk { color: var(--text-muted); background: var(--bg-elevated); }
 .turn-changes .session-changes { max-height: 600px; }
 .session-changes .inline-error { display: flex; gap: 10px; align-items: center; }
 
@@ -742,3 +751,20 @@ button:focus:not(:focus-visible) { outline: none; }
 .git-bn-preview .chat-markdown .gfm-table { width: 100%; table-layout: fixed; }
 .git-bn-preview .chat-markdown .gfm-table :is(th, td) { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
 
+.session-form-card { display: grid; gap: 14px; margin: 16px 0; padding: 18px; border: 1px solid var(--accent-border, var(--border-default)); border-radius: 12px; background: var(--bg-elevated); color: var(--text-primary); min-width: 0; }
+.session-form-card h3 { margin: 0 0 4px; font-size: 15px; }
+.session-form-card header > span, .session-form-card__field p, .session-form-card small { color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.session-form-card fieldset { display: grid; gap: 18px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.session-form-card__field { display: grid; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+.session-form-card__field > label { font-weight: 600; font-size: 13px; }
+.session-form-card__field p { margin: 0; white-space: pre-wrap; }
+.session-form-card__options { display: flex; flex-wrap: wrap; gap: 8px; }
+.session-form-card__options label { display: flex; align-items: flex-start; gap: 8px; padding: 9px 12px; border: 1px solid var(--border-default); border-radius: 8px; cursor: pointer; }
+.session-form-card__options label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.session-form-card small { display: block; margin-top: 3px; }
+.session-form-card input:not([type=checkbox]):not([type=radio]) { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid var(--border-default); border-radius: 7px; background: var(--bg-canvas); color: var(--text-primary); font: inherit; }
+.session-form-card input[type=checkbox], .session-form-card input[type=radio] { accent-color: var(--accent); width: 16px; height: 16px; }
+.session-form-card button { padding: 9px 12px; border: 1px solid var(--border-default); border-radius: 7px; background: var(--bg-canvas); color: var(--text-primary); cursor: pointer; font: inherit; }
+.session-form-card button[type=submit] { background: var(--accent-soft); border-color: var(--accent); }
+.session-form-card button:disabled { opacity: .5; cursor: not-allowed; }
+.session-form-card :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

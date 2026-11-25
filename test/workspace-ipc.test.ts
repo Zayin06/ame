@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import path from 'node:path'
+import { tmpdir } from 'node:os'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
 import * as React from 'react'
@@ -9,8 +11,12 @@ import * as jsxRuntime from 'react/jsx-runtime'
 import { renderToStaticMarkup } from 'react-dom/server'
 import * as rendererState from '../apps/desktop/src/renderer/state'
 import * as editorSplit from '../apps/desktop/src/renderer/editor-split'
+import * as editorModelLifecycle from '../apps/desktop/src/renderer/editor-model-lifecycle'
 import * as workspacePaths from '../apps/desktop/src/renderer/workspace-paths'
 import * as terminalControls from '../apps/desktop/src/renderer/terminal-controls'
+import * as projectRemoval from '../apps/desktop/src/renderer/project-removal'
+import * as petSessionMapping from '../apps/desktop/src/renderer/pet-sessions'
+import * as chatRefresh from '../apps/desktop/src/renderer/chat-refresh'
 import * as platform from '../apps/desktop/src/renderer/platform'
 import * as composerMentions from '../apps/desktop/src/renderer/composer-mentions'
 import { chatSubmit } from '../apps/desktop/src/renderer/chat-submit'
@@ -18,6 +24,8 @@ import * as modelSelection from '../apps/desktop/src/renderer/model-selection'
 import { projectChatTimeline } from '../apps/desktop/src/renderer/chat-timeline'
 import { familySummaryFromSessions } from '../apps/desktop/src/renderer/agent-map-model'
 import { z } from 'zod'
+import { rendererSource, isRendererDocument } from '../apps/desktop/src/main/renderer-source'
+import { replaceInWorkspace } from '../packages/ide-core/src/search'
 import { validateWorkspacePath } from '../packages/ide-core/src/workspace-fs'
 import type { BuildNotesRequest, DesktopApi } from '../packages/protocol/src/index'
 import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
@@ -26,6 +34,11 @@ import { buildAndroidTranslationPrompt, createTranslationLockStore } from '../pa
 
 type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
+  { method: 'forms', args: ['p', 's'] },
+  { method: 'replyForm', args: ['p', 's', 'f', { locale: 'ja', multiple: ['a', 'b'], enabled: true, count: 2 }] },
+  { method: 'cancelForm', args: ['p', 's', 'f', 'skip'] },
+  { method: 'sessionPermissionMode', args: ['p', 's'] },
+  { method: 'updateSessionPermissionMode', args: ['p', 's', 'ask'] },
   { method: 'listFiles', args: ['p'] },
   { method: 'sessionUsage', args: ['p', 's'] },
   { method: 'agentMap', args: ['p', 's'] },
@@ -63,6 +76,15 @@ const examples: Invocation[] = [
 ]
 
 const buildNotesRequest: BuildNotesRequest = { mode: 'range', baseCommit: 'abcdef0', includeWorking: true }
+
+test('form IPC rejects unsafe answer maps and oversized payloads before dispatch', async () => {
+  const h = await harness()
+  for (const answer of [JSON.parse('{"__proto__":"bad"}'), { constructor: 'bad' }, { prototype: 'bad' }, { nested: {} }, { a: null }, { a: Infinity }, { a: 'x'.repeat(20001) }, { ['x'.repeat(201)]: 'a' }, Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`k${i}`, true])), { a: Array(101).fill('x') }]) {
+    await assert.rejects(async () => h.dispatch('replyForm', ['p', 's', 'f', answer]))
+  }
+  await assert.rejects(async () => h.dispatch('cancelForm', ['p', 's', 'f', 'x'.repeat(2001)]))
+  assert.equal(h.calls.length, 0)
+})
 const buildNotesExamples: Invocation[] = [
   { method: 'buildNotesPreview', args: ['p', buildNotesRequest] },
   { method: 'generateBuildNotes', args: ['p', { mode: 'commits', commitHashes: ['ABCDEF0'], includeWorking: false, note: 'Release highlights' }] },
@@ -131,6 +153,7 @@ async function harness(directory = 'workspace') {
   const calls: Invocation[] = []
   const messages: string[] = []
   let response = 1
+  let onConfirm: (() => Promise<void>) | undefined
   let picked = { canceled: true, filePaths: [] as string[] }
   const resolved = [{ ok: true, kind: 'workspace-file', path: 'src/app.ts', name: 'app.ts' }]
   let preview = { filesChanged: 2, replacements: 3, previews: [] }
@@ -152,7 +175,7 @@ async function harness(directory = 'workspace') {
   let notesSummary = buildNotesSummary
   workspace.buildNotesSummary = async (...args: unknown[]) => { calls.push({ method: 'buildNotesSummary', args }); return notesSummary }
   workspace.stagedDiffSummary = async (...args: unknown[]) => { calls.push({ method: 'stagedDiffSummary', args }); return summary }
-  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt', 'cancel'].map(method => [method, async (...args: unknown[]) => {
+  const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['forms', 'replyForm', 'cancelForm', 'sessionPermissionMode', 'updateSessionPermissionMode', 'renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt', 'cancel'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args })
     if (operationGate) await operationGate
     return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
@@ -215,7 +238,7 @@ async function harness(directory = 'workspace') {
   adapter.sessions = async (...args: unknown[]) => { calls.push({ method: 'sessions', args }); return sessions }
   adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
-    z, Buffer, process, window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
+    z, Buffer, process, randomUUID, window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
     translationLocks, buildAndroidTranslationPrompt,
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
     detectAndroidProject: async (...args: unknown[]) => { calls.push({ method: 'detectAndroidProject', args }); return detected },
@@ -233,10 +256,11 @@ async function harness(directory = 'workspace') {
       return picked
     }, showMessageBox: async (window: unknown, options: any) => {
       assert.equal(window, parent)
-      assert.deepEqual(Array.from(options.buttons), ['Hủy', 'Xác nhận'])
+      assert.deepEqual(Array.from(options.buttons), options.buttons.length === 3 ? ['Hủy', 'Lưu và gỡ', 'Bỏ thay đổi và gỡ'] : ['Hủy', 'Xác nhận'])
       assert.equal(options.defaultId, 0); assert.equal(options.cancelId, 0)
       messages.push(options.message)
       calls.push({ method: 'confirm', args: options.detail ? [options.message, options.detail] : [options.message] })
+      await onConfirm?.()
       return { response }
     } }
   }
@@ -247,6 +271,8 @@ async function harness(directory = 'workspace') {
   }
   return {
     dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState, resolved,
+    setReplacement: (replace: (...args: any[]) => Promise<unknown>) => { workspace.replaceInProject = replace },
+    onConfirm: (callback: () => Promise<void>) => { onConfirm = callback },
     setPicked: (value: typeof picked) => { picked = value },
     setCommitEnhanceReader: (reader: NonNullable<typeof account.readCommitEnhanceSkill>) => { account.readCommitEnhanceSkill = reader },
     setCommitEnhanceFeatureReader: (reader: NonNullable<typeof account.readCommitEnhanceFeature>) => { account.readCommitEnhanceFeature = reader },
@@ -272,7 +298,7 @@ async function harness(directory = 'workspace') {
       status = { account: { role: 'admin' }, models: { default_model: value[0]?.modelID ?? 'missing', models: value.map(model => ({ id: model.modelID ?? model.id })) } }
     }, setSummary: (value: typeof summary) => { summary = value },
     failPolicy: (value: string) => { policyError = value }, gatePolicy: (value: Promise<void>) => { policyGate = value },
-    cancel: () => { response = 0 }, approve: () => { response = 1 }, empty: () => { preview = { filesChanged: 0, replacements: 0, previews: [] } }
+    cancel: () => { response = 0 }, approve: () => { response = 1 }, discard: () => { response = 2 }, empty: () => { preview = { filesChanged: 0, replacements: 0, previews: [] } }
   }
 }
 
@@ -326,7 +352,9 @@ async function rendererModule(file: string, hooks: ReturnType<typeof rendererHoo
   const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'renderer', file), 'utf8')
   const modules: Record<string, unknown> = {
     react: hooks.react, 'react/jsx-runtime': jsxRuntime, './state': rendererState, './editor-split': editorSplit,
-    './workspace-paths': workspacePaths, './terminal-controls': terminalControls, './platform': platform,
+    './workspace-paths': workspacePaths, './terminal-controls': terminalControls, './platform': platform, './project-removal': projectRemoval,
+    './pet-sessions': petSessionMapping, '../chat-refresh': chatRefresh, './editor-model-lifecycle': editorModelLifecycle,
+    'monaco-editor': { editor: { getModels: () => [] }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } },
     '../composer-mentions': composerMentions, '../chat-submit': { chatSubmit }, '../model-selection': modelSelection,
     '../chat-timeline': { projectChatTimeline }, '../agent-map-model': { familySummaryFromSessions }
   }
@@ -445,7 +473,7 @@ async function appRenderer(overrides: Record<string, (...args: any[]) => any> = 
     assert.ok(element, `${name} should be rendered`); return element.props
   }
   await settle()
-  return { calls, props, settle, windowListeners, dispose: () => hooks.dispose(),
+  return { calls, props, settle, windowListeners, alerts: () => rendererElements(tree, element => element.props.role === 'alert'), dispose: () => hooks.dispose(),
     emit: (event: any) => {
       if (event.type === 'debug' && event.event.snapshot) debugStates.set(event.projectID, event.event.snapshot)
       listeners.forEach(listener => listener(event))
@@ -453,6 +481,45 @@ async function appRenderer(overrides: Record<string, (...args: any[]) => any> = 
     tick: async (delay: number) => { for (const [id, timer] of [...timers]) if (timer.delay === delay) { timers.delete(id); timer.callback() }; await flushRendererPromises(); await settle() }
   }
 }
+
+test('App New Chat rotates draft identity and ignores in-flight creation callbacks from the old draft', async () => {
+  for (const phase of ['create', 'prompt']) {
+    const h = await appRenderer({ connection: async () => ({ connected: true, url: '' }), sessions: async () => [] })
+    try {
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const oldChat = h.props('Chat')
+      const prompts: [string, string][] = []
+      let creates = 0
+      const submit = chatSubmit({
+        createSession: async () => { const id = `session-${++creates}`; if (phase === 'create' && creates === 1) await gate; return { id, title: id } },
+        prompt: async (_project, id, text) => { prompts.push([id, text]); if (phase === 'prompt' && id === 'session-1') await gate },
+      }, oldChat.onCreated)
+      const old = submit('p', undefined, 'A', selectedModel, undefined, undefined, oldChat.draftID)
+      await flushRendererPromises()
+      oldChat.onCreate()
+      // The guard must work even before React has rendered the new draft.
+      if (phase === 'create') { release(); await old }
+      await h.settle()
+      const newChat = h.props('Chat')
+      assert.notEqual(newChat.draftID, oldChat.draftID)
+      assert.equal(newChat.sessionID, undefined)
+      const newSubmit = chatSubmit({
+        createSession: async () => ({ id: `session-${++creates}`, title: 'B' }),
+        prompt: async (_project, id, text) => { prompts.push([id, text]) },
+      }, newChat.onCreated)
+      await newSubmit('p', undefined, 'B', selectedModel, undefined, undefined, newChat.draftID)
+      if (phase === 'prompt') { release(); await old }
+      await h.settle()
+      assert.equal(h.props('Chat').sessionID, 'session-2')
+      assert.equal(creates, 2)
+      assert.deepEqual(prompts, [['session-1', 'A'], ['session-2', 'B']])
+      oldChat.onCreated({ id: 'stale', title: 'Stale' })
+      await h.settle()
+      assert.equal(h.props('Chat').sessionID, 'session-2')
+    } finally { h.dispose() }
+  }
+})
 
 test('file-only submission retains the pending guard and reuses a draft after a failed prompt', async () => {
   let release!: () => void
@@ -475,6 +542,83 @@ test('file-only submission retains the pending guard and reuses a draft after a 
   for (const call of calls) assert.deepEqual(call.args, ['p', 'draft', '', selectedModel, 'build', files])
 })
 
+test('permission IPC validates enum-only inputs and forwards create/update/read through preload', async () => {
+  const h = await harness()
+  for (const mode of ['default', 'ask', 'readonly', 'full']) {
+    await h.dispatch('createSession', ['p', mode])
+    assert.deepEqual(plain(h.calls.at(-1)), { method: 'createSession', args: ['p', mode] })
+    await h.dispatch('updateSessionPermissionMode', ['p', 's', mode])
+    assert.deepEqual(plain(h.calls.at(-1)), { method: 'updateSessionPermissionMode', args: ['p', 's', mode] })
+  }
+  for (const invalid of ['admin', '', null, 42, {}, [{ action: '*', resource: '*', effect: 'allow' }]]) {
+    await assert.rejects(h.dispatch('createSession', ['p', invalid]))
+    await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's', invalid]))
+  }
+  await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's']))
+  await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's', 'full', []]))
+})
+
+test('Chat permission picker replaces Agent, persists drafts, updates sessions immediately and guards pending sends', async () => {
+  const hooks = rendererHooks(), calls: Invocation[] = [], errors: unknown[] = []
+  const saved = new Map([['s1', 'readonly'], ['s2', 'ask']])
+  let release: (() => void) | undefined, fail = false
+  const api = {
+    models: async () => [selectedModel], agents: async () => [], commands: async () => [], skills: async () => [],
+    onEvent: () => () => {}, messages: async () => [], permissions: async () => [],
+    sessionPermissionMode: async (_project: string, session: string) => saved.get(session) ?? 'default',
+    updateSessionPermissionMode: async (...args: string[]) => {
+      calls.push({ method: 'updateSessionPermissionMode', args })
+      await new Promise<void>(resolve => { release = resolve })
+      if (fail) throw new Error('update failed')
+      saved.set(args[1], args[2]); return args[2]
+    },
+    createSession: async (...args: unknown[]) => { calls.push({ method: 'createSession', args }); return { id: 'created', title: 'New' } },
+    prompt: async (...args: unknown[]) => { calls.push({ method: 'prompt', args }) },
+  }
+  const { exports } = await rendererModule('components\\Chat.tsx', hooks, {
+    window: { ame: api, addEventListener() {}, removeEventListener() {} },
+    setTimeout, clearTimeout,
+  })
+  let props: any = { projectID: 'permission-project', connected: true, ready: true, accountRole: 'admin', defaultModelID: selectedModel.id, modelLevels: {},
+    draftID: 1, sessions: [], tabs: [], changes: 0, changesStatus: 'ready', theme: 'dark',
+    report: (e: unknown) => errors.push(e), onCreated() {}, onActivity() {}, onCreate() {}, onOpenPanel() {}, onOpenFile() {}, onSelectSession() {} }
+  let tree: React.ReactNode
+  const render = () => { tree = hooks.render(exports.Chat, props) }
+  const settle = async () => { for (let i = 0; i < 3; i++) { render(); hooks.effects(); await flushRendererPromises() }; render() }
+  const picker = () => rendererElements(tree, node => node.type === 'select' && node.props['aria-label'] === 'Quyền thực thi')[0].props
+  const send = async () => {
+    const event = { preventDefault() {} }
+    rendererElements(tree, node => node.type === 'form' && node.props.className === 'composer-card')[0].props.onSubmit(event)
+    await settle()
+  }
+  const enter = () => rendererElements(tree, node => node.type === 'textarea')[0].props.onChange({ target: { value: 'hello', selectionStart: 5 } })
+  try {
+    await settle()
+    assert.equal(rendererElements(tree, node => node.type === 'select' && node.props['aria-label'] === 'Agent').length, 0)
+    assert.deepEqual(plain(rendererElements(picker().children, node => node.type === 'option').map(node => [node.props.value, node.props.children])), [
+      ['default', 'Mặc định'], ['ask', 'Hỏi trước'], ['readonly', 'Chỉ đọc'], ['full', 'Tự động cho phép'],
+    ])
+    picker().onChange({ target: { value: 'full' } }); await settle()
+    assert.match(rendererElements(tree, node => node.type === 'label' && String(node.props.className).includes('composer-picker--permission'))[0].props.title, /Cảnh báo.*không hỏi/)
+    assert.equal(calls.length, 0)
+    props = { ...props, draftID: 2 }; await settle(); assert.equal(picker().value, 'default')
+    props = { ...props, draftID: 1 }; await settle(); assert.equal(picker().value, 'full')
+    enter(); await settle(); await send()
+    assert.deepEqual(plain(calls.find(call => call.method === 'createSession')), { method: 'createSession', args: ['permission-project', 'full'] })
+    assert.equal(calls.find(call => call.method === 'prompt')?.args[4], undefined, 'OpenCode chooses the agent')
+    props = { ...props, sessionID: 's1' }; await settle(); assert.equal(picker().value, 'readonly')
+    picker().onChange({ target: { value: 'ask' } }); await settle()
+    assert.equal(picker().disabled, true)
+    enter(); await settle(); const count = calls.length; await send(); assert.equal(calls.length, count)
+    release!(); await settle(); assert.equal(picker().value, 'ask')
+    assert.deepEqual(plain(calls.at(-1)), { method: 'updateSessionPermissionMode', args: ['permission-project', 's1', 'ask'] })
+    fail = true; picker().onChange({ target: { value: 'full' } }); release!(); await settle()
+    assert.equal(picker().value, 'ask'); assert.equal(errors.length, 1)
+    props = { ...props, sessionID: 's2' }; await settle(); assert.equal(picker().value, 'ask')
+    saved.set('s1', 'readonly'); props = { ...props, sessionID: 's1' }; await settle(); assert.equal(picker().value, 'readonly')
+  } finally { hooks.dispose() }
+})
+
 test('Chat wires nested drops, browser paste, native picker, deduplication, limits and attachment-only submission', async () => {
   const hooks = rendererHooks(), calls: Invocation[] = []
   const image = { ok: true, kind: 'media', name: 'shot.png', mime: 'image/png', dataUrl: 'data:image/png;base64,YQ==', size: 1 }
@@ -485,6 +629,7 @@ test('Chat wires nested drops, browser paste, native picker, deduplication, limi
     androidTranslationInfo: async () => ({ lockedSessionIDs: [], translationSessionIDs: translation ? ['s'] : [] }),
     models: async () => [selectedModel], agents: async () => [], commands: async () => [], skills: async () => [],
     messages: async () => [], permissions: async () => [], onEvent: () => () => {},
+    sessionPermissionMode: async () => 'default',
     filePath: (file: { path?: string }) => file.path ?? '',
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return [image] },
     pickAttachmentFiles: async (...args: unknown[]) => { calls.push({ method: 'pickAttachmentFiles', args }); return picked },
@@ -814,6 +959,64 @@ test('project removal retains services on cancellation/failure and awaits debugg
   assert.equal(h.services.length, 0)
 })
 
+test('App removal includes inactive dirty tabs and only cleans renderer state after approved successful removal', async () => {
+  for (const choice of ['cancel', 'discard', 'save', 'failure']) {
+    const h = await appRenderer({
+      confirmProjectRemoval: async (_id, paths) => {
+        assert.deepEqual(plain(paths), ['hidden.txt', 'visible.txt'])
+        return choice === 'cancel' ? null : { choice: choice === 'discard' ? 'discard' : 'save', token: 'approved' }
+      },
+      save: async (_id, path, content) => {
+        if (choice === 'failure' && path === 'visible.txt') throw new Error('FILE_CONFLICT')
+        return { path, content, revision: 'v2' }
+      },
+    })
+    try {
+      for (const path of ['hidden.txt', 'visible.txt']) {
+        h.props('Inspector').onOpen(path); await h.settle()
+        h.props('EditorStage').onChange(`edited ${path}`); await h.settle()
+      }
+      h.calls.length = 0
+      h.props('ProjectRail').onRemove('p'); await h.settle()
+      const saves = h.calls.filter(call => call.method === 'save')
+      assert.deepEqual(saves.map(call => call.args[1]), choice === 'save' || choice === 'failure' ? ['hidden.txt', 'visible.txt'] : [])
+      const removed = choice === 'save' || choice === 'discard'
+      assert.equal(h.props('ProjectRail').projects.some((project: any) => project.id === 'p'), !removed)
+      assert.equal(h.calls.some(call => call.method === 'removeProject'), removed)
+      if (removed && choice === 'save') assert.ok(h.calls.findIndex(call => call.method === 'removeProject') > Math.max(...h.calls.map((call, index) => call.method === 'save' ? index : -1)))
+      if (!removed) {
+        assert.equal(h.props('EditorStage').buffer.text, 'edited visible.txt')
+        if (choice === 'failure') {
+          assert.equal(h.props('EditorStage').buffer.conflict, true)
+          assert.match(renderToStaticMarkup(h.alerts()), /visible.txt.*FILE_CONFLICT/)
+        }
+        h.props('Inspector').onOpen('hidden.txt'); await h.settle()
+        assert.equal(h.props('EditorStage').buffer.text, 'edited hidden.txt')
+      }
+    } finally { h.dispose() }
+  }
+})
+
+test('dirty removal requires a native, project-bound, single-use approval without a second dialog', async () => {
+  for (const choice of ['save', 'discard', 'cancel']) {
+    const h = await harness()
+    if (choice === 'discard') h.discard()
+    if (choice === 'cancel') h.cancel()
+    const approval = await h.dispatch('confirmProjectRemoval', ['p', ['visible.txt', 'hidden.txt']]) as { choice: string; token: string } | null
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm'])
+    assert.match(h.calls[0].args[1] as string, /hidden.txt/)
+    if (choice === 'cancel') { assert.equal(approval, null); continue }
+    assert.equal(approval!.choice, choice)
+    await h.dispatch('removeProject', ['p', approval!.token])
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'terminal:closeProject', 'remove', 'detach'])
+    await assert.rejects(h.dispatch('removeProject', ['p', approval!.token]), /CANCELLED/)
+  }
+  const h = await harness()
+  for (const args of [[], ['p', []], ['p', ['../escape']], ['p', ['ok'], true]]) await assert.rejects(h.dispatch('confirmProjectRemoval', args))
+  await assert.rejects(h.dispatch('removeProject', ['p', randomUUID()]), /CANCELLED/)
+  assert.deepEqual(h.calls, [])
+})
+
 test('artifact, side-thread, pet and platform tuples reject extra or malformed input without side effects', async () => {
   const h = await harness()
   for (const { method, args } of nativeExamples) {
@@ -1004,6 +1207,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     }
     const context = {
       process: { platform, env: {}, resourcesPath: 'resources' }, path, here: 'main', window: undefined,
+      renderer: rendererSource(false, path.resolve('main')), isRendererDocument,
       workspace: undefined, terminals: undefined, adapter: undefined, runtime: undefined, account: undefined, pairing: undefined,
       petHost: undefined, sprite: '', managed: true, shuttingDown: false, authority: Promise.resolve(), lspServices, debuggers,
       translationLocks: undefined,
@@ -1804,7 +2008,7 @@ test('replacement previews before confirmation, cancels without writes, and skip
   assert.deepEqual(plain(h.calls), [
     { method: 'replaceInProject', args: ['p', { ...options, dryRun: true }] },
     { method: 'confirm', args: ['Thay thế 3 vị trí trong 2 tệp?'] },
-    { method: 'replaceInProject', args: ['p', options] }
+    { method: 'replaceInProject', args: ['p', options, []] }
   ])
   h.calls.length = 0
   await h.dispatch('replaceInProject', ['p', { query: 'hello', replacement: 'bye' }])
@@ -1814,6 +2018,25 @@ test('replacement previews before confirmation, cancels without writes, and skip
   assert.deepEqual(plain(await h.dispatch('replaceInProject', ['p', options])), { filesChanged: 0, replacements: 0, previews: [] })
   assert.deepEqual(h.calls.map(call => call.method), ['replaceInProject'])
   assert.deepEqual(h.messages, [])
+})
+
+test('replacement confirmation applies the fixed preview despite new files and revision edits while dialog is open', async t => {
+  const root = await mkdtemp(path.join(process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA!, 'Temp', 'opencode') : tmpdir(), 'ame-replace-ipc-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await writeFile(path.join(root, 'a.txt'), 'cat')
+  await writeFile(path.join(root, 'b.txt'), 'cat')
+  const h = await harness(root)
+  h.setReplacement((_id, options, plan) => replaceInWorkspace(root, options, plan))
+  h.onConfirm(async () => {
+    await writeFile(path.join(root, 'new.txt'), 'cat')
+    await writeFile(path.join(root, 'b.txt'), 'cat edited during confirmation')
+  })
+  const result = await h.dispatch('replaceInProject', ['p', { query: 'cat', replacement: 'dog' }]) as Awaited<ReturnType<typeof replaceInWorkspace>>
+  assert.deepEqual(result.writtenFiles, ['a.txt'])
+  assert.deepEqual(result.conflicts, ['b.txt'])
+  assert.equal(await readFile(path.join(root, 'new.txt'), 'utf8'), 'cat')
+  assert.equal(await readFile(path.join(root, 'b.txt'), 'utf8'), 'cat edited during confirmation')
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'dog')
 })
 
 test('commit skips confirmation while pairing, branch deletion and stash drop retain native confirmations', async () => {
@@ -1929,6 +2152,9 @@ test('preload forwards all new methods, optional arguments, return values and re
   assert.ok(api)
   const methods = api as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
   for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples, ...buildNotesExamples,
+    { method: 'confirmProjectRemoval', args: ['p', ['visible.txt', 'hidden.txt']] },
+    { method: 'removeProject', args: ['p'] },
+    { method: 'removeProject', args: ['p', randomUUID()] },
     { method: 'resolveDroppedPaths', args: ['p', ['C:\\images\\shot.png']] },
     { method: 'pickAttachmentFiles', args: ['p'] },
     { method: 'prompt', args: ['p', 's', '', selectedModel, undefined, [{ uri: 'data:image/png;base64,YQ==', name: 'shot.png', source: { type: 'inline' } }]] }

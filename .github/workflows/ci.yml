@@ -30,18 +30,23 @@ jobs:
           cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
-      - name: Build without private runtime
-        if: env.AME_OPENCODE_CLI == ''
+      - name: Prepare configured trusted OpenCode 2.3.2 before tests
+        if: env.AME_OPENCODE_CLI != ''
+        run: npm run runtime:prepare
+      - name: Build backend plugin before tests
         run: npm run build:server
+      - name: Explain optional backend coverage
+        if: env.AME_OPENCODE_CLI == ''
+        run: node -e "console.log('AME_OPENCODE_CLI is not configured; real runtime and native nesting tests may skip. Release requires this coverage.')"
+      - name: Test (require real backend when configured)
+        env:
+          AME_REQUIRE_BACKEND_TESTS: ${{ env.AME_OPENCODE_CLI != '' && '1' || '0' }}
+        run: npm test
       - name: Build Electron without private runtime
         if: env.AME_OPENCODE_CLI == ''
         env:
           NODE_OPTIONS: --max-old-space-size=6144
         run: npx electron-vite build
-      - name: Prepare configured trusted OpenCode 2.3.2
-        if: env.AME_OPENCODE_CLI != ''
-        run: npm run runtime:prepare
       - name: Full build with private runtime
         if: env.AME_OPENCODE_CLI != ''
         env:

@@ -95,7 +95,7 @@ export async function discardFile(root: string, relative: string): Promise<void>
   if (indexed) {
     // Restore the index version, including staged additions without a HEAD entry.
     await git.raw(['checkout', '--', spec])
-  } else if (await hasHead(git) && (await git.raw(['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', file])).split('\0').includes(file)) {
+  } else if (await hasHead(git) && (await git.raw(['--literal-pathspecs', 'ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', file])).split('\0').includes(file)) {
     await git.raw(['checkout', 'HEAD', '--', spec])
   } else if (entry) {
     await unlink(target)

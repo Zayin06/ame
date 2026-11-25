@@ -13,7 +13,10 @@ export default defineConfig({
   },
   preload: {
     plugins: [externalizeDepsPlugin()],
-    build: { rollupOptions: { input: resolve('apps/desktop/src/preload/index.ts'), output: { format: 'cjs', entryFileNames: 'index.cjs' } } }
+    build: { rollupOptions: { input: {
+      index: resolve('apps/desktop/src/preload/index.ts'),
+      pet: resolve('apps/desktop/src/preload/pet.ts')
+    }, output: { format: 'cjs', entryFileNames: '[name].cjs' } } }
   },
   renderer: {
     root: resolve('apps/desktop/src/renderer'),

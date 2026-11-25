@@ -1,7 +1,7 @@
-import type { FileDocument } from '../../../../packages/protocol/src/index'
+import type { DiffTarget, FileDocument } from '../../../../packages/protocol/src/index'
 
 export type Pane = 'rail' | 'inspector' | 'stage'
-export type Tab = { path: string; mode: 'file' | 'diff' }
+export type Tab = { path: string; mode: 'file' | 'diff'; target?: DiffTarget }
 export type ProjectView = { session?: string; tabs: Tab[]; active?: string; selectedTabs?: Partial<Record<Tab['mode'], string>> }
 export function selectedTab(view: ProjectView, mode: Tab['mode']) {
   return view.tabs.find(tab => tab.mode === mode && tabID(tab) === view.active)
@@ -33,7 +33,16 @@ export type Preferences = {
   project?: string; projects: Record<string, ProjectView>
 }
 export const defaultWidths = { rail: 256, inspector: 240, stage: 480 }
-export const tabID = (tab: Tab) => `${tab.mode}:${tab.path}`
+export const tabID = (tab: Tab) => tab.mode === 'diff' && tab.target
+  ? `diff:${JSON.stringify([tab.path, tab.target.kind, tab.target.kind === 'commit' ? tab.target.commit.toLowerCase() : null])}`
+  : `${tab.mode}:${tab.path}`
+export const diffID = (project: string, tab: Tab) => documentID(project, tabID(tab))
+export const tabTitle = (tab: Tab) => {
+  const name = tab.path.split(/[\\/]/).pop()
+  if (tab.mode !== 'diff') return name
+  const label = tab.target?.kind === 'commit' ? tab.target.commit.slice(0, 7) : tab.target?.kind === 'staged' ? 'Staged' : tab.target?.kind === 'working' ? 'Changes' : 'HEAD → Disk'
+  return `${name} (${label})`
+}
 export const documentID = (project: string, path: string) => JSON.stringify([project, path])
 export const clampWidth = (pane: Pane, width: number) => Math.round(Math.max(pane === 'stage' ? 300 : 190, Math.min(pane === 'stage' ? 780 : 360, width)))
 export const defaults = (): Preferences => ({ theme: 'dark', widths: { ...defaultWidths }, rail: true, inspector: false, stage: true, terminalOpen: true, inspectorTab: 'files', panel: 'files', layoutMode: 'swe', tint: 'default', chatWidth: 760, timelineDetail: 'compact', projects: {} })
@@ -60,7 +69,11 @@ export function parsePreferences(raw: string | null): Preferences {
     if (value.projects && typeof value.projects === 'object') for (const [id, view] of Object.entries(value.projects)) {
       if (!view || typeof view !== 'object') continue
       const v = view as Partial<ProjectView>
-      const tabs = Array.isArray(v.tabs) ? v.tabs.filter(t => t && typeof t.path === 'string' && (t.mode === 'file' || t.mode === 'diff')).map(t => ({ path: t.path, mode: t.mode })) : []
+       const tabs: Tab[] = Array.isArray(v.tabs) ? v.tabs.filter(t => t && typeof t.path === 'string' && (t.mode === 'file' || t.mode === 'diff')).map(t => {
+         const target = t.target
+         const valid = target?.kind === 'staged' || target?.kind === 'working' || (target?.kind === 'commit' && typeof target.commit === 'string' && /^[a-f0-9]{7,40}$/i.test(target.commit))
+         return { path: t.path, mode: t.mode, ...(t.mode === 'diff' && valid ? { target } : {}) }
+       }) : []
       result.projects[id] = { session: typeof v.session === 'string' ? v.session : undefined, tabs, active: typeof v.active === 'string' ? v.active : undefined }
       if (v.selectedTabs && typeof v.selectedTabs === 'object') {
         result.projects[id].selectedTabs = {}

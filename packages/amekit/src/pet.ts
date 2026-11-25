@@ -58,7 +58,12 @@ export class PetActivity {
         this.started.set(session.key, session.busy ?? now)
         if (this.effect?.state !== "failed") this.effect = undefined
       }
-      const completed = previous && !session.running && session.idle !== undefined && session.idle > Math.max(previous.idle ?? 0, previous.busy ?? 0) && session.idle >= (session.busy ?? 0)
+      // Idle/status can arrive before the execution outcome; allow that outcome once,
+      // without replaying effects for an unchanged completed snapshot.
+      const completed = previous && !session.running && session.idle !== undefined && session.idle >= (session.busy ?? 0) && (
+        session.idle > Math.max(previous.idle ?? 0, previous.busy ?? 0) ||
+        session.idle === previous.idle && previous.outcome === undefined && session.outcome !== undefined
+      )
       if (completed && session.outcome === "failed") this.effect = { state: "failed", until: now + 4000 }
       else if (completed && !session.child && session.outcome === "succeeded" && this.effect?.state !== "failed") {
         const start = this.started.get(session.key) ?? session.busy
@@ -96,5 +101,5 @@ export async function loadPetSprite(pngPath: string): Promise<string> {
 }
 export function petHtml(sprite = ""): string {
   if (sprite) validatePetSprite(sprite)
-  return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; media-src data:; style-src 'unsafe-inline'; script-src 'none'"><title>AmeKit Pet</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}body{-webkit-app-region:drag;user-select:none}${petSpriteCss}.amekit-pet-sprite{background-image:url('${sprite}');background-position-y:100%}</style></head><body><div class="amekit-pet-sprite" role="img" aria-label="AME Chibi — Đang nghỉ"></div></body></html>`
+  return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; media-src data:; style-src 'unsafe-inline'; script-src 'none'"><title>AmeKit Pet</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}body{user-select:none;touch-action:none}${petSpriteCss}.amekit-pet-sprite{background-image:url('${sprite}');background-position-y:100%}</style></head><body><div class="amekit-pet-sprite" role="img" aria-label="AME Chibi — Đang nghỉ"></div></body></html>`
 }

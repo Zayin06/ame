@@ -2,6 +2,7 @@ import { createServer } from "node:http"
 import { randomBytes } from "node:crypto"
 import { Readable } from "node:stream"
 import { assertModel, managedProvider, parseModelLevel, type modelPolicy } from "../../amekit/src/model-policy"
+import { MAX_MODEL_REQUEST_BYTES } from "../../ide-core/src/dropped-attachments"
 
 type Access = { policy: ReturnType<typeof modelPolicy>; provider: { base_url: string; api_key: string } }
 export async function modelGateway(access: () => Access | undefined) {
@@ -14,7 +15,7 @@ export async function modelGateway(access: () => Access | undefined) {
       const chunks: Buffer[] = []; let size = 0
       for await (const chunk of req) {
         size += chunk.length
-        if (size > 8 * 1024 * 1024) throw new Error("AMECODE_REQUEST_TOO_LARGE")
+        if (size > MAX_MODEL_REQUEST_BYTES) throw new Error("AMECODE_REQUEST_TOO_LARGE")
         chunks.push(Buffer.from(chunk))
       }
       let body = Buffer.concat(chunks)
@@ -40,7 +41,7 @@ export async function modelGateway(access: () => Access | undefined) {
     } catch (error) {
       if (res.headersSent) { res.destroy(); return }
       const code = error instanceof Error && /^AMECODE_[A-Z_]+$/.test(error.message) ? error.message : "AMECODE_PROVIDER_ERROR"
-      res.writeHead(403, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { code, message: code } }))
+      res.writeHead(code === "AMECODE_REQUEST_TOO_LARGE" ? 413 : 403, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { code, message: code } }))
     }
   })
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve() }) })

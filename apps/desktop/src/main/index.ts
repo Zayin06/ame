@@ -1,10 +1,12 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, powerSaveBlocker, screen, shell } from 'electron'
 import { readFile, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { PairingHost } from '../../../../packages/opencode-adapter/src/pairing'
 import { RemotePairing, automaticTunnel } from '../../../../packages/opencode-adapter/src/remote-pairing'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
+import { rendererSource, isRendererDocument } from './renderer-source'
 import { Workspaces } from '../../../../packages/ide-core/src/workspace'
 import { validateWorkspacePath } from '../../../../packages/ide-core/src/workspace-fs'
 import { resolveDroppedPaths } from '../../../../packages/ide-core/src/dropped-attachments'
@@ -16,12 +18,14 @@ import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtim
 import { createAmeKit } from '../../../../packages/amekit/src/index'
 import { detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore } from '../../../../packages/amekit/src/android-translation'
 import { createPetHost } from '../../../../packages/amekit/src/pet-host'
+import { revealPetMainWindow } from '../../../../packages/amekit/src/pet-interaction'
 import { loadPetSprite } from '../../../../packages/amekit/src/pet'
 import type { UsagePrices } from '../../../../packages/amekit/src/usage-pricing'
 import type { AndroidTranslationInfo, AndroidTranslationPromptResult, BuildNotesPreview, BuildNotesResult, IdeEvent, Model, SessionLockState } from '../../../../packages/protocol/src/index'
 
 if (!app.isPackaged && process.env.AME_IDE_TEST_DATA) app.setPath('userData', path.resolve(process.env.AME_IDE_TEST_DATA))
 const here = path.dirname(fileURLToPath(import.meta.url))
+const renderer = rendererSource(app.isPackaged, here, process.env.ELECTRON_RENDERER_URL)
 let window: BrowserWindow | undefined
 let workspace: Workspaces
 let terminals: Terminals
@@ -90,6 +94,11 @@ const promptFileSchema = z.object({
 }).strict()
 const promptFilesSchema = z.array(promptFileSchema).max(8)
 const boundedID = id.refine(value => !!value.trim() && !value.includes('\0'))
+const formAnswerKey = z.string().min(1).max(200).refine(value => !!value.trim() && !value.includes('\0') && !['__proto__', 'prototype', 'constructor'].includes(value))
+const formAnswerString = z.string().max(20000).refine(value => !value.includes('\0'))
+const formAnswer = z.custom<Record<string, unknown>>(input => !!input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input).every(key => formAnswerKey.safeParse(key).success))
+  .pipe(z.record(formAnswerKey, z.union([formAnswerString, z.number().finite(), z.boolean(), z.array(formAnswerString).max(100)])))
+  .refine(answer => Object.keys(answer).length <= 100 && JSON.stringify(answer).length <= 200000)
 const artifactID = text.min(1).max(200).refine(value => value === value.trim() && !value.includes('\0'))
 const question = text.min(1).max(20000).refine(value => !!value.trim() && !value.includes('\0'))
 const petModel = z.string().min(1).max(200).refine(value => value === value.trim() && !value.includes('\0'))
@@ -123,11 +132,17 @@ const searchQuery = z.object({
   include: z.array(z.string().min(1).max(4096)).max(100).optional(),
   exclude: z.array(z.string().min(1).max(4096)).max(100).optional(),
   maxFiles: z.number().int().min(1).max(10000).optional(),
-  maxMatches: z.number().int().min(1).max(100000).optional()
+  maxMatches: z.number().int().min(1).max(100000).optional(),
+  maxResponseBytes: z.number().int().min(256).max(1024 * 1024).optional()
 }).strict()
 const replaceOptions = searchQuery.extend({
   replacement: z.string().max(200000), files: z.array(workspacePath).max(5000).optional(), dryRun: z.boolean().optional()
 }).strict()
+const diffTargetSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('staged') }).strict(),
+  z.object({ kind: z.literal('working') }).strict(),
+  z.object({ kind: z.literal('commit'), commit: z.string().regex(/^[a-f0-9]{7,40}$/i) }).strict()
+])
 const schema = {
   platform: z.tuple([]),
   artifacts: z.tuple([boundedID, boundedID.optional()]), artifact: z.tuple([boundedID, artifactID]), deleteArtifact: z.tuple([boundedID, artifactID]),
@@ -152,7 +167,9 @@ const schema = {
   debugContinue: z.tuple([boundedID]), debugPause: z.tuple([boundedID]),
   debugStepOver: z.tuple([boundedID]), debugStepInto: z.tuple([boundedID]), debugStepOut: z.tuple([boundedID]),
   debugEvaluate: z.tuple([boundedID, question, boundedID.optional()]),
-  projects: z.tuple([]), pickProject: z.tuple([]), removeProject: z.tuple([id]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
+  projects: z.tuple([]), pickProject: z.tuple([]),
+  confirmProjectRemoval: z.tuple([boundedID, z.array(sourcePath).min(1).max(10000)]),
+  removeProject: z.tuple([id, z.string().uuid().optional()]), entries: z.tuple([id, relative]), read: z.tuple([id, relative]),
   listFiles: z.tuple([id]), sessionUsage: z.tuple([id, id]), agentMap: z.tuple([boundedID, boundedID]),
   save: z.tuple([id, relative, z.string().max(4 * 1024 * 1024), z.string().regex(/^[a-f0-9]{64}$/)]),
   createFile: z.tuple([id, workspacePath, content.optional()]), createDirectory: z.tuple([id, workspacePath]),
@@ -161,7 +178,7 @@ const schema = {
   searchProject: z.tuple([id, searchQuery]), replaceInProject: z.tuple([id, replaceOptions]),
   stageAll: z.tuple([id]), unstageAll: z.tuple([id]), discardFile: z.tuple([id, workspacePath]),
   gitBranches: z.tuple([id]), checkoutBranch: z.tuple([id, branchName]), createBranch: z.tuple([id, branchName, z.boolean().optional()]),
-  git: z.tuple([id]), diff: z.tuple([id, relative]), stage: z.tuple([id, relative, z.boolean()]), commit: z.tuple([id, z.string().min(1).max(10000).refine(value => !!value.trim() && !value.includes('\0')), commitOptionsSchema.optional()]),
+  git: z.tuple([id]), diff: z.tuple([id, relative, diffTargetSchema.optional()]), stage: z.tuple([id, relative, z.boolean()]), commit: z.tuple([id, z.string().min(1).max(10000).refine(value => !!value.trim() && !value.includes('\0')), commitOptionsSchema.optional()]),
   gitDeleteBranch: z.tuple([id, branchName, z.boolean().optional()]),
   gitFetch: z.tuple([id]), gitPull: z.tuple([id]),
   gitPush: z.tuple([id, z.object({ setUpstream: z.boolean().optional() }).strict().optional()]),
@@ -172,7 +189,9 @@ const schema = {
   gitStashApply: z.tuple([id, z.number().int().min(0).max(10000), z.boolean().optional()]),
   gitStashDrop: z.tuple([id, z.number().int().min(0).max(10000)]),
   connection: z.tuple([]), startBackend: z.tuple([]), discover: z.tuple([]), connect: z.tuple([z.string().max(2048), z.string().max(512).optional(), z.string().max(8192).optional()]),
-  sessions: z.tuple([id]), createSession: z.tuple([id]), messages: z.tuple([id, id]), sessionDiff: z.tuple([id, id, id.optional()]), models: z.tuple([id]), agents: z.tuple([id]),
+  sessions: z.tuple([id]), createSession: z.tuple([id, z.enum(['default', 'ask', 'readonly', 'full']).optional()]), messages: z.tuple([id, id]), sessionDiff: z.tuple([id, id, id.optional()]), models: z.tuple([id]), agents: z.tuple([id]),
+  sessionPermissionMode: z.tuple([id, id]),
+  updateSessionPermissionMode: z.tuple([id, id, z.enum(['default', 'ask', 'readonly', 'full'])]),
   renameSession: z.tuple([id, id, sessionTitle]), archiveSession: z.tuple([id, id, z.boolean()]), deleteSession: z.tuple([id, id]),
   commands: z.tuple([id]), skills: z.tuple([id]), generateCommitMessage: z.tuple([id, modelSchema.optional()]),
   buildNotesPreview: z.tuple([id, buildNotesRequestSchema]),
@@ -184,6 +203,8 @@ const schema = {
   resolveDroppedPaths: z.tuple([boundedID, z.array(z.string().max(4096)).max(32)]),
   pickAttachmentFiles: z.tuple([boundedID]),
   cancel: z.tuple([id, id]), permissions: z.tuple([id, id]), replyPermission: z.tuple([id, id, z.enum(['once', 'always', 'reject'])]),
+  forms: z.tuple([boundedID, boundedID]), replyForm: z.tuple([boundedID, boundedID, boundedID, formAnswer]),
+  cancelForm: z.tuple([boundedID, boundedID, boundedID, z.string().max(2000).refine(value => !value.includes('\0')).optional()]),
   pairingStatus: z.tuple([]), pairingConfigure: z.tuple([pairingSchema]), pairingCode: z.tuple([]),
   account: z.tuple([z.string().max(64), z.record(z.string(), z.string().max(8192))]), pickImport: z.tuple([]), window: z.tuple([z.enum(['minimize', 'maximize', 'close'])])
 } as const
@@ -202,6 +223,7 @@ function debuggerFor(projectID: string) {
   return service
 }
 function notify(event: IdeEvent) { if (window && !window.isDestroyed()) window.webContents.send('ame:event', event) }
+const projectRemovalConfirmations = new Map<string, { token: string; expires: number }>()
 async function confirmation(message: string, detail?: string) {
   const result = await dialog.showMessageBox(window!, { type: 'question', buttons: ['Hủy', 'Xác nhận'], defaultId: 0, cancelId: 0, message, ...(detail ? { detail } : {}) })
   if (result.response !== 1) throw new Error('CANCELLED')
@@ -327,9 +349,26 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       if (result.canceled || !result.filePaths[0]) return null
       const project = await workspace.add(result.filePaths[0]); adapter.attach(project.id, project.directory); return project
     }
+    case 'confirmProjectRemoval': {
+      const project = workspace.get(a)
+      projectRemovalConfirmations.delete(a)
+      const { response } = await dialog.showMessageBox(window!, {
+        type: 'warning', buttons: ['Hủy', 'Lưu và gỡ', 'Bỏ thay đổi và gỡ'], defaultId: 0, cancelId: 0,
+        message: `Gỡ dự án ${project.name} có ${b.length} tệp chưa lưu?`,
+        detail: `Tệp trên ổ đĩa sẽ KHÔNG bị xóa. Chọn bỏ thay đổi sẽ mất các chỉnh sửa chưa lưu.\n\n${b.join('\n')}`,
+      })
+      if (response !== 1 && response !== 2) return null
+      const token = randomUUID()
+      projectRemovalConfirmations.set(a, { token, expires: Date.now() + 5 * 60_000 })
+      return { choice: response === 1 ? 'save' : 'discard', token }
+    }
     case 'removeProject': {
       const project = workspace.get(a)
-      await confirmation(`Gỡ dự án ${project.name} khỏi danh sách? Tệp trên ổ đĩa sẽ KHÔNG bị xóa.`)
+      const approved = projectRemovalConfirmations.get(a)
+      projectRemovalConfirmations.delete(a)
+      if (b !== undefined) {
+        if (!approved || approved.token !== b || approved.expires < Date.now()) throw new Error('CANCELLED: Xác nhận gỡ dự án đã hết hiệu lực.')
+      } else await confirmation(`Gỡ dự án ${project.name} khỏi danh sách? Tệp trên ổ đĩa sẽ KHÔNG bị xóa.`)
       terminals.closeProject(a)
       await workspace.remove(a)
       try { lspServices.get(a)?.dispose() }
@@ -345,7 +384,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'read': return workspace.read(a, b)
     case 'save': return workspace.save(a, b, c, d)
     case 'git': return workspace.status(a)
-    case 'diff': return workspace.diff(a, b)
+    case 'diff': return workspace.diff(a, b, c)
     case 'createFile': return workspace.createFile(a, b, c)
     case 'createDirectory': return workspace.createDirectory(a, b)
     case 'renamePath': return workspace.renamePath(a, b, c)
@@ -363,7 +402,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       const preview = await workspace.replaceInProject(a, { ...b, dryRun: true })
       if (preview.replacements === 0) return preview
       await confirmation(`Thay thế ${preview.replacements} vị trí trong ${preview.filesChanged} tệp?`)
-      return workspace.replaceInProject(a, b)
+      return workspace.replaceInProject(a, b, preview.previews)
     }
     case 'stageAll': return workspace.stageAll(a)
     case 'unstageAll': return workspace.unstageAll(a)
@@ -409,7 +448,9 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       return configurePairing(a)
     case 'pairingCode': return pairing.issue()
     case 'sessions': return adapter.sessions(a)
-    case 'createSession': return adapter.createSession(a)
+    case 'createSession': return adapter.createSession(a, b)
+    case 'sessionPermissionMode': return adapter.sessionPermissionMode(a, b)
+    case 'updateSessionPermissionMode': return adapter.updateSessionPermissionMode(a, b, c)
     case 'renameSession': return adapter.renameSession(a, b, c)
     case 'archiveSession': return adapter.archiveSession(a, b, c)
     case 'deleteSession':
@@ -550,6 +591,9 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     }
     case 'cancel': return adapter.cancel(a, b)
     case 'permissions': return adapter.permissions(a, b)
+    case 'forms': return adapter.forms(a, b)
+    case 'replyForm': return adapter.replyForm(a, b, c, d)
+    case 'cancelForm': return adapter.cancelForm(a, b, c, d)
     case 'replyPermission': return adapter.replyPermission(a, b, c)
     case 'account': return account.call(a, b)
     case 'pickImport': return pickImport()
@@ -574,7 +618,6 @@ async function openWindow() {
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' as const, trafficLightPosition: { x: 14, y: 12 } } : { frame: false }),
     webPreferences: { preload: path.join(here, '../preload/index.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } })
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-  const devURL = process.env.ELECTRON_RENDERER_URL
   window.webContents.on('will-navigate', (event, target) => {
     if (target !== window?.webContents.getURL()) event.preventDefault()
   })
@@ -584,8 +627,8 @@ async function openWindow() {
   })
   window.webContents.on('render-process-gone', () => terminals.dispose())
   window.on('closed', () => { terminals.dispose(); window = undefined; petHost?.reconcile() })
-  if (devURL) await window.loadURL(devURL)
-  else await window.loadFile(path.join(here, '../renderer/index.html'))
+  if (renderer.url) await window.loadURL(renderer.url)
+  else await window.loadFile(renderer.file!)
   petHost?.reconcile()
 }
 const primaryInstance = app.requestSingleInstanceLock()
@@ -609,6 +652,7 @@ void app.whenReady().then(async () => {
   const spritePath = app.isPackaged ? path.join(process.resourcesPath, 'ame-chibi.png') : path.join(app.getAppPath(), 'packages/amekit/src/assets/ame-chibi.png')
   sprite = await loadPetSprite(spritePath).catch(() => '')
   petHost = createPetHost({ userData: app.getPath('userData'), electron: { BrowserWindow, screen }, sprite, defaultEnabled: false,
+    interactionPreload: path.join(here, '../preload/pet.cjs'), onActivate: () => revealPetMainWindow(window),
     hasMainWindow: () => Boolean(window && !window.isDestroyed()), onStateChanged: state => notify({ type: 'pet', state }),
     generateDialogue: (model, signal) => account.generatePetDialogue(model, signal) })
   runtime = new PrivateRuntime({ resources: app.isPackaged ? process.resourcesPath : path.join(app.getAppPath(), 'resources'), profile: path.join(app.getPath('userData'), 'backend'), onExit: () => {
@@ -631,7 +675,7 @@ void app.whenReady().then(async () => {
   })
   await petHost.init()
   ipcMain.handle('ame:call', async (event, method: unknown, args: unknown) => {
-    if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame) throw new Error('UNTRUSTED_CALLER')
+    if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || !isRendererDocument(event.senderFrame.url, renderer)) throw new Error('UNTRUSTED_CALLER')
     if (typeof method !== 'string' || !Object.hasOwn(schema, method) || !Array.isArray(args)) throw new Error('INVALID_REQUEST')
     try { return await dispatch(method as keyof typeof schema, args) }
     catch (error) {

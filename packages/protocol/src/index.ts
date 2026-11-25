@@ -19,6 +19,9 @@ export type Project = { id: string; name: string; directory: string }
 export type FileEntry = { path: string; name: string; directory: boolean }
 export type FileDocument = { path: string; content: string; revision: string }
 export type Change = { path: string; index: string; working: string }
+/** Omitted target preserves legacy HEAD → disk comparison. */
+export type DiffTarget = { kind: 'staged' } | { kind: 'working' } | { kind: 'commit'; commit: string }
+export type GitDiffScope = DiffTarget
 export type GitState = { branch: string; changes: Change[]; tracking?: string | null; ahead?: number; behind?: number; hasRemote?: boolean; merging?: boolean }
 export type GitBranch = { name: string; current: boolean; commit: string; upstream?: string; remote?: boolean }
 export type GitBranches = { current: string; branches: GitBranch[]; remoteBranches?: GitBranch[] }
@@ -43,13 +46,17 @@ export type SearchQuery = {
   exclude?: string[]
   maxFiles?: number
   maxMatches?: number
+  maxResponseBytes?: number
 }
-export type SearchMatch = { line: number; column: number; length: number; lineText: string; matchText: string }
+export type SearchMatch = { line: number; column: number; length: number; lineText: string; matchText: string; snippetStart?: number; snippetTruncated?: boolean }
 export type SearchFileResult = { path: string; matches: SearchMatch[] }
 export type SearchResponse = { results: SearchFileResult[]; totalMatches: number; filesSearched: number; truncated: boolean; engine: 'ripgrep' | 'node' }
 export type ReplaceOptions = SearchQuery & { replacement: string; files?: string[]; dryRun?: boolean }
-export type ReplaceResult = { filesChanged: number; replacements: number; previews: { path: string; count: number; sampleBefore: string; sampleAfter: string }[] }
-export type Session = { id: string; title: string; updatedAt?: number; parentID?: string; agent?: string; status?: 'running' | 'idle'; outcome?: 'succeeded' | 'failed' | 'interrupted' }
+export type ReplacePreview = { path: string; revision: string; count: number; sampleBefore: string; sampleAfter: string }
+export type ReplaceResult = { filesChanged: number; replacements: number; previews: ReplacePreview[]; writtenFiles: string[]; conflicts: string[]; errors: { path: string; code: string }[] }
+export type { PermissionMode } from './permission-mode'
+import type { PermissionMode } from './permission-mode'
+export type Session = { id: string; title: string; permissionMode?: PermissionMode; updatedAt?: number; parentID?: string; agent?: string; status?: 'running' | 'idle'; activity?: 'thinking' | 'working' | 'waiting'; busyAt?: number; idleAt?: number; outcome?: 'succeeded' | 'failed' | 'interrupted' }
 export type SessionUsageView = {
   origin: string | null
   nodes: import('../../amekit/src/usage').UsageNode[]
@@ -95,6 +102,8 @@ export type AndroidTranslationInfo = SessionLockState & {
 export type AndroidTranslationPromptResult = { session: Session; model: Model; locked: boolean }
 export type Agent = { id: string; name: string }
 export type Permission = { id: string; sessionID: string; title: string }
+export type { SessionForm, SessionFormField, SessionFormOption, SessionFormWhen, SessionFormAnswer, SessionFormValue } from './session-form'
+import type { SessionForm, SessionFormAnswer } from './session-form'
 export type Connection = { connected: boolean; url: string; version?: string; error?: string }
 export type PairingPreferences = { enabled: boolean; keepScreenActive: boolean }
 export type PairingSettings = PairingPreferences & { publicURL: string; port: number; connecting?: boolean; error?: string }
@@ -200,7 +209,8 @@ export interface DesktopApi {
   debugEvaluate(projectID: string, expression: string, callFrameId?: string): Promise<{ value: string; type: string; error?: string }>
   projects(): Promise<Project[]>
   pickProject(): Promise<Project | null>
-  removeProject(projectID: string): Promise<void>
+  confirmProjectRemoval(projectID: string, dirtyPaths: string[]): Promise<{ choice: 'save' | 'discard'; token: string } | null>
+  removeProject(projectID: string, confirmationToken?: string): Promise<void>
   entries(projectID: string, relative: string): Promise<FileEntry[]>
   listFiles(projectID: string): Promise<string[]>
   read(projectID: string, relative: string): Promise<FileDocument>
@@ -219,7 +229,7 @@ export interface DesktopApi {
   checkoutBranch(projectID: string, name: string): Promise<void>
   createBranch(projectID: string, name: string, checkout?: boolean): Promise<void>
   git(projectID: string): Promise<GitState>
-  diff(projectID: string, relative: string): Promise<{ original: string; modified: string }>
+  diff(projectID: string, relative: string, target?: DiffTarget): Promise<{ original: string; modified: string }>
   stage(projectID: string, relative: string, staged: boolean): Promise<void>
   commit(projectID: string, message: string, options?: GitCommitOptions): Promise<void>
   gitDeleteBranch(projectID: string, name: string, force?: boolean): Promise<void>
@@ -243,7 +253,9 @@ export interface DesktopApi {
   connect(url: string, username?: string, password?: string): Promise<Connection>
   discover(): Promise<Connection>
   sessions(projectID: string): Promise<Session[]>
-  createSession(projectID: string): Promise<Session>
+  createSession(projectID: string, permissionMode?: PermissionMode): Promise<Session>
+  sessionPermissionMode(projectID: string, sessionID: string): Promise<PermissionMode>
+  updateSessionPermissionMode(projectID: string, sessionID: string, permissionMode: PermissionMode): Promise<PermissionMode>
   renameSession(projectID: string, sessionID: string, title: string): Promise<void>
   archiveSession(projectID: string, sessionID: string, archived: boolean): Promise<void>
   deleteSession(projectID: string, sessionID: string): Promise<void>
@@ -265,6 +277,9 @@ export interface DesktopApi {
   filePath(file: File): string
   cancel(projectID: string, sessionID: string): Promise<void>
   permissions(projectID: string, sessionID: string): Promise<Permission[]>
+  forms(projectID: string, sessionID: string): Promise<SessionForm[]>
+  replyForm(projectID: string, sessionID: string, formID: string, answer: SessionFormAnswer): Promise<void>
+  cancelForm(projectID: string, sessionID: string, formID: string, message?: string): Promise<void>
   replyPermission(projectID: string, permissionID: string, reply: 'once' | 'always' | 'reject'): Promise<void>
   account(operation: string, payload?: Record<string, string>): Promise<unknown>
   pickImport(): Promise<string | null>

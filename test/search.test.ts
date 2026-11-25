@@ -3,6 +3,7 @@ import { test, type TestContext } from 'node:test'
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { findRipgrep, replaceInWorkspace, searchWorkspace } from '../packages/ide-core/src/search'
 
 async function fixture(t: TestContext) {
@@ -145,15 +146,53 @@ test('dry run returns accurate preview; allowlist replacement preserves CRLF, BO
   await put('b.txt', 'cat')
   const options = { query: 'cat', wholeWord: true, replacement: 'dog', files: ['a.txt'] }
   const preview = await replaceInWorkspace(root, { ...options, dryRun: true })
-  assert.deepEqual(preview, { filesChanged: 1, replacements: 3, previews: [{ path: 'a.txt', count: 3, sampleBefore: original, sampleAfter: '\ufeffdog dog scatter\r\ndog\r\n' }] })
+  assert.deepEqual(preview, { filesChanged: 1, replacements: 3, previews: [{ path: 'a.txt', revision: createHash('sha256').update(Buffer.from(original)).digest('hex'), count: 3, sampleBefore: original, sampleAfter: '\ufeffdog dog scatter\r\ndog\r\n' }], writtenFiles: [], conflicts: [], errors: [] })
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), original)
-  assert.deepEqual(await replaceInWorkspace(root, options), preview)
+  assert.deepEqual(await replaceInWorkspace(root, options), { ...preview, writtenFiles: ['a.txt'] })
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), preview.previews[0].sampleAfter)
   assert.equal(await readFile(path.join(root, 'b.txt'), 'utf8'), 'cat')
   const unchanged = await replaceInWorkspace(root, { query: 'cat', replacement: 'cat', files: ['b.txt'] })
   assert.equal(unchanged.filesChanged, 0)
-  assert.equal(unchanged.replacements, 1)
-  assert.deepEqual(await replaceInWorkspace(root, { query: 'cat', replacement: 'dog', files: [] }), { filesChanged: 0, replacements: 0, previews: [] })
+  assert.equal(unchanged.replacements, 0)
+  assert.deepEqual(await replaceInWorkspace(root, { query: 'cat', replacement: 'dog', files: [] }), { filesChanged: 0, replacements: 0, previews: [], writtenFiles: [], conflicts: [], errors: [] })
+})
+
+test('approved replacement plan excludes new files and reports changed, missing and successfully written files', async t => {
+  const { root, put } = await fixture(t)
+  for (const file of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) await put(file, '\ufeffcat\r\ncat')
+  const options = { query: 'cat', replacement: 'dog' }
+  const preview = await replaceInWorkspace(root, { ...options, dryRun: true })
+  assert.equal(preview.previews[0].revision, createHash('sha256').update(await readFile(path.join(root, 'a.txt'))).digest('hex'))
+  await put('new.txt', 'cat')
+  await put('b.txt', 'cat edited')
+  await rm(path.join(root, 'c.txt'))
+  const result = await replaceInWorkspace(root, options, preview.previews)
+  assert.deepEqual(result.writtenFiles, ['a.txt', 'd.txt'])
+  assert.deepEqual(result.conflicts, ['b.txt'])
+  assert.deepEqual(result.errors.map(item => item.path), ['c.txt'])
+  assert.equal(result.filesChanged, 2)
+  assert.equal(result.replacements, 4)
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), '\ufeffdog\r\ndog')
+  assert.equal(await readFile(path.join(root, 'b.txt'), 'utf8'), 'cat edited')
+  assert.equal(await readFile(path.join(root, 'new.txt'), 'utf8'), 'cat')
+})
+
+test('long minified lines return bounded snippets with real columns and a hard response byte budget', async t => {
+  const { root, put } = await fixture(t)
+  const line = ('界'.repeat(900) + 'needle').repeat(150)
+  await put('minified.js', line)
+  const full = await searchWorkspace(root, { query: 'needle' }, nodeEngine)
+  assert.equal(full.totalMatches, 150)
+  assert.equal(full.results[0].matches.at(-1)!.column, line.lastIndexOf('needle') + 1)
+  assert.ok(full.results[0].matches.every(match => match.snippetTruncated && match.lineText.length <= 208))
+  assert.ok(Buffer.byteLength(JSON.stringify(full)) < 150_000)
+  const bounded = await searchWorkspace(root, { query: 'needle', maxResponseBytes: 4096 }, nodeEngine)
+  assert.equal(bounded.truncated, true)
+  assert.ok(bounded.totalMatches > 0 && bounded.totalMatches < 150)
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= 4096)
+  const hugeMatch = await searchWorkspace(root, { query: '.+', regex: true, maxResponseBytes: 4096 }, nodeEngine)
+  assert.ok(hugeMatch.results[0].matches[0].matchText.length <= 100)
+  assert.equal(hugeMatch.results[0].matches[0].length, line.length)
 })
 
 test('replacement handles regex captures, literal dollars, zero-width matches, shrinking and limits', async t => {

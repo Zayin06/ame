@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AndroidTranslationInfo, ChatItem, Model, Permission, Session } from '../../../../../packages/protocol/src/index'
 import { projectChatTimeline } from '../chat-timeline'
+import type { SessionForm } from '../../../../../packages/protocol/src/index'
+import { SessionFormCard } from './SessionFormCard'
 import { formatAmeKitError } from '../amekit-ui'
 import type { TimelineDetailMode } from '../state'
 import { Icon } from './Icon'
@@ -33,6 +35,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
   const [pinnedModel, setPinnedModel] = useState<Model>()
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
+  const [forms, setForms] = useState<SessionForm[]>([])
   const [text, setText] = useState('')
   const [mode, setMode] = useState<'update' | 'full' | 'scan' | 'custom'>('custom')
   const [busy, setBusy] = useState(false)
@@ -52,8 +55,8 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
   const epoch = useRef(0)
   const callbacks = useRef({ onClose, onActivity }); callbacks.current = { onClose, onActivity }
   const locked = !!sessionID && !!info?.lockedSessionIDs.includes(sessionID)
-  const running = session?.status === 'running'
-  const available = connected && !!info?.configured && !locked && !busy && !running && (!sessionID || loaded)
+  const running = session?.status === 'running' || forms.length > 0
+  const available = connected && !!info?.configured && !locked && !busy && !running && !forms.length && (!sessionID || loaded)
 
   useEffect(() => {
     mounted.current = true
@@ -63,7 +66,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
       if (event.isComposing) return
       if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); callbacks.current.onClose(); return }
       if (event.key !== 'Tab') return
-      const nodes = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),textarea:not(:disabled),[tabindex="0"]') ?? [])
+      const nodes = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]') ?? []).filter(node => !node.closest('fieldset:disabled'))
       const first = nodes[0], last = nodes[nodes.length - 1]
       if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog.current)) { event.preventDefault(); last?.focus() }
       else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialog.current)) { event.preventDefault(); first?.focus() }
@@ -106,9 +109,9 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
       if (loading) { queued = true; return }
       loading = true
       try {
-        const [items, pending, sessions] = await Promise.all([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID), window.ame.sessions(projectID)])
+        const [items, pending, sessions, pendingForms] = await Promise.all([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID), window.ame.sessions(projectID), window.ame.forms(projectID, sessionID)])
         if (alive) {
-          setMessages(items); setPermissions(pending); setLoaded(true)
+          setMessages(items); setPermissions(pending); setForms(pendingForms); setLoaded(true)
           const latest = sessions.find(item => item.id === sessionID)
           if (latest) setSession(latest)
         }
@@ -132,7 +135,9 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
     return () => { alive = false }
   }, [projectID, sessionID, connected])
 
-  useEffect(() => { if (follow.current) stream.current?.scrollTo({ top: stream.current.scrollHeight }) }, [messages, permissions])
+  useEffect(() => { if (follow.current) stream.current?.scrollTo({ top: stream.current.scrollHeight }) }, [messages, permissions, forms])
+  const formIDs = forms.map(form => form.id).join(',')
+  useEffect(() => { if (forms.length) { follow.current = true; stream.current?.scrollTo({ top: stream.current.scrollHeight }) } }, [formIDs])
 
   const send = async (value = text, preset = mode) => {
     if (!available || !value.trim() || operation.current) return
@@ -156,7 +161,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
     } finally { operation.current = false; if (mounted.current) setBusy(false) }
   }
   const finish = async () => {
-    if (!sessionID || busy || running || !loaded || permissions.length || operation.current || !connected) return
+    if (!sessionID || busy || running || !loaded || permissions.length || forms.length || operation.current || !connected) return
     operation.current = true; setBusy(true); setError('')
     try {
       const state = await window.ame.androidTranslationLock(projectID, sessionID)
@@ -170,7 +175,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
   const newSession = () => {
     if (busy || running || operation.current) return
     epoch.current++; setSession(undefined); currentSession.current = undefined; setPinnedModel(undefined)
-    setMessages([]); setPermissions([]); setText(''); setMode('custom'); setLoaded(false); setError(''); follow.current = true
+    setMessages([]); setPermissions([]); setForms([]); setText(''); setMode('custom'); setLoaded(false); setError(''); follow.current = true
     input.current?.focus()
   }
   const reply = async (permission: Permission, response: 'once' | 'always' | 'reject') => {
@@ -183,7 +188,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
     } catch (e) { if (mounted.current) setError(errorText(e)) }
     finally { if (mounted.current) setReplying(false) }
   }
-  const finishDisabled = !connected || !sessionID || busy || running || locked || !loaded || permissions.length > 0
+  const finishDisabled = !connected || !sessionID || busy || running || locked || !loaded || permissions.length > 0 || forms.length > 0
   const actions = { projectDirectory, onOpenFile }
   return <div className="translation-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
     <div ref={dialog} className="translation-modal" role="dialog" aria-modal="true" aria-label="Dịch Android Strings" tabIndex={-1}>
@@ -199,11 +204,13 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
           <div className="msg-turn-body">{turn.blocks.map(block => {
             if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
             if (block.kind === 'active-tools') return <ActiveToolsView key={block.id} items={block.items} {...actions} />
-            if (block.kind === 'live-status') return <LiveTurnStatus key={block.id} label={block.label} />
+            if (block.kind === 'live-status') return <LiveTurnStatus key={block.id} label={forms.length ? 'Đang chờ bạn trả lời câu hỏi…' : block.label} />
             const item = block.item
+            if (block.kind === 'tool' && item.tool?.name === 'question' && (item.tool.status === 'running' || item.tool.status === 'streaming')) return <ActiveToolsView key={block.id} items={[item]} {...actions} />
             return <article key={block.id} className="msg-agent">{block.kind === 'tool' && item.tool ? <ToolCard call={item.tool} {...actions} /> : block.kind === 'changes' && item.turn && sessionID ? <TurnChanges projectID={projectID} sessionID={sessionID} from={item.turn.from} files={item.turn.files} theme={theme} /> : block.kind === 'reasoning' ? <details className="thought-block"><summary>Suy nghĩ</summary><MessageContent text={item.text || '…'} onOpenFile={onOpenFile} /></details> : <MessageContent text={item.text || '…'} onOpenFile={onOpenFile} />}</article>
           })}</div>
         </section>)}
+        {!locked && forms.map(form => <SessionFormCard key={`${sessionID}:${form.id}`} projectID={projectID} form={form} disabled={!connected} onResolved={id => { setForms(current => current.filter(form => form.id !== id)); setRevision(value => value + 1) }} />)}
         {!locked && permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying || !connected} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying || !connected} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying || !connected} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
       {locked ? <div className="translation-locked-banner" role="status"><Icon name="lock" /><p>Phiên dịch đã hoàn tất và được khóa vĩnh viễn. Nội dung chỉ đọc.</p><button type="button" disabled={busy || running} onClick={newSession}>Phiên dịch mới</button></div> : <div className="composer-dock translation-composer"><div className="composer-dock__inner">

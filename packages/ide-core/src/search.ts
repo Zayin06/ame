@@ -1,23 +1,13 @@
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import type { SearchQuery, SearchMatch, SearchResponse, ReplaceOptions, ReplacePreview, ReplaceResult } from '../../protocol/src/index'
 import { existsSync } from 'node:fs'
 import { lstat, open, readFile, readdir, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { validateWorkspacePath } from './workspace-fs'
 
-export type SearchQuery = {
-  query: string
-  caseSensitive?: boolean
-  wholeWord?: boolean
-  regex?: boolean
-  include?: string[]
-  exclude?: string[]
-  maxFiles?: number
-  maxMatches?: number
-}
-export type SearchMatch = { line: number; column: number; length: number; lineText: string; matchText: string }
-export type SearchFileResult = { path: string; matches: SearchMatch[] }
-export type SearchResponse = { results: SearchFileResult[]; totalMatches: number; filesSearched: number; truncated: boolean; engine: 'ripgrep' | 'node' }
+export type { SearchQuery, SearchMatch, SearchResponse } from '../../protocol/src/index'
 type SearchOptions = { signal?: AbortSignal; forceEngine?: 'ripgrep' | 'node'; rgPath?: string }
 type IgnoreRule = { base: string; pattern: RegExp; directory: boolean; negate: boolean }
 const skipped = new Set(['.git', 'node_modules', 'dist', 'out', '.next'])
@@ -108,10 +98,10 @@ async function discovery(root: string, options: SearchOptions): Promise<{ engine
   }
 }
 
-async function* textFiles(root: string, query: SearchQuery, signal?: AbortSignal, discovered?: Set<string>, allowlist?: Set<string>): AsyncGenerator<{ path: string; content: string }> {
+async function* textFiles(root: string, query: SearchQuery, signal?: AbortSignal, discovered?: Set<string>, allowlist?: Set<string>): AsyncGenerator<{ path: string; content: string; revision: string }> {
   const includes = query.include?.map(pattern => glob(pattern))
   const excludes = query.exclude?.map(pattern => glob(pattern.replace(/\/$/, '') + (pattern.endsWith('/') ? '/**' : '')))
-  async function* walk(directory: string, inherited: IgnoreRule[]): AsyncGenerator<{ path: string; content: string }> {
+  async function* walk(directory: string, inherited: IgnoreRule[]): AsyncGenerator<{ path: string; content: string; revision: string }> {
     abort(signal)
     const rules = await ignoreRules(root, directory, inherited)
     const checked = await validateWorkspacePath(root, directory, { allowRoot: true })
@@ -139,26 +129,28 @@ async function* textFiles(root: string, query: SearchQuery, signal?: AbortSignal
         let content: string
         try { content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, size)) } catch { continue }
         abort(signal)
-        yield { path: relative, content }
+        yield { path: relative, content, revision: revision(bytes.subarray(0, size)) }
       } finally { await handle.close() }
     }
   }
   yield* walk('', [])
 }
 
-function lineMatches(content: string, expression: RegExp, maximum: number): SearchMatch[] {
-  const matches: SearchMatch[] = []
+function* lineMatches(content: string, expression: RegExp): Generator<SearchMatch> {
   const lines = content.split(/\r\n|\n|\r/)
   for (let index = 0; index < lines.length; index++) {
     expression.lastIndex = 0
     let match: RegExpExecArray | null
     while ((match = expression.exec(lines[index]))) {
-      matches.push({ line: index + 1, column: match.index + 1, length: match[0].length, lineText: lines[index], matchText: match[0] })
-      if (matches.length >= maximum) return matches
+      const start = Math.max(0, match.index - 100)
+      const end = Math.min(lines[index].length, match.index + Math.min(match[0].length, 100) + 100)
+      const snippetTruncated = start > 0 || end < lines[index].length
+      yield { line: index + 1, column: match.index + 1, length: match[0].length,
+        lineText: `${start ? '…' : ''}${lines[index].slice(start, end)}${end < lines[index].length ? '…' : ''}`,
+        matchText: match[0].slice(0, 100), snippetStart: start + 1, snippetTruncated }
       if (!match[0].length) expression.lastIndex++
     }
   }
-  return matches
 }
 
 export async function searchWorkspace(root: string, query: SearchQuery, options: SearchOptions = {}): Promise<SearchResponse> {
@@ -170,27 +162,74 @@ export async function searchWorkspace(root: string, query: SearchQuery, options:
   const found = await discovery(rootReal, options)
   response.engine = found.engine
   const maxFiles = limit(query.maxFiles, 5000), maxMatches = limit(query.maxMatches, 1000)
+  const responseBudget = Math.max(256, Math.min(limit(query.maxResponseBytes, 1024 * 1024), 1024 * 1024))
+  let responseBytes = 160 // Envelope and counters, including the final truncated flag.
   if (!maxFiles || !maxMatches) return { ...response, truncated: true }
   for await (const file of textFiles(rootReal, query, options.signal, found.paths)) {
     response.filesSearched++
-    const matches = lineMatches(file.content, expression, maxMatches - response.totalMatches)
+    const matches: SearchMatch[] = []
+    const fileBytes = Buffer.byteLength(JSON.stringify({ path: file.path, matches: [] })) + 1
+    for (const match of lineMatches(file.content, expression)) {
+      const bytes = Buffer.byteLength(JSON.stringify(match)) + 1 + (matches.length ? 0 : fileBytes)
+      if (responseBytes + bytes > responseBudget) { response.truncated = true; break }
+      responseBytes += bytes
+      matches.push(match)
+      if (response.totalMatches + matches.length >= maxMatches) break
+    }
     if (matches.length) response.results.push({ path: file.path, matches })
     response.totalMatches += matches.length
-    if (response.filesSearched >= maxFiles || response.totalMatches >= maxMatches) { response.truncated = true; break }
+    if (response.truncated || response.filesSearched >= maxFiles || response.totalMatches >= maxMatches) { response.truncated = true; break }
   }
   abort(options.signal)
   return response
 }
 
-export async function replaceInWorkspace(root: string, options: SearchQuery & { replacement: string; files?: string[]; dryRun?: boolean }): Promise<{ filesChanged: number; replacements: number; previews: { path: string; count: number; sampleBefore: string; sampleAfter: string }[] }> {
+const revision = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
+
+export async function replaceInWorkspace(root: string, options: ReplaceOptions, plan?: ReplacePreview[]): Promise<ReplaceResult> {
   const { rootReal } = await validateWorkspacePath(root, '', { allowRoot: true })
   let allowlist: Set<string> | undefined
-  if (options.files) {
+  if (options.files && !plan) {
     allowlist = new Set()
     // Validate the entire list before any write, even entries after a limit or an empty query.
     for (const file of options.files) allowlist.add((await validateWorkspacePath(rootReal, file)).normalized)
   }
-  const result = { filesChanged: 0, replacements: 0, previews: [] as { path: string; count: number; sampleBefore: string; sampleAfter: string }[] }
+  const result: ReplaceResult = { filesChanged: 0, replacements: 0, previews: [], writtenFiles: [], conflicts: [], errors: [] }
+  if (plan && !options.dryRun) {
+    // No discovery here: only the exact files and per-file replacement counts approved in preview.
+    for (const entry of plan) {
+      try {
+        const checked = await validateWorkspacePath(rootReal, entry.path)
+        const handle = await open(checked.target, 'r+')
+        try {
+          const before = await handle.readFile()
+          if (revision(before) !== entry.revision) { result.conflicts.push(entry.path); continue }
+          const changed = replacementText(before.toString('utf8'), matcher(options), options, entry.count)
+          const current = await readFile(checked.target)
+          if (revision(current) !== entry.revision) { result.conflicts.push(entry.path); continue }
+          const bytes = Buffer.from(changed.after, 'utf8')
+          let offset = 0
+          while (offset < bytes.length) {
+            const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, offset)
+            if (!bytesWritten) throw new Error('WRITE_FAILED')
+            offset += bytesWritten
+          }
+          await handle.truncate(bytes.length)
+          result.filesChanged++
+          result.replacements += changed.count
+          result.writtenFiles.push(entry.path)
+          result.previews.push(entry)
+        } finally { await handle.close() }
+      } catch (error) {
+        result.errors.push({ path: entry.path, code: (error as NodeJS.ErrnoException).code ?? 'WRITE_FAILED' })
+      }
+    }
+    return result
+  }
+  if (!options.dryRun) {
+    const preview = await replaceInWorkspace(rootReal, { ...options, dryRun: true })
+    return replaceInWorkspace(rootReal, options, preview.previews)
+  }
   if (!options.query) return result
   const expression = matcher(options)
   const maxFiles = limit(options.maxFiles, 5000), maxMatches = limit(options.maxMatches, 1000)
@@ -198,13 +237,25 @@ export async function replaceInWorkspace(root: string, options: SearchQuery & { 
   if (!maxFiles || !maxMatches) return result
   for await (const file of textFiles(rootReal, options, undefined, undefined, allowlist)) {
     filesSearched++
+    const { after, count } = replacementText(file.content, expression, options, maxMatches - result.replacements)
+    result.replacements += count
+    if (after !== file.content) {
+      result.filesChanged++
+      result.previews.push({ path: file.path, revision: file.revision, count, sampleBefore: file.content.slice(0, 500), sampleAfter: after.slice(0, 500) })
+    }
+    if (filesSearched >= maxFiles || result.replacements >= maxMatches) break
+  }
+  return result
+}
+
+function replacementText(content: string, expression: RegExp, options: ReplaceOptions, maximum: number) {
     let count = 0
     // Split with captured separators so CRLF, LF, and CR are preserved byte-for-byte.
-    const after = file.content.split(/(\r\n|\n|\r)/).map((line, index) => {
+    const after = content.split(/(\r\n|\n|\r)/).map((line, index) => {
       if (index % 2) return line
       expression.lastIndex = 0
       return line.replace(expression, (...args: unknown[]) => {
-        if (result.replacements + count >= maxMatches) return args[0] as string
+        if (count >= maximum) return args[0] as string
         count++
         if (!options.regex) return options.replacement
         const match = args[0] as string
@@ -225,28 +276,5 @@ export async function replaceInWorkspace(root: string, options: SearchQuery & { 
         })
       })
     }).join('')
-    result.replacements += count
-    if (after !== file.content) {
-      if (!options.dryRun) {
-        const checked = await validateWorkspacePath(rootReal, file.path)
-        const handle = await open(checked.target, 'r+')
-        try {
-          const current = await handle.readFile('utf8')
-          if (current !== file.content) throw new Error('FILE_CONFLICT')
-          const bytes = Buffer.from(after, 'utf8')
-          let offset = 0
-          while (offset < bytes.length) {
-            const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, offset)
-            if (!bytesWritten) throw new Error('WRITE_FAILED')
-            offset += bytesWritten
-          }
-          await handle.truncate(bytes.length)
-        } finally { await handle.close() }
-      }
-      result.filesChanged++
-      result.previews.push({ path: file.path, count, sampleBefore: file.content.slice(0, 500), sampleAfter: after.slice(0, 500) })
-    }
-    if (filesSearched >= maxFiles || result.replacements >= maxMatches) break
-  }
-  return result
+    return { after, count }
 }

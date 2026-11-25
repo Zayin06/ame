@@ -10,6 +10,42 @@ import type { UsagePrices } from '../packages/amekit/src/usage-pricing'
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 const waitFor = async (check: () => boolean) => { for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)) }; throw new Error('TIMED_OUT') }
+
+test('session forms use real SDK routes, enforce ownership, and notify on all form SSE events', async () => {
+  const directory = process.cwd(), events: IdeEvent[] = [], calls: { path: string; body: unknown; message: string | null }[] = []
+  let stream!: ReadableStreamDefaultController<Uint8Array>
+  const form = { id: 'f', sessionID: 's', title: 'Locale', fields: [{ key: 'locale', type: 'string', options: [{ value: 'ja', label: 'Japanese' }] }] }
+  const adapter = new OpenCodeAdapter(event => events.push(event), async (input, init = {}) => {
+    const url = new URL(String(input)); calls.push({ path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : undefined, message: url.searchParams.get('message') })
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) { stream = controller; init.signal?.addEventListener('abort', () => controller.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session/s') return json({ data: { id: 's', location: { directory } } })
+    if (url.pathname === '/api/session/foreign') return json({ data: { id: 'foreign', location: { directory: path.join(directory, 'foreign') } } })
+    if (url.pathname === '/api/session/s/form') return json({ data: [form, { ...form, id: 'foreign-form', sessionID: 'foreign' }] })
+    if (url.pathname.endsWith('/reply') || url.pathname === '/api/session/s/form/f') return new Response(null, { status: 204 })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    assert.deepEqual(await adapter.forms('p', 's'), [form])
+    await adapter.replyForm('p', 's', 'f', { locale: 'ja', enabled: false, choices: ['a', 'b'] })
+    await adapter.cancelForm('p', 's', 'f', 'skip')
+    await adapter.cancelForm('p', 's', 'f')
+    assert.deepEqual(calls.find(call => call.path.endsWith('/form/f/reply'))?.body, { answer: { locale: 'ja', enabled: false, choices: ['a', 'b'] } })
+    assert.deepEqual(calls.filter(call => call.path.endsWith('/form/f')).map(call => call.message), ['skip', null])
+    for (const action of [() => adapter.forms('p', 'foreign'), () => adapter.replyForm('p', 'foreign', 'f', {}), () => adapter.cancelForm('p', 'foreign', 'f'), () => adapter.forms('unknown', 's')]) await assert.rejects(action)
+    const count = calls.length
+    await assert.rejects(() => adapter.replyForm('p', 's', 'f', JSON.parse('{"__proto__":"bad"}')))
+    assert.equal(calls.slice(count).some(call => call.path.endsWith('/reply')), false)
+    events.length = 0
+    for (const type of ['form.created', 'form.replied', 'form.cancelled']) {
+      stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, location: { directory }, data: type === 'form.created' ? { form } : { id: 'f', sessionID: 's', answer: {} } })}\n\n`))
+    }
+    await waitFor(() => events.length === 3)
+    assert.deepEqual(events, Array(3).fill({ type: 'opencode', projectID: 'p', sessionID: 's' }))
+  } finally { adapter.dispose() }
+})
 test('only local origins accepted; unsupported server does not attach', async () => {
   for (const url of ['https://example.com', 'http://user:pass@localhost:4096', 'http://localhost:4096/api', 'http://localhost:4096/?token=x', 'http://192.168.1.5']) assert.throws(() => localURL(url), /LOCAL_SERVER_REQUIRED/)
   const adapter = new OpenCodeAdapter(() => {}, async () => json({ version: '1.0.0' }))
@@ -617,6 +653,60 @@ test('persisted tool metadata wins over colliding live text while longer text de
   } finally { adapter.dispose() }
 })
 
+test('live text merges field-by-field and completed history retires stale live entries', async () => {
+  const directory = process.cwd(), notifications: IdeEvent[] = []
+  let stream!: ReadableStreamDefaultController<Uint8Array>
+  let history: unknown[] = []
+  const adapter = new OpenCodeAdapter(event => notifications.push(event), async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/session/s1') return json({ data: { location: { directory } } })
+    if (url.pathname.endsWith('/message')) return json({ data: [...history].reverse(), cursor: {} })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      stream = controller
+      init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  const send = async (type: string, data: unknown) => {
+    const before = notifications.length
+    stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, data })}\n\n`))
+    await waitFor(() => notifications.length > before)
+  }
+  const assistant = (text: string, completed?: number) => ({ id: 'a', type: 'assistant', time: { created: 10, ...(completed !== undefined ? { completed } : {}) }, content: [{ type: 'text', text, native: { phase: 'final_answer' } }] })
+  const delta = (delta: string) => send('session.text.delta', { sessionID: 's1', assistantMessageID: 'a', ordinal: 0, delta })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    await delta('Saved')
+    history = [assistant('Saved')]
+    assert.deepEqual(await adapter.messages('p', 's1'), normalizeMessages(history as SessionMessageInfo[]), 'equal text preserves metadata')
+    await delta(' plus live')
+    const [merged] = await adapter.messages('p', 's1')
+    assert.deepEqual(merged, { ...normalizeMessages(history as SessionMessageInfo[])[0], text: 'Saved plus live' })
+    history = [{ id: 'u', type: 'user', text: 'go', time: { created: 0 } }, assistant('Saved', 20), { id: 'idle', type: 'idle', time: { created: 30 } }]
+    const completed = normalizeMessages(history as SessionMessageInfo[])
+    assert.deepEqual(await adapter.messages('p', 's1'), completed, 'completed history wins over longer stale live text')
+    assert.deepEqual(completed[1], { id: 'a:0', role: 'assistant', kind: 'text', text: 'Saved', phase: 'final_answer', createdAt: 10, completedAt: 20, workedMs: 30 })
+    history = []
+    assert.deepEqual(await adapter.messages('p', 's1'), [], 'retired live entry cannot reappear when history is absent')
+    history = [assistant('Saved', 0)]
+    await delta('Saved')
+    assert.deepEqual(await adapter.messages('p', 's1'), normalizeMessages(history as SessionMessageInfo[]), 'zero completedAt and equal live text are also authoritative')
+    history = []
+    assert.deepEqual(await adapter.messages('p', 's1'), [])
+    for (const [type, extra] of [
+      ['session.idle', {}], ['session.execution.succeeded', {}], ['session.execution.failed', {}],
+      ['session.execution.interrupted', {}], ['session.status', { status: { type: 'idle' } }],
+    ] as const) {
+      await delta('Pending')
+      assert.equal((await adapter.messages('p', 's1'))[0].text, 'Pending')
+      await send(type, { sessionID: 's1', ...extra })
+      assert.deepEqual(await adapter.messages('p', 's1'), [], type + ' clears live state')
+    }
+  } finally { adapter.dispose() }
+})
+
 test('commit generation sends staged context and selected model, strips fences, rejects empty output and preserves truncation', async () => {
   const calls: { url: URL; init: RequestInit }[] = []
   let output = '  ```text\nfeat: improve tools\n\n- Preserve metadata\n```  '
@@ -894,7 +984,7 @@ test('forkSession checks ownership and maps native session activity, parent, age
     await assert.rejects(adapter.forkSession('p', 'foreign'), /SESSION_PROJECT_MISMATCH/)
     assert.equal(calls.some(c => c.url.pathname.endsWith('/fork')), false)
     calls.length = 0
-    assert.deepEqual(await adapter.forkSession('p', 's1'), { id: 'fork1', parentID: 's1', agent: 'architect', title: 'Forked', updatedAt: 50, status: 'running', outcome: 'succeeded' })
+    assert.deepEqual(await adapter.forkSession('p', 's1'), { id: 'fork1', parentID: 's1', agent: 'architect', title: 'Forked', updatedAt: 50, status: 'running', busyAt: 40, idleAt: 30, outcome: 'succeeded' })
     assert.deepEqual(calls.map(c => c.url.pathname), ['/api/session/s1', '/api/session/s1/fork'])
     assert.equal(calls[1].init.method, 'POST')
     assert.equal(calls[1].url.searchParams.has('before'), false)

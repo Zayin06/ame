@@ -486,7 +486,11 @@ test('CI YAML runs Node 22 checks and runtime-free builds on Windows and macOS',
   assert.equal(node.with['cache-dependency-path'], 'package-lock.json')
   const commands = steps(job)
   for (const command of ['npm ci', 'npm run typecheck', 'npm test', 'npm run build:server', 'npx electron-vite build', 'npm run runtime:prepare', 'npm run build']) assert.ok(commands.includes(command), command)
-  for (const command of ['npm run build:server', 'npx electron-vite build']) assert.equal(job.steps.find((step: any) => step.run === command).if, "env.AME_OPENCODE_CLI == ''")
+  // The backend plugin is now built for every test run, including trusted runtime coverage.
+  const backendBuild = job.steps.find((step: any) => step.run === 'npm run build:server')
+  assert.equal(backendBuild.if, undefined)
+  assert.ok(job.steps.indexOf(backendBuild) < job.steps.findIndex((step: any) => step.run === 'npm test'))
+  assert.equal(job.steps.find((step: any) => step.run === 'npx electron-vite build').if, "env.AME_OPENCODE_CLI == ''")
   for (const command of ['npm run runtime:prepare', 'npm run build']) assert.equal(job.steps.find((step: any) => step.run === command).if, "env.AME_OPENCODE_CLI != ''")
 })
 

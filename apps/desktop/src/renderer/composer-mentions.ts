@@ -1,10 +1,9 @@
 import { rankQuickOpenFiles } from './quick-open'
 import type { PromptFileAttachment, ResolvedDroppedFile } from '../../../../packages/ide-core/src/dropped-attachments'
+import { attachmentBatchSizeError, attachmentSizeError, MAX_EXTERNAL_TEXT_BYTES, MAX_PROMPT_FILES, SUPPORTED_MEDIA_MIMES } from '../../../../packages/ide-core/src/dropped-attachments'
+export { MAX_EXTERNAL_TEXT_BYTES, MAX_MEDIA_BYTES, MAX_PROMPT_FILES } from '../../../../packages/ide-core/src/dropped-attachments'
 
 export const WORKSPACE_DRAG_MIME = 'application/x-ame-workspace-path'
-export const MAX_PROMPT_FILES = 8
-export const MAX_MEDIA_BYTES = 10 * 1024 * 1024
-export const MAX_EXTERNAL_TEXT_BYTES = 512 * 1024
 
 export type ComposerTrigger = { kind: '@' | '/'; start: number; end: number; query: string }
 
@@ -51,6 +50,18 @@ export type ComposerAttachment =
   | { id: string; kind: 'file' | 'selection'; path: string; lineStart?: number; lineEnd?: number; excerpt?: string }
   | { id: string; kind: 'media' | 'external-text'; name: string; mime: string; dataUrl: string; size: number; workspacePath?: string }
 
+// Validate the whole draft, including attachments from earlier picker/drop events.
+// Keep this pure so a failed validation never discards the user's draft.
+export function composerAttachmentSizeError(attachments: readonly ComposerAttachment[]): string | undefined {
+  const inline = attachments.filter((item): item is Extract<ComposerAttachment, { dataUrl: string }> => 'dataUrl' in item)
+  for (const item of inline) {
+    const error = attachmentSizeError(item)
+    if (error) return error
+  }
+  const unique = inline.filter((item, index) => inline.findIndex(other => other.dataUrl === item.dataUrl && other.name === item.name) === index)
+  return attachmentBatchSizeError(unique)
+}
+
 export function composePromptWithAttachments(text: string, attachments: readonly ComposerAttachment[]): string {
   const seen = new Set<string>()
   const blocks: string[] = []
@@ -89,9 +100,7 @@ export function splitComposerAttachments(text: string, attachments: readonly Com
   return { text: composePromptWithAttachments(text, attachments), files, truncatedCount }
 }
 
-const mediaMimes: Readonly<Record<string, string>> = {
-  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', pdf: 'application/pdf'
-}
+const mediaMimes = SUPPORTED_MEDIA_MIMES
 const textExtensions = new Set('txt md mdx json jsonc yaml yml xml gradle kts kt java ts tsx js jsx mjs cjs css scss html py sh bat ps1 sql toml ini cfg conf csv log properties svg go rs c cpp h hpp swift rb php dart'.split(' '))
 
 export function classifyBrowserFile(file: { name: string; type?: string; size: number }): { ok: true; kind: 'media' | 'external-text'; mime: string } | { ok: false; reason: string } {
@@ -100,7 +109,8 @@ export function classifyBrowserFile(file: { name: string; type?: string; size: n
   const type = file.type?.toLowerCase() || ''
   const mime = Object.values(mediaMimes).includes(type) ? type : Object.hasOwn(mediaMimes, extension) ? mediaMimes[extension] : undefined
   if (mime) {
-    return file.size > MAX_MEDIA_BYTES ? { ok: false, reason: 'Tệp ảnh/PDF vượt quá giới hạn 10 MiB.' } : { ok: true, kind: 'media', mime }
+    const reason = attachmentSizeError({ ...file, mime })
+    return reason ? { ok: false, reason } : { ok: true, kind: 'media', mime }
   }
   if (textExtensions.has(extension) || file.name.toLowerCase().endsWith('.env.example')) {
     return file.size > MAX_EXTERNAL_TEXT_BYTES ? { ok: false, reason: 'Tệp văn bản bên ngoài vượt quá giới hạn 512 KiB.' } : { ok: true, kind: 'external-text', mime: 'text/plain' }

@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArtifactViewer } from './components/ArtifactViewer'
 import { formatShortcut, isMacPlatform } from './platform'
-import type { Connection, DebugSessionSnapshot, LspDiagnostic, GitState, Model, PetHostState, PetSession, Project, Session, TerminalInfo } from '../../../../packages/protocol/src/index'
+import type { Connection, DebugSessionSnapshot, LspDiagnostic, GitState, Model, PetHostState, Project, Session, TerminalInfo } from '../../../../packages/protocol/src/index'
+import { petSessions } from './pet-sessions'
 import { activateTab, defaults, dirty, documentID, languageFor, parsePreferences, projectDirtyPaths, reconcileDocument, removeTab, savedDocument, selectedTab, tabID, withoutKey, withoutProject, withoutProjectDocuments, type Buffer, type Pane, type Preferences, type ProjectView, type Tab } from './state'
+import { diffID } from './state'
+import type { DiffTarget } from '../../../../packages/protocol/src/index'
 import { Icon } from './components/Icon'
 import { ProjectRail } from './components/ProjectRail'
 import type { CSSProperties } from 'react'
@@ -10,6 +13,8 @@ import { Chat } from './components/Chat'
 import { AndroidTranslationModal } from './components/AndroidTranslationModal'
 import type { ModelLevels } from './model-selection'
 import { EditorStage, type EditorStatus } from './components/EditorStage'
+import { disposeOrphanedFileModels } from './editor-model-lifecycle'
+import { editor as monacoEditor, Uri as MonacoUri } from 'monaco-editor'
 import { QuickOpen } from './components/QuickOpen'
 import { UsagePanel } from './components/UsagePanel'
 import type { SessionUsageView } from '../../../../packages/protocol/src/index'
@@ -22,6 +27,7 @@ import { SessionChanges } from './components/SessionChanges'
 import { watchSessionChanges, type SessionChangesState } from './session-changes'
 import { TerminalPanel, type BottomPanelTab } from './components/TerminalPanel'
 import { createProjectTerminal, isTerminalKey, newTerminalShortcut } from './terminal-controls'
+import { removeProjectSafely } from './project-removal'
 import { changePathDocuments, deleteFromView, renameBuffers, renamedPath, renameView, resolveWorkspaceFilePath, sanitizeProjectView, type NavigationTarget } from './workspace-paths'
 
 const storageKey = 'ame.ide.layout.v1'
@@ -42,6 +48,8 @@ export function App() {
   const [sessionCache, setSessionCache] = useState<Record<string, Session[]>>({})
   const sessionCacheRef = useRef(sessionCache); sessionCacheRef.current = sessionCache
   const draftProjects = useRef(new Set<string>())
+  // Updated synchronously on New Chat, before an older createSession can resolve.
+  const chatDraftIDs = useRef<Record<string, number>>({})
   const [composerFocusNonce, setComposerFocusNonce] = useState(0)
   const [bundleToast, setBundleToast] = useState('')
   useEffect(() => {
@@ -54,6 +62,9 @@ export function App() {
   const [projectsLoading, setProjectsLoading] = useState(true)
   const [connection, setConnection] = useState<Connection>({ connected: false, url: '' })
   const [buffers, setBuffers] = useState<Record<string, Buffer>>({})
+  useEffect(() => {
+    disposeOrphanedFileModels(monacoEditor.getModels(), Object.values(buffers), uri => MonacoUri.parse(uri).toString())
+  }, [buffers])
   const [readErrors, setReadErrors] = useState<Record<string, string>>({})
   const readErrorsRef = useRef(readErrors)
   const updateReadErrors = useCallback((update: (current: Record<string, string>) => Record<string, string>) => {
@@ -119,8 +130,10 @@ export function App() {
   const buffersRef = useRef(buffers); buffersRef.current = buffers
   const preferencesRef = useRef(preferences); preferencesRef.current = preferences
   const saving = useRef(new Set<string>())
+  const removingProjects = useRef(new Set<string>())
   const pendingReads = useRef(new Set<string>())
   const projectID = preferences.project
+  const chatDraftID = projectID ? chatDraftIDs.current[projectID] || 0 : 0
   const currentCommitDraft = projectID ? commitDrafts[projectID] ?? { message: '', amend: false, noVerify: false } : { message: '', amend: false, noVerify: false }
   const updateCommitDraft = useCallback((patch: Partial<{ message: string; amend: boolean; noVerify: boolean }>) => {
     if (!projectID || removedProjects.current.has(projectID)) return
@@ -426,10 +439,10 @@ export function App() {
   useEffect(() => {
     if (projectsLoading || !projectID || !activeTab || activeTab.mode !== 'diff' || !window.ame) return
     let alive = true
-    const key = documentID(projectID, activeTab.path)
-    void window.ame.diff(projectID, activeTab.path).then(value => { if (alive && !removedProjects.current.has(projectID)) setDiffs(current => ({ ...current, [key]: value })) }).catch(e => { if (alive) report(e) })
+    const key = diffID(projectID, activeTab)
+    void window.ame.diff(projectID, activeTab.path, activeTab.target).then(value => { if (alive && !removedProjects.current.has(projectID)) setDiffs(current => ({ ...current, [key]: value })) }).catch(e => { if (alive) report(e) })
     return () => { alive = false }
-  }, [projectsLoading, projectID, activeTab?.path, activeTab?.mode, generation, report])
+  }, [projectsLoading, projectID, activeTab && tabID(activeTab), generation, report])
 
   useEffect(() => {
     if (modal !== 'settings' && modal !== 'account' && !pet?.preferences.enabled) return
@@ -445,9 +458,7 @@ export function App() {
   }, [preferences.theme, preferences.tint, pet?.preferences.enabled, report])
   useEffect(() => {
     if (!pet?.preferences.enabled) return
-    const sessions: PetSession[] = Object.entries(sessionCache).flatMap(([project, items]) => items.map(item => ({
-      key: `${project}:${item.id}`, running: item.status === 'running', waiting: false, thinking: item.status === 'running', child: Boolean(item.parentID), outcome: item.outcome,
-    })))
+    const sessions = petSessions(sessionCache)
     void window.ame.petReport(sessions).catch(report)
   }, [sessionCache, pet?.preferences.enabled, report])
 
@@ -455,8 +466,19 @@ export function App() {
     try { const selected = await window.ame.pickProject(); if (selected) { removedProjects.current.delete(selected.id); setProjects(current => current.some(p => p.id === selected.id) ? current : [...current, selected]); setPreferences(p => ({ ...p, project: selected.id })); refresh() } } catch (e) { report(e) }
   }
   const removeProject = async (id: string) => {
+    if (removingProjects.current.has(id)) return
+    removingProjects.current.add(id)
     try {
-      await window.ame.removeProject(id)
+      const removed = await removeProjectSafely(id, {
+        api: window.ame, buffers: () => buffersRef.current, saving: saving.current,
+        update: (key, update) => {
+          const current = buffersRef.current
+          if (!current[key]) return
+          buffersRef.current = { ...current, [key]: update(current[key]) }
+          setBuffers(buffersRef.current)
+        },
+      })
+      if (!removed) return
       removedProjects.current.add(id)
       draftProjects.current.delete(id)
       const remaining = projectsRef.current.filter(project => project.id !== id)
@@ -478,7 +500,11 @@ export function App() {
       setSelectedFrames(current => withoutKey(current, id))
       setDebugOutputs(current => withoutKey(current, id))
       for (const key of overlayTexts.current.keys()) if ((JSON.parse(key) as string[])[0] === id) { overlayTexts.current.delete(key); overlayQueues.current.delete(key) }
-    } catch (e) { if (!errorText(e).includes('CANCELLED')) report(e) }
+    } catch (e) {
+      // Keep the file path: generic error humanization replaces FILE_CONFLICT/ENOENT messages.
+      if (!errorText(e).includes('CANCELLED')) setError(errorText(e))
+    }
+    finally { removingProjects.current.delete(id) }
   }
   const newTerminal = async () => {
     setBottomTab('terminal')
@@ -492,6 +518,7 @@ export function App() {
     setGitWorkspaceOpen(false)
     if (!id || !connection.connected) return
     draftProjects.current.add(id)
+    chatDraftIDs.current[id] = (chatDraftIDs.current[id] || 0) + 1
     updateView(id, current => ({ ...current, session: undefined }))
     setPreferences(current => ({ ...current, project: id }))
     setComposerFocusNonce(n => n + 1)
@@ -507,7 +534,7 @@ export function App() {
     setPreferences(current => ({ ...current, panel: 'files', stage: true }))
     updateSplit(projectID, current => current.secondary ? unsplit(current) : splitRight(current))
   }
-  const openProjectTab = (id: string, path: string, mode: Tab['mode'], line?: number, column?: number) => {
+  const openProjectTab = (id: string, path: string, mode: Tab['mode'], line?: number, column?: number, target?: DiffTarget) => {
     if (removedProjects.current.has(id)) return
     const dir = projectsRef.current.find(project => project.id === id)?.directory
     const resolved = resolveWorkspaceFilePath(path, dir)
@@ -518,12 +545,12 @@ export function App() {
     updateReadErrors(current => withoutKey(current, key))
     if (mode === 'file') void loadFile(id, path, true)
     setNavigation(mode === 'file' && line !== undefined ? { projectID: id, path, line, column, nonce: ++navigationNonce.current } : undefined)
-    const tab = { path, mode }
+    const tab = { path, mode, ...(mode === 'diff' && target ? { target } : {}) }
     if (mode === 'file') updateSplit(id, current => openTabInGroup(current, tab))
     updateView(id, current => activateTab({ ...current, tabs: current.tabs.some(t => tabID(t) === tabID(tab)) ? current.tabs : [...current.tabs, tab] }, tab))
     setPreferences(p => ({ ...p, project: id, stage: true, panel: mode === 'diff' ? 'diff' : 'files', layoutMode: mode === 'diff' ? 'swe' : p.layoutMode }))
   }
-  const openTab = (path: string, mode: Tab['mode'], line?: number, column?: number) => { if (projectID) openProjectTab(projectID, path, mode, line, column) }
+  const openTab = (path: string, mode: Tab['mode'], line?: number, column?: number, target?: DiffTarget) => { if (projectID) openProjectTab(projectID, path, mode, line, column, target) }
   navigateRef.current = (id, path, line, column) => openProjectTab(id, path, 'file', line, column)
   const closeOverlay = (id: string, path: string) => {
     if (!isSourceFile(path)) return
@@ -698,7 +725,7 @@ export function App() {
     const tab = diffMode ? selectedTab(view, 'diff') : editorGroup?.active
     const buffer = projectID && tab ? buffers[documentID(projectID, tab.path)] : undefined
     return <div key={group} className={`editor-group ${splitState.focused === group ? 'is-focused' : ''}`} onFocusCapture={() => { if (projectID && !diffMode) updateSplit(projectID, current => focusGroup(current, group)) }} onPointerDownCapture={() => { if (projectID && !diffMode) updateSplit(projectID, current => focusGroup(current, group)) }}>
-      <EditorStage projectID={projectID || ''} target={group === splitState.focused || diffMode ? navigation : undefined} dirtyPaths={projectDirtyPaths(buffers, projectID)} tabs={diffMode ? view.tabs.filter(tab => tab.mode === 'diff') : editorGroup?.tabs || []} active={tab} buffer={buffer} loadError={projectID && tab ? readErrors[documentID(projectID, tab.path)] : undefined} diff={projectID && tab ? diffs[documentID(projectID, tab.path)] : undefined} theme={preferences.theme}
+      <EditorStage projectID={projectID || ''} target={group === splitState.focused || diffMode ? navigation : undefined} dirtyPaths={projectDirtyPaths(buffers, projectID)} tabs={diffMode ? view.tabs.filter(tab => tab.mode === 'diff') : editorGroup?.tabs || []} active={tab} buffer={buffer} loadError={projectID && tab ? readErrors[documentID(projectID, tab.path)] : undefined} diff={projectID && tab ? diffs[diffID(projectID, tab)] : undefined} theme={preferences.theme}
         diagnostics={diagnostics} breakpoints={projectID && tab ? breakpointsByProject[projectID]?.[tab.path] ?? [] : []}
         pausedLine={tab?.path === pausedFrame?.path ? pausedFrame?.line : undefined}
         onToggleBreakpoint={line => { if (tab?.mode === 'file') toggleBreakpoint(tab.path, line) }}
@@ -715,14 +742,14 @@ export function App() {
     {error && <div className="error-banner" role="alert"><span>{error}</span><IconButton label="Đóng thông báo" onClick={() => setError('')}><Icon name="close" /></IconButton></div>}
     <div className={`workspace-body ${!preferences.rail ? 'is-sidebar-collapsed' : ''} ${!preferences.inspector ? 'is-inspector-collapsed' : ''} ${!preferences.stage ? 'is-sidepanel-collapsed' : ''} ${maximized && preferences.stage ? 'is-sidepanel-maximized' : ''} ${gitWorkspaceOpen && projectID ? 'is-git-workspace' : ''}`} style={{ '--sidebar-w': `${preferences.widths.rail}px`, '--inspector-w': `${preferences.widths.inspector}px`, '--sidepanel-w': `${preferences.widths.stage}px` } as CSSProperties}>
       {preferences.rail && <><ProjectRail projects={projects} projectID={projectID} sessions={sessions} sessionCache={sessionCache} onRemove={id => void removeProject(id)} onSessionRemoved={(id, removed) => { const remaining = (sessionCacheRef.current[id] || []).filter(session => session.id !== removed); setSessionCache(current => ({ ...current, [id]: (current[id] || []).filter(session => session.id !== removed) })); updateView(id, current => current.session === removed ? { ...current, session: remaining[0]?.id } : current); refreshSessions() }} onSessions={(id, items) => { setSessionCache(current => removedProjects.current.has(id) ? current : ({ ...current, [id]: items })); updateView(id, current => ({ ...current, session: !current.session && (draftProjects.current.has(id) || sessionCacheRef.current[id] !== undefined) ? undefined : items.some(item => item.id === current.session) ? current.session : items[0]?.id })) }} sessionID={view.session} loading={projectsLoading} sessionsLoading={sessionsLoading} error={sessionError} connected={connection.connected} creating={creating} git={git} generation={generation} onSelect={id => setPreferences(p => ({ ...p, project: id }))} onSession={(id, session) => { setGitWorkspaceOpen(false); draftProjects.current.delete(id); setPreferences(p => ({ ...p, project: id })); updateView(id, current => ({ ...current, session })) }} onTool={(id, tab) => setPreferences(p => ({ ...p, project: id, inspector: true, inspectorTab: tab }))} onCreate={id => void createSession(id)} onPick={() => void pickProject()} onRetry={refreshSessions} /><Resizer pane="rail" width={preferences.widths.rail} onChange={w => setWidth('rail', w)} /></>}
-      {preferences.inspector && <><Inspector projectID={projectID} name={project?.name} connected={connection.connected} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={(path, line, column) => openTab(path, 'file', line, column)} onRename={(from, to) => { if (projectID) renameOpenPath(projectID, from, to) }} onDelete={path => { if (projectID) deleteOpenPath(projectID, path) }} onDiff={path => openTab(path, 'diff')} onHide={() => toggle('inspector')} report={report}
+      {preferences.inspector && <><Inspector projectID={projectID} name={project?.name} connected={connection.connected} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={(path, line, column) => openTab(path, 'file', line, column)} onRename={(from, to) => { if (projectID) renameOpenPath(projectID, from, to) }} onDelete={path => { if (projectID) deleteOpenPath(projectID, path) }} onDiff={(path, target) => openTab(path, 'diff', undefined, undefined, target)} onHide={() => toggle('inspector')} report={report}
         commitMessage={currentCommitDraft.message} onCommitMessageChange={message => updateCommitDraft({ message })}
         gitWorkspaceOpen={gitWorkspaceOpen} onOpenGitWorkspace={(tab = 'commit') => {
           if (gitWorkspaceOpen && tab === 'commit' && gitWorkspaceTab === 'commit') { setGitWorkspaceOpen(false); return }
           setGitWorkspaceTab(tab); setGitWorkspaceOpen(true)
           setPreferences(p => ({ ...p, inspector: true, inspectorTab: 'git' }))
         }} onCommitEnhanceSkillChange={setCommitEnhanceSkill} /><Resizer pane="inspector" width={preferences.widths.inspector} onChange={w => setWidth('inspector', w)} /></>}
-      <Chat focusNonce={composerFocusNonce} onOpenAndroidTranslation={() => setTranslationModalOpen(true)} timelineDetail={preferences.timelineDetail} projectDirectory={project?.directory} accountRole={accountRole} defaultModelID={accountDefaultModel} modelLevels={accountModelLevels} connectionUrl={connection.url} onModelChange={setSelectedModel} key={projectID || ''} files={files} activeFile={activeTab?.mode === 'file' ? activeTab.path : undefined} onRequestFiles={requestFiles} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!view.session || !!activeSession) && !sessionError} onCreated={session => { if (projectID) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={(path, line) => openTab(path, 'file', line)} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: id })) } }} />
+      <Chat draftID={chatDraftID} focusNonce={composerFocusNonce} onOpenAndroidTranslation={() => setTranslationModalOpen(true)} timelineDetail={preferences.timelineDetail} projectDirectory={project?.directory} accountRole={accountRole} defaultModelID={accountDefaultModel} modelLevels={accountModelLevels} connectionUrl={connection.url} onModelChange={setSelectedModel} key={JSON.stringify([projectID, chatDraftID])} files={files} activeFile={activeTab?.mode === 'file' ? activeTab.path : undefined} onRequestFiles={requestFiles} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!view.session || !!activeSession) && !sessionError} onCreated={session => { if (projectID && (chatDraftIDs.current[projectID] || 0) === chatDraftID && !removedProjects.current.has(projectID)) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={(path, line) => openTab(path, 'file', line)} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: id })) } }} />
       {gitWorkspaceOpen && projectID && <GitWorkspace
         projectID={projectID} projectName={project?.name} connected={connection.connected}
         git={git} gitError={gitError} generation={generation}
@@ -730,7 +757,7 @@ export function App() {
         message={currentCommitDraft.message} onMessageChange={message => updateCommitDraft({ message })}
         amend={currentCommitDraft.amend} onAmendChange={amend => updateCommitDraft({ amend })}
         noVerify={currentCommitDraft.noVerify} onNoVerifyChange={noVerify => updateCommitDraft({ noVerify })}
-        commitEnhanceSkill={commitEnhanceSkill} onDiff={path => openTab(path, 'diff')}
+        commitEnhanceSkill={commitEnhanceSkill} onDiff={(path, target) => openTab(path, 'diff', undefined, undefined, target)}
         onOpenFile={(path, line) => openTab(path, 'file', line)}
         onClose={() => setGitWorkspaceOpen(false)} refresh={refresh}
       />}

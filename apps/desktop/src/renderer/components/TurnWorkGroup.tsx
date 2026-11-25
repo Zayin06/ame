@@ -24,6 +24,7 @@ function inputText(value: unknown) {
 
 function ToolPanels({ item }: { item: ChatItem }) {
   const call = item.tool
+  if (call?.name === 'question' && (call.status === 'running' || call.status === 'streaming')) return <p className="work-row__panels">Trả lời trong biểu mẫu bên dưới.</p>
   const panels = [
     { label: 'Input', text: call?.input !== undefined ? inputText(call.input) : undefined },
     { label: 'Output', text: call?.output ?? (!call ? item.text : undefined) },

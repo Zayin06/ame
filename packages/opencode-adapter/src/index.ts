@@ -1,10 +1,14 @@
 import { OpenCode, type ArtifactInfo, type OpenCodeClient, type OpenCodeEvent, type SessionInfo, type SessionMessageInfo } from '@opencode/client'
 import { Service } from '@opencode/client/service'
+import { permissionRules, permissionModeFromSession } from './permission-mode'
+import { sessionFormAnswerSchema, sessionFormKeySchema, type SessionForm, type SessionFormAnswer } from '../../protocol/src/session-form'
+import { permissionModeSchema, type PermissionMode } from '../../protocol/src/permission-mode'
 import path from 'node:path'
 import { summarizeUsage, usageFamily, type UsageNode } from '../../amekit/src/usage'
 import type { UsagePrices } from '../../amekit/src/usage-pricing'
 import type { Agent, AgentMapView, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
 import { buildAgentMap, resolveAgentMapFamily } from './agent-map'
+import { SessionActivity } from './session-activity'
 import { MAX_PROMPT_FILES, type ChatAttachment, type PromptFileAttachment } from '../../ide-core/src/dropped-attachments'
 import type { BuildNotesSummary } from '../../ide-core/src/git-ops'
 
@@ -117,7 +121,8 @@ function mapSession(s: SessionInfo): Session {
   return {
     id: s.id, title: s.title || 'Untitled', updatedAt: s.time?.updated, parentID: s.parentID, agent: s.agent,
     status: s.time ? s.time.busy !== undefined && (s.time.idle === undefined || s.time.busy > s.time.idle) ? 'running' : 'idle' : undefined,
-    outcome: s.outcome,
+    busyAt: s.time?.busy, idleAt: s.time?.idle,
+    outcome: s.outcome, ...(s.permissions !== undefined ? { permissionMode: permissionModeFromSession(s) } : {}),
   }
 }
 function mapArtifact(info: ArtifactInfo): ArtifactSummary {
@@ -137,6 +142,7 @@ export class OpenCodeAdapter {
   private stream?: AbortController
   private projects = new Map<string, string>()
   private live = new Map<string, Map<string, ChatItem>>()
+  private activity = new SessionActivity()
   constructor(private notify: (event: IdeEvent) => void, private fetcher: typeof fetch = fetch) {}
   connection() { return { ...this.state } }
   disconnected(error: string) {
@@ -157,7 +163,7 @@ export class OpenCodeAdapter {
     const client = OpenCode.make({ baseUrl: url, headers, fetch: this.fetcher })
     const info = await client.server.info({ signal: AbortSignal.timeout(8000) })
     if (info.version !== '2.3.2') throw new Error('UNSUPPORTED_SERVER_VERSION: Requires OpenCode 2.3.2')
-    this.stream?.abort(); this.live.clear()
+    this.stream?.abort(); this.live.clear(); this.activity.clear()
     this.client = client; this.credentials = { url, headers }
     this.state = { connected: true, url, version: info.version }
     this.notify({ type: 'connection', connection: this.connection() })
@@ -211,11 +217,45 @@ export class OpenCodeAdapter {
       if (cursor && cursors.has(cursor)) throw new Error('SESSION_CURSOR_REPEATED')
       if (cursor) cursors.add(cursor)
     } while (cursor)
-    return [...sessions.values()]
+    // Recover pending prompts and active tools after attaching/reconnecting (SSE has no replay).
+    const recover = [...sessions.values()].filter(s => s.status === 'running' && !this.activity.has(s.id))
+    let next = 0
+    await Promise.all(Array.from({ length: Math.min(6, recover.length) }, async () => {
+      while (next < recover.length) {
+        const s = recover[next++]
+        const options = { signal: AbortSignal.timeout(8000) }
+        const [permissions, forms, messages] = await Promise.allSettled([
+          this.api().permission.list({ sessionID: s.id }, options), this.api().session.form.list({ sessionID: s.id }, options),
+          this.api().message.list({ sessionID: s.id, limit: 1, order: 'desc', type: 'assistant' }, options),
+        ])
+        // Do not overwrite SSE that arrived while the snapshot requests were in flight.
+        if (this.activity.has(s.id)) continue
+        if (permissions.status === 'fulfilled') this.activity.pending(s.id, 'permissions', permissions.value.map(p => p.id))
+        if (forms.status === 'fulfilled') this.activity.pending(s.id, 'forms', forms.value.filter(f => f.sessionID === s.id).map(f => f.id))
+        if (messages.status === 'fulfilled') {
+          const message = messages.value.data[0]
+          const parts = message?.type === 'assistant' && message.time?.completed === undefined ? message.content : []
+          this.activity.snapshot(s.id, parts.flatMap(p => p.type === 'tool' && p.state.status === 'running' ? [`${message.id}:${p.id}`] : []), parts.at(-1)?.type === 'text' ? 'working' : 'thinking')
+        }
+      }
+    }))
+    return [...sessions.values()].map(s => this.activity.map(s))
   }
-  async createSession(projectID: string): Promise<Session> {
-    const s = await this.api().session.create({ location: { directory: this.directory(projectID) } })
-    return { id: s.id, title: s.title || 'New conversation', updatedAt: s.time.updated }
+  async createSession(projectID: string, mode: PermissionMode = 'default'): Promise<Session> {
+    const permissions = permissionRules(mode)
+    const s = await this.api().session.create({ location: { directory: this.directory(projectID) }, permissions })
+    return mapSession(s)
+  }
+  async sessionPermissionMode(projectID: string, sessionID: string): Promise<PermissionMode> {
+    return permissionModeFromSession(await this.owned(projectID, sessionID))
+  }
+  async updateSessionPermissionMode(projectID: string, sessionID: string, mode: PermissionMode): Promise<PermissionMode> {
+    const parsed = permissionModeSchema.parse(mode)
+    await this.owned(projectID, sessionID)
+    await this.api().session.update({ sessionID, permissions: permissionRules(parsed) })
+    const result = await this.sessionPermissionMode(projectID, sessionID)
+    this.notify({ type: 'opencode', projectID, sessionID })
+    return result
   }
   async forkSession(projectID: string, sessionID: string): Promise<Session> {
     await this.owned(projectID, sessionID)
@@ -260,6 +300,7 @@ export class OpenCodeAdapter {
     await this.owned(projectID, sessionID)
     await this.api().session.remove({ sessionID })
     this.live.delete(sessionID)
+    this.activity.delete(sessionID)
   }
   async commands(projectID: string): Promise<SlashCommand[]> {
     const list = await this.api().command.list({ location: { directory: this.directory(projectID) } })
@@ -314,8 +355,14 @@ export class OpenCodeAdapter {
     const live = this.live.get(sessionID)
     if (live) for (const [key, item] of live) {
       const index = items.findIndex(i => i.id === key)
-      if (index >= 0) { if (!items[index].tool && item.text.length >= items[index].text.length) items[index] = item } else items.push(item)
+      if (index >= 0) {
+        const history = items[index]
+        // Completed history is authoritative, even if a stale delta is longer.
+        if (history.completedAt !== undefined) live.delete(key)
+        else if (!history.tool && item.text.length > history.text.length) items[index] = { ...history, text: item.text }
+      } else items.push(item)
     }
+    if (live?.size === 0) this.live.delete(sessionID)
     return items
   }
   async sessionUsage(projectID: string, sessionID: string, prices: UsagePrices, origin: string | null): Promise<{ origin: string | null; nodes: UsageNode[]; limited: boolean }> {
@@ -434,7 +481,29 @@ export class OpenCodeAdapter {
   async cancel(projectID: string, sessionID: string) { await this.owned(projectID, sessionID); await this.api().session.interrupt({ sessionID }) }
   async permissions(projectID: string, sessionID: string) {
     await this.owned(projectID, sessionID)
-    return (await this.api().permission.list({ sessionID })).map(p => ({ id: p.id, sessionID: p.sessionID, title: `${p.action}: ${p.resources.join(', ')}${p.message ? '\n' + p.message : ''}` }))
+    const permissions = await this.api().permission.list({ sessionID })
+    this.activity.pending(sessionID, 'permissions', permissions.map(p => p.id))
+    return permissions.map(p => ({ id: p.id, sessionID: p.sessionID, title: `${p.action}: ${p.resources.join(', ')}${p.message ? '\n' + p.message : ''}` }))
+  }
+  async forms(projectID: string, sessionID: string): Promise<SessionForm[]> {
+    await this.owned(projectID, sessionID)
+    const forms = (await this.api().session.form.list({ sessionID })).filter(form => form.sessionID === sessionID)
+    this.activity.pending(sessionID, 'forms', forms.map(f => f.id))
+    return forms.map(form => ({
+      id: form.id, sessionID: form.sessionID, title: form.title,
+      fields: form.fields.map(field => {
+        sessionFormKeySchema.parse(field.key)
+        return structuredClone(field)
+      }),
+    }))
+  }
+  async replyForm(projectID: string, sessionID: string, formID: string, answer: SessionFormAnswer) {
+    await this.owned(projectID, sessionID)
+    await this.api().session.form.reply({ sessionID, formID, answer: sessionFormAnswerSchema.parse(answer) })
+  }
+  async cancelForm(projectID: string, sessionID: string, formID: string, message?: string) {
+    await this.owned(projectID, sessionID)
+    await this.api().session.form.cancel({ sessionID, formID, ...(message ? { message } : {}) })
   }
   async replyPermission(projectID: string, permissionID: string, decision: 'once' | 'always' | 'reject') {
     for (const session of await this.sessions(projectID)) {
@@ -451,7 +520,7 @@ export class OpenCodeAdapter {
           if (signal.aborted) break
           if (event.type === 'server.connected') {
             // SSE has no replay. Drop deltas and force history reads on every reconnect.
-            attempt = 0; this.live.clear()
+            attempt = 0; this.live.clear(); this.activity.clear()
             this.state = { ...this.state, connected: true, error: undefined }
             this.notify({ type: 'connection', connection: this.connection() })
             for (const projectID of this.projects.keys()) this.notify({ type: 'opencode', projectID })
@@ -471,6 +540,10 @@ export class OpenCodeAdapter {
     }
   }
   private accept(event: OpenCodeEvent) {
+    this.activity.accept(event)
+    if (event.type === 'session.idle' || event.type === 'session.execution.succeeded' || event.type === 'session.execution.failed' || event.type === 'session.execution.interrupted' || event.type === 'session.status' && event.data.status.type === 'idle') {
+      this.live.delete(event.data.sessionID)
+    }
     if (event.type === 'session.text.delta' || event.type === 'session.reasoning.delta' || event.type === 'session.text.ended' || event.type === 'session.reasoning.ended') {
       const { sessionID, assistantMessageID, ordinal } = event.data
       let live = this.live.get(sessionID)
@@ -496,11 +569,11 @@ export class OpenCodeAdapter {
       if (!matched) this.notify({ type: 'catalog' })
       return
     }
-    const sessionID = 'data' in event && event.data && typeof event.data === 'object' && 'sessionID' in event.data ? String(event.data.sessionID) : undefined
+    const sessionID = event.type === 'form.created' ? event.data.form.sessionID : 'data' in event && event.data && typeof event.data === 'object' && 'sessionID' in event.data ? String(event.data.sessionID) : undefined
     const directory = 'location' in event ? event.location?.directory : undefined
     for (const [projectID, root] of this.projects) {
       if (!directory || path.resolve(directory) === path.resolve(root)) this.notify(sessionID === undefined ? { type: 'opencode', projectID } : { type: 'opencode', projectID, sessionID })
     }
   }
-  dispose() { this.stream?.abort(); this.client = undefined; this.credentials = undefined; this.live.clear() }
+  dispose() { this.stream?.abort(); this.client = undefined; this.credentials = undefined; this.live.clear(); this.activity.clear() }
 }

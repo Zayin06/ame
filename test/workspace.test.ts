@@ -13,7 +13,8 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, changed?: (p
   const directory = path.join(root, 'project'); await mkdir(directory)
   const workspaces = new Workspaces(path.join(root, 'projects.json'), changed)
   const project = await workspaces.add(directory)
-  t.after(async () => { workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
+  // Windows can briefly retain watcher/Git handles after disposal.
+  t.after(async () => { workspaces.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) })
   return { root, directory, workspaces, project }
 }
 test('build notes workspace delegate is read-only and emits no change notifications', async t => {
@@ -335,7 +336,8 @@ test('Explorer and search delegates persist mutations and notify only after actu
   assert.equal(preview.replacements, 2)
   assert.equal(await readFile(path.join(directory, 'src', 'renamed.txt'), 'utf8'), 'hello hello\n')
   const replaced = await check(workspaces.replaceInProject(project.id, { query: 'hello', replacement: 'bye' }), 1)
-  assert.deepEqual(replaced, preview)
+  assert.deepEqual(preview.writtenFiles, [])
+  assert.deepEqual(replaced, { ...preview, writtenFiles: ['src/renamed.txt'] })
   assert.equal(await readFile(path.join(directory, 'src', 'renamed.txt'), 'utf8'), 'bye bye\n')
   await check(workspaces.replaceInProject(project.id, { query: 'missing', replacement: 'bye' }), 0)
   assert.deepEqual(await check(workspaces.deletePath(project.id, 'empty.txt'), 1), { path: 'empty.txt', directory: false })

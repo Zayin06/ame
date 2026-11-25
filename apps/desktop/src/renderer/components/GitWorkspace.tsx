@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { GitCommitDetail, GitCommitSummary, GitStashEntry, GitState } from '../../../../../packages/protocol/src/index'
+import type { DiffTarget, GitCommitDetail, GitCommitSummary, GitStashEntry, GitState } from '../../../../../packages/protocol/src/index'
 import { analyzeCommitMessage, formatGitError, formatRelativeGitDate, syncBadgeSummary } from '../git-ui'
 import { canCommit, commitShortcut } from '../scm-commit'
 import { FileTypeIcon } from './FileTypeIcon'
@@ -23,7 +23,7 @@ export type GitWorkspaceProps = {
   noVerify: boolean
   onNoVerifyChange: (value: boolean) => void
   commitEnhanceSkill: string
-  onDiff: (path: string) => void
+  onDiff: (path: string, target?: DiffTarget) => void
   onOpenFile?: (path: string, line?: number) => void
   onClose: () => void
   refresh: () => void
@@ -243,7 +243,7 @@ export function GitWorkspace(props: GitWorkspaceProps) {
           {!changes.length && <p>Cây làm việc sạch. Dùng Amend hoặc tạo thay đổi mới trước khi commit.</p>}
           {!!changes.length && !stagedChanges.length && <p>Stage tệp để bắt đầu soạn commit.</p>}
           <ul>{stagedChanges.map(file => <li key={file.path}>
-            <button type="button" onClick={() => props.onDiff(file.path)}><FileTypeIcon path={file.path} />{file.path}<span>{file.index}</span></button>
+            <button type="button" onClick={() => props.onDiff(file.path, { kind: 'staged' })}><FileTypeIcon path={file.path} />{file.path}<span>{file.index}</span></button>
             <button type="button" aria-label={`Bỏ stage ${file.path}`} disabled={busy} onClick={() => void run('Bỏ stage', async () => { await window.ame.stage(projectID, file.path, false) })}>Bỏ stage</button>
           </li>)}</ul>
         </section>
@@ -266,7 +266,7 @@ export function GitWorkspace(props: GitWorkspaceProps) {
         {detailLoading && <p role="status">Đang tải commit…</p>}
         {detail && <article className="git-history__detail">
           <h2>{detail.subject}</h2><p style={{ whiteSpace: 'pre-wrap' }}>{detail.body}</p>
-          <ul>{detail.files.map(file => <li key={file.path}><button type="button" onClick={() => props.onDiff(file.path)}><span>{file.status}</span><FileTypeIcon path={file.path} />{file.path}<span>+{file.additions} −{file.deletions}</span></button></li>)}</ul>
+          <ul>{detail.files.map(file => <li key={file.path}><button type="button" onClick={() => props.onDiff(file.path, { kind: 'commit', commit: detail.hash })}><span>{file.status}</span><FileTypeIcon path={file.path} />{file.path}<span>+{file.additions} −{file.deletions}</span></button></li>)}</ul>
           <pre className="git-commit-patch">{detail.patch}</pre>
         </article>}
       </div>}

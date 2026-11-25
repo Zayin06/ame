@@ -25,27 +25,131 @@ export type ViewDiff = {
   deletions: number
   status?: "added" | "deleted" | "modified"
   fileDiff: FileDiffMetadata
+  eolNormalized?: boolean
+  eolOnly?: boolean
+  parseFailed?: boolean
 }
 
-const diffCacheLimit = 16
+const diffCacheLimit = 64
 
 const fileDiffCache = new Map<string, FileDiffMetadata>()
 
+function countHunkChanges(fileDiff: FileDiffMetadata) {
+  let additions = 0
+  let deletions = 0
+  for (const hunk of fileDiff.hunks) {
+    additions += hunk.additionLines
+    deletions += hunk.deletionLines
+  }
+  return { additions, deletions }
+}
+
+function normalizeContentPair(
+  file: string,
+  before: string,
+  after: string,
+  rawCounts?: { additions: number; deletions: number },
+) {
+  const beforeLF = before.replace(/\r\n/g, "\n")
+  const afterLF = after.replace(/\r\n/g, "\n")
+  if (beforeLF === before && afterLF === after) return
+  if (beforeLF === afterLF) {
+    return {
+      fileDiff: emptyFileDiff(file),
+      additions: 0,
+      deletions: 0,
+      eolNormalized: true,
+      eolOnly: true,
+    }
+  }
+  const lfDiff = fileDiffFromContent(file, beforeLF, afterLF)
+  const lfCounts = countHunkChanges(lfDiff)
+  const baseline = rawCounts ?? countHunkChanges(fileDiffFromContent(file, before, after))
+  if (lfCounts.additions + lfCounts.deletions < baseline.additions + baseline.deletions) {
+    return {
+      fileDiff: lfDiff,
+      additions: lfCounts.additions,
+      deletions: lfCounts.deletions,
+      eolNormalized: true,
+    }
+  }
+  return
+}
+
+function resolveDiffResult(
+  diff: DiffSource & { additions?: number; deletions?: number },
+  context = hunkContext,
+): { fileDiff: FileDiffMetadata; additions: number; deletions: number; eolNormalized?: boolean; eolOnly?: boolean; parseFailed?: boolean } {
+  const fallbackAdditions = diff.additions ?? 0
+  const fallbackDeletions = diff.deletions ?? 0
+  if (diff.patch == null) {
+    const before = diff.before ?? ""
+    const after = diff.after ?? ""
+    const normalized = normalizeContentPair(diff.file, before, after)
+    if (normalized) return normalized
+    const fileDiff = fileDiffFromContent(diff.file, before, after)
+    const counts = countHunkChanges(fileDiff)
+    return {
+      fileDiff,
+      additions: diff.additions ?? counts.additions,
+      deletions: diff.deletions ?? counts.deletions,
+    }
+  }
+
+  const key = context === hunkContext ? `${diff.file}\0${diff.patch}` : `${diff.file}\0${diff.patch}\0${context}`
+  const complete = completePatch(diff.patch)
+  if (complete) {
+    const rawDiff = fileDiffFromCompletePatch(diff.file, complete, context)
+    const rawCounts = countHunkChanges(rawDiff)
+    const normalized = normalizeContentPair(diff.file, complete.before, complete.after, rawCounts)
+    if (normalized) return normalized
+    rawDiff.cacheKey = highlightKey(key)
+    return {
+      fileDiff: rawDiff,
+      additions: diff.additions ?? rawCounts.additions,
+      deletions: diff.deletions ?? rawCounts.deletions,
+    }
+  }
+
+  if (diff.patch.includes("\r\n")) {
+    const normalizedPartial = normalizePartialPatchCrlf(diff.file, diff.patch, fallbackAdditions, fallbackDeletions)
+    if (normalizedPartial) return normalizedPartial
+  }
+
+  const partial = partialFileDiff(diff.file, trimContext(diff.patch, context))
+  if (!partial || (diff.patch.trim().length > 0 && partial.hunks.length === 0)) {
+    return {
+      fileDiff: emptyFileDiff(diff.file),
+      additions: fallbackAdditions,
+      deletions: fallbackDeletions,
+      parseFailed: diff.patch.trim().length > 0,
+    }
+  }
+  partial.cacheKey = highlightKey(key)
+  const counts = countHunkChanges(partial)
+  return {
+    fileDiff: partial,
+    additions: diff.additions ?? counts.additions,
+    deletions: diff.deletions ?? counts.deletions,
+  }
+}
+
 /** `context` is how many unchanged lines a diff built from complete contents keeps around each change. */
 export function resolveFileDiff(diff: DiffSource, context = hunkContext) {
-  // Untyped persisted payloads may carry `patch: null`; those render from their contents.
-  if (diff.patch != null) return fileDiffFromPatch(diff.file, diff.patch, context)
-
-  return fileDiffFromContent(diff.file, diff.before ?? "", diff.after ?? "")
+  return resolveDiffResult(diff, context).fileDiff
 }
 
 export function normalize(diff: ReviewDiff, context?: number): ViewDiff {
+  const resolved = resolveDiffResult(diff, context)
   return {
     file: diff.file,
-    additions: diff.additions,
-    deletions: diff.deletions,
+    additions: resolved.additions,
+    deletions: resolved.deletions,
     status: diff.status,
-    fileDiff: resolveFileDiff(diff, context),
+    fileDiff: resolved.fileDiff,
+    ...(resolved.eolNormalized ? { eolNormalized: true } : {}),
+    ...(resolved.eolOnly ? { eolOnly: true } : {}),
+    ...(resolved.parseFailed ? { parseFailed: true } : {}),
   }
 }
 
@@ -98,6 +202,58 @@ export function completePatchContents(patch: string) {
   return { before: complete.before, after: complete.after }
 }
 
+function reconstructHunkSides(
+  bodyLines: readonly string[],
+  deletionCount: number,
+  additionCount: number,
+  stripCR = false,
+) {
+  const lines: string[] = []
+  const before: Array<{ text: string; newline: boolean }> = []
+  const after: Array<{ text: string; newline: boolean }> = []
+  let previous: "-" | "+" | " " | undefined
+
+  for (const raw of bodyLines) {
+    if (before.length >= deletionCount && after.length >= additionCount && !raw.startsWith("\\")) break
+    const line = stripCR && raw.endsWith("\r") ? raw.slice(0, -1) : raw
+    lines.push(line)
+
+    if (line.startsWith("\\")) {
+      if (previous === "-" || previous === " ") {
+        const value = before.at(-1)
+        if (value) value.newline = false
+      }
+      if (previous === "+" || previous === " ") {
+        const value = after.at(-1)
+        if (value) value.newline = false
+      }
+      continue
+    }
+
+    if (line.startsWith("-")) {
+      before.push({ text: line.slice(1), newline: true })
+      previous = "-"
+      continue
+    }
+
+    if (line.startsWith("+")) {
+      after.push({ text: line.slice(1), newline: true })
+      previous = "+"
+      continue
+    }
+
+    if (!line.startsWith(" ")) continue
+    before.push({ text: line.slice(1), newline: true })
+    after.push({ text: line.slice(1), newline: true })
+    previous = " "
+  }
+
+  const text = (items: Array<{ text: string; newline: boolean }>) =>
+    items.map((item) => item.text + (item.newline ? "\n" : "")).join("")
+
+  return { before: text(before), after: text(after), lines }
+}
+
 function completePatch(patch: string) {
   const parsed = splitPatch(patch)
 
@@ -116,52 +272,7 @@ function completePatch(patch: string) {
   if (hunk.deletionStart + (hunk.deletionCount ? 0 : 1) > 1 || hunk.additionStart + (hunk.additionCount ? 0 : 1) > 1)
     return
 
-  const lines: string[] = []
-  const before: Array<{ text: string; newline: boolean }> = []
-  const after: Array<{ text: string; newline: boolean }> = []
-  let previous: "-" | "+" | " " | undefined
-
-  for (const line of parsed.body.split("\n").slice(1)) {
-    if (before.length >= hunk.deletionCount && after.length >= hunk.additionCount && !line.startsWith("\\")) break
-    lines.push(line)
-
-    if (line.startsWith("\\")) {
-      if (previous === "-" || previous === " ") {
-        const value = before.at(-1)
-
-        if (value) value.newline = false
-      }
-
-      if (previous === "+" || previous === " ") {
-        const value = after.at(-1)
-
-        if (value) value.newline = false
-      }
-
-      continue
-    }
-
-    if (line.startsWith("-")) {
-      before.push({ text: line.slice(1), newline: true })
-      previous = "-"
-      continue
-    }
-
-    if (line.startsWith("+")) {
-      after.push({ text: line.slice(1), newline: true })
-      previous = "+"
-      continue
-    }
-
-    before.push({ text: line.slice(1), newline: true })
-    after.push({ text: line.slice(1), newline: true })
-    previous = " "
-  }
-
-  const text = (lines: Array<{ text: string; newline: boolean }>) =>
-    lines.map((line) => line.text + (line.newline ? "\n" : "")).join("")
-
-  return { before: text(before), after: text(after), lines }
+  return reconstructHunkSides(parsed.body.split("\n").slice(1), hunk.deletionCount, hunk.additionCount)
 }
 
 // Splits a one-file patch at its first hunk. Pierre's strict parser checks the hunks behind a fixed header, so a
@@ -171,13 +282,22 @@ function splitPatch(patch: string) {
   const header = start === -1 ? patch : patch.slice(0, start)
   const body = start === -1 ? "" : patch.slice(start)
 
-  try {
-    const hunks = body
-      ? (processFile(`--- a\n+++ a\n${body}`, { isGitDiff: false, throwOnError: true })?.hunks ?? [])
+  const parse = (input: string) =>
+    input
+      ? (processFile(`--- a\n+++ a\n${input}`, { isGitDiff: false, throwOnError: true })?.hunks ?? [])
       : []
 
-    return { header, body, hunks }
+  try {
+    return { header, body, hunks: parse(body) }
   } catch {
+    const lfBody = body.replace(/\r\n/g, "\n")
+    if (lfBody !== body) {
+      try {
+        return { header: header.replace(/\r\n/g, "\n"), body: lfBody, hunks: parse(lfBody) }
+      } catch {
+        return
+      }
+    }
     return
   }
 }
@@ -322,18 +442,111 @@ function trimContext(patch: string, context: number) {
     .out.join("\n")
 }
 
+function collapseConcatenatedHeaders(file: string, patch: string) {
+  const sections = patch.split(/^(?=diff --git )/m)
+  if (sections.length <= 1) return patch
+  const hunks = sections.flatMap((section) => {
+    const at = section.search(/^@@ /m)
+    return at === -1 ? [] : [section.slice(at).trimEnd()]
+  })
+  if (!hunks.length) return patch
+  return `Index: ${file}\n===================================================================\n--- ${file}\t\n+++ ${file}\t\n${hunks.join("\n")}\n`
+}
+
 function partialFileDiff(file: string, patch: string) {
-  const parsed = splitPatch(patch)
+  const normalizedInput = collapseConcatenatedHeaders(file, patch)
+  const parsed = splitPatch(normalizedInput)
+  if (parsed) {
+    if (/^(?:Index:|diff(?: -r \w+)+|---|\+\+\+)\s/m.test(parsed.header)) {
+      const fromHeader = parsePatchFiles(normalizedInput, undefined, false)[0]?.files[0]
+      if (fromHeader?.hunks.length) return fromHeader
+    }
+    if (parsed.hunks.length) {
+      const synthesized = `Index: ${file}\n===================================================================\n--- ${file}\t\n+++ ${file}\t\n${parsed.body}`
+      const fromBody = parsePatchFiles(synthesized, undefined, false)[0]?.files[0]
+      if (fromBody?.hunks.length) return fromBody
+    }
+  }
+  const lf = normalizedInput.replace(/\r\n/g, "\n")
+  if (lf !== normalizedInput) {
+    const fallback = parsePatchFiles(lf, undefined, false)[0]?.files[0]
+    if (fallback?.hunks.length) return fallback
+  }
+  return
+}
 
-  if (!parsed) return
+function emitHunkLines(subHunk: FileDiffMetadata["hunks"][number], subDiff: FileDiffMetadata) {
+  const out: string[] = []
+  const emit = (prefix: " " | "-" | "+", line: string | undefined) => {
+    const value = line ?? ""
+    if (value.endsWith("\n")) {
+      out.push(`${prefix}${value.slice(0, -1)}`)
+      return
+    }
+    out.push(`${prefix}${value}`, "\\ No newline at end of file")
+  }
+  for (const content of subHunk.hunkContent) {
+    if (content.type === "context") {
+      for (let i = 0; i < content.lines; i++) emit(" ", subDiff.additionLines[content.additionLineIndex + i])
+      continue
+    }
+    for (let i = 0; i < content.deletions; i++) emit("-", subDiff.deletionLines[content.deletionLineIndex + i])
+    for (let i = 0; i < content.additions; i++) emit("+", subDiff.additionLines[content.additionLineIndex + i])
+  }
+  return out
+}
 
-  if (/^(?:Index:|diff(?: -r \w+)+|---|\+\+\+)\s/m.test(parsed.header)) return parsePatchFiles(patch)[0]?.files[0]
+function normalizePartialPatchCrlf(file: string, patch: string, reportedAdditions: number, reportedDeletions: number) {
+  const collapsed = collapseConcatenatedHeaders(file, patch)
+  const start = collapsed.search(/^@@ /m)
+  if (start === -1) return
+  const sections = collapsed.slice(start).split(/^(?=@@ )/m)
+  const emittedHunks: string[] = []
+  let rawAdds = 0
+  let rawDels = 0
+  let lfAdds = 0
+  let lfDels = 0
 
-  if (!parsed.hunks.length) return
+  for (const section of sections) {
+    const lines = section.split("\n")
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(lines[0] ?? "")
+    if (!header) return
+    const delStart = Number(header[1])
+    const delCount = header[2] === undefined ? 1 : Number(header[2])
+    const addStart = Number(header[3])
+    const addCount = header[4] === undefined ? 1 : Number(header[4])
+    const bodyLines = lines.slice(1)
+    for (const line of bodyLines) {
+      if (line.startsWith("+")) rawAdds++
+      else if (line.startsWith("-")) rawDels++
+    }
+    const sides = reconstructHunkSides(bodyLines, delCount, addCount, true)
+    if (sides.before === sides.after) continue
+    const subDiff = parseDiffFromFile({ name: file, contents: sides.before }, { name: file, contents: sides.after })
+    const oldBase = delCount === 0 ? delStart : delStart - 1
+    const newBase = addCount === 0 ? addStart : addStart - 1
+    for (const subHunk of subDiff.hunks) {
+      lfAdds += subHunk.additionLines
+      lfDels += subHunk.deletionLines
+      const oldStart = oldBase + subHunk.deletionStart
+      const newStart = newBase + subHunk.additionStart
+      emittedHunks.push(
+        `@@ -${oldStart},${subHunk.deletionCount} +${newStart},${subHunk.additionCount} @@`,
+        ...emitHunkLines(subHunk, subDiff),
+      )
+    }
+  }
 
-  return parsePatchFiles(
-    `Index: ${file}\n===================================================================\n--- ${file}\t\n+++ ${file}\t\n${patch}`,
-  )[0]?.files[0]
+  const baselineTotal = Math.max(rawAdds + rawDels, reportedAdditions + reportedDeletions)
+  if (lfAdds + lfDels === 0) {
+    return { fileDiff: emptyFileDiff(file), additions: 0, deletions: 0, eolNormalized: true, eolOnly: true }
+  }
+  if (lfAdds + lfDels >= baselineTotal) return
+  const cleanedPatch = `Index: ${file}\n===================================================================\n--- ${file}\t\n+++ ${file}\t\n${emittedHunks.join("\n")}\n`
+  const fileDiff = partialFileDiff(file, cleanedPatch)
+  if (!fileDiff || !fileDiff.hunks.length) return
+  fileDiff.cacheKey = highlightKey(`${file}\0lf\0${cleanedPatch}`)
+  return { fileDiff, additions: lfAdds, deletions: lfDels, eolNormalized: true }
 }
 
 function fileDiffFromContent(file: string, before: string, after: string) {

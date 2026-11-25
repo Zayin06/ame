@@ -163,10 +163,11 @@ function workedDuration(user: ChatItem | undefined, items: readonly ChatItem[]):
 }
 
 function activeTool(item: ChatItem): boolean {
-  return item.kind === 'tool' && (item.tool?.status === 'running' || item.tool?.status === 'streaming' || item.tool?.status === 'error')
+  return item.kind === 'tool' && (item.tool?.status === 'running' || item.tool?.status === 'streaming')
 }
 
 function liveStatusLabel(items: readonly ChatItem[]): string {
+  if (items.some(item => activeTool(item) && item.tool?.name === 'question')) return 'Đang chờ bạn trả lời câu hỏi…'
   const active = items[lastIndexWhere(items, item => item.kind === 'tool' && (item.tool?.status === 'running' || item.tool?.status === 'streaming'))]
   if (active) {
     const kind = classifyTool(active.tool?.name ?? '').kind
@@ -177,7 +178,7 @@ function liveStatusLabel(items: readonly ChatItem[]): string {
   return items[lastIndexWhere(items, item => item.kind !== 'changes')]?.kind === 'reasoning' ? 'Đang suy nghĩ…' : 'Đang xử lý…'
 }
 
-export function projectChatTimeline(items: readonly ChatItem[], options: { running: boolean; mode: TimelineDetailMode }): ChatTurn[] {
+export function projectChatTimeline(items: readonly ChatItem[], options: { running: boolean; mode: TimelineDetailMode; pendingForms?: boolean }): ChatTurn[] {
   const turns: { id: string; user?: ChatItem; items: ChatItem[] }[] = []
   for (const item of items) {
     if (item.role === 'user') turns.push({ id: item.id, user: item, items: [] })
@@ -189,7 +190,7 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
   return turns.map((turn, turnIndex) => {
     const assistantItems = turn.items
     const visible = assistantItems.filter(isVisible)
-    const live = turnIndex === turns.length - 1 && (options.running || assistantItems.some(item => item.tool?.status === 'running' || item.tool?.status === 'streaming'))
+    const live = turnIndex === turns.length - 1 && (options.running || options.pendingForms || assistantItems.some(activeTool))
     const workedMs = workedDuration(turn.user, assistantItems)
     const lastWorkIndex = lastIndexWhere(visible, item => item.kind === 'tool' || item.kind === 'reasoning')
     const commentary = new Set(visible.filter((item, index) => isText(item) && (item.phase === 'commentary' || item.phase !== 'final_answer' && index < lastWorkIndex)))
@@ -233,7 +234,7 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
       const prior: ChatItem[] = []
       const inline: ChatItem[] = []
       visible.forEach((item, index) => {
-        const completed = item.kind === 'tool' && item.tool?.status === 'completed' && (firstActive < 0 || index < firstActive)
+        const completed = item.kind === 'tool' && (item.tool?.status === 'completed' || item.tool?.status === 'error') && (firstActive < 0 || index < firstActive)
         const beforeActive = firstActive < 0 || index < firstActive
         const earlierReasoning = item.kind === 'reasoning' && index !== tail && beforeActive
         const earlierCommentary = commentary.has(item) && index < lastWorkIndex && beforeActive
@@ -242,14 +243,14 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
       })
       workGroup(prior, `${turn.id}:work-live`, true)
       for (const item of inline) {
-        if (activeTool(item)) {
+        if (activeTool(item) || item.kind === 'tool' && item.tool?.status === 'error') {
           const previous = blocks.at(-1)
           if (previous?.kind === 'active-tools') previous.items.push(item)
           else blocks.push({ kind: 'active-tools', id: `${item.id}:active`, items: [item] })
         } else individual(item)
       }
     }
-    if (live) blocks.push({ kind: 'live-status', id: `${turn.id}:status`, label: liveStatusLabel(visible) })
+    if (live) blocks.push({ kind: 'live-status', id: `${turn.id}:status`, label: options.pendingForms ? 'Đang chờ bạn trả lời câu hỏi…' : liveStatusLabel(visible) })
     return { id: turn.id, ...(turn.user ? { user: turn.user } : {}), live, blocks }
   })
 }

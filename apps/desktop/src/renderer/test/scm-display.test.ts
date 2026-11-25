@@ -73,7 +73,7 @@ test('Inspector SSR renders rich staged/working rows without changing diff or wa
   ].entries()) {
     const row = rows[index][2], { name, dir } = splitFilePath(path)
     assert.equal(rows[index][1], status)
-    assert.ok(row.includes(`title="Diff với HEAD: ${path}"`))
+    assert.ok(row.includes(`title="${index === 0 ? 'Staged' : 'Changes'}: ${path}"`))
     assert.ok(row.includes(`<span class="scm-file-name">${name}</span><span class="scm-file-dir">${dir}</span>`))
     assert.ok(row.includes(`class="file-type-icon file-type-icon--${kind}" aria-hidden="true"`))
     assert.ok(row.includes(`class="git-badge git-badge--${status}" title="${label}">${code}</span>`))

@@ -6,12 +6,15 @@ import { mkdtemp, readFile, writeFile, rm, readdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { runInNewContext } from "node:vm"
+import ts from "typescript"
 import { defaultPetPreferences, loadPetSprite, PetActivity, petBounds, petHtml, petScale, type PetSession } from "../src/pet"
 import { petBubbleBounds, petPalette, defaultPetPalette } from "../src/pet-appearance"
 import { dialoguePrompt, localDialogue, parseDialogue, PetSpeech, petBubbleHtml } from "../src/pet-dialogue"
 import { petChime } from "../src/pet-chime"
 import { createPetHost, type PetHostOptions } from "../src/pet-host"
 import { generatePetDialogue } from "../src/pet-generation"
+import { PetInteraction, revealPetMainWindow } from "../src/pet-interaction"
 import type { AmeApi } from "../src/api"
 
 const area = { x: 0, y: 0, width: 1200, height: 800 }
@@ -139,6 +142,7 @@ class MockWindow extends EventEmitter {
   destroyed = false; shown = false; ignoreMouse = false; scripts: string[] = []; url = ""
   bounds = { x: 0, y: 0, width: 48, height: 52 }
   webContents = Object.assign(new EventEmitter(), {
+    mainFrame: {},
     setWindowOpenHandler: (handler: () => { action: string }) => { this.openHandler = handler },
     executeJavaScript: async (code: string) => { this.scripts.push(code); return code.includes("getBoundingClientRect") ? 92 : undefined },
   })
@@ -147,6 +151,7 @@ class MockWindow extends EventEmitter {
   isDestroyed() { return this.destroyed }
   getBounds() { return { ...this.bounds } }
   setBounds(bounds: typeof this.bounds) { this.bounds = bounds; this.emit("moved") }
+  setPosition(x: number, y: number) { this.bounds = { ...this.bounds, x, y }; this.emit("moved") }
   async loadURL(url: string) { this.url = url }
   showInactive() { this.shown = true }
   setIgnoreMouseEvents(value: boolean) { this.ignoreMouse = value }
@@ -154,13 +159,118 @@ class MockWindow extends EventEmitter {
 }
 async function fixture(t: { after: (fn: () => void | Promise<void>) => void }, extra: Partial<PetHostOptions> = {}) {
   const userData = await mkdtemp(join(tmpdir(), "ame-pet-"))
-  const screen = Object.assign(new EventEmitter(), { getAllDisplays: () => [{ workArea: area }], getPrimaryDisplay: () => ({ workArea: area }) })
+  let cursor = { x: 100, y: 100 }
+  const screen = Object.assign(new EventEmitter(), { getAllDisplays: () => [{ workArea: area }], getPrimaryDisplay: () => ({ workArea: area }), getCursorScreenPoint: () => ({ ...cursor }) })
   MockWindow.windows = []
   let main = true
   const host = createPetHost({ userData, sprite, electron: { BrowserWindow: MockWindow, screen } as unknown as PetHostOptions["electron"], hasMainWindow: () => main, ...extra })
   t.after(async () => { host.dispose(); await rm(userData, { recursive: true, force: true }) })
-  return { host, userData, screen, setMain(value: boolean) { main = value } }
+  return { host, userData, screen, setCursor(x: number, y: number) { cursor = { x, y } }, setMain(value: boolean) { main = value } }
 }
+
+test("pet short click reveals, restores and focuses the main window; dragging never activates", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 })
+  const calls: string[] = []
+  let minimized = true
+  const main = { isDestroyed: () => false, isMinimized: () => minimized,
+    restore() { calls.push("restore"); minimized = false }, show() { calls.push("show") }, focus() { calls.push("focus") } }
+  const { host, setCursor, setMain, userData } = await fixture(t, {
+    defaultEnabled: true, interactionPreload: "/preload/pet.cjs", onActivate: () => revealPetMainWindow(main),
+  })
+  await host.init(); await flush()
+  const pet = MockWindow.windows[0]
+  assert.equal(pet.options.webPreferences.preload, "/preload/pet.cjs")
+  const pointer = (phase: string, frame = pet.webContents.mainFrame, channel = "ame:pet-pointer", ...extra: unknown[]) =>
+    pet.webContents.emit("ipc-message", { senderFrame: frame }, channel, phase, ...extra)
+  pointer("down"); t.mock.timers.tick(100); setCursor(102, 101); pointer("up")
+  assert.deepEqual(calls.splice(0), ["restore", "show", "focus"])
+  pointer("down"); pointer("up")
+  assert.deepEqual(calls.splice(0), ["show", "focus"])
+
+  const origin = pet.getBounds()
+  pointer("down"); setCursor(152, 131); pointer("move")
+  assert.deepEqual(pet.getBounds(), { ...origin, x: origin.x + 50, y: origin.y + 30 })
+  pointer("up")
+  assert.deepEqual(calls, [])
+  // Moving away and back is still a drag, even on a very fast release.
+  pointer("down"); setCursor(180, 131); pointer("move"); setCursor(152, 131); pointer("up")
+  assert.deepEqual(calls, [])
+  // The final release alone must also detect movement (coalesced move events).
+  pointer("down"); setCursor(202, 131); pointer("up")
+  assert.deepEqual(calls, [])
+  host.dispose()
+  const saved = JSON.parse(await readFile(join(userData, "desktop-pet.json"), "utf8"))
+  assert.deepEqual(saved.preferences.position, { x: origin.x + 100, y: origin.y + 30 })
+  pointer("down"); pointer("up"); assert.deepEqual(calls, [])
+  setMain(false)
+})
+
+test("completion outcome arriving after idle triggers exactly once", () => {
+  const activity = new PetActivity()
+  activity.report('main', [session({ busy: 100, thinking: true })], 100)
+  assert.equal(activity.report('main', [session({ busy: 100, running: false, idle: 200 })], 200), 'idle')
+  assert.equal(activity.report('main', [session({ busy: 100, running: false, idle: 200, outcome: 'succeeded' })], 201), 'wave')
+  assert.equal(activity.report('main', [session({ busy: 100, running: false, idle: 200, outcome: 'succeeded' })], 4000), 'idle')
+})
+
+test("pet rejects long presses, cancelled gestures, untrusted IPC and stale windows", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 })
+  let activations = 0
+  const { host, setMain } = await fixture(t, { defaultEnabled: true, onActivate: () => { activations++ } })
+  await host.init(); await flush()
+  const pet = MockWindow.windows[0]
+  const pointer = (phase: string, frame = pet.webContents.mainFrame, channel = "ame:pet-pointer", ...extra: unknown[]) =>
+    pet.webContents.emit("ipc-message", { senderFrame: frame }, channel, phase, ...extra)
+  pointer("up")
+  pointer("down"); t.mock.timers.tick(501); pointer("up")
+  pointer("down"); pointer("cancel"); pointer("up")
+  pointer("down", {}); pointer("up")
+  pointer("down", pet.webContents.mainFrame, "ame:call"); pointer("up")
+  pointer("down", pet.webContents.mainFrame, "ame:pet-pointer", "extra"); pointer("up")
+  pointer("invalid"); pointer("up")
+  assert.equal(activations, 0)
+  setMain(false); pointer("down"); pointer("up"); assert.equal(activations, 0)
+  setMain(true)
+  await host.configure({ enabled: false }); await host.configure({ enabled: true }); await flush()
+  pointer("down"); pointer("up"); assert.equal(activations, 0)
+})
+
+test("gesture threshold is sticky and reveal safely ignores missing or destroyed windows", () => {
+  const gesture = new PetInteraction(), origin = { x: -500, y: 30 }
+  gesture.update("down", { x: 0, y: 0 }, origin, 0)
+  assert.deepEqual(gesture.update("move", { x: 3, y: 4 }, origin, 1), { position: { x: -497, y: 34 } })
+  assert.deepEqual(gesture.update("up", { x: 0, y: 0 }, origin, 2), { position: origin })
+  assert.deepEqual(gesture.update("up", origin, origin, 3), {})
+  revealPetMainWindow(undefined)
+  revealPetMainWindow({ isDestroyed: () => true, isMinimized() { throw new Error("destroyed") },
+    restore() { assert.fail() }, show() { assert.fail() }, focus() { assert.fail() } })
+})
+
+test("sandbox pet preload captures only trusted primary gestures without exposing a page API", async () => {
+  const source = await readFile(new URL("../../../apps/desktop/src/preload/pet.ts", import.meta.url), "utf8")
+  const listeners = new Map<string, (event: any) => void>(), sent: unknown[][] = [], captured: number[] = []
+  let loaded!: () => void
+  runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, {
+    exports: {}, require: (name: string) => {
+      assert.equal(name, "electron")
+      return { ipcRenderer: { send: (...args: unknown[]) => sent.push(args) } }
+    },
+    window: { addEventListener: (name: string, listener: () => void) => { assert.equal(name, "DOMContentLoaded"); loaded = listener } },
+    document: { body: { addEventListener: (name: string, listener: (event: any) => void) => listeners.set(name, listener),
+      setPointerCapture: (id: number) => captured.push(id) } },
+  })
+  loaded()
+  const emit = (name: string, extra = {}) => listeners.get(name)!({ isTrusted: true, isPrimary: true, button: 0, pointerId: 7, ...extra })
+  emit("pointerdown", { isTrusted: false }); emit("pointerdown", { button: 2 }); emit("pointerdown", { isPrimary: false })
+  assert.deepEqual(sent, [])
+  emit("pointerdown"); emit("pointermove", { pointerId: 8 }); emit("pointermove"); emit("pointerup"); emit("lostpointercapture")
+  assert.deepEqual(captured, [7])
+  assert.deepEqual(sent.splice(0), [["ame:pet-pointer", "down"], ["ame:pet-pointer", "move"], ["ame:pet-pointer", "up"]])
+  emit("pointerdown"); emit("pointercancel"); emit("pointerup")
+  emit("pointerdown"); emit("lostpointercapture"); emit("pointerup")
+  assert.deepEqual(sent, [["ame:pet-pointer", "down"], ["ame:pet-pointer", "cancel"], ["ame:pet-pointer", "down"], ["ame:pet-pointer", "cancel"]])
+  assert.doesNotMatch(petHtml(), /app-region:drag|<script/)
+})
 
 test("host defaults off; lifecycle, secure windows, speech, displays and drag persistence", async t => {
   let notifications = 0

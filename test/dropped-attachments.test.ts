@@ -121,7 +121,7 @@ test('rejects junction/symlink paths, linked ancestors and linked project roots'
 test('enforces media/text size boundaries, empty media and the per-drop batch cap', async t => {
   const { root, file } = await fixture(t)
   for (const [name, size, external, reason] of [
-    ['large.png', MAX_MEDIA_BYTES + 1, false, /10 MiB/],
+    ['large.png', MAX_MEDIA_BYTES + 1, false, /6 MiB/],
     ['large.txt', MAX_EXTERNAL_TEXT_BYTES + 1, true, /512 KiB/],
     ['empty.pdf', 0, false, /rỗng/]
   ] as const) {
@@ -138,4 +138,20 @@ test('enforces media/text size boundaries, empty media and the per-drop batch ca
   assert.equal(results.length, MAX_DROPPED_BATCH + 1)
   assert.ok(results.slice(0, MAX_DROPPED_BATCH).every(result => result.ok))
   assert.deepEqual(results.at(-1), { ok: false, name: '...', reason: 'Chỉ xử lý tối đa 16 tệp mỗi lần kéo thả.' })
+})
+
+test('rejects a 7 MiB dropped image with its filename and rejects an oversized encoded batch', async t => {
+  const { root, file } = await fixture(t)
+  const name = 'ảnh lớn.png'
+  const [large] = await resolveDroppedPaths(root, [await file(name, Buffer.alloc(7 * 1024 * 1024))])
+  assert.ok(!large.ok)
+  assert.equal(large.name, name)
+  assert.match(large.reason, /ảnh lớn\.png.*Giới hạn thực tế.*6 MiB/s)
+  const paths = await Promise.all(['one.png', 'two.png', 'three.png'].map(name => file(name, Buffer.alloc(2 * 1024 * 1024))))
+  const results = await resolveDroppedPaths(root, paths)
+  assert.equal(results.length, 3)
+  for (const result of results) {
+    assert.ok(!result.ok)
+    assert.match(result.reason, /Tổng dung lượng.*vượt mức 6 MiB/)
+  }
 })
