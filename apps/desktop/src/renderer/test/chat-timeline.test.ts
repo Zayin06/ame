@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ChatItem } from '../../../../../packages/protocol/src/index'
-import { classifyTool, extractUserDisplayText, formatAgentDuration, groupExpandedWork, projectChatTimeline, summarizeWorkItems, toolTarget } from '../chat-timeline'
+import { classifyTool, extractCommitMessagesFromText, extractUserDisplayText, formatAgentDuration, groupExpandedWork, projectChatTimeline, summarizeWorkItems, toolTarget } from '../chat-timeline'
 import type { TimelineBlock } from '../chat-timeline'
 
 const text = (id: string, extra: Partial<ChatItem> = {}): ChatItem => ({ id, role: 'assistant', text: id, ...extra })
@@ -10,6 +10,25 @@ const user = (id = 'user', extra: Partial<ChatItem> = {}): ChatItem => text(id, 
 const reasoning = (id = 'reasoning'): ChatItem => text(id, { kind: 'reasoning' })
 const changes = (id = 'changes'): ChatItem => text(id, { kind: 'changes', turn: { from: 'user', files: ['src/main.ts'] } })
 const compact = (items: ChatItem[], running = false) => projectChatTimeline(items, { running, mode: 'compact' })
+test('commit display strips scoped instructions and all supported commit modes', () => {
+  for (const mode of ['analyze', 'split', 'single', 'custom']) {
+    const wrapped = `[STRICT SCOPE: GIT COMMIT ASSISTANT ONLY]\nInstructions\n\nUser request:\n[Commit mode: ${mode}]\nTách thành 8 commit`
+    assert.equal(extractUserDisplayText(wrapped), 'Tách thành 8 commit')
+    assert.equal(extractUserDisplayText(wrapped.replace(/\n/g, '\r\n')), 'Tách thành 8 commit')
+  }
+  assert.equal(extractUserDisplayText('[Commit mode: split]\nNormal request'), '[Commit mode: split]\nNormal request')
+})
+
+test('commit extraction keeps complete trimmed messages, supports eight commits and caps at twenty', () => {
+  const message = 'feat(git): thêm trợ lý commit\n\n- Đọc toàn bộ diff\n- Hỏi xác nhận'
+  assert.deepEqual(extractCommitMessagesFromText(`Answer\n\`\`\`commit\n  ${message}\n\n\`\`\``), [message])
+  const messages = Array.from({ length: 25 }, (_, i) => `fix: thay đổi ${i}`)
+  const fenced = (values: string[]) => values.map(value => `\`\`\`text\n${value}\n\`\`\``).join('\n')
+  assert.deepEqual(extractCommitMessagesFromText(fenced(messages.slice(0, 8))), messages.slice(0, 8))
+  assert.deepEqual(extractCommitMessagesFromText(fenced(messages)), messages.slice(0, 20))
+  assert.deepEqual(extractCommitMessagesFromText('```commit\n \n```\n```text\nconst a = 1\n```\n```ts\nfeat: not a message\n```\n```commit\nmissing colon\n```'), [])
+  assert.deepEqual(extractCommitMessagesFromText('```js\n```commit\nfeat: nested code\n```\n```'), [])
+})
 const work = (block: TimelineBlock) => {
   assert.equal(block.kind, 'work-group')
   if (block.kind !== 'work-group') throw new Error('Expected work group')

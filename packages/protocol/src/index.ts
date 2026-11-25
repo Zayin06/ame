@@ -105,6 +105,20 @@ export type AndroidTranslationInfo = SessionLockState & {
   stringsFiles: string[]
 }
 export type AndroidTranslationPromptResult = { session: Session; model: Model; locked: boolean }
+export type CommitAgentMode = 'analyze' | 'split' | 'single' | 'custom'
+export type CommitAgentSessionState = { commitSessionIDs: string[]; lockedSessionIDs: string[] }
+export type CommitAgentInfo = CommitAgentSessionState & {
+  configured: boolean
+  skill?: string
+  configuredModelID?: string
+  effectiveModelID?: string
+  effectiveModelName?: string
+  fallbackToDefault: boolean
+  branch?: string
+  stagedCount: number
+  workingCount: number
+}
+export type CommitAgentPromptResult = { session: Session; model: Model; locked: boolean }
 export type Agent = { id: string; name: string }
 export type Permission = { id: string; sessionID: string; title: string }
 export type { SessionForm, SessionFormField, SessionFormOption, SessionFormWhen, SessionFormAnswer, SessionFormValue } from './session-form'
@@ -271,6 +285,9 @@ export interface DesktopApi {
   androidTranslationInfo(projectID: string): Promise<AndroidTranslationInfo>
   androidTranslationPrompt(projectID: string, sessionID: string | undefined, text: string, mode?: 'update' | 'full' | 'scan' | 'custom'): Promise<AndroidTranslationPromptResult>
   androidTranslationLock(projectID: string, sessionID: string): Promise<SessionLockState>
+  commitAgentInfo(projectID: string): Promise<CommitAgentInfo>
+  commitAgentPrompt(projectID: string, sessionID: string | undefined, text: string, mode?: CommitAgentMode): Promise<CommitAgentPromptResult>
+  commitAgentLock(projectID: string, sessionID: string): Promise<CommitAgentSessionState>
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
   sessionUsage(projectID: string, sessionID: string): Promise<SessionUsageView>

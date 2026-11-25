@@ -29,9 +29,24 @@ export type TimelineBlock =
 export type ChatTurn = { id: string; user?: ChatItem; live: boolean; blocks: TimelineBlock[] }
 
 export function extractUserDisplayText(text: string): string {
+  const normalized = text.replace(/\r\n/g, '\n')
   const marker = '\n\nUser request:\n'
-  if (!text.startsWith('[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]') || !text.includes(marker)) return text
-  return text.slice(text.lastIndexOf(marker) + marker.length).replace(/^\[Translation mode: (?:update|full|scan|custom)\]\n/, '')
+  if (!/^\[STRICT SCOPE: (?:ANDROID STRINGS TRANSLATION|GIT COMMIT ASSISTANT) ONLY\]/.test(normalized) || !normalized.includes(marker)) return text
+  return normalized.slice(normalized.lastIndexOf(marker) + marker.length).replace(/^\[(?:Translation mode: (?:update|full|scan|custom)|Commit mode: (?:analyze|split|single|custom))\]\n/, '')
+}
+
+/** Only explicit commit/text fences with a Conventional Commit subject are actionable. */
+export function extractCommitMessagesFromText(text: string): string[] {
+  const messages: string[] = []
+  const fences = /^ {0,3}(`{3,})([^\r\n]*)\r?\n([\s\S]*?)^ {0,3}\1`*[ \t]*(?:\r?\n|$)/gm
+  for (const match of text.matchAll(fences)) {
+    if (!/^(?:commit|text)$/i.test(match[2].trim())) continue
+    const message = match[3].trim()
+    if (!/^[a-z][a-z0-9-]*(?:\([^\r\n()]+\))?!?:[^\S\r\n]+\S[^\r\n]*(?:\r?\n|$)/.test(message)) continue
+    messages.push(message)
+    if (messages.length === 20) break
+  }
+  return messages
 }
 
 export function classifyTool(name: string): ToolClassification {

@@ -4,12 +4,13 @@ import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink } from 'node:
 import path from 'node:path'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
+import os from 'node:os'
 import { z } from 'zod'
 import { simpleGit } from 'simple-git'
 import { Workspaces } from '../packages/ide-core/src/workspace'
 
 async function fixture(t: { after(fn: () => Promise<void>): void }, changed?: (projectID: string) => void) {
-  const root = await mkdtemp(path.join(process.cwd(), '.ame-workspace-test-'))
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ame-workspace-test-'))
   const directory = path.join(root, 'project'); await mkdir(directory)
   const workspaces = new Workspaces(path.join(root, 'projects.json'), changed)
   const project = await workspaces.add(directory)
@@ -120,7 +121,7 @@ test('removal creates missing persistence directories even without a watcher', a
 })
 
 test('failed atomic persistence keeps project readable, watcher and pending timer intact and cleans temporary files', async t => {
-  const root = await mkdtemp(path.join(process.cwd(), '.ame-workspace-test-'))
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ame-workspace-test-'))
   const directory = path.join(root, 'project'); await mkdir(directory)
   const workspaces = new Workspaces(path.join(root, 'projects.json'))
   t.after(async () => { workspaces.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) })

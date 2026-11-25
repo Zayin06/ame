@@ -43,6 +43,9 @@
 .translation-finish-banner { margin-bottom: 12px; }
 .translation-finish-banner p, .translation-locked-banner p { flex: 1; min-width: 180px; margin: 0; }
 .translation-locked-banner { margin: 12px 22px 18px; flex-shrink: 0; }
+.commit-agent-modal .commit-agent-modal__apply { display: flex; flex-wrap: wrap; gap: 8px; min-width: 0; max-width: 100%; margin-top: 10px; padding: 8px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-elevated); }
+.commit-agent-modal .commit-agent-modal__apply button { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; color: var(--accent); border-color: var(--border-default); }
+.commit-agent-modal .commit-agent-modal__apply button:hover:not(:disabled) { border-color: var(--accent); }
 .android-translate-trigger { white-space: nowrap; }
 @media (max-width: 720px) { .translation-presets__grid { grid-template-columns: minmax(0, 1fr); } .translation-modal__header, .translation-modal__metadata { padding-left: 14px; padding-right: 14px; } .translation-modal .chat-stream__inner { padding: 12px 14px; } .translation-modal .translation-composer { padding: 10px 14px; } }
 

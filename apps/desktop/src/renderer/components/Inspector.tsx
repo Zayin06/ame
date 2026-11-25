@@ -19,6 +19,7 @@ type InspectorProps = {
   onCommitMessageChange?: (value: string) => void
   gitWorkspaceOpen?: boolean
   onOpenGitWorkspace?: (tab?: 'commit' | 'history' | 'stash' | 'build-notes') => void
+  onOpenCommitAgent?: () => void
   onCommitEnhanceSkillChange?: (skill: string) => void
 }
 
@@ -195,7 +196,7 @@ export function Inspector(props: InspectorProps) {
   return <ProjectInspector key={props.projectID || ''} {...props} />
 }
 
-function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report, commitMessage, onCommitMessageChange, gitWorkspaceOpen, onOpenGitWorkspace, onCommitEnhanceSkillChange }: InspectorProps) {
+function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report, commitMessage, onCommitMessageChange, gitWorkspaceOpen, onOpenGitWorkspace, onOpenCommitAgent, onCommitEnhanceSkillChange }: InspectorProps) {
   const [localMessage, setLocalMessage] = useState('')
   const message = commitMessage ?? localMessage
   const setMessage = (next: string) => {
@@ -310,6 +311,7 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
         <button type="button" data-testid="scm-pull-btn" disabled={!sync.canSync || busy} onClick={() => syncRemote('pull')}>{sync.pullLabel}</button>
         <button type="button" data-testid="scm-push-btn" disabled={!sync.canSync || busy} onClick={() => syncRemote('push')}>{sync.pushLabel}</button>
         <IconButton label="Lịch sử commit" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('history')}><Icon name="history" /></IconButton>
+        <span data-testid="scm-commit-agent-btn"><IconButton label="Trợ lý Commit AI (phân tích & tách commit)" disabled={!projectID || !onOpenCommitAgent} onClick={() => onOpenCommitAgent?.()}><Icon name="wand" /></IconButton></span>
         <IconButton label="Quản lý Stash" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('stash')}><Icon name="stash" /></IconButton>
         <IconButton label="Mô tả bản build (QC)" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('build-notes')}><Icon name="notes" /></IconButton>
       </div>

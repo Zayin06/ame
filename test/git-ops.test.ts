@@ -302,6 +302,7 @@ test('diff summary preserves exact staged names, index content and UTF-8 byte bo
   assert.ok(full.diff.includes('+staged'))
   assert.ok(!full.diff.includes('+not staged'))
   assert.equal(full.truncated, false)
+  assert.equal(full.stat, undefined)
   const bytes = Buffer.from(full.diff)
   const multibyte = bytes.indexOf(Buffer.from('🌏'))
   assert.ok(multibyte > 0)
@@ -318,6 +319,7 @@ test('diff summary preserves exact staged names, index content and UTF-8 byte bo
   await write('large.txt', 'x'.repeat(70000)); await stageAll(root)
   const defaultLimit = await stagedDiffSummary(root)
   assert.equal(defaultLimit.truncated, true)
+  assert.ok(defaultLimit.stat?.includes('large.txt'))
   assert.ok(Buffer.byteLength(defaultLimit.diff) <= 65536)
 })
 

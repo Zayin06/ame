@@ -25,6 +25,7 @@ export type GitWorkspaceProps = {
   commitEnhanceSkill: string
   onDiff: (path: string, target?: DiffTarget) => void
   onOpenFile?: (path: string, line?: number) => void
+  onOpenCommitAgent?: () => void
   onClose: () => void
   refresh: () => void
 }
@@ -222,6 +223,7 @@ export function GitWorkspace(props: GitWorkspaceProps) {
             <button type="button" data-testid="git-workspace-enhance-btn" disabled={!props.connected || busy || !stagedChanges.length} aria-busy={pending === 'Enhance bằng AI'} onClick={enhance}>
               {pending === 'Enhance bằng AI' ? <span className="amekit-spinner" aria-hidden="true" /> : <Icon name="wand" />}Enhance bằng AI
             </button>
+            <button type="button" data-testid="git-workspace-commit-agent-btn" disabled={!props.connected || busy || !changes.length || !props.onOpenCommitAgent} title="Mở phiên agent có tool để đọc đủ diff, hỏi xác nhận và tách nhiều commit" onClick={() => props.onOpenCommitAgent?.()}><Icon name="wand" />Trợ lý Commit AI</button>
             <button type="button" data-testid="git-workspace-undo-commit-btn" disabled={busy} onClick={undo}><Icon name="undo" />Hoàn tác commit cuối</button>
             <button type="button" disabled={busy || !message} onClick={() => { setError(undefined); onMessageChange('') }}>Xóa nội dung</button>
           </div>

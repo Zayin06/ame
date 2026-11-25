@@ -401,7 +401,7 @@ export async function gitStashDrop(root: string, index: number): Promise<void> {
   await git.raw(['stash', 'drop', ref])
 }
 
-export async function stagedDiffSummary(root: string, maxBytes = 65536): Promise<{ diff: string; files: string[]; truncated: boolean }> {
+export async function stagedDiffSummary(root: string, maxBytes = 65536): Promise<{ diff: string; files: string[]; truncated: boolean; stat?: string }> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('INVALID_MAX_BYTES')
   const { git } = await repository(root)
   const files = (await git.raw(['diff', '--cached', '--name-only', '-z', '--'])).split('\0').filter(Boolean)
@@ -409,5 +409,11 @@ export async function stagedDiffSummary(root: string, maxBytes = 65536): Promise
   let end = Math.min(maxBytes, bytes.length)
   // Do not split a UTF-8 code point or introduce replacement characters.
   while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--
-  return { diff: bytes.subarray(0, end).toString('utf8'), files, truncated: bytes.length > maxBytes }
+  const diff = bytes.subarray(0, end).toString('utf8')
+  const truncated = bytes.length > maxBytes
+  if (truncated) {
+    const stat = (await git.raw(['diff', '--cached', '--stat'])).trimEnd()
+    return { diff, files, truncated, stat }
+  }
+  return { diff, files, truncated }
 }

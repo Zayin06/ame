@@ -21,7 +21,7 @@ import * as platform from '../apps/desktop/src/renderer/platform'
 import * as composerMentions from '../apps/desktop/src/renderer/composer-mentions'
 import { chatSubmit } from '../apps/desktop/src/renderer/chat-submit'
 import * as modelSelection from '../apps/desktop/src/renderer/model-selection'
-import { projectChatTimeline } from '../apps/desktop/src/renderer/chat-timeline'
+import * as chatTimeline from '../apps/desktop/src/renderer/chat-timeline'
 import { familySummaryFromSessions } from '../apps/desktop/src/renderer/agent-map-model'
 import { z } from 'zod'
 import { rendererSource, isRendererDocument } from '../apps/desktop/src/main/renderer-source'
@@ -31,6 +31,7 @@ import type { BuildNotesRequest, DesktopApi } from '../packages/protocol/src/ind
 import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
 import type { AmeKit } from '../packages/amekit/src/index'
 import { buildAndroidTranslationPrompt, createTranslationLockStore } from '../packages/amekit/src/android-translation'
+import { buildCommitAgentPrompt, createCommitAgentLockStore } from '../packages/amekit/src/commit-agent'
 
 type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
@@ -116,6 +117,12 @@ const translationExamples: Invocation[] = [
   { method: 'androidTranslationLock', args: ['p', 'translation-1'] }
 ]
 
+const commitAgentExamples: Invocation[] = [
+  { method: 'commitAgentInfo', args: ['p'] },
+  { method: 'commitAgentPrompt', args: ['p', undefined, 'Analyze changes', 'analyze'] },
+  { method: 'commitAgentLock', args: ['p', 'commit-1'] }
+]
+
 const smartExamples: Invocation[] = [
   { method: 'lspUpdateDocument', args: ['p', 'src/app.ts', 'export const value = 1', 7] },
   { method: 'lspCloseDocument', args: ['p', 'src/app.ts'] },
@@ -177,6 +184,15 @@ async function harness(directory = 'workspace') {
   }]))
   workspace.get = (id: unknown) => { if (id !== 'p') throw new Error('UNKNOWN_PROJECT'); return { directory } }
   workspace.list = () => [{ id: 'p', directory }]
+  workspace.status = async (...args: unknown[]) => {
+    calls.push({ method: 'status', args })
+    return { branch: 'feature/commit', changes: [
+      { path: 'staged.ts', index: 'M', working: ' ' },
+      { path: 'both.ts', index: 'M', working: 'M' },
+      { path: 'working.ts', index: ' ', working: 'M' },
+      { path: 'new.ts', index: '?', working: '?' },
+    ] }
+  }
   let models = [{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }]
   let status: any = { account: { role: 'admin' }, models: { default_model: 'server-model', models: [{ id: 'server-model' }] } }
   let operationGate: Promise<void> | undefined
@@ -238,6 +254,15 @@ async function harness(directory = 'workspace') {
     translationSessionIDs: (projectID: string) => [...(translationSessions.get(projectID) ?? [])],
     lockedSessionIDs: (projectID: string) => [...(lockedSessions.get(projectID) ?? [])]
   }
+  const commitSessions = new Map<string, Set<string>>(), commitLocked = new Map<string, Set<string>>()
+  const commitAgentLocks = {
+    recordSession: async (project: string, session: string) => { const ids = commitSessions.get(project) ?? new Set(); ids.add(session); commitSessions.set(project, ids) },
+    lockSession: async (project: string, session: string) => { const ids = commitLocked.get(project) ?? new Set(); ids.add(session); commitLocked.set(project, ids) },
+    isSession: (project: string, session: string) => commitSessions.get(project)?.has(session) ?? false,
+    isLocked: (project: string, session: string) => commitLocked.get(project)?.has(session) ?? false,
+    sessionIDs: (project: string) => [...(commitSessions.get(project) ?? [])],
+    lockedSessionIDs: (project: string) => [...(commitLocked.get(project) ?? [])]
+  }
   let detected = { isAndroid: true, stringsFiles: ['app/src/main/res/values/strings.xml'] }
   let sessions = [{ id: 'translation-1', title: 'Translation' }]
   let sessionMessages: unknown[] = []
@@ -251,7 +276,7 @@ async function harness(directory = 'workspace') {
   adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
     z, URL, Buffer, process, randomUUID, window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
-    translationLocks, buildAndroidTranslationPrompt,
+    translationLocks, buildAndroidTranslationPrompt, commitAgentLocks, buildCommitAgentPrompt,
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
     detectAndroidProject: async (...args: unknown[]) => { calls.push({ method: 'detectAndroidProject', args }); return detected },
     pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
@@ -301,6 +326,8 @@ async function harness(directory = 'workspace') {
     setSessions: (value: typeof sessions) => { sessions = value },
     translationLocks,
     useLockStore: (store: ReturnType<typeof createTranslationLockStore>) => { context.translationLocks = store },
+    commitAgentLocks,
+    useCommitLockStore: (store: ReturnType<typeof createCommitAgentLockStore>) => { context.commitAgentLocks = store },
     failRemove: () => { workspace.remove = async (...args: unknown[]) => { calls.push({ method: 'remove', args }); throw new Error('REMOVE_FAILED') } },
     setProjectDirectory: (id: string, value: string) => { const previous = workspace.get; workspace.get = key => key === id ? { directory: value } : previous(key) },
     invalidateProject: () => { workspace.get = () => { throw new Error('UNKNOWN_PROJECT') } }, setPricing: (value: typeof pricing) => { pricing = value },
@@ -370,7 +397,7 @@ async function rendererModule(file: string, hooks: ReturnType<typeof rendererHoo
     './pet-sessions': petSessionMapping, '../chat-refresh': chatRefresh, './editor-model-lifecycle': editorModelLifecycle,
     'monaco-editor': { editor: { getModels: () => [] }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } },
     '../composer-mentions': composerMentions, '../chat-submit': { chatSubmit }, '../model-selection': modelSelection,
-    '../chat-timeline': { projectChatTimeline }, '../agent-map-model': { familySummaryFromSessions }
+    '../chat-timeline': chatTimeline, '../agent-map-model': { familySummaryFromSessions }
   }
   const components = new Map<string, React.ComponentType<any>>()
   const exports: Record<string, any> = {}
@@ -1226,6 +1253,11 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
       workspace: undefined, terminals: undefined, adapter: undefined, runtime: undefined, account: undefined, pairing: undefined,
       petHost: undefined, sprite: '', managed: true, shuttingDown: false, authority: Promise.resolve(), lspServices, debuggers,
       translationLocks: undefined,
+      commitAgentLocks: undefined,
+      createCommitAgentLockStore: (file: string) => {
+        assert.equal(file, path.join('userData', 'commit-agent-locks.json'))
+        return { load: async () => { sequence.push('commit-agent-locks:load') } }
+      },
       createTranslationLockStore: (file: string) => {
         assert.equal(file, path.join('userData', 'translation-locks.json'))
         return { load: async () => { sequence.push('translation-locks:load') } }
@@ -1275,6 +1307,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     assert.equal(spritePath, path.join(process.cwd(), 'packages/amekit/src/assets/ame-chibi.png'))
     assert.ok(sequence.indexOf('pet:create') < sequence.indexOf('runtime:create'))
     assert.ok(sequence.indexOf('translation-locks:load') < sequence.indexOf('window'))
+    assert.ok(sequence.indexOf('commit-agent-locks:load') < sequence.indexOf('window'))
     assert.ok(sequence.indexOf('pet:init') < sequence.indexOf('window'))
     assert.ok(sequence.indexOf('pet:init') < sequence.indexOf('backend:start'))
     const signal = new AbortController().signal
@@ -1988,6 +2021,161 @@ test('translation lock serializes after pending prompts and permanently rejects 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+const commitSkill = { name: 'git-commit', instructions: 'Inspect every diff before proposing commits.', directory: 'workspace/.opencode/skills/git-commit' }
+
+test('commit agent info reports feature policy, Git counts and independent lock state with a usable default skill', async () => {
+  const h = await harness()
+  h.setReadStatus(async () => ({ models: { default_model: 'server-model', active_models: [{ id: 'server-model', name: 'Default' }, { id: 'feature', name: 'Feature' }] } }) as any)
+  h.setCommitEnhanceFeatureReader(async () => ({ skill: commitSkill, model: 'feature' }))
+  await h.commitAgentLocks.recordSession('p', 'commit-1')
+  await h.commitAgentLocks.lockSession('p', 'commit-1')
+  assert.deepEqual(plain(await h.dispatch('commitAgentInfo', ['p'])), {
+    configured: true, skill: 'git-commit', configuredModelID: 'feature', effectiveModelID: 'feature', effectiveModelName: 'Feature',
+    fallbackToDefault: false, branch: 'feature/commit', stagedCount: 2, workingCount: 3,
+    commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1']
+  })
+  h.setCommitEnhanceFeatureReader(async () => ({ skill: null, rawSkillName: 'missing-skill', model: 'inactive' }))
+  const fallback = await h.dispatch('commitAgentInfo', ['p']) as any
+  assert.equal(fallback.configured, true); assert.equal(fallback.skill, 'missing-skill')
+  assert.equal(fallback.effectiveModelID, 'server-model'); assert.equal(fallback.fallbackToDefault, true)
+  const defaults = await harness()
+  assert.equal((await defaults.dispatch('commitAgentInfo', ['p']) as any).configured, true)
+  defaults.setCommitEnhanceReader(async () => commitSkill)
+  assert.equal((await defaults.dispatch('commitAgentInfo', ['p']) as any).skill, commitSkill.name)
+})
+
+test('commit agent creates its own session, pins the authorized feature model and attaches native skills only on first turns', async () => {
+  for (const matchBy of ['name', 'id']) {
+    const h = await harness()
+    h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+    const featureModel = { id: 'feature', modelID: 'feature', name: 'Feature', providerID: 'amecode' }
+    h.setModels([{ id: 'model', modelID: 'server-model', name: 'Default', providerID: 'amecode' }, featureModel])
+    h.setFeatureAuthorizer(async id => id === 'feature' ? id : null)
+    h.setCommitEnhanceFeatureReader(async () => ({ skill: commitSkill, model: 'feature' }))
+    let lookups = 0
+    h.setSkillsReader(async () => { lookups++; return [{ id: matchBy === 'id' ? commitSkill.name : 'native-commit', name: matchBy === 'name' ? commitSkill.name : 'Other' }] })
+    const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Review changes', 'split']) as any
+    assert.equal(result.session.id, 'commit-1'); assert.equal(result.locked, false)
+    assert.deepEqual(plain(result.model), featureModel)
+    assert.equal(h.commitAgentLocks.isSession('p', 'commit-1'), true)
+    assert.equal(h.translationLocks.isTranslationSession('p', 'commit-1'), false)
+    const first = h.calls.find(call => call.method === 'prompt')!
+    assert.deepEqual(plain(first.args[6]), [{ id: matchBy === 'id' ? commitSkill.name : 'native-commit' }])
+    for (const fragment of [commitSkill.instructions, commitSkill.directory, 'feature/commit', 'staged.ts', 'working.ts', 'new.ts', '[Commit mode: split]', 'Review changes']) assert.ok(String(first.args[2]).includes(fragment), fragment)
+    h.setSessionMessages([{}])
+    h.setCommitEnhanceFeatureReader(async () => ({ skill: null, model: 'changed' }))
+    h.setStatus({ account: { role: 'admin' }, models: { default_model: 'feature', models: [{ id: 'feature' }] } })
+    const next = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue', 'custom']) as any
+    assert.equal(next.model.modelID, 'feature'); assert.equal(lookups, 1)
+    const prompt = h.calls.filter(call => call.method === 'prompt').at(-1)!
+    assert.equal(prompt.args[6], undefined)
+    assert.match(String(prompt.args[2]), /STRICT SCOPE: GIT COMMIT ASSISTANT ONLY/)
+    assert.equal(String(prompt.args[2]).includes(commitSkill.instructions), false)
+    await assert.rejects(h.dispatch('prompt', ['p', 'commit-1', 'Code', selectedModel]), /COMMIT_AGENT_SESSION_REQUIRED/)
+    await assert.rejects(h.dispatch('btwAsk', ['p', 'commit-1', 'Code', selectedModel]), /COMMIT_AGENT_SESSION_REQUIRED/)
+    assert.equal(h.calls.filter(call => call.method === 'createSession').length, 1)
+  }
+})
+
+test('commit agent defaults work without custom skills and native lookup failures retain verified instructions', async () => {
+  for (const native of ['none', 'miss', 'fail']) {
+    const h = await harness()
+    h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+    if (native !== 'none') h.setCommitEnhanceFeatureReader(async () => ({ skill: commitSkill, model: 'inactive' }))
+    h.setFeatureAuthorizer(async () => null)
+    h.setSkillsReader(async () => { if (native === 'fail') throw new Error('offline'); return [] })
+    const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze', 'analyze']) as any
+    assert.equal(result.model.modelID, 'server-model')
+    const prompt = h.calls.find(call => call.method === 'prompt')!
+    assert.equal(prompt.args[6], undefined)
+    assert.match(String(prompt.args[2]), /Conventional Commits/)
+    if (native !== 'none') assert.ok(String(prompt.args[2]).includes(commitSkill.instructions))
+  }
+})
+
+test('commit agent recovers model pins on restart, rejects foreign sessions and never silently changes an unavailable pin', async () => {
+  const h = await harness()
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  await h.commitAgentLocks.recordSession('p', 'commit-1')
+  h.setSessionModel('server-model'); h.setSessionMessages([{}])
+  h.setCommitEnhanceFeatureReader(async () => ({ skill: null, model: 'new-config' }))
+  assert.equal((await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any).model.modelID, 'server-model')
+  for (const method of ['commitAgentPrompt', 'commitAgentLock']) {
+    await assert.rejects(h.dispatch(method, method === 'commitAgentPrompt' ? ['p', 'main-chat', 'Analyze'] : ['p', 'main-chat']), /COMMIT_AGENT_SESSION_REQUIRED/)
+  }
+  h.setProjectDirectory('q', 'other')
+  await assert.rejects(h.dispatch('commitAgentPrompt', ['q', 'commit-1', 'Analyze']), /COMMIT_AGENT_SESSION_REQUIRED/)
+  await assert.rejects(h.dispatch('commitAgentLock', ['q', 'commit-1']), /COMMIT_AGENT_SESSION_REQUIRED/)
+  h.setSessions([])
+  await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /SESSION_NOT_FOUND/)
+  h.setModels([{ id: 'other', modelID: 'other', name: 'Other', providerID: 'amecode' }])
+  h.setFeatureAuthorizer(async () => null)
+  await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /COMMIT_AGENT_MODEL_UNAVAILABLE/)
+})
+
+test('commit agent preserves legacy verified skill instructions without guessing a directory and pins the API default', async () => {
+  const h = await harness()
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  h.setCommitEnhanceReader(async () => ({ name: 'legacy-commit', instructions: 'Legacy verified guidance' }))
+  h.setSkillsReader(async () => [])
+  await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
+  const first = h.calls.find(call => call.method === 'prompt')!
+  assert.match(String(first.args[2]), /Legacy verified guidance/)
+  assert.match(String(first.args[2]), /unavailable: do not resolve or execute bundled/)
+  const changed = { id: 'changed', modelID: 'changed', name: 'Changed', providerID: 'amecode' }
+  h.setModels([changed, { id: 'model', modelID: 'server-model', name: 'Original', providerID: 'amecode' }])
+  h.setFeatureAuthorizer(async id => id === 'server-model' ? id : null)
+  h.setSessionMessages([{}])
+  assert.equal((await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any).model.modelID, 'server-model')
+  await h.dispatch('prompt', ['p', 'main-chat', 'Code', changed])
+  assert.equal((h.calls.filter(call => call.method === 'prompt').at(-1)!.args[3] as any).modelID, 'changed')
+})
+
+test('commit agent lock queues after prompts, persists across restart, cancels generation and notifies even on cancel failure', async () => {
+  const root = await mkdtemp(path.join(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'commit-ipc-'))
+  try {
+    const file = path.join(root, 'commit-agent-locks.json')
+    const store = createCommitAgentLockStore(file); await store.load()
+    const h = await harness(); h.useCommitLockStore(store)
+    h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+    let release!: () => void
+    h.gateOperation(new Promise<void>(resolve => { release = resolve }))
+    const pending = h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
+    await new Promise(resolve => setImmediate(resolve))
+    const lock = h.dispatch('commitAgentLock', ['p', 'commit-1'])
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(store.isLocked('p', 'commit-1'), false)
+    release(); await pending
+    assert.deepEqual(plain(await lock), { commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'] })
+    assert.deepEqual(plain(h.calls.filter(call => call.method === 'cancel')), [{ method: 'cancel', args: ['p', 'commit-1'] }])
+    assert.deepEqual(plain(h.calls.at(-1)), { method: 'ame:event', args: [{ type: 'opencode', projectID: 'p', sessionID: 'commit-1' }] })
+    const reloaded = createCommitAgentLockStore(file); await reloaded.load()
+    const restarted = await harness(); restarted.useCommitLockStore(reloaded)
+    await assert.rejects(restarted.dispatch('prompt', ['p', 'commit-1', 'Code', selectedModel]), /COMMIT_AGENT_SESSION_LOCKED/)
+    await assert.rejects(restarted.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /COMMIT_AGENT_SESSION_LOCKED/)
+    await restarted.dispatch('prompt', ['p', 'main-chat', 'Code', selectedModel])
+    restarted.failInterrupt()
+    await assert.rejects(restarted.dispatch('commitAgentLock', ['p', 'commit-1']), /INTERRUPT_FAILED/)
+    assert.equal(reloaded.isLocked('p', 'commit-1'), true)
+    assert.equal(reloaded.isSession('q', 'commit-1'), false)
+    assert.deepEqual(plain(restarted.calls.at(-1)), { method: 'ame:event', args: [{ type: 'opencode', projectID: 'p', sessionID: 'commit-1' }] })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('commit agent IPC rejects malformed IDs, text, modes and extra arguments before side effects', async () => {
+  const h = await harness()
+  const invalid: Invocation[] = [
+    ...commitAgentExamples.flatMap(({ method, args }) => [[], ['', ...args.slice(1)], ['bad\0id', ...args.slice(1)], ['  ', ...args.slice(1)], ['x'.repeat(513), ...args.slice(1)], [...args, 'extra']].map(args => ({ method, args }))),
+    ...['', '  ', '\0', 42, 'x'.repeat(200001)].map(value => ({ method: 'commitAgentPrompt', args: ['p', undefined, value] })),
+    ...['', null, 42, 'bad\0id', '  '].flatMap(value => [
+      { method: 'commitAgentPrompt', args: ['p', value, 'Analyze'] }, { method: 'commitAgentLock', args: ['p', value] }
+    ]),
+    { method: 'commitAgentPrompt', args: ['p', undefined, 'Analyze', 'invalid'] }
+  ]
+  for (const { method, args } of invalid) await assert.rejects(h.dispatch(method, args), method)
+  assert.deepEqual(h.calls, [])
+})
+
 test('AI commit fails closed for unavailable models, rejected policy, or no staged changes', async () => {
   const h = await harness()
   for (const models of [[], [{ id: 'model', modelID: 'model', name: 'Model', providerID: 'external' }]]) {
@@ -2211,7 +2399,7 @@ test('preload forwards all new methods, optional arguments, return values and re
   runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, context)
   assert.ok(api)
   const methods = api as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
-  for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples, ...buildNotesExamples,
+  for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples, ...commitAgentExamples, ...buildNotesExamples,
     { method: 'openExternal', args: ['https://example.com/answer'] },
     { method: 'confirmProjectRemoval', args: ['p', ['visible.txt', 'hidden.txt']] },
     { method: 'removeProject', args: ['p'] },
