@@ -11,6 +11,156 @@ import type { UsagePrices } from '../packages/amekit/src/usage-pricing'
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 const waitFor = async (check: () => boolean) => { for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)) }; throw new Error('TIMED_OUT') }
 
+test('sessions reconcile persisted running state with live executions and safely fall back', async t => {
+  for (const scenario of ['zombie', 'running', '404', 'array', 'invalid-value', 'null', 'new-execution'] as const) await t.test(scenario, async () => {
+    const events: IdeEvent[] = [], recovery: string[] = []
+    let stream!: ReadableStreamDefaultController<Uint8Array>, activeCalls = 0
+    let release!: (value: Response) => void
+    const pending = new Promise<Response>(resolve => { release = resolve })
+    const adapter = new OpenCodeAdapter(event => events.push(event), async (input, init = {}) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+      if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+        stream = controller; init.signal?.addEventListener('abort', () => controller.close())
+      } }), { headers: { 'content-type': 'text/event-stream' } })
+      if (url.pathname === '/api/session') return json({ data: [{ id: 's', time: { busy: 100 } }], cursor: {} })
+      if (url.pathname === '/api/session/active') {
+        activeCalls++
+        assert.ok(init.signal)
+        if (scenario === 'new-execution') return pending
+        if (scenario === '404') return json({ error: 'not found' }, 404)
+        return json({ data: scenario === 'running' ? { s: { type: 'running' } } : scenario === 'array' ? [] : scenario === 'invalid-value' ? { s: { type: 'idle' } } : scenario === 'null' ? null : {} })
+      }
+      recovery.push(url.pathname)
+      if (url.pathname.endsWith('/permission')) return json({ data: [{ id: 'permission', sessionID: 's' }] })
+      if (url.pathname.endsWith('/form')) return json({ data: [{ id: 'form', sessionID: 's', fields: [] }] })
+      if (url.pathname.endsWith('/message')) return json({ data: [], cursor: {} })
+      throw new Error('Unexpected ' + url.pathname)
+    })
+    const send = async (type: string, data: object) => {
+      const before = events.length
+      stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, created: 110, data: { sessionID: 's', ...data } })}\n\n`))
+      await waitFor(() => events.length > before)
+    }
+    adapter.attach('p', process.cwd())
+    try {
+      await adapter.connect('http://localhost:4096')
+      // Stale in-memory activity must be cleared as well as the persisted status.
+      if (scenario === 'zombie') {
+        await send('permission.asked', { id: 'stale-permission' })
+        await send('form.created', { form: { id: 'stale-form', sessionID: 's', fields: [] } })
+        await send('session.tool.called', { assistantMessageID: 'a', id: 'stale-tool' })
+      }
+      const result = adapter.sessions('p')
+      if (scenario === 'new-execution') {
+        await waitFor(() => activeCalls === 1)
+        await send('session.execution.started', {})
+        release(json({ data: {} }))
+      }
+      const session = (await result)[0]
+      assert.equal(activeCalls, 1)
+      assert.equal(session.status, scenario === 'zombie' ? 'idle' : 'running')
+      assert.equal(session.activity, scenario === 'zombie' ? undefined : scenario === 'new-execution' ? 'thinking' : 'waiting')
+      assert.equal(recovery.length, scenario === 'zombie' || scenario === 'new-execution' ? 0 : 3)
+      if (scenario === 'zombie') {
+        assert.ok(session.idleAt! >= 100)
+        assert.equal((await adapter.sessions('p'))[0].activity, undefined)
+        assert.deepEqual(recovery, [])
+      }
+    } finally { release(json({ data: {} })); adapter.dispose() }
+  })
+})
+
+test('cancel unlocks a non-live execution, clears stale activity and notifies immediately', async t => {
+  for (const interrupted of [false, true]) await t.test(String(interrupted), async () => {
+    const events: IdeEvent[] = []
+    const busy = Date.now() + 60_000
+    let stream!: ReadableStreamDefaultController<Uint8Array>, recoveries = 0
+    const adapter = new OpenCodeAdapter(event => events.push(event), async (input, init = {}) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+      if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+        stream = controller; init.signal?.addEventListener('abort', () => controller.close())
+      } }), { headers: { 'content-type': 'text/event-stream' } })
+      if (url.pathname === '/api/session/s/interrupt') return json({ interrupted })
+      if (url.pathname === '/api/session/s') return json({ data: { id: 's', location: { directory: process.cwd() }, time: { busy } } })
+      if (url.pathname === '/api/session') return json({ data: [{ id: 's', time: { busy } }], cursor: {} })
+      // Even without the live endpoint, the cancellation override must beat persisted busy.
+      if (url.pathname === '/api/session/active') return json({}, 404)
+      recoveries++
+      return json({ data: [], cursor: {} })
+    })
+    adapter.attach('p', process.cwd())
+    try {
+      await adapter.connect('http://localhost:4096')
+      for (const [type, data] of [
+        ['permission.asked', { id: 'permission' }],
+        ['form.created', { form: { id: 'form', sessionID: 's', fields: [] } }],
+        ['session.tool.called', { assistantMessageID: 'a', id: 'tool' }],
+      ] as const) {
+        const before = events.length
+        stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, created: busy, data: { sessionID: 's', ...data } })}\n\n`))
+        await waitFor(() => events.length > before)
+      }
+      events.length = 0
+      await adapter.cancel('p', 's')
+      assert.deepEqual(events, interrupted ? [] : [{ type: 'opencode', projectID: 'p', sessionID: 's' }])
+      const session = (await adapter.sessions('p'))[0]
+      assert.equal(session.status, interrupted ? 'running' : 'idle')
+      assert.equal(session.activity, interrupted ? 'waiting' : undefined)
+      assert.equal(recoveries, 0)
+      if (!interrupted) assert.ok(session.idleAt! >= busy)
+    } finally { adapter.dispose() }
+  })
+})
+
+test('recovery is independent per section and newer SSE wins over in-flight snapshots', async t => {
+  for (const liveKind of ['permissions', 'forms', 'tools'] as const) await t.test(liveKind, async () => {
+    const directory = process.cwd(), calls = { permissions: 0, forms: 0, tools: 0 }
+    const failedKind = liveKind === 'permissions' ? 'forms' : 'permissions'
+    let stream!: ReadableStreamDefaultController<Uint8Array>, notifications = 0
+    let release!: (value: Response) => void
+    const stale = new Promise<Response>(resolve => { release = resolve })
+    const adapter = new OpenCodeAdapter(() => { notifications++ }, async (input, init = {}) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+      if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+        stream = controller; init.signal?.addEventListener('abort', () => controller.close())
+      } }), { headers: { 'content-type': 'text/event-stream' } })
+      if (url.pathname === '/api/session') return json({ data: [{ id: 's', time: { busy: 100 } }], cursor: {} })
+      const kind = url.pathname.endsWith('/permission') ? 'permissions' : url.pathname.endsWith('/form') ? 'forms' : url.pathname.endsWith('/message') ? 'tools' : undefined
+      if (!kind) throw new Error('Unexpected ' + url.pathname)
+      calls[kind]++
+      if (kind === liveKind) return stale
+      if (kind === failedKind && calls[kind] === 1) throw new Error('temporary failure')
+      return json({ data: [], cursor: {} })
+    })
+    const send = async (type: string, data: object) => {
+      const before = notifications
+      stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, created: 110, data: { sessionID: 's', ...data } })}\n\n`))
+      await waitFor(() => notifications > before)
+    }
+    adapter.attach('p', directory)
+    try {
+      await adapter.connect('http://localhost:4096')
+      const recovery = adapter.sessions('p')
+      await waitFor(() => calls[liveKind] === 1)
+      if (liveKind === 'permissions') await send('permission.created', { id: 'live-permission' })
+      else if (liveKind === 'forms') await send('form.created', { form: { id: 'live-form', sessionID: 's', fields: [] } })
+      else await send('session.tool.called', { assistantMessageID: 'a', id: 'live-tool', input: {}, executed: false })
+      release(json({ data: [], cursor: {} }))
+      const expected = liveKind === 'tools' ? 'working' : 'waiting'
+      assert.equal((await recovery)[0].activity, expected, 'empty stale snapshot cannot erase newer live activity')
+      assert.equal((await adapter.sessions('p'))[0].activity, expected, 'retry preserves recovered sections')
+      assert.deepEqual(calls, { permissions: failedKind === 'permissions' ? 2 : 1, forms: failedKind === 'forms' ? 2 : 1, tools: 1 })
+      if (liveKind === 'permissions') await send('permission.replied', { requestID: 'live-permission', reply: 'once' })
+      else if (liveKind === 'forms') await send('form.cancelled', { id: 'live-form' })
+      else await send('session.tool.success', { assistantMessageID: 'a', id: 'live-tool', content: [] })
+      assert.equal((await adapter.sessions('p'))[0].activity, 'thinking')
+    } finally { release(json({ data: [], cursor: {} })); adapter.dispose() }
+  })
+})
+
 test('session forms use real SDK routes, enforce ownership, and notify on all form SSE events', async () => {
   const directory = process.cwd(), events: IdeEvent[] = [], calls: { path: string; body: unknown; message: string | null }[] = []
   let stream!: ReadableStreamDefaultController<Uint8Array>
@@ -142,6 +292,10 @@ test('real SDK requests use location, main-only auth, session binding, prompt an
     assert.deepEqual(JSON.parse(String(calls.find(c => c.url.pathname === '/api/session/s1/model')!.init.body)).model, { id: 'server-model-id', providerID: 'amecode' })
     const promptBodies = () => calls.filter(call => call.url.pathname === '/api/session/s1/prompt').map(call => JSON.parse(String(call.init.body)))
     assert.deepEqual(promptBodies().at(-1), { text: 'test' })
+    await adapter.prompt('project', 's1', 'native skill', model, undefined, undefined, [{ id: 'skill-translation' }])
+    assert.deepEqual(promptBodies().at(-1), { text: 'native skill', skills: [{ id: 'skill-translation' }] })
+    await adapter.prompt('project', 's1', 'no skills', model, undefined, undefined, [])
+    assert.deepEqual(promptBodies().at(-1), { text: 'no skills' })
     const file = { uri: 'data:image/png;base64,iVBOR', name: 'shot.png', mime: 'image/png', source: { type: 'inline' as const } }
     await adapter.prompt('project', 's1', '', model, undefined, [file])
     assert.deepEqual(promptBodies().at(-1), { text: '(Đính kèm tệp)', files: [{ uri: file.uri, name: file.name, source: file.source }] })
@@ -161,6 +315,41 @@ test('real SDK requests use location, main-only auth, session binding, prompt an
     assert.equal(new Headers(calls[0].init.headers).get('authorization'), 'Basic ' + Buffer.from('opencode:private-password').toString('base64'))
     assert.ok(!JSON.stringify(adapter.connection()).includes('private-password'))
   } finally { adapter.dispose() }
+})
+test('normalization exposes compaction, assistant and idle errors with timestamps and fallbacks', () => {
+  const items = normalizeMessages([
+    { id: 'compact', type: 'compaction', status: 'failed', reason: 'auto', time: { created: 0 }, error: { type: 'CompactionError', message: 'Compaction summary reached the output token limit' } },
+    { id: 'assistant', type: 'assistant', time: { created: 10, completed: 20 }, content: [{ type: 'text', text: 'Partial answer' }], error: { type: 'ProviderError', message: 'Provider failed' } },
+    { id: 'idle', type: 'idle', outcome: 'failed', time: { created: 30 }, error: { type: 'ExecutionError', message: 'Execution failed' } },
+    { id: 'type-only', type: 'assistant', content: [], error: { type: 'UnknownError', message: '' } },
+    { id: 'fallback', type: 'compaction', status: 'failed', reason: 'auto', error: { type: '', message: '' } },
+  ] as SessionMessageInfo[])
+  assert.deepEqual(items, [
+    { id: 'compact:error', role: 'assistant', kind: 'error', text: 'Compaction summary reached the output token limit', createdAt: 0 },
+    { id: 'assistant:0', role: 'assistant', kind: 'text', text: 'Partial answer', createdAt: 10, completedAt: 20 },
+    { id: 'assistant:error', role: 'assistant', kind: 'error', text: 'Provider failed', createdAt: 10, completedAt: 20 },
+    { id: 'idle:error', role: 'assistant', kind: 'error', text: 'Execution failed', createdAt: 30 },
+    { id: 'type-only:error', role: 'assistant', kind: 'error', text: 'UnknownError' },
+    { id: 'fallback:error', role: 'assistant', kind: 'error', text: 'Phiên thực thi gặp lỗi.' },
+  ])
+})
+test('failed idle only deduplicates an immediately preceding identical error within its turn', () => {
+  const error = { type: 'ExecutionError', message: 'Failed' }
+  const items = normalizeMessages([
+    { id: 'u1', type: 'user', text: 'Start' },
+    { id: 'a1', type: 'assistant', content: [], error },
+    { id: 'idle1', type: 'idle', outcome: 'failed', error },
+    { id: 'u2', type: 'user', text: 'Retry' },
+    { id: 'idle2', type: 'idle', outcome: 'failed', error },
+    { id: 'compact', type: 'compaction', status: 'failed', reason: 'auto', error },
+    { id: 'idle3', type: 'idle', outcome: 'failed', error },
+    { id: 'a2', type: 'assistant', content: [], error },
+    { id: 'a3', type: 'assistant', content: [{ type: 'text', text: 'More output' }] },
+    { id: 'idle4', type: 'idle', outcome: 'failed', error },
+    { id: 'idle5', type: 'idle', outcome: 'succeeded', error },
+    { id: 'idle6', type: 'idle', outcome: 'failed' },
+  ] as SessionMessageInfo[])
+  assert.deepEqual(items.filter(item => item.kind === 'error').map(item => item.id), ['a1:error', 'idle2:error', 'compact:error', 'a2:error', 'idle4:error'])
 })
 test('detaching a project rejects its API access and stops its event routing without disconnecting other projects', async () => {
   const notifications: IdeEvent[] = []

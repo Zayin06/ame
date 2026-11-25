@@ -23,10 +23,16 @@ export type ExpandedWorkRow =
 export type TimelineBlock =
   | { kind: 'work-group'; id: string; items: ChatItem[]; summary: WorkSummary; live?: boolean; defaultOpen?: boolean; workedMs?: number }
   | { kind: 'active-tools'; id: string; items: ChatItem[] }
-  | { kind: 'text' | 'reasoning' | 'tool' | 'changes'; id: string; item: ChatItem }
+  | { kind: 'text' | 'reasoning' | 'tool' | 'changes' | 'error'; id: string; item: ChatItem }
   | { kind: 'live-status'; id: string; label: string }
 
 export type ChatTurn = { id: string; user?: ChatItem; live: boolean; blocks: TimelineBlock[] }
+
+export function extractUserDisplayText(text: string): string {
+  const marker = '\n\nUser request:\n'
+  if (!text.startsWith('[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]') || !text.includes(marker)) return text
+  return text.slice(text.lastIndexOf(marker) + marker.length).replace(/^\[Translation mode: (?:update|full|scan|custom)\]\n/, '')
+}
 
 export function classifyTool(name: string): ToolClassification {
   switch (name.trim().toLowerCase()) {
@@ -62,7 +68,7 @@ export function formatAgentDuration(durationMs?: number): string {
 }
 
 function isText(item: ChatItem): boolean {
-  return item.kind !== 'tool' && item.kind !== 'reasoning' && item.kind !== 'changes' && !!item.text.trim()
+  return item.kind !== 'tool' && item.kind !== 'reasoning' && item.kind !== 'changes' && item.kind !== 'error' && !!item.text.trim()
 }
 
 function isVisible(item: ChatItem): boolean {
@@ -162,13 +168,13 @@ function workedDuration(user: ChatItem | undefined, items: readonly ChatItem[]):
   return toolMs > 0 ? toolMs : undefined
 }
 
-function activeTool(item: ChatItem): boolean {
-  return item.kind === 'tool' && (item.tool?.status === 'running' || item.tool?.status === 'streaming')
+function activeTool(item: ChatItem, questionActive: boolean): boolean {
+  return item.kind === 'tool' && (item.tool?.status === 'running' || item.tool?.status === 'streaming') && (item.tool.name !== 'question' || questionActive)
 }
 
-function liveStatusLabel(items: readonly ChatItem[]): string {
-  if (items.some(item => activeTool(item) && item.tool?.name === 'question')) return 'Đang chờ bạn trả lời câu hỏi…'
-  const active = items[lastIndexWhere(items, item => item.kind === 'tool' && (item.tool?.status === 'running' || item.tool?.status === 'streaming'))]
+function liveStatusLabel(items: readonly ChatItem[], questionActive: boolean): string {
+  if (items.some(item => activeTool(item, questionActive) && item.tool?.name === 'question')) return 'Đang chờ bạn trả lời câu hỏi…'
+  const active = items[lastIndexWhere(items, item => activeTool(item, questionActive))]
   if (active) {
     const kind = classifyTool(active.tool?.name ?? '').kind
     const verb = { read: 'Đang đọc', search: 'Đang tìm kiếm', skill: 'Đang nạp skill', edit: 'Đang sửa', run: 'Đang chạy', subagent: 'Đang chạy tác vụ con', other: 'Đang dùng công cụ' }[kind]
@@ -179,6 +185,7 @@ function liveStatusLabel(items: readonly ChatItem[]): string {
 }
 
 export function projectChatTimeline(items: readonly ChatItem[], options: { running: boolean; mode: TimelineDetailMode; pendingForms?: boolean }): ChatTurn[] {
+  const isActive = (item: ChatItem) => activeTool(item, options.running || !!options.pendingForms)
   const turns: { id: string; user?: ChatItem; items: ChatItem[] }[] = []
   for (const item of items) {
     if (item.role === 'user') turns.push({ id: item.id, user: item, items: [] })
@@ -190,7 +197,7 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
   return turns.map((turn, turnIndex) => {
     const assistantItems = turn.items
     const visible = assistantItems.filter(isVisible)
-    const live = turnIndex === turns.length - 1 && (options.running || options.pendingForms || assistantItems.some(activeTool))
+    const live = turnIndex === turns.length - 1 && (options.running || !!options.pendingForms || assistantItems.some(isActive))
     const workedMs = workedDuration(turn.user, assistantItems)
     const lastWorkIndex = lastIndexWhere(visible, item => item.kind === 'tool' || item.kind === 'reasoning')
     const commentary = new Set(visible.filter((item, index) => isText(item) && (item.phase === 'commentary' || item.phase !== 'final_answer' && index < lastWorkIndex)))
@@ -208,7 +215,7 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
     const individual = (item: ChatItem) => {
       if (item.kind === 'changes') {
         if (item.turn) blocks.push({ kind: 'changes', id: item.id, item })
-      } else if (item.kind === 'tool' || item.kind === 'reasoning') blocks.push({ kind: item.kind, id: item.id, item })
+      } else if (item.kind === 'tool' || item.kind === 'reasoning' || item.kind === 'error') blocks.push({ kind: item.kind, id: item.id, item })
       else if (isText(item) || options.mode !== 'compact') blocks.push({ kind: 'text', id: item.id, item })
     }
     if (options.mode === 'everything') visible.forEach(individual)
@@ -225,12 +232,12 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
       flush()
     } else if (!live) {
       workGroup(visible.filter(item => item.kind === 'tool' || item.kind === 'reasoning' || commentary.has(item)), `${turn.id}:work`, false, true)
-      visible.filter(item => isText(item) && !commentary.has(item)).forEach(individual)
+      visible.filter(item => item.kind === 'error' || isText(item) && !commentary.has(item)).forEach(individual)
       const changes = visible[lastIndexWhere(visible, item => item.kind === 'changes' && !!item.turn)]
       if (changes) individual(changes)
     } else {
       const tail = lastIndexWhere(visible, item => item.kind === 'tool' || item.kind === 'reasoning' || isText(item))
-      const firstActive = visible.findIndex(activeTool)
+      const firstActive = visible.findIndex(isActive)
       const prior: ChatItem[] = []
       const inline: ChatItem[] = []
       visible.forEach((item, index) => {
@@ -243,14 +250,14 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
       })
       workGroup(prior, `${turn.id}:work-live`, true)
       for (const item of inline) {
-        if (activeTool(item) || item.kind === 'tool' && item.tool?.status === 'error') {
+        if (isActive(item) || item.kind === 'tool' && item.tool?.status === 'error') {
           const previous = blocks.at(-1)
           if (previous?.kind === 'active-tools') previous.items.push(item)
           else blocks.push({ kind: 'active-tools', id: `${item.id}:active`, items: [item] })
         } else individual(item)
       }
     }
-    if (live) blocks.push({ kind: 'live-status', id: `${turn.id}:status`, label: options.pendingForms ? 'Đang chờ bạn trả lời câu hỏi…' : liveStatusLabel(visible) })
+    if (live) blocks.push({ kind: 'live-status', id: `${turn.id}:status`, label: options.pendingForms ? 'Đang chờ bạn trả lời câu hỏi…' : liveStatusLabel(visible, options.running || !!options.pendingForms) })
     return { id: turn.id, ...(turn.user ? { user: turn.user } : {}), live, blocks }
   })
 }

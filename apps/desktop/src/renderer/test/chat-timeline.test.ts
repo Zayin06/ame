@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { ChatItem } from '../../../../../packages/protocol/src/index'
-import { classifyTool, formatAgentDuration, groupExpandedWork, projectChatTimeline, summarizeWorkItems, toolTarget } from '../chat-timeline'
+import { classifyTool, extractUserDisplayText, formatAgentDuration, groupExpandedWork, projectChatTimeline, summarizeWorkItems, toolTarget } from '../chat-timeline'
 import type { TimelineBlock } from '../chat-timeline'
 
 const text = (id: string, extra: Partial<ChatItem> = {}): ChatItem => ({ id, role: 'assistant', text: id, ...extra })
@@ -20,6 +20,31 @@ const blockItems = (blocks: TimelineBlock[]) => blocks.flatMap(block => {
   return 'item' in block ? [block.item.id] : []
 })
 
+test('translation display text strips only scoped wrappers and the supported mode header after the last request marker', () => {
+  const scope = '[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]'
+  const request = 'file tạo ở đâu rồi?'
+  const skill = `SKILL.md\n${'translation instructions '.repeat(800)}\n\nUser request:\nexample embedded in skill`
+  assert.equal(extractUserDisplayText(`${scope}\n${skill}\n\nUser request:\n[Translation mode: full]\n${request}`), request)
+  assert.equal(extractUserDisplayText(`${scope}\nFollow-up constraints\n\nUser request:\n${request}`), request)
+  for (const mode of ['update', 'full', 'scan', 'custom']) {
+    assert.equal(extractUserDisplayText(`${scope}\n\nUser request:\n[Translation mode: ${mode}]\n${request}`), request)
+  }
+  for (const normal of [request, '', `${scope}\nMissing request marker`, `Ordinary message\n\nUser request:\n${request}`, `[Translation mode: full]\n${request}`]) {
+    assert.equal(extractUserDisplayText(normal), normal)
+  }
+})
+
+test('session errors always remain standalone blocks in all detail modes, live and settled', () => {
+  for (const mode of ['compact', 'detailed', 'everything'] as const) for (const running of [false, true]) {
+    const errors = [text('early-error', { kind: 'error', phase: 'commentary', text: 'Compaction summary reached the output token limit' }), text('last-error', { kind: 'error', text: '' })]
+    const items = [user(), errors[0], reasoning(), tool('read', 'read'), text('answer', { phase: 'final_answer' }), errors[1]]
+    const [turn] = projectChatTimeline(items, { mode, running })
+    assert.deepEqual(turn.blocks.filter(block => block.kind === 'error'), errors.map(item => ({ kind: 'error', id: item.id, item })))
+    assert.ok(!turn.blocks.some(block => (block.kind === 'work-group' || block.kind === 'active-tools') && block.items.some(item => item.kind === 'error')))
+    assert.equal(blockItems(turn.blocks).filter(id => errors.some(item => item.id === id)).length, errors.length)
+  }
+})
+
 test('a finished error does not strand later completed tools outside the live work group', () => {
   const items = [user(), tool('missing', 'read', { status: 'error', error: 'File not found' }), ...Array.from({ length: 8 }, (_, i) => tool(`read-${i}`, 'read')), tool('running', 'shell', { status: 'running' })]
   const blocks = compact(items, true)[0].blocks
@@ -33,6 +58,32 @@ test('a finished error does not strand later completed tools outside the live wo
 test('question tools and pending forms announce that user input is required', () => {
   for (const blocks of [compact([user(), tool('q', 'question', { status: 'running' })], true)[0].blocks, projectChatTimeline([user(), text('wait')], { running: false, mode: 'compact', pendingForms: true })[0].blocks]) {
     assert.deepEqual(blocks.at(-1), { kind: 'live-status', id: 'user:status', label: 'Đang chờ bạn trả lời câu hỏi…' })
+  }
+})
+
+test('interrupted questions do not keep idle turns live or announce a missing form', () => {
+  for (const mode of ['compact', 'detailed', 'everything'] as const) for (const status of ['running', 'streaming'] as const) {
+    const items = [user(), tool('q', 'question', { status })]
+    const [turn] = projectChatTimeline(items, { running: false, pendingForms: false, mode })
+    assert.equal(turn.live, false)
+    assert.ok(!turn.blocks.some(block => block.kind === 'active-tools' || block.kind === 'live-status'))
+    assert.deepEqual(blockItems(turn.blocks), ['q'], 'historical question is retained')
+    for (const options of [{ running: true, pendingForms: false }, { running: false, pendingForms: true }]) {
+      const [active] = projectChatTimeline(items, { ...options, mode })
+      assert.equal(active.live, true)
+      assert.equal(active.blocks.at(-1)?.kind, 'live-status')
+      assert.match(JSON.stringify(active.blocks.at(-1)), /Đang chờ bạn trả lời câu hỏi…/)
+    }
+  }
+})
+
+test('stale questions do not override other active tool status in idle sessions', () => {
+  for (const name of ['shell', 'bash', 'read']) {
+    const [turn] = projectChatTimeline([user(), tool('active', name, { status: 'running' }), tool('q', 'question', { status: 'running' })], { running: false, pendingForms: false, mode: 'compact' })
+    assert.equal(turn.live, true)
+    assert.deepEqual(turn.blocks.filter(block => block.kind === 'active-tools').flatMap(block => block.items.map(item => item.id)), ['active'])
+    assert.doesNotMatch(JSON.stringify(turn.blocks.at(-1)), /Đang chờ bạn trả lời câu hỏi…/)
+    assert.match(JSON.stringify(turn.blocks.at(-1)), name === 'read' ? /Đang đọc/ : /Đang chạy/)
   }
 })
 

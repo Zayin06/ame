@@ -77,6 +77,18 @@ const examples: Invocation[] = [
 
 const buildNotesRequest: BuildNotesRequest = { mode: 'range', baseCommit: 'abcdef0', includeWorking: true }
 
+test('openExternal IPC opens canonical HTTP URLs only and rejects unsafe or malformed URLs', async () => {
+  const h = await harness()
+  for (const url of ['https://example.com/answer?q=1', 'http://example.com', 'https://EXAMPLE.com/a/../answer']) {
+    await h.dispatch('openExternal', [url])
+    assert.deepEqual(plain(h.calls.pop()), { method: 'shell:openExternal', args: [new URL(url).href] })
+  }
+  for (const url of ['javascript:alert(1)', 'file:///secret', 'https://', 'not a URL', 'https://example.com\n', 'https://example.com/\u0000', 'https://example.com/\u007f', 'https://example.com/' + 'x'.repeat(2048), 'https://[broken', '//example.com', 'https:example.com']) {
+    await assert.rejects(h.dispatch('openExternal', [url]))
+  }
+  assert.equal(h.calls.length, 0)
+})
+
 test('form IPC rejects unsafe answer maps and oversized payloads before dispatch', async () => {
   const h = await harness()
   for (const answer of [JSON.parse('{"__proto__":"bad"}'), { constructor: 'bad' }, { prototype: 'bad' }, { nested: {} }, { a: null }, { a: Infinity }, { a: 'x'.repeat(20001) }, { ['x'.repeat(201)]: 'a' }, Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`k${i}`, true])), { a: Array(101).fill('x') }]) {
@@ -238,7 +250,7 @@ async function harness(directory = 'workspace') {
   adapter.sessions = async (...args: unknown[]) => { calls.push({ method: 'sessions', args }); return sessions }
   adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
-    z, Buffer, process, randomUUID, window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
+    z, URL, Buffer, process, randomUUID, window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
     translationLocks, buildAndroidTranslationPrompt,
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
     detectAndroidProject: async (...args: unknown[]) => { calls.push({ method: 'detectAndroidProject', args }); return detected },
@@ -249,7 +261,7 @@ async function harness(directory = 'workspace') {
     terminals: { closeProject: (...args: unknown[]) => { calls.push({ method: 'terminal:closeProject', args }) } },
     pairing: { status: () => ({ enabled: false }) },
     configurePairing: async (settings: unknown) => { calls.push({ method: 'configurePairing', args: [settings] }); return settings },
-    shell: { showItemInFolder: (target: string) => calls.push({ method: 'shell', args: [target] }) },
+    shell: { showItemInFolder: (target: string) => calls.push({ method: 'shell', args: [target] }), openExternal: async (url: string) => { calls.push({ method: 'shell:openExternal', args: [url] }) } },
     dialog: { showOpenDialog: async (window: unknown, options: unknown) => {
       assert.equal(window, parent)
       calls.push({ method: 'showOpenDialog', args: [options] })
@@ -280,6 +292,7 @@ async function harness(directory = 'workspace') {
     setBuildNotesSummary: (value: BuildNotesSummary) => { notesSummary = value },
     setReadStatus: (reader: NonNullable<typeof account.readStatus>) => { account.readStatus = reader },
     setAndroidTranslationReader: (reader: NonNullable<typeof account.readAndroidTranslationFeature>) => { account.readAndroidTranslationFeature = reader },
+    setSkillsReader: (reader: (...args: any[]) => Promise<unknown>) => { adapter.skills = reader },
     setFeatureAuthorizer: (authorize: NonNullable<typeof account.authorizeFeatureModel>) => { account.authorizeFeatureModel = authorize },
     setDetected: (value: typeof detected) => { detected = value },
     setSessionMessages: (value: unknown[]) => { sessionMessages = value },
@@ -324,6 +337,7 @@ function rendererHooks() {
       return slots[index] ??= { current: initial }
     },
     useId() { return `test-id-${cursor++}` },
+    useSyncExternalStore(_subscribe: unknown, getSnapshot: () => unknown) { return getSnapshot() },
     useCallback(callback: any, deps: readonly unknown[]) {
       const index = cursor++, previous = slots[index]
       if (!previous || !same(previous.deps, deps)) slots[index] = { deps, callback }
@@ -939,6 +953,7 @@ test('project removal retains services on cancellation/failure and awaits debugg
       await assert.rejects(h.dispatch('removeProject', ['p']), failure === 'cancel' ? /CANCELLED/ : /REMOVE_FAILED/)
       assert.equal(h.lspServices.size, 1); assert.equal(h.debuggers.size, 1)
       assert.equal(h.calls.some(call => call.method.endsWith(':dispose')), false)
+      assert.equal(h.calls.some(call => call.method === 'terminal:closeProject' || call.method === 'detach'), false)
       continue
     }
     let release!: () => void
@@ -947,7 +962,7 @@ test('project removal retains services on cancellation/failure and awaits debugg
     if (failure === 'lsp-dispose') h.services[0].methods.dispose = () => { h.calls.push({ method: 'lsp:dispose', args: [] }); throw new Error('DISPOSE_FAILED') }
     const removal = h.dispatch('removeProject', ['p'])
     await new Promise(resolve => setImmediate(resolve))
-    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'terminal:closeProject', 'remove', 'lsp:dispose', 'debug:dispose'])
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'remove', 'terminal:closeProject', 'lsp:dispose', 'debug:dispose'])
     assert.equal(h.lspServices.size, 0); assert.equal(h.debuggers.size, 1)
     release()
     if (failure === 'dispose' || failure === 'lsp-dispose') await assert.rejects(removal, /DISPOSE_FAILED/)
@@ -1008,7 +1023,7 @@ test('dirty removal requires a native, project-bound, single-use approval withou
     if (choice === 'cancel') { assert.equal(approval, null); continue }
     assert.equal(approval!.choice, choice)
     await h.dispatch('removeProject', ['p', approval!.token])
-    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'terminal:closeProject', 'remove', 'detach'])
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'remove', 'terminal:closeProject', 'detach'])
     await assert.rejects(h.dispatch('removeProject', ['p', approval!.token]), /CANCELLED/)
   }
   const h = await harness()
@@ -1253,7 +1268,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     bundleTimers.shift()!()
     assert.equal(bundleEvents.length, 1)
     context.shuttingDown = false
-    assert.equal(options.defaultEnabled, false)
+    assert.equal(options.defaultEnabled, true)
     assert.equal(options.sprite, '')
     assert.equal(options.electron.screen, context.screen)
     assert.equal(options.hasMainWindow(), true)
@@ -1781,6 +1796,51 @@ test('Android translation creates an isolated session, authorizes the pinned mod
   assert.equal(h.calls.some(call => call.method === 'createSession'), false)
 })
 
+test('Android translation attaches a matching native skill only on the first turn', async () => {
+  for (const matchBy of ['name', 'id']) {
+    const h = await harness()
+    const skill = { id: matchBy === 'id' ? translationSkill.name : 'native-translation', name: matchBy === 'name' ? translationSkill.name : 'Other name' }
+    let lookups = 0
+    h.setAndroidTranslationReader(async () => ({ skill: translationSkill }))
+    h.setSkillsReader(async projectID => {
+      assert.equal(projectID, 'p')
+      lookups++
+      return [{ id: 'unrelated', name: 'Other skill' }, skill]
+    })
+    // An existing but empty translation session also needs first-turn skill attachment.
+    await h.translationLocks.recordSession('p', 'translation-1')
+    h.setSessionModel('server-model')
+    await h.dispatch('androidTranslationPrompt', ['p', matchBy === 'id' ? 'translation-1' : undefined, 'Translate'])
+    const first = h.calls.find(call => call.method === 'prompt')!
+    assert.equal(first.args.length, 7)
+    assert.equal(first.args[4], undefined)
+    assert.equal(first.args[5], undefined)
+    assert.deepEqual(plain(first.args[6]), [{ id: skill.id }])
+    assert.ok(String(first.args[2]).includes('[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]'))
+    assert.ok(String(first.args[2]).includes(translationSkill.instructions))
+    h.calls.length = 0
+    h.setSessionMessages([{ role: 'user', text: 'previous' }])
+    await h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue'])
+    assert.equal(h.calls.find(call => call.method === 'prompt')!.args.length, 4)
+    assert.equal(lookups, 1)
+  }
+})
+
+test('Android translation preserves the legacy prompt call when native skill lookup misses or fails', async () => {
+  for (const fail of [false, true]) {
+    const h = await harness()
+    h.setAndroidTranslationReader(async () => ({ skill: translationSkill }))
+    h.setSkillsReader(async () => {
+      if (fail) throw new Error('SKILLS_UNAVAILABLE')
+      return [{ id: 'unrelated', name: 'Other skill' }]
+    })
+    await h.dispatch('androidTranslationPrompt', ['p', undefined, 'Translate'])
+    const prompt = h.calls.find(call => call.method === 'prompt')!
+    assert.equal(prompt.args.length, 4)
+    assert.ok(String(prompt.args[2]).includes(translationSkill.instructions))
+  }
+})
+
 test('translation followups keep their initial model despite configuration/default changes and never leak it to regular Chat', async () => {
   const h = await harness()
   const defaultModel = { id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }
@@ -2152,6 +2212,7 @@ test('preload forwards all new methods, optional arguments, return values and re
   assert.ok(api)
   const methods = api as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
   for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples, ...buildNotesExamples,
+    { method: 'openExternal', args: ['https://example.com/answer'] },
     { method: 'confirmProjectRemoval', args: ['p', ['visible.txt', 'hidden.txt']] },
     { method: 'removeProject', args: ['p'] },
     { method: 'removeProject', args: ['p', randomUUID()] },

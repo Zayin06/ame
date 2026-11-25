@@ -5,7 +5,7 @@ import type { Connection, DebugSessionSnapshot, LspDiagnostic, GitState, Model, 
 import { petSessions } from './pet-sessions'
 import { activateTab, defaults, dirty, documentID, languageFor, parsePreferences, projectDirtyPaths, reconcileDocument, removeTab, savedDocument, selectedTab, tabID, withoutKey, withoutProject, withoutProjectDocuments, type Buffer, type Pane, type Preferences, type ProjectView, type Tab } from './state'
 import { diffID } from './state'
-import type { DiffTarget } from '../../../../packages/protocol/src/index'
+import type { DiffContent, DiffTarget } from '../../../../packages/protocol/src/index'
 import { Icon } from './components/Icon'
 import { ProjectRail } from './components/ProjectRail'
 import type { CSSProperties } from 'react'
@@ -13,7 +13,7 @@ import { Chat } from './components/Chat'
 import { AndroidTranslationModal } from './components/AndroidTranslationModal'
 import type { ModelLevels } from './model-selection'
 import { EditorStage, type EditorStatus } from './components/EditorStage'
-import { disposeOrphanedFileModels } from './editor-model-lifecycle'
+import { disposeOrphanedFileModels, reconcileDiffResources } from './editor-model-lifecycle'
 import { editor as monacoEditor, Uri as MonacoUri } from 'monaco-editor'
 import { QuickOpen } from './components/QuickOpen'
 import { UsagePanel } from './components/UsagePanel'
@@ -71,7 +71,15 @@ export function App() {
     readErrorsRef.current = update(readErrorsRef.current)
     setReadErrors(readErrorsRef.current)
   }, [])
-  const [diffs, setDiffs] = useState<Record<string, { original: string; modified: string }>>({})
+  const [diffs, setDiffs] = useState<Record<string, DiffContent>>({})
+  const previousViews = useRef(preferences.projects)
+  useEffect(() => {
+    const previous = previousViews.current
+    previousViews.current = preferences.projects
+    // Keep disposal outside the state updater (which React may replay).
+    reconcileDiffResources({ editor: monacoEditor, Uri: MonacoUri }, previous, preferences.projects, {})
+    setDiffs(current => reconcileDiffResources({ editor: monacoEditor, Uri: MonacoUri }, {}, preferences.projects, current))
+  }, [preferences.projects])
   const [gitCache, setGitCache] = useState<Record<string, GitState>>({})
   const [accountRole, setAccountRole] = useState('')
   const [accountDefaultModel, setAccountDefaultModel] = useState('')

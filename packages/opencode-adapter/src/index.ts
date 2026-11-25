@@ -1,4 +1,4 @@
-import { OpenCode, type ArtifactInfo, type OpenCodeClient, type OpenCodeEvent, type SessionInfo, type SessionMessageInfo } from '@opencode/client'
+import { OpenCode, type ArtifactInfo, type OpenCodeClient, type OpenCodeEvent, type SessionInfo, type SessionMessageInfo, type SessionStructuredError } from '@opencode/client'
 import { Service } from '@opencode/client/service'
 import { permissionRules, permissionModeFromSession } from './permission-mode'
 import { sessionFormAnswerSchema, sessionFormKeySchema, type SessionForm, type SessionFormAnswer } from '../../protocol/src/session-form'
@@ -43,10 +43,15 @@ function extractToolDiffs(message: SessionMessageInfo, projectRoot: string): Ses
     })
   })
 }
+function sessionErrorMessage(error?: SessionStructuredError): string {
+  return error?.message || error?.type || 'Phiên thực thi gặp lỗi.'
+}
 export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
   let execution: { opener: string; files: Set<string>; startedAt?: number; lastAssistant?: ChatItem } | undefined
+  let lastItem: ChatItem | undefined
   return messages.flatMap<ChatItem>(message => {
     if (message.type === 'user') {
+      lastItem = undefined
       execution ??= { opener: message.id, files: new Set(), startedAt: message.time?.created }
       const attachments: ChatAttachment[] = 'files' in message && Array.isArray(message.files) && message.files.length
         ? message.files.map(file => {
@@ -63,13 +68,24 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
         }) : []
       return [{ id: message.id, role: 'user', text: message.text, ...(attachments.length ? { attachments } : {}), ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }]
     }
+    if (message.type === 'compaction' && message.status === 'failed') {
+      lastItem = { id: `${message.id}:error`, role: 'assistant', kind: 'error', text: sessionErrorMessage(message.error), ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }
+      return [lastItem]
+    }
     if (message.type === 'idle') {
       if (execution?.lastAssistant && execution.startedAt !== undefined && message.time?.created !== undefined && message.time.created >= execution.startedAt) {
         execution.lastAssistant.workedMs = message.time.created - execution.startedAt
       }
       const turn = execution
       execution = undefined
-      return turn?.files.size ? [{ id: `${message.id}:changes`, role: 'assistant', kind: 'changes', text: '', turn: { from: turn.opener, files: [...turn.files].sort() } }] : []
+      const items: ChatItem[] = []
+      if (message.outcome === 'failed' && 'error' in message && message.error) {
+        const text = sessionErrorMessage(message.error)
+        if (lastItem?.kind !== 'error' || lastItem.text !== text) items.push({ id: `${message.id}:error`, role: 'assistant', kind: 'error', text, ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) })
+      }
+      if (turn?.files.size) items.push({ id: `${message.id}:changes`, role: 'assistant', kind: 'changes', text: '', turn: { from: turn.opener, files: [...turn.files].sort() } })
+      lastItem = undefined
+      return items
     }
     if (message.type !== 'assistant') return []
     message.snapshot?.files?.forEach(file => execution?.files.add(file))
@@ -81,12 +97,12 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
         if (entry && typeof entry === 'object' && !Array.isArray(entry) && typeof entry.file === 'string' && entry.file.trim()) execution?.files.add(entry.file.replace(/\\/g, '/'))
       }
     }
+    const time = {
+      ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}),
+      ...(message.time?.completed !== undefined ? { completedAt: message.time.completed } : {}),
+    }
     const items = message.content.map((part, i): ChatItem => {
       const id = `${message.id}:${i}`
-      const time = {
-        ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}),
-        ...(message.time?.completed !== undefined ? { completedAt: message.time.completed } : {}),
-      }
       if (part.type !== 'tool') return {
         id, role: 'assistant', kind: part.type, text: part.text, ...time,
         ...(part.type === 'text' && (part.native?.phase === 'commentary' || part.native?.phase === 'final_answer') ? { phase: part.native.phase } : {}),
@@ -113,6 +129,8 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
       }
       return { id, role: 'assistant', kind: 'tool', text: `${part.name} · ${part.state.status}`, tool, ...time }
     })
+    if (message.error) items.push({ id: `${message.id}:error`, role: 'assistant', kind: 'error', text: sessionErrorMessage(message.error), ...time })
+    if (items.length) lastItem = items[items.length - 1]
     if (execution && items.length) execution.lastAssistant = items[items.length - 1]
     return items
   })
@@ -217,22 +235,36 @@ export class OpenCodeAdapter {
       if (cursor && cursors.has(cursor)) throw new Error('SESSION_CURSOR_REPEATED')
       if (cursor) cursors.add(cursor)
     } while (cursor)
+    const running = [...sessions.values()].filter(s => s.status === 'running')
+    if (running.length) {
+      const current = new Map(running.map(s => [s.id, this.activity.executionCheckpoint(s.id)]))
+      try {
+        const active = await this.api().session.active({ signal: AbortSignal.timeout(8000) })
+        // Older servers/mocks may not expose this endpoint or may return another payload.
+        if (active && typeof active === 'object' && !Array.isArray(active) && Object.values(active).every(value => value && typeof value === 'object' && !Array.isArray(value) && value.type === 'running')) {
+          for (const s of running) if (!Object.hasOwn(active, s.id) && current.get(s.id)!()) this.activity.idle(s.id, s.busyAt, s.idleAt)
+        }
+      } catch { /* Keep persisted status when live execution state is unavailable. */ }
+    }
     // Recover pending prompts and active tools after attaching/reconnecting (SSE has no replay).
-    const recover = [...sessions.values()].filter(s => s.status === 'running' && !this.activity.has(s.id))
+    const recover = [...sessions.values()].filter(s => this.activity.map(s).status === 'running' && (['permissions', 'forms', 'tools'] as const).some(kind => this.activity.needsRecovery(s.id, kind)))
     let next = 0
     await Promise.all(Array.from({ length: Math.min(6, recover.length) }, async () => {
       while (next < recover.length) {
         const s = recover[next++]
         const options = { signal: AbortSignal.timeout(8000) }
+        const permissionsCurrent = this.activity.checkpoint(s.id, 'permissions')
+        const formsCurrent = this.activity.checkpoint(s.id, 'forms')
+        const toolsCurrent = this.activity.checkpoint(s.id, 'tools')
         const [permissions, forms, messages] = await Promise.allSettled([
-          this.api().permission.list({ sessionID: s.id }, options), this.api().session.form.list({ sessionID: s.id }, options),
-          this.api().message.list({ sessionID: s.id, limit: 1, order: 'desc', type: 'assistant' }, options),
+          this.activity.needsRecovery(s.id, 'permissions') ? this.api().permission.list({ sessionID: s.id }, options) : undefined,
+          this.activity.needsRecovery(s.id, 'forms') ? this.api().session.form.list({ sessionID: s.id }, options) : undefined,
+          this.activity.needsRecovery(s.id, 'tools') ? this.api().message.list({ sessionID: s.id, limit: 1, order: 'desc', type: 'assistant' }, options) : undefined,
         ])
-        // Do not overwrite SSE that arrived while the snapshot requests were in flight.
-        if (this.activity.has(s.id)) continue
-        if (permissions.status === 'fulfilled') this.activity.pending(s.id, 'permissions', permissions.value.map(p => p.id))
-        if (forms.status === 'fulfilled') this.activity.pending(s.id, 'forms', forms.value.filter(f => f.sessionID === s.id).map(f => f.id))
-        if (messages.status === 'fulfilled') {
+        // Each snapshot only yields to newer updates for its own data, including reconnects.
+        if (permissions.status === 'fulfilled' && permissions.value && permissionsCurrent()) this.activity.pending(s.id, 'permissions', permissions.value.map(p => p.id))
+        if (forms.status === 'fulfilled' && forms.value && formsCurrent()) this.activity.pending(s.id, 'forms', forms.value.filter(f => f.sessionID === s.id).map(f => f.id))
+        if (messages.status === 'fulfilled' && messages.value && toolsCurrent()) {
           const message = messages.value.data[0]
           const parts = message?.type === 'assistant' && message.time?.completed === undefined ? message.content : []
           this.activity.snapshot(s.id, parts.flatMap(p => p.type === 'tool' && p.state.status === 'running' ? [`${message.id}:${p.id}`] : []), parts.at(-1)?.type === 'text' ? 'working' : 'thinking')
@@ -469,26 +501,35 @@ export class OpenCodeAdapter {
     const list = await this.api().agent.list({ location: { directory: this.directory(projectID) } })
     return list.data.filter(a => !a.hidden && a.mode !== 'subagent').map(a => ({ id: a.id, name: a.name }))
   }
-  async prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string, files?: PromptFileAttachment[]) {
+  async prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string, files?: PromptFileAttachment[], skills?: { id: string }[]) {
     await this.owned(projectID, sessionID)
     if (!(text.trim().length > 0 || (Array.isArray(files) && files.length > 0)) || text.length > 200000) throw new Error('INVALID_PROMPT')
     if (!model) throw new Error('SELECT_MODEL_REQUIRED')
     const mappedFiles = (files ?? []).slice(0, MAX_PROMPT_FILES).map(file => ({ uri: file.uri, ...(file.name ? { name: file.name } : {}), ...(file.source ? { source: file.source } : {}) }))
     await this.api().session.switchModel({ sessionID, model: { id: model.id, providerID: model.providerID } })
     if (agent) await this.api().session.switchAgent({ sessionID, agent })
-    await this.api().session.prompt({ sessionID, text: text.trim() ? text : '(Đính kèm tệp)', ...(mappedFiles.length ? { files: mappedFiles } : {}) })
+    await this.api().session.prompt({ sessionID, text: text.trim() ? text : '(Đính kèm tệp)', ...(mappedFiles.length ? { files: mappedFiles } : {}), ...(skills?.length ? { skills } : {}) })
   }
-  async cancel(projectID: string, sessionID: string) { await this.owned(projectID, sessionID); await this.api().session.interrupt({ sessionID }) }
+  async cancel(projectID: string, sessionID: string) {
+    const session = await this.owned(projectID, sessionID)
+    const result = await this.api().session.interrupt({ sessionID })
+    if (result.interrupted === false) {
+      this.activity.idle(sessionID, session.time?.busy, session.time?.idle)
+      this.notify({ type: 'opencode', projectID, sessionID })
+    }
+  }
   async permissions(projectID: string, sessionID: string) {
     await this.owned(projectID, sessionID)
+    const current = this.activity.checkpoint(sessionID, 'permissions')
     const permissions = await this.api().permission.list({ sessionID })
-    this.activity.pending(sessionID, 'permissions', permissions.map(p => p.id))
+    if (current()) this.activity.pending(sessionID, 'permissions', permissions.map(p => p.id))
     return permissions.map(p => ({ id: p.id, sessionID: p.sessionID, title: `${p.action}: ${p.resources.join(', ')}${p.message ? '\n' + p.message : ''}` }))
   }
   async forms(projectID: string, sessionID: string): Promise<SessionForm[]> {
     await this.owned(projectID, sessionID)
+    const current = this.activity.checkpoint(sessionID, 'forms')
     const forms = (await this.api().session.form.list({ sessionID })).filter(form => form.sessionID === sessionID)
-    this.activity.pending(sessionID, 'forms', forms.map(f => f.id))
+    if (current()) this.activity.pending(sessionID, 'forms', forms.map(f => f.id))
     return forms.map(form => ({
       id: form.id, sessionID: form.sessionID, title: form.title,
       fields: form.fields.map(field => {

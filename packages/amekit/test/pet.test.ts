@@ -8,7 +8,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { runInNewContext } from "node:vm"
 import ts from "typescript"
-import { defaultPetPreferences, loadPetSprite, PetActivity, petBounds, petHtml, petScale, type PetSession } from "../src/pet"
+import { defaultPetPreferences, loadPetSprite, PetActivity, petBounds, petHtml, petScale, petSpriteCss, type PetSession } from "../src/pet"
 import { petBubbleBounds, petPalette, defaultPetPalette } from "../src/pet-appearance"
 import { dialoguePrompt, localDialogue, parseDialogue, PetSpeech, petBubbleHtml } from "../src/pet-dialogue"
 import { petChime } from "../src/pet-chime"
@@ -141,17 +141,21 @@ class MockWindow extends EventEmitter {
   static windows: MockWindow[] = []
   destroyed = false; shown = false; ignoreMouse = false; scripts: string[] = []; url = ""
   bounds = { x: 0, y: 0, width: 48, height: 52 }
+  minimumSize = [0, 0]; maximumSize = [0, 0]; positionCalls = 0
+  sizeLocks: { kind: string; size: number[] }[] = []
   webContents = Object.assign(new EventEmitter(), {
     mainFrame: {},
     setWindowOpenHandler: (handler: () => { action: string }) => { this.openHandler = handler },
     executeJavaScript: async (code: string) => { this.scripts.push(code); return code.includes("getBoundingClientRect") ? 92 : undefined },
   })
   openHandler?: () => { action: string }
-  constructor(readonly options: Record<string, any>) { super(); this.bounds = { ...this.bounds, ...Object.fromEntries(Object.entries(options).filter(([key]) => ["x", "y", "width", "height"].includes(key))) }; MockWindow.windows.push(this) }
+  constructor(readonly options: Record<string, any>) { super(); this.bounds = { ...this.bounds, ...Object.fromEntries(Object.entries(options).filter(([key]) => ["x", "y", "width", "height"].includes(key))) }; this.minimumSize = [options.minWidth ?? 0, options.minHeight ?? 0]; this.maximumSize = [options.maxWidth ?? 0, options.maxHeight ?? 0]; MockWindow.windows.push(this) }
   isDestroyed() { return this.destroyed }
   getBounds() { return { ...this.bounds } }
   setBounds(bounds: typeof this.bounds) { this.bounds = bounds; this.emit("moved") }
-  setPosition(x: number, y: number) { this.bounds = { ...this.bounds, x, y }; this.emit("moved") }
+  setMinimumSize(width: number, height: number) { this.minimumSize = [width, height]; this.sizeLocks.push({ kind: "min", size: [width, height] }) }
+  setMaximumSize(width: number, height: number) { this.maximumSize = [width, height]; this.sizeLocks.push({ kind: "max", size: [width, height] }) }
+  setPosition(x: number, y: number) { this.positionCalls++; this.bounds = { x, y, width: this.bounds.width + 1, height: this.bounds.height + 1 }; this.emit("moved") }
   async loadURL(url: string) { this.url = url }
   showInactive() { this.shown = true }
   setIgnoreMouseEvents(value: boolean) { this.ignoreMouse = value }
@@ -203,6 +207,54 @@ test("pet short click reveals, restores and focuses the main window; dragging ne
   assert.deepEqual(saved.preferences.position, { x: origin.x + 100, y: origin.y + 30 })
   pointer("down"); pointer("up"); assert.deepEqual(calls, [])
   setMain(false)
+})
+
+test("pet drag and native DPI drift keep canonical size and locks across moves, scales and displays", async t => {
+  const { host, setCursor, screen } = await fixture(t)
+  await host.init(); await flush()
+  const pet = MockWindow.windows[0], origin = pet.getBounds()
+  assert.deepEqual([pet.options.minWidth, pet.options.maxWidth, pet.options.minHeight, pet.options.maxHeight], [48, 48, 52, 52])
+  let expected = [48, 52], boundsCalls = 0
+  const setBounds = pet.setBounds.bind(pet)
+  pet.setBounds = target => {
+    boundsCalls++
+    assert.deepEqual([target.width, target.height], expected)
+    assert.deepEqual(pet.minimumSize, expected)
+    assert.deepEqual(pet.maximumSize, expected)
+    setBounds(target) // Synchronous moved events also exercise the recursion guard.
+  }
+  const pointer = (phase: string) => pet.webContents.emit("ipc-message", { senderFrame: pet.webContents.mainFrame }, "ame:pet-pointer", phase)
+  pointer("down")
+  for (let i = 1; i <= 100; i++) {
+    setCursor(100 + i * 5 + 0.25, 100 - i * 3 + 0.75); pointer("move")
+    assert.deepEqual(pet.getBounds(), { x: Math.round(origin.x + i * 5 + 0.25), y: Math.round(origin.y - i * 3 + 0.75), width: 48, height: 52 })
+    for (const event of ["moved", "resized"]) {
+      const before = pet.getBounds(), calls = boundsCalls
+      pet.bounds = { ...before, width: before.width + 1, height: before.height + 2 }
+      pet.emit(event)
+      assert.deepEqual(pet.getBounds(), before)
+      assert.equal(boundsCalls, calls + 1)
+    }
+  }
+  pointer("up")
+  assert.equal(pet.positionCalls, 0)
+  assert.ok(pet.sizeLocks.length > 0)
+  assert.ok(pet.sizeLocks.every(lock => lock.size[0] === 48 && lock.size[1] === 52))
+  for (const scale of [0.5, 1, 0.25]) {
+    expected = [Math.round(192 * scale), Math.round(208 * scale)]
+    await host.configure({ scale })
+    assert.deepEqual([pet.bounds.width, pet.bounds.height], expected)
+    pet.bounds.width++; pet.bounds.height++
+    screen.emit("display-metrics-changed")
+    assert.deepEqual([pet.bounds.width, pet.bounds.height], expected)
+    assert.deepEqual(pet.minimumSize, expected); assert.deepEqual(pet.maximumSize, expected)
+  }
+})
+
+test("sprite fits both viewport dimensions without stretching its aspect ratio", () => {
+  assert.match(petSpriteCss, /width:min\(100%,calc\(100vh \* 192 \/ 208\)\)/)
+  assert.match(petSpriteCss, /height:auto;aspect-ratio:192 \/ 208;max-width:100%;max-height:100%;margin:auto/)
+  assert.ok(petHtml().includes(petSpriteCss))
 })
 
 test("completion outcome arriving after idle triggers exactly once", () => {
@@ -272,11 +324,12 @@ test("sandbox pet preload captures only trusted primary gestures without exposin
   assert.doesNotMatch(petHtml(), /app-region:drag|<script/)
 })
 
-test("host defaults off; lifecycle, secure windows, speech, displays and drag persistence", async t => {
+test("host defaults on; lifecycle, secure windows, speech, displays and drag persistence", async t => {
   let notifications = 0
   const { host, userData, screen, setMain } = await fixture(t, { onStateChanged: () => { notifications++ } })
-  assert.equal((await host.init()).preferences.enabled, false); assert.equal(MockWindow.windows.length, 0)
-  await host.configure({ enabled: true }); await flush()
+  assert.deepEqual(defaultPetPreferences, { enabled: true, scale: 0.25, position: null })
+  assert.equal((await host.init()).preferences.enabled, true); assert.equal(MockWindow.windows.length, 1)
+  await flush()
   const pet = MockWindow.windows[0]
   assert.equal(pet.shown, true); assert.equal(pet.options.transparent, true)
   for (const key of ["frame", "hasShadow", "focusable", "resizable"]) assert.equal(pet.options[key], false)
@@ -349,6 +402,31 @@ test("host recovers corrupt JSON/schema and persists preferences across restarts
     assert.equal(next.state().preferences.scale, 0.5)
     next.dispose()
   }
+})
+
+test("explicit defaultEnabled false stays off until enabled", async t => {
+  const { host } = await fixture(t, { defaultEnabled: false })
+  assert.equal((await host.init()).preferences.enabled, false)
+  assert.equal(MockWindow.windows.length, 0)
+  await host.configure({ enabled: true }); await flush()
+  assert.equal(MockWindow.windows.length, 1)
+})
+
+test("saved disabled preference overrides the new enabled default", async t => {
+  const { host, userData } = await fixture(t, { defaultEnabled: true })
+  await writeFile(join(userData, "desktop-pet.json"), JSON.stringify({ preferences: { enabled: false, scale: 0.5, position: { x: 20, y: 30 } }, speech: { enabled: true, sound: false }, cache: null }))
+  assert.deepEqual((await host.init()).preferences, { enabled: false, scale: 0.5, position: { x: 20, y: 30 } })
+  assert.equal(MockWindow.windows.length, 0)
+})
+
+test("default enabled pet waits for a main window", async t => {
+  const { host, setMain } = await fixture(t)
+  setMain(false)
+  assert.equal((await host.init()).preferences.enabled, true)
+  assert.equal(MockWindow.windows.length, 0)
+  setMain(true); host.reconcile(); await flush()
+  assert.equal(MockWindow.windows.length, 1)
+  assert.equal(MockWindow.windows[0].shown, true)
 })
 
 test("host handles renderer crashes and explicit defaultEnabled", async t => {

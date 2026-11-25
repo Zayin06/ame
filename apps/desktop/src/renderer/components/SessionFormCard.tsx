@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import type { SessionForm, SessionFormAnswer, SessionFormField } from '../../../../../packages/protocol/src/index'
-import { sessionFormAnswerSchema } from '../../../../../packages/protocol/src/session-form'
+import { normalizeFormNumber, sessionFormAnswerSchema } from '../../../../../packages/protocol/src/session-form'
 import { errorText } from './Primitives'
 
 export function visibleFormField(field: SessionFormField, answer: SessionFormAnswer): boolean {
@@ -8,16 +8,22 @@ export function visibleFormField(field: SessionFormField, answer: SessionFormAns
 }
 
 export function initialFormAnswer(form: SessionForm): SessionFormAnswer {
-  return Object.fromEntries(form.fields.flatMap(field => 'default' in field && field.default !== undefined ? [[field.key, field.default]] : [])) as SessionFormAnswer
+  return Object.fromEntries(form.fields.flatMap(field => {
+    if (!('default' in field)) return []
+    const value = field.type === 'number' || field.type === 'integer' ? normalizeFormNumber(field.default, field.type) : field.default
+    return value === undefined ? [] : [[field.key, value]]
+  })) as SessionFormAnswer
 }
 
 export function validateFormAnswer(form: SessionForm, answer: SessionFormAnswer): SessionFormAnswer {
   const result: SessionFormAnswer = Object.create(null)
   for (const field of form.fields) {
     if (!visibleFormField(field, answer) || field.type === 'external') continue
-    const value = answer[field.key]
+    const raw = answer[field.key]
+    const value = field.type === 'number' || field.type === 'integer' ? normalizeFormNumber(raw, field.type) : raw
     const missing = value === undefined || typeof value === 'string' && !value.trim() || Array.isArray(value) && !value.length
     const fail = () => { throw new Error(`Vui lòng kiểm tra câu trả lời: ${field.title || field.key}`) }
+    if (value === undefined && raw !== undefined && !(typeof raw === 'string' && !raw.trim())) fail()
     if (missing) { if (field.required) fail(); else continue }
     if (field.type === 'string') {
       if (typeof value !== 'string') fail()
@@ -30,7 +36,7 @@ export function validateFormAnswer(form: SessionForm, answer: SessionFormAnswer)
       if (Array.isArray(value) && !field.custom && value.some(entry => !field.options.some(option => option.value === entry))) fail()
     } else if (field.type === 'boolean') { if (typeof value !== 'boolean') fail() }
     else if (typeof value !== 'number' || !Number.isFinite(value) || field.type === 'integer' && !Number.isInteger(value) || value < Number(field.minimum ?? -Infinity) || value > Number(field.maximum ?? Infinity)) fail()
-    result[field.key] = value
+    result[field.key] = value!
   }
   return sessionFormAnswerSchema.parse(result)
 }
@@ -39,6 +45,7 @@ export function SessionFormCard({ projectID, form, disabled = false, onResolved 
   const [answer, setAnswer] = useState<SessionFormAnswer>(() => initialFormAnswer(form))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [copied, setCopied] = useState('')
   const inFlight = useRef(false)
   const set = (key: string, value: SessionFormAnswer[string] | undefined) => setAnswer(current => {
     const next = { ...current }; if (value === undefined) delete next[key]; else Object.defineProperty(next, key, { value, enumerable: true, configurable: true, writable: true }); return next
@@ -72,7 +79,11 @@ export function SessionFormCard({ projectID, form, disabled = false, onResolved 
           {field.type === 'multiselect' && Array.isArray(value) && value.filter(entry => !field.options.some(option => option.value === entry)).map(entry => <button type="button" key={entry} onClick={() => set(field.key, value.filter(item => item !== entry))}>{entry} ×</button>)}
           {field.type === 'boolean' && <input id={`${form.id}-${field.key}`} aria-label={label} type="checkbox" checked={value === true} onChange={event => set(field.key, event.target.checked)} />}
           {(field.type === 'number' || field.type === 'integer') && <input id={`${form.id}-${field.key}`} aria-label={label} type="number" step={field.type === 'integer' ? 1 : 'any'} min={typeof field.minimum === 'number' ? field.minimum : undefined} max={typeof field.maximum === 'number' ? field.maximum : undefined} value={typeof value === 'number' ? value : ''} onChange={event => set(field.key, event.target.value === '' ? undefined : event.target.valueAsNumber)} />}
-          {field.type === 'external' && (/^https?:\/\//i.test(field.url) ? <a href={field.url} target="_blank" rel="noreferrer">Mở trang trả lời</a> : <p>Không thể mở liên kết này. Bạn có thể hủy câu hỏi.</p>)}
+          {field.type === 'external' && (/^https?:\/\//i.test(field.url) ? <div className="button-row">
+            <button type="button" onClick={async () => { try { await window.ame.openExternal(field.url) } catch (e) { setError(errorText(e)) } }}>Mở trang trả lời</button>
+            <button type="button" onClick={async () => { setCopied(''); try { await navigator.clipboard.writeText(field.url); setCopied(field.key) } catch (e) { setError(errorText(e)) } }}>Sao chép liên kết</button>
+            {copied === field.key && <span role="status">Đã sao chép</span>}
+          </div> : <p>Không thể mở liên kết này. Bạn có thể hủy câu hỏi.</p>)}
         </div>
       })}
     </fieldset>

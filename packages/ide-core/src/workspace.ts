@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, watch, type FSWatcher } from 'node:fs'
-import { readFile, readdir, realpath, stat, lstat, writeFile, mkdir } from 'node:fs/promises'
+import { readFile, readdir, realpath, stat, lstat, writeFile, mkdir, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { simpleGit } from 'simple-git'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { diffContent, diffPreviewLimit, readDiffSide, type DiffSide } from './diff-content'
 import type { BuildNotesRequest, Project, FileDocument, FileEntry, GitState, GitBranches, GitCommitOptions, GitPushOptions, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
 import * as workspaceFs from './workspace-fs'
 import { searchWorkspace, replaceInWorkspace } from './search'
@@ -55,14 +58,25 @@ export class Workspaces {
   }
   async remove(id: string): Promise<void> {
     this.get(id)
+    await this.writeProjectsAtomic(this.list().filter(project => project.id !== id))
     clearTimeout(this.watchTimers.get(id))
     this.watchTimers.delete(id)
     this.watchers.get(id)?.close()
     this.watchers.delete(id)
     this.projects.delete(id)
     this.fileBoms.delete(id)
+  }
+  private async writeProjectsAtomic(projects: Project[]): Promise<void> {
     await mkdir(path.dirname(this.storage), { recursive: true })
-    await writeFile(this.storage, JSON.stringify(this.list()), 'utf8')
+    const temporary = `${this.storage}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporary, JSON.stringify(projects), { encoding: 'utf8', flag: 'wx' })
+      // Never unlink the destination: failed replacement must preserve stored projects.
+      await rename(temporary, this.storage)
+    } catch (error) {
+      await unlink(temporary).catch(() => {})
+      throw error
+    }
   }
   get(id: string) { const project = this.projects.get(id); if (!project) throw new Error('UNKNOWN_PROJECT'); return project }
   async resolve(id: string, relative: string): Promise<string> {
@@ -279,30 +293,45 @@ export class Workspaces {
     const git = this.git(id)
     if (target && (!['staged', 'working', 'commit'].includes(target.kind) || (target.kind === 'commit' && !/^[a-f0-9]{7,40}$/i.test(target.commit)))) throw new Error('INVALID_DIFF_TARGET')
     // A missing path is an empty side; a failed read of an existing blob is not.
-    const blob = async (ref: string) => {
-      try { return await git.raw(['cat-file', 'blob', `${ref}:./${file}`]) } catch {
+    const empty: DiffSide = { content: '', size: 0 }
+    const blob = async (ref: string): Promise<DiffSide> => {
+      const spec = `${ref}:./${file}`
+      let size: number
+      try { size = Number((await git.raw(['cat-file', '-s', spec])).trim()) } catch {
         const tracked = await git.raw(ref === ''
           ? ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', file]
           : ['--literal-pathspecs', 'ls-tree', '-r', '--name-only', '-z', ref, '--', file])
         if (tracked) throw new Error('GIT_DIFF_READ_FAILED')
-        return ''
+        return empty
       }
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error('GIT_DIFF_READ_FAILED')
+      return readDiffSide(size, async () => {
+        const { stdout } = await promisify(execFile)('git', ['cat-file', '-p', spec], {
+          cwd: this.get(id).directory, encoding: 'buffer', maxBuffer: diffPreviewLimit + 1, timeout: 10000,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' },
+        })
+        return stdout
+      })
     }
     if (target?.kind === 'commit') {
       // Resolve once, validating existence and distinguishing root commits from read errors.
       const hash = (await git.raw(['rev-parse', '--verify', `${target.commit}^{commit}`])).trim()
       const parents = (await git.raw(['rev-list', '--parents', '-n', '1', hash])).trim().split(/\s+/)
-      return { original: parents[1] ? await blob(`${hash}^`) : '', modified: await blob(hash) }
+      return diffContent(parents[1] ? await blob(`${hash}^`) : empty, await blob(hash))
     }
     const head = async () => {
       const exists = await git.raw(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false)
-      return exists ? blob('HEAD') : ''
+      return exists ? blob('HEAD') : empty
     }
-    if (target?.kind === 'staged') return { original: await head(), modified: await blob('') }
+    if (target?.kind === 'staged') return diffContent(await head(), await blob(''))
     const original = target?.kind === 'working' ? await blob('') : await head()
-    let modified = ''
-    try { modified = (await this.read(id, relative)).content } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-    return { original, modified }
+    let modified = empty
+    try {
+      const disk = await this.resolve(id, relative), info = await stat(disk)
+      if (info.isDirectory()) throw new Error('IS_DIRECTORY')
+      modified = await readDiffSide(info.size, () => readFile(disk))
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    return diffContent(original, modified)
   }
   async stage(id: string, relative: string, staged: boolean) {
     const file = await this.gitPath(id, relative)

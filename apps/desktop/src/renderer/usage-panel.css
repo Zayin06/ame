@@ -29,7 +29,7 @@
 .usage-header, .usage-node-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .usage-header > div, .usage-node-header h3 { flex: 1; min-width: 100px; }
 .usage-header p, .usage-origin, .usage-empty, .usage-panel footer { color: var(--text-secondary); }
-.usage-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.usage-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
 .usage-kpi {
   display: flex;
   flex-direction: column;
@@ -42,6 +42,12 @@
 }
 .usage-kpi > span:first-child, .usage-kpi small, .usage-token-breakdown, .usage-group small { color: var(--text-secondary); font-size: 12px; }
 .usage-kpi > strong { font-size: 16px; font-variant-numeric: tabular-nums; }
+.usage-cache-hit { color: var(--usage-cache-color, var(--text-secondary, inherit)); font-variant-numeric: tabular-nums; }
+.usage-cache-hit-good { --usage-cache-color: var(--success, var(--text-primary, inherit)); --usage-cache-bg: var(--success-soft, transparent); }
+.usage-cache-hit-warn { --usage-cache-color: var(--warning, var(--text-primary, inherit)); --usage-cache-bg: var(--warning-soft, transparent); }
+.usage-cache-hit-low { --usage-cache-color: var(--danger, var(--text-primary, inherit)); --usage-cache-bg: var(--danger-soft, transparent); }
+.usage-cache-badge { align-self: flex-start; display: inline-block; padding: 2px 7px; border-radius: var(--radius-pill, 999px); background: var(--usage-cache-bg, var(--bg-elevated, transparent)); font-size: 11px; }
+.usage-node-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
 .usage-notice, .usage-error { padding: 10px 12px; border-radius: var(--radius-sm); }
 .usage-notice { color: var(--warning); background: var(--warning-soft); }
 .usage-error { color: var(--danger); background: var(--danger-soft); }
@@ -67,6 +73,6 @@
 .usage-panel footer { font-size: 11px; }
 @media (max-width: 1000px) { .usage-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 480px) { .usage-kpis { grid-template-columns: minmax(0, 1fr); } .usage-panel { padding: 10px; } }
-@container (min-width: 621px) { .usage-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-@container (max-width: 620px) { .usage-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@container (min-width: 821px) { .usage-kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+@container (max-width: 820px) { .usage-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @container (max-width: 320px) { .usage-kpis { grid-template-columns: minmax(0, 1fr); } }

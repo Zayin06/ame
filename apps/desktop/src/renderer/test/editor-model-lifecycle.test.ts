@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { closeTabInGroup, createSplitState, splitRight } from '../editor-split'
-import { disposeOrphanedFileModels, modelUri, synchronizeCleanFileModel } from '../editor-model-lifecycle'
-import type { Tab } from '../state'
+import { disposeDiffModels, disposeProjectModels, disposeOrphanedFileModels, modelUri, reconcileDiffResources, synchronizeCleanFileModel } from '../editor-model-lifecycle'
+import { diffID, tabID, type ProjectView, type Tab } from '../state'
 
 // Small structural Monaco double: setValue resets undo, while an editor edit
 // appends to it. This catches accidental resets when mounting a second pane.
@@ -116,4 +116,34 @@ test('URI identity handles separators and reserved characters without cross-proj
   retained.uri.toString = () => serializeUri(modelUri('p', 'src/a.ts'))
   disposeOrphanedFileModels([retained], [{ projectID: 'p', path: 'src\\a.ts' }], serializeUri)
   assert.equal(retained.isDisposed(), false)
+})
+
+test('closing successive commit diffs releases both models and cache only after the last owner closes', () => {
+  const tabs: Tab[] = ['abcdef1', 'abcdef2', 'abcdef3'].map(commit => ({ path: 'src/a #%.ts', mode: 'diff', target: { kind: 'commit', commit } }))
+  const project = 'a/b #%', models = tabs.flatMap(tab => ['original', 'modified'].map(mode => new Model('version', modelUri(project, tabID(tab), mode))))
+  const api = { editor: { getModels: () => models }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } }
+  let views: Record<string, ProjectView> = { [project]: { tabs: [...tabs, tabs[0]] } }
+  let cache = Object.fromEntries(tabs.map(tab => [diffID(project, tab), { original: 'old', modified: 'new' }]))
+  let next = { [project]: { tabs: [...tabs] } }
+  cache = reconcileDiffResources(api, views, next, cache); views = next
+  assert.equal(models.filter(model => !model.disposed).length, 6)
+  assert.equal(Object.keys(cache).length, 3)
+  for (const [index, tab] of tabs.entries()) {
+    next = { [project]: { tabs: views[project].tabs.filter(item => tabID(item) !== tabID(tab)) } }
+    cache = reconcileDiffResources(api, views, next, cache); views = next
+    assert.equal(models.filter(model => !model.disposed).length, (2 - index) * 2)
+    assert.equal(Object.keys(cache).length, 2 - index)
+    disposeDiffModels(api, project, tabID(tab)) // idempotent
+  }
+})
+
+test('removing a project disposes all its models, not another project or foreign models', () => {
+  const models = ['file', 'original', 'modified', 'head'].map(mode => new Model('text', modelUri('p', 'path', mode)))
+  const other = new Model('other', modelUri('pp', 'path')), foreign = new Model('foreign', 'file:///path')
+  models.push(other, foreign)
+  const api = { editor: { getModels: () => models }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } }
+  reconcileDiffResources(api, { p: { tabs: [] } }, {}, {})
+  disposeProjectModels(api, 'p')
+  assert.ok(models.slice(0, 4).every(model => model.disposed))
+  assert.equal(other.disposed, false); assert.equal(foreign.disposed, false)
 })

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink } from 'node:fs/promises'
 import path from 'node:path'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
@@ -119,6 +119,34 @@ test('removal creates missing persistence directories even without a watcher', a
   assert.deepEqual(JSON.parse(await readFile(storage, 'utf8')), [])
 })
 
+test('failed atomic persistence keeps project readable, watcher and pending timer intact and cleans temporary files', async t => {
+  const root = await mkdtemp(path.join(process.cwd(), '.ame-workspace-test-'))
+  const directory = path.join(root, 'project'); await mkdir(directory)
+  const workspaces = new Workspaces(path.join(root, 'projects.json'))
+  t.after(async () => { workspaces.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) })
+  // Populate the directory before watching it so delayed Windows events cannot replace the timer.
+  await writeFile(path.join(directory, 'keep.txt'), 'still readable')
+  const project = await workspaces.add(directory)
+  const internals = workspaces as unknown as { watchers: Map<string, { close(): void }>; watchTimers: Map<string, ReturnType<typeof setTimeout>> }
+  const watcher = internals.watchers.get(project.id)!
+  const close = t.mock.method(watcher, 'close')
+  const timer = setTimeout(() => {}, 60000)
+  t.after(() => clearTimeout(timer))
+  clearTimeout(internals.watchTimers.get(project.id)); internals.watchTimers.set(project.id, timer)
+  const storage = path.join(root, 'projects.json')
+  // A directory at the destination deterministically fails rename, including on Windows.
+  await rm(storage); await mkdir(storage)
+  await assert.rejects(workspaces.remove(project.id))
+  assert.equal(workspaces.get(project.id), project)
+  assert.equal((await workspaces.read(project.id, 'keep.txt')).content, 'still readable')
+  assert.equal(close.mock.callCount(), 0)
+  assert.equal(internals.watchers.get(project.id), watcher)
+  assert.equal(internals.watchTimers.get(project.id), timer)
+  assert.equal((await readdir(root)).some(name => name.endsWith('.tmp')), false)
+  await rm(storage, { recursive: true }); await writeFile(storage, JSON.stringify([project]))
+  await workspaces.remove(project.id)
+})
+
 test('rejects escapes, Git metadata, alternate streams, binary and oversized files', async t => {
   const { root, directory, workspaces, project } = await fixture(t)
   await writeFile(path.join(root, 'outside.txt'), 'private')
@@ -183,10 +211,10 @@ test('removeProject IPC validates its tuple, requires native confirmation and pr
   assert.deepEqual(calls, ['get', 'confirm']); calls.length = 0
   response = 1
   assert.equal(await dispatch('removeProject', ['p']), undefined)
-  assert.deepEqual(calls, ['get', 'confirm', 'closeProject', 'remove', 'detach']); calls.length = 0
+  assert.deepEqual(calls, ['get', 'confirm', 'remove', 'closeProject', 'detach']); calls.length = 0
   persistFailure = true
   await assert.rejects(dispatch('removeProject', ['p']), /SAVE_FAILED/)
-  assert.deepEqual(calls, ['get', 'confirm', 'closeProject', 'remove'])
+  assert.deepEqual(calls, ['get', 'confirm', 'remove'])
 })
 
 test('preload removeProject forwards the project ID and preserves IPC rejections', async () => {

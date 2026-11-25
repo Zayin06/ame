@@ -76,6 +76,19 @@ test('required backend mode exits nonzero on a clean checkout without resources'
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('npm test includes all gateway tests for local, CI and release coverage', async () => {
+  const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.ok(manifest.scripts.test.split(/\s+/).includes('packages/amekit-server/test/*.test.ts'))
+  for (const [file, job] of [['ci.yml', 'check'], ['release.yml', 'package']]) {
+    const value = await workflow(file)
+    const steps: Step[] = value.jobs[job].steps
+    const tests = steps.find(step => step.run === 'npm test')
+    assert.ok(tests, `${file} must run npm test`)
+    assert.equal(tests.if, undefined, `${file} must run npm test unconditionally`)
+    assert.ok(!tests['continue-on-error'], `${file} must fail on test errors`)
+  }
+})
+
 test('release prepares real backend before tests and preserves Node to Electron ABI order', async () => {
   const release = await workflow('release.yml')
   const steps: Step[] = release.jobs.package.steps

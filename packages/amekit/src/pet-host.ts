@@ -34,7 +34,7 @@ export function createPetHost(options: PetHostOptions) {
   const file = join(options.userData, "desktop-pet.json")
   const activity = new PetActivity(), speaker = new PetSpeech(), lifetime = new AbortController()
   const chime = petChime()
-  let preferences: PetPreferences = { ...defaultPetPreferences, enabled: options.defaultEnabled ?? false }
+  let preferences: PetPreferences = { ...defaultPetPreferences, enabled: options.defaultEnabled ?? defaultPetPreferences.enabled }
   let speech: PetSpeechPreferences = { enabled: true, sound: true }
   let cache: PetDialogueCache | null = null, dialogue = localDialogue, palette = defaultPetPalette
   let currentState: PetState = "idle", error = "", generating = false, initialized = false, disposed = false
@@ -107,10 +107,15 @@ export function createPetHost(options: PetHostOptions) {
     bubble.setBounds(layout.bounds)
     if (bubbleReady) return bubble.webContents.executeJavaScript(`${petPaletteScript(palette)};document.documentElement.dataset.side=${JSON.stringify(layout.side)};document.documentElement.style.setProperty('--bubble-anchor',${JSON.stringify(`${layout.anchor}px`)})`).catch(() => {})
   }
+  function lockSize(win: BrowserWindow, width: number, height: number) {
+    win.setMinimumSize?.(width, height)
+    win.setMaximumSize?.(width, height)
+  }
   function place() {
     if (!window || window.isDestroyed()) return
+    const target = bounds()
     changingBounds = true
-    try { window.setBounds(bounds()); void placeBubble() } finally { changingBounds = false }
+    try { lockSize(window, target.width, target.height); window.setBounds(target); void placeBubble() } finally { changingBounds = false }
   }
   function secure(current: BrowserWindow) {
     current.webContents.setWindowOpenHandler(() => ({ action: "deny" }))
@@ -158,7 +163,9 @@ export function createPetHost(options: PetHostOptions) {
     if (window && !window.isDestroyed()) { place(); return }
     try {
       validatePetSprite(options.sprite)
-      const current = new electron.BrowserWindow({ ...windowOptions, ...bounds(), title: "AmeKit Pet",
+      const initial = bounds()
+      const current = new electron.BrowserWindow({ ...windowOptions, ...initial,
+        minWidth: initial.width, maxWidth: initial.width, minHeight: initial.height, maxHeight: initial.height, title: "AmeKit Pet",
         webPreferences: { ...windowOptions.webPreferences, preload: options.interactionPreload } })
       window = current; secure(current)
       const interaction = new PetInteraction()
@@ -168,7 +175,13 @@ export function createPetHost(options: PetHostOptions) {
         const phase = args[0]
         if (phase !== "down" && phase !== "move" && phase !== "up" && phase !== "cancel") return
         const result = interaction.update(phase, electron.screen.getCursorScreenPoint(), current.getBounds(), Date.now())
-        if (result.position) current.setPosition(result.position.x, result.position.y)
+        if (result.position) {
+          // Moving with setPosition can accumulate DIP/pixel rounding errors on Windows.
+          // Always restore the size derived from preferences, never the native window size.
+          const { width, height } = bounds()
+          lockSize(current, width, height)
+          current.setBounds({ x: Math.round(result.position.x), y: Math.round(result.position.y), width, height })
+        }
         if (result.activate && options.hasMainWindow()) options.onActivate?.()
       })
       current.webContents.on("render-process-gone", () => { if (window === current) fail() })
@@ -177,12 +190,22 @@ export function createPetHost(options: PetHostOptions) {
         if (saveTimer) clearTimeout(saveTimer)
         saveTimer = undefined; window = undefined; ready = false; closeBubble(); speaker.reset()
       })
-      current.on("moved", () => {
+      const onBoundsChanged = () => {
         if (disposed || changingBounds || window !== current) return
+        const cur = current.getBounds(), expected = bounds()
+        if (cur.width !== expected.width || cur.height !== expected.height) {
+          changingBounds = true
+          try {
+            lockSize(current, expected.width, expected.height)
+            current.setBounds({ x: cur.x, y: cur.y, width: expected.width, height: expected.height })
+          } finally { changingBounds = false }
+        }
         void placeBubble()
         if (saveTimer) clearTimeout(saveTimer)
         saveTimer = setTimeout(() => { saveTimer = undefined; persistPosition() }, 400)
-      })
+      }
+      current.on("moved", onBoundsChanged)
+      current.on("resized", onBoundsChanged)
       // Keep the URL small; Chromium rejects data URLs containing the full sprite sheet.
       void current.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(petHtml())}`).then(async () => {
         if (disposed || window !== current || current.isDestroyed()) return

@@ -7,7 +7,7 @@ import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
 import type { AndroidTranslationInfo, ChatItem, IdeEvent, Permission, Session, SessionForm, SkillSummary } from '../../../../../packages/protocol/src/index'
-import { projectChatTimeline } from '../chat-timeline'
+import { extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
 import * as modelSelection from '../model-selection'
 import * as amekitUI from '../amekit-ui'
 import { detectComposerTrigger, filterSlashEntries } from '../composer-mentions'
@@ -21,7 +21,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
   let cursor = 0, effectIndex = 0, writes = 0, tree: ReactNode, closed = 0, activity = 0, focused = 0
   let info = { ...baseInfo, ...options.info }, items: ChatItem[] = [], permissions: Permission[] = [], sessions: Session[] = []
   const calls: { method: string; args: unknown[] }[] = [], listeners = new Map<string, Set<(event: Event) => void>>(), events = new Set<(event: IdeEvent) => void>()
-  let promptError = '', lockError = '', nextPrompt: Promise<unknown> | undefined
+  let promptError = '', lockError = '', formsError = '', nextPrompt: Promise<unknown> | undefined
   let sessionModel: string | undefined
   let forms: SessionForm[] = []
   let skills: SkillSummary[] = [], skillsLoads = 0
@@ -36,6 +36,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     },
     useRef(initial: unknown) { const index = cursor++; if (!(index in slots)) slots[index] = { current: initial }; return slots[index] },
     useId() { return `test-${cursor++}` },
+    useSyncExternalStore(_subscribe: unknown, getSnapshot: () => unknown) { return getSnapshot() },
     useEffect(run: () => (() => void) | undefined, deps: unknown[]) {
       const index = effectIndex++, old = effects[index]
       if (!old || deps.some((dep, i) => !Object.is(dep, old.deps[i]))) pending.push(() => { old?.cleanup?.(); effects[index] = { deps, cleanup: run() } })
@@ -61,12 +62,12 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     },
     async messages() { return items },
     async permissions() { return permissions },
-    async forms() { return forms },
+    async forms() { if (formsError) throw new Error(formsError); return forms },
     async sessionPermissionMode() { return 'default' },
     async sessions() { return sessions },
     async agentMap(_projectID: string, sessionID: string) { return { nodes: sessionModel ? [{ id: sessionID, model: sessionModel, providerID: 'amecode' }] : [] } },
     async replyPermission(...args: unknown[]) { calls.push({ method: 'permission', args }); permissions = []; return undefined },
-    async cancel(...args: unknown[]) { calls.push({ method: 'cancel', args }) },
+    async cancel(...args: unknown[]) { calls.push({ method: 'cancel', args }); sessions = sessions.map(session => session.id === args[1] ? { ...session, status: 'idle' } : session); forms = [] },
     onEvent(fn: (event: IdeEvent) => void) { events.add(fn); options.onSubscribe?.(fn); return () => events.delete(fn) },
     async account() { return { account: { role: 'user' }, models: { default_model: 'default' } } },
     async models() { return [{ id: 'default', providerID: 'amecode', name: 'Default' }, model] },
@@ -86,8 +87,8 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     './Primitives': { errorText: (e: unknown) => String(e).replace(/^Error: /, ''), IconButton: marker, Empty: marker },
     './SessionChanges': { TurnChanges: marker }, './ToolCard': { ToolCard: marker },
     './SessionFormCard': { SessionFormCard: ({ form }: { form: SessionForm }) => `Pending form: ${form.title}` },
-    './TurnWorkGroup': { TurnWorkGroup: marker, ActiveToolsView: marker, LiveTurnStatus: marker },
-    '../chat-timeline': { projectChatTimeline }, '../model-selection': modelSelection, '../amekit-ui': amekitUI,
+    './TurnWorkGroup': { TurnWorkGroup: marker, ActiveToolsView: ({ items }: { items: ChatItem[] }) => `Active tools: ${items.map(item => item.tool?.name).join(', ')}`, LiveTurnStatus: ({ label }: { label: string }) => label },
+    '../chat-timeline': { extractUserDisplayText, projectChatTimeline }, '../model-selection': modelSelection, '../amekit-ui': amekitUI,
     './AgentList': { AgentList: marker }, './AgentMap': { AgentMap: marker },
     '../agent-map-model': { familySummaryFromSessions: () => ({ runningCount: 0, subagentCount: 0 }) },
     './ArtifactViewer': { ArtifactViewer: marker },
@@ -143,6 +144,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     updateMessages(value: ChatItem[]) { items = value },
     updatePermissions(value: Permission[]) { permissions = value },
     updateForms(value: SessionForm[]) { forms = value },
+    failForms(value: string) { formsError = value },
     updateSkills(value: SkillSummary[]) { skills = value },
     get skillsLoads() { return skillsLoads },
     get eventListeners() { return events.size },
@@ -152,6 +154,55 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     unmount() { effects.forEach(effect => effect.cleanup?.()) },
   }
 }
+
+test('translation and Chat user bubbles display only the original request without changing history', async () => {
+  for (const component of ['AndroidTranslationModal', 'Chat'] as const) {
+    const h = harness({ component, info: { translationSessionIDs: ['translation-display'] }, props: { sessionID: 'translation-display' } })
+    const request = 'file tạo ở đâu rồi?'
+    const wrapped = `[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY]\nSKILL.md\n${'instructions '.repeat(1500)}\n\nUser request:\n[Translation mode: full]\n${request}`
+    const item: ChatItem = { id: 'user', role: 'user', text: wrapped }
+    try {
+      h.updateSession({ id: 'translation-display', title: 'Translation', status: 'idle' })
+      h.updateMessages([item])
+      h.render(); const html = await h.flush()
+      const bubble = h.find(node => node.type === 'article' && node.props.className === 'msg-user')
+      assert.equal(renderToStaticMarkup(bubble.props.children as ReactNode), request)
+      assert.doesNotMatch(html, /\[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY\]|\[Translation mode: full\]|SKILL\.md/)
+      assert.equal(item.text, wrapped, 'display cleanup must not mutate backend history')
+    } finally { h.unmount() }
+  }
+})
+
+test('failed translation surfaces compaction errors and a new-session action instead of the finish banner', async () => {
+  for (const component of ['AndroidTranslationModal', 'Chat'] as const) for (const timelineDetail of ['compact', 'detailed', 'everything']) {
+    const h = harness({ component, info: { translationSessionIDs: ['translation-failed'] }, props: { sessionID: 'translation-failed', timelineDetail } })
+    try {
+      h.updateSession({ id: 'translation-failed', title: 'Translation', status: 'idle', outcome: 'failed' })
+      h.updateMessages([
+        { id: 'user', role: 'user', text: 'Dịch sang ja' },
+        { id: 'compaction', role: 'assistant', kind: 'error', text: 'Compaction summary reached the output token limit' },
+        { id: 'tool', role: 'assistant', kind: 'tool', text: '', tool: { name: 'read', status: 'completed' } },
+      ])
+      h.render(); const html = await h.flush()
+      const alert = h.find(node => node.props.role === 'alert' && renderToStaticMarkup(node.props.children as ReactNode).includes('Compaction summary'))
+      assert.equal(alert.props.className, 'inline-error')
+      assert.match(renderToStaticMarkup(alert), /Compaction summary reached the output token limit/)
+      assert.match(renderToStaticMarkup(alert), /Ngữ cảnh phiên đã quá dài khiến bước tóm tắt bị vượt giới hạn token\. Hãy bấm Phiên dịch mới \(hoặc tạo cuộc trò chuyện mới\) để tiếp tục\./)
+      assert.doesNotMatch(html, /Đã dịch xong\?/)
+      if (component === 'AndroidTranslationModal') {
+        const banner = h.find(node => node.props.role === 'alert' && renderToStaticMarkup(node.props.children as ReactNode).includes('Lượt dịch gần nhất gặp lỗi'))
+        assert.match(renderToStaticMarkup(banner), /Lượt dịch gần nhất gặp lỗi và chưa hoàn tất\. Hãy xem chi tiết lỗi ở trên hoặc bấm Phiên dịch mới để chạy lại\./)
+        const button = (banner.props.children as ReactElement<Record<string, unknown>>[]).find(node => node.type === 'button')
+        assert.ok(button)
+        assert.equal(renderToStaticMarkup(button.props.children as ReactNode), 'Phiên dịch mới')
+        assert.equal(button.props.disabled, false)
+        ;(button.props.onClick as () => void)()
+        assert.doesNotMatch(h.render(), /Compaction summary|Lượt dịch gần nhất gặp lỗi/)
+        assert.match(h.render(), /Chỉ dịch Android Strings/)
+      }
+    } finally { h.unmount() }
+  }
+})
 
 test('Chat shows the responsive Android translation trigger only for Android projects', async () => {
   for (const isAndroid of [false, true]) {
@@ -287,6 +338,76 @@ test('resumes only an unlocked translation session, streams permission and block
   h.emit({ type: 'opencode', projectID: 'project', sessionID: 'translation-2' }); html = await h.flush()
   assert.match(html, /Scan complete/); assert.equal(h.button('✓ Hoàn tất').props.disabled, false)
   h.unmount()
+})
+
+test('new translation remains usable while the previous session is running or awaiting forms', async () => {
+  for (const pendingForm of [false, true]) {
+    const h = harness({ info: { translationSessionIDs: ['old'] } })
+    try {
+      h.updateSession({ id: 'old', title: 'Old translation', status: pendingForm ? 'idle' : 'running' })
+      h.updateMessages([{ id: 'old-user', role: 'user', text: 'Old request' }])
+      if (pendingForm) h.updateForms([{ id: 'form', sessionID: 'old', title: 'Locale', fields: [{ key: 'locale', type: 'string' }] }])
+      h.render(); await h.flush()
+      assert.equal(h.button('✓ Hoàn tất').props.disabled, true)
+      assert.equal(h.button('Phiên dịch mới').props.disabled, false)
+      h.click('Phiên dịch mới'); const html = h.render()
+      assert.match(html, /Chỉ dịch Android Strings/)
+      assert.doesNotMatch(html, /Old request|Pending form:/)
+      assert.equal(h.find(node => node.type === 'textarea').props.disabled, false)
+      h.click('Quét key thiếu'); await h.flush()
+      assert.equal(h.calls.find(call => call.method === 'prompt')?.args[1], undefined)
+    } finally { h.unmount() }
+  }
+})
+
+test('idle interrupted questions release the composer, new session and finish actions in every detail mode', async () => {
+  for (const timelineDetail of ['compact', 'detailed', 'everything']) for (const status of ['running', 'streaming'] as const) {
+    const h = harness({ info: { translationSessionIDs: ['old'] }, props: { timelineDetail } })
+    try {
+      h.updateSession({ id: 'old', title: 'Old translation', status: 'idle' })
+      h.updateMessages([{ id: 'user', role: 'user', text: 'Dịch sang ja' }, { id: 'question', role: 'assistant', kind: 'tool', text: '', tool: { name: 'question', status } }])
+      h.render(); const html = await h.flush()
+      assert.doesNotMatch(html, /Đang chờ bạn trả lời câu hỏi…|Active tools: question/)
+      assert.match(html, /role="status">Câu hỏi trước đó đã bị gián đoạn và không còn hiệu lực\./)
+      assert.equal(h.find(node => node.type === 'textarea').props.disabled, false)
+      assert.equal(h.button('Phiên dịch mới').props.disabled, false)
+      assert.equal(h.button('✓ Hoàn tất').props.disabled, false)
+      h.change('Tiếp tục dịch'); h.render(); h.submit(); await h.flush()
+      assert.equal(h.calls.find(call => call.method === 'prompt')?.args[1], 'old')
+    } finally { h.unmount() }
+  }
+})
+
+test('forms failures preserve loaded history and successful session status updates', async () => {
+  const h = harness({ info: { translationSessionIDs: ['old'] } })
+  try {
+    h.updateSession({ id: 'old', title: 'Old translation', status: 'running' })
+    h.updateMessages([{ id: 'answer', role: 'assistant', text: 'Lịch sử dịch vẫn hiển thị' }])
+    h.failForms('FORMS_UNAVAILABLE')
+    h.render(); let html = await h.flush()
+    assert.match(html, /Lịch sử dịch vẫn hiển thị/)
+    assert.match(html, /role="alert">Không tải được một phần dữ liệu phiên dịch: FORMS_UNAVAILABLE/)
+    assert.doesNotMatch(html, /Đang tải phiên dịch…/)
+    assert.equal(h.button('✓ Hoàn tất').props.disabled, true)
+    h.updateSession({ id: 'old', title: 'Old translation', status: 'idle' })
+    h.emit({ type: 'opencode', projectID: 'project', sessionID: 'old' }); html = await h.flush()
+    assert.match(html, /Lịch sử dịch vẫn hiển thị/)
+    assert.equal(h.button('✓ Hoàn tất').props.disabled, false)
+  } finally { h.unmount() }
+})
+
+test('stopping a response immediately reloads session status without a timer or event', async () => {
+  const h = harness({ info: { translationSessionIDs: ['old'] } })
+  try {
+    h.updateSession({ id: 'old', title: 'Old translation', status: 'running' })
+    h.updateMessages([{ id: 'question', role: 'assistant', kind: 'tool', text: '', tool: { name: 'question', status: 'running' } }])
+    h.render(); assert.match(await h.flush(), /Đang chờ bạn trả lời câu hỏi…/)
+    h.click('Dừng phản hồi'); const html = await h.flush()
+    assert.deepEqual(h.calls.at(-1), { method: 'cancel', args: ['project', 'old'] })
+    assert.doesNotMatch(html, /Đang chờ bạn trả lời câu hỏi…|Dừng phản hồi/)
+    assert.match(html, /Câu hỏi trước đó đã bị gián đoạn/)
+    assert.equal(h.button('✓ Hoàn tất').props.disabled, false)
+  } finally { h.unmount() }
 })
 
 test('fallback and missing configuration are visible; disconnected and unconfigured cannot submit', async () => {

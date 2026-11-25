@@ -3,6 +3,7 @@ import type { DesktopApi, IdeEvent } from '../../../../packages/protocol/src/ind
 
 const invoke = (method: string, ...args: unknown[]) => ipcRenderer.invoke('ame:call', method, args)
 const api: DesktopApi = {
+  openExternal: url => invoke('openExternal', url),
   platform: () => invoke('platform'),
   artifacts: (id, session) => invoke('artifacts', id, session),
   artifact: (id, artifact) => invoke('artifact', id, artifact),

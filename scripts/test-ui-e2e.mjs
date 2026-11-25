@@ -105,12 +105,13 @@ async function agentMapFixture(directory) {
     }
     if (req.method === 'POST' && route === '/api/rpc/amekit-models/update') { req.resume(); return json({ output: true }) }
     if (req.method === 'GET' && route === '/api/session') return json({ data: !url.searchParams.get('directory') || path.resolve(url.searchParams.get('directory')) === path.resolve(directory) ? sessions : [], cursor: {} })
-    const sessionRoute = /^\/api\/session\/([^/]+)(?:\/(message|permission|diff))?$/.exec(route)
+    if (req.method === 'GET' && route === '/api/session/active') return json({ data: Object.fromEntries(sessions.filter(s => s.time?.busy !== undefined && (s.time?.idle === undefined || s.time.busy > s.time.idle)).map(s => [s.id, { type: 'running' }])) })
+    const sessionRoute = /^\/api\/session\/([^/]+)(?:\/(message|permission|diff|form))?$/.exec(route)
     if (req.method === 'GET' && sessionRoute) {
       const [, id, resource] = sessionRoute
       // Requests already queued while changing backends may still reference the previous native session.
       if (!resource) return json({ data: sessions.find(session => session.id === id) ?? { ...sessions[0], id } })
-      if (resource === 'permission' || resource === 'diff') return json({ data: [] })
+      if (resource === 'permission' || resource === 'diff' || resource === 'form') return json({ data: [] })
       let messages = [...(histories.get(id) ?? [])]
       if (url.searchParams.has('type')) messages = messages.filter(message => message.type === url.searchParams.get('type'))
       if (url.searchParams.get('order') === 'desc') messages.reverse()
@@ -329,7 +330,7 @@ async function main() {
       await evaluate(`localStorage.setItem('ame.ide.layout.v1', ${quote(JSON.stringify(legacy))}); window.__uiE2eBeforeReload = true`)
       await command('Page.reload')
       await until('!window.__uiE2eBeforeReload && Boolean(document.querySelector(".app-shell")) && document.querySelectorAll(".proj-group").length === 3', 'reloaded app with legacy preferences', 30000)
-      await until('document.querySelectorAll(".editor-tab").length === 1 && document.querySelector(".editor-tab.selected button")?.title === "README.md" && document.querySelector(".monaco-editor .view-lines")?.textContent.includes("Self-healed")', 'one normalized README tab and actual Monaco content', 30000)
+      await until('document.querySelectorAll(".editor-tab").length === 1 && document.querySelector(".editor-tab.selected [data-tab-id]")?.dataset.tabId === "file:README.md" && document.querySelector(".monaco-editor .view-lines")?.textContent.includes("Self-healed")', 'one normalized README tab and actual Monaco content', 30000)
       assert.equal(await evaluate('document.querySelector(".editor-surface").textContent.includes("Đang đọc tệp…")'), false, 'README remained stuck loading')
       await noGlobalError()
       await shot('01-self-healed-open-file.png')
@@ -366,7 +367,7 @@ async function main() {
       await noGlobalError()
       await shot('02-binary-file-error-recovery.png')
       await click('.editor-load-error .button-row button:last-child', 'Đóng tab for unreadable binary')
-      await until('!document.querySelector(".editor-load-error") && !document.querySelector(\'.editor-tab button[title="assets/logo.png"]\') && document.querySelector(".monaco-editor .view-lines")?.textContent.includes("Self-healed")', 'binary tab closed and readable README recovered')
+      await until('!document.querySelector(".editor-load-error") && !document.querySelector(\'.editor-tab [data-tab-id="file:assets/logo.png"]\') && document.querySelector(".monaco-editor .view-lines")?.textContent.includes("Self-healed")', 'binary tab closed and readable README recovered')
       await noGlobalError()
     })
 
@@ -375,7 +376,7 @@ async function main() {
       await type('.quick-open__input', 'package.json')
       await until('[...document.querySelectorAll(".quick-open__path")].some(e=>e.textContent === "package.json")', 'package.json in QuickOpen results')
       await key('Enter', 'Enter', 13)
-      await until('!document.querySelector(".quick-open") && document.querySelector(".editor-tab.selected button")?.title === "package.json" && document.querySelector(".monaco-editor .view-lines")?.textContent.includes("alpha-ui-e2e")', 'package.json tab with rendered JSON')
+      await until('!document.querySelector(".quick-open") && document.querySelector(".editor-tab.selected [data-tab-id]")?.dataset.tabId === "file:package.json" && document.querySelector(".monaco-editor .view-lines")?.textContent.includes("alpha-ui-e2e")', 'package.json tab with rendered JSON')
       await until('document.querySelector(".editor-toolbar button:last-child")?.textContent === "Chia đôi"', 'Chia đôi toolbar action')
       await click('.editor-toolbar button:last-child', 'Chia đôi')
       await until('document.querySelectorAll(".editor-group").length === 2 && document.querySelectorAll(".editor-group .monaco-editor .view-lines").length === 2 && [...document.querySelectorAll(".editor-group .monaco-editor .view-lines")].every(e=>e.textContent.includes("alpha-ui-e2e"))', 'two editor groups each displaying the live JSON document')
@@ -410,12 +411,12 @@ async function main() {
       try {
         await until('Boolean(document.querySelector(".scm-commit-dock .scm-enhance-icon-btn svg"))', 'commit Enhance wand icon')
         assert.equal(await evaluate('document.querySelector(".scm-commit-input-bar").textContent.trim()'), '', 'Commit toolbar must contain only the wand icon, without a skill hint or Enhance text')
-        await until(`Boolean(document.querySelector('.scm-file-row__main[title="Diff với HEAD: src/app.ts"] .file-type-icon--ts'))`, 'SCM rows with shared file icons')
+        await until(`Boolean(document.querySelector('.scm-file-row__main[title="Changes: src/app.ts"] .file-type-icon--ts'))`, 'SCM rows with shared file icons')
         const scm = await evaluate(`(() => {
           const inspector=document.querySelector('[data-testid="inspector"]');
           const style=element=>getComputedStyle(element);
           const neutral=style(inspector).color;
-          const row=path=>inspector.querySelector('.scm-file-row__main[title="Diff với HEAD: '+path+'"]');
+          const row=path=>inspector.querySelector('.scm-file-row__main[title="Changes: '+path+'"]');
           const files=['src/app.ts','README.md','package.json'].map(path=>{
             const main=row(path), container=main.closest('.scm-file-row'), icon=main.querySelector('.file-type-icon'), name=main.querySelector('.scm-file-name'), dir=main.querySelector('.scm-file-dir'), badge=container.querySelector('.git-badge');
             const box=icon.getBoundingClientRect();
@@ -746,7 +747,7 @@ async function main() {
         const chip = `${stream} .work-row--read-group > .work-row__line > .work-row__actions button[aria-label="Mở tệp ${target}"]`
         assert.equal(await evaluate(`document.querySelector(${quote(chip)}).title`), `Mở tệp: ${target}`)
         await click(chip, `open the specific ${basename} filename chip`)
-        await until(`document.querySelector('.editor-tab.selected button')?.title === ${quote(target)} && document.querySelector('.monaco-editor .view-lines')?.textContent.replace(/\\s/g, ' ').includes(${quote(basename === 'README.md' ? 'Alpha UI E2E' : 'real workspace')})`, `${basename} chip opens its matching workspace content`)
+        await until(`document.querySelector('.editor-tab.selected [data-tab-mode="file"]')?.dataset.tabPath === ${quote(target)} && document.querySelector('.monaco-editor .view-lines')?.textContent.replace(/\\s/g, ' ').includes(${quote(basename === 'README.md' ? 'Alpha UI E2E' : 'real workspace')})`, `${basename} chip opens its matching workspace content`)
       }
       assert.ok(expanded.buttons.includes('Agent map'), 'Expanded subagent row must expose Agent map')
       assert.equal(expanded.cards, 0, 'Activity rail must use compact rows, not legacy tool cards')

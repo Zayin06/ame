@@ -21,6 +21,11 @@ export type FileDocument = { path: string; content: string; revision: string }
 export type Change = { path: string; index: string; working: string }
 /** Omitted target preserves legacy HEAD → disk comparison. */
 export type DiffTarget = { kind: 'staged' } | { kind: 'working' } | { kind: 'commit'; commit: string }
+export type DiffContent = {
+  original: string; modified: string
+  binary?: boolean; tooLarge?: boolean; reason?: string
+  sizeBytes?: number; originalSize?: number; modifiedSize?: number
+}
 export type GitDiffScope = DiffTarget
 export type GitState = { branch: string; changes: Change[]; tracking?: string | null; ahead?: number; behind?: number; hasRemote?: boolean; merging?: boolean }
 export type GitBranch = { name: string; current: boolean; commit: string; upstream?: string; remote?: boolean }
@@ -167,6 +172,7 @@ export type AgentMapView = {
   fetchedAt: number
 }
 export interface DesktopApi {
+  openExternal(url: string): Promise<void>
   platform(): Promise<string>
   artifacts(projectID: string, sessionID?: string): Promise<ArtifactSummary[]>
   artifact(projectID: string, artifactID: string): Promise<ArtifactDetail>
@@ -229,7 +235,7 @@ export interface DesktopApi {
   checkoutBranch(projectID: string, name: string): Promise<void>
   createBranch(projectID: string, name: string, checkout?: boolean): Promise<void>
   git(projectID: string): Promise<GitState>
-  diff(projectID: string, relative: string, target?: DiffTarget): Promise<{ original: string; modified: string }>
+  diff(projectID: string, relative: string, target?: DiffTarget): Promise<DiffContent>
   stage(projectID: string, relative: string, staged: boolean): Promise<void>
   commit(projectID: string, message: string, options?: GitCommitOptions): Promise<void>
   gitDeleteBranch(projectID: string, name: string, force?: boolean): Promise<void>

@@ -447,7 +447,8 @@ function collapseConcatenatedHeaders(file: string, patch: string) {
   if (sections.length <= 1) return patch
   const hunks = sections.flatMap((section) => {
     const at = section.search(/^@@ /m)
-    return at === -1 ? [] : [section.slice(at).trimEnd()]
+    // Only remove separator newlines; spaces and tabs belong to the final patch line.
+    return at === -1 ? [] : [section.slice(at).replace(/(?:\r?\n)+$/, "")]
   })
   if (!hunks.length) return patch
   return `Index: ${file}\n===================================================================\n--- ${file}\t\n+++ ${file}\t\n${hunks.join("\n")}\n`

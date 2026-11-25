@@ -7,7 +7,7 @@ export const petLabels: Record<PetState, string> = { idle: "Đang nghỉ", think
 export type Point = { x: number; y: number }
 export type Rectangle = Point & { width: number; height: number }
 export type PetPreferences = { enabled: boolean; scale: number; position: Point | null }
-export const defaultPetPreferences: PetPreferences = { enabled: false, scale: 0.25, position: null }
+export const defaultPetPreferences: PetPreferences = { enabled: true, scale: 0.25, position: null }
 export type PetSpeechPreferences = { enabled: boolean; sound: boolean }
 export type PetDialogueCache = { model: string; generatedAt: number; json: string }
 export const petPreferencesSchema = z.object({
@@ -84,7 +84,7 @@ export class PetActivity {
 }
 
 export const petSpriteCss = `
-.amekit-pet-sprite{width:100%;height:100%;background-size:600% 900%;background-repeat:no-repeat;animation:amekit-pet-frames 1833.333ms step-end infinite}
+.amekit-pet-sprite{width:min(100%,calc(100vh * 192 / 208));height:auto;aspect-ratio:192 / 208;max-width:100%;max-height:100%;margin:auto;background-size:600% 900%;background-repeat:no-repeat;animation:amekit-pet-frames 1833.333ms step-end infinite}
 @keyframes amekit-pet-frames{0%,100%{background-position-x:0%}10%,90%{background-position-x:20%}20%,80%{background-position-x:40%}30%,70%{background-position-x:60%}40%,60%{background-position-x:80%}50%{background-position-x:100%}}
 @media(prefers-reduced-motion:reduce){.amekit-pet-sprite{animation:none}}
 `

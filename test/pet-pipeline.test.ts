@@ -5,6 +5,46 @@ import { PetActivity } from '../packages/amekit/src/pet'
 import { petSessions } from '../apps/desktop/src/renderer/pet-sessions'
 import type { SessionInfo } from '@opencode/client'
 
+test('reconnect retries failed permissions independently and moves Pet from thinking to waiting', async () => {
+  const directory = process.cwd(), calls = { permissions: 0, forms: 0, messages: 0 }
+  let stream!: ReadableStreamDefaultController<Uint8Array>, notifications = 0, failPermissions = false
+  const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } })
+  const adapter = new OpenCodeAdapter(() => { notifications++ }, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      stream = controller; init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session') return json({ data: [{ id: 's', title: 'Pet', time: { busy: 100 } }], cursor: {} })
+    if (url.pathname.endsWith('/permission')) {
+      calls.permissions++
+      if (failPermissions) { failPermissions = false; throw new Error('permissions temporarily unavailable') }
+      return json({ data: [{ id: 'pending', sessionID: 's', action: 'edit', resources: [] }] })
+    }
+    if (url.pathname.endsWith('/form')) { calls.forms++; return json({ data: [] }) }
+    if (url.pathname.endsWith('/message')) { calls.messages++; return json({ data: [], cursor: {} }) }
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  const activity = new PetActivity()
+  const report = async () => activity.report('window', petSessions({ p: await adapter.sessions('p') }), 100)
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    assert.equal(await report(), 'waiting')
+    failPermissions = true
+    const before = notifications
+    stream.enqueue(new TextEncoder().encode('data: {"type":"server.connected"}\n\n'))
+    for (let i = 0; i < 100 && notifications === before; i++) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(notifications > before, 'reconnect was consumed')
+    assert.equal(await report(), 'thinking')
+    assert.deepEqual(calls, { permissions: 2, forms: 2, messages: 2 })
+    assert.equal(await report(), 'waiting')
+    assert.deepEqual(calls, { permissions: 3, forms: 2, messages: 2 }, 'only the failed section is retried')
+    assert.equal(await report(), 'waiting')
+    assert.deepEqual(calls, { permissions: 3, forms: 2, messages: 2 })
+  } finally { adapter.dispose() }
+})
+
 test('SessionInfo + real SDK SSE → sessions → renderer mapper → all Pet activity states', async () => {
   const directory = process.cwd()
   let stream!: ReadableStreamDefaultController<Uint8Array>, notifications = 0

@@ -154,6 +154,34 @@ test('normalize collapses Windows CRLF vs LF inflation across full, mixed, parti
   assert.equal(partialNormalized.fileDiff.deletionLines.join(''), 'keep\noldVal\n')
 })
 
+for (const { name, value, context } of [
+  { name: 'two trailing spaces', value: 'new  ', context: false },
+  { name: 'a trailing tab', value: 'new\t', context: false },
+  { name: 'a whitespace-only addition', value: '  \t ', context: false },
+  { name: 'a whitespace-only context line', value: '  \t ', context: true },
+]) {
+  for (const separator of ['\n', '\n\n', '\r\n\r\n']) {
+    test(`normalize preserves ${name} in concatenated patches separated by ${JSON.stringify(separator)}`, () => {
+      const section = (start: number) => [
+        'diff --git a/whitespace.ts b/whitespace.ts',
+        '--- a/whitespace.ts',
+        '+++ b/whitespace.ts',
+        `@@ -${start},${context ? 2 : 1} +${start},${context ? 2 : 1} @@`,
+        '-old',
+        `+${context ? 'new' : value}`,
+        ...(context ? [` ${value}`] : []),
+      ].join('\n')
+      const patch = section(5) + separator + section(20) + separator
+      const normalized = normalize({ file: 'whitespace.ts', patch, additions: 2, deletions: 2, status: 'modified' })
+
+      assert.equal(normalized.parseFailed, undefined)
+      assert.equal(normalized.fileDiff.hunks.length, 2)
+      assert.equal(normalized.fileDiff.additionLines.join(''), (context ? `new\n${value}\n` : `${value}\n`).repeat(2))
+      assert.equal(normalized.fileDiff.deletionLines.join(''), (context ? `old\n${value}\n` : 'old\n').repeat(2))
+    })
+  }
+}
+
 test('normalize handles concatenated tool patches, flags unparseable patches, and SessionChanges lazy-mounts closed details', () => {
   const concatenated = [
     'diff --git a/multi.ts b/multi.ts',

@@ -2,6 +2,24 @@ import type { SessionInfo, SessionMessageInfo } from "@opencode/client"
 import { estimateUsage, tokenValues, validTokens, type UsagePrices, type UsageTokens } from "./usage-pricing"
 
 export const emptyTokens = (): UsageTokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
+
+export function cacheHitRate(tokens: UsageTokens): number | null {
+  if (!validTokens(tokens)) return null
+  // SDK input excludes cache reads/writes; include both in the complete prompt.
+  const prompt = tokens.input + tokens.cache.read + tokens.cache.write
+  return prompt > 0 ? tokens.cache.read / prompt : null
+}
+
+export function formatCacheHitRate(tokens: UsageTokens): string {
+  const rate = cacheHitRate(tokens)
+  return rate === null ? "—" : `${Number((rate * 100).toFixed(1))}%`
+}
+
+export function cacheHitLevel(tokens: UsageTokens): "good" | "warn" | "low" | "none" {
+  const rate = cacheHitRate(tokens)
+  return rate === null ? "none" : rate >= 0.7 ? "good" : rate >= 0.3 ? "warn" : "low"
+}
+
 function addTokens(to: UsageTokens, from: UsageTokens) {
   to.input += from.input; to.output += from.output; to.reasoning += from.reasoning
   to.cache.read += from.cache.read; to.cache.write += from.cache.write

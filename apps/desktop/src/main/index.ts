@@ -144,6 +144,10 @@ const diffTargetSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('commit'), commit: z.string().regex(/^[a-f0-9]{7,40}$/i) }).strict()
 ])
 const schema = {
+  openExternal: z.tuple([z.string().min(1).max(2048).refine(value => {
+    if (/[\u0000-\u0020\u007f-\u009f]/.test(value) || !/^https?:\/\//i.test(value)) return false
+    try { const parsed = new URL(value); return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && !!parsed.hostname } catch { return false }
+  })]),
   platform: z.tuple([]),
   artifacts: z.tuple([boundedID, boundedID.optional()]), artifact: z.tuple([boundedID, artifactID]), deleteArtifact: z.tuple([boundedID, artifactID]),
   btwAsk: z.tuple([boundedID, boundedID, question, modelSchema.optional()]), forkSession: z.tuple([boundedID, boundedID]),
@@ -369,8 +373,8 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       if (b !== undefined) {
         if (!approved || approved.token !== b || approved.expires < Date.now()) throw new Error('CANCELLED: Xác nhận gỡ dự án đã hết hiệu lực.')
       } else await confirmation(`Gỡ dự án ${project.name} khỏi danh sách? Tệp trên ổ đĩa sẽ KHÔNG bị xóa.`)
-      terminals.closeProject(a)
       await workspace.remove(a)
+      terminals.closeProject(a)
       try { lspServices.get(a)?.dispose() }
       finally {
         lspServices.delete(a)
@@ -396,6 +400,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       shell.showItemInFolder(target)
       return
     }
+    case 'openExternal': return shell.openExternal(new URL(a).href)
     case 'searchProject': return workspace.searchProject(a, b)
     case 'replaceInProject': {
       if (b.dryRun === true) return workspace.replaceInProject(a, b)
@@ -550,7 +555,16 @@ async function call(method: keyof typeof schema, args: unknown[]) {
         userText: d && d !== 'custom' ? `[Translation mode: ${d}]\n${c}` : c,
         isFirstTurn, skill: feature.skill, stringsFiles: detected.stringsFiles
       })
-      await adapter.prompt(a, session.id, prompt, model)
+      let skills: { id: string }[] | undefined
+      if (isFirstTurn) {
+        const skillName = feature.skill.name
+        try {
+          const matched = (await adapter.skills(a)).find(skill => skill.name === skillName || skill.id === skillName)
+          if (matched) skills = [{ id: matched.id }]
+        } catch { /* Native skills may be unavailable; retain the scoped text prompt. */ }
+      }
+      if (skills) await adapter.prompt(a, session.id, prompt, model, undefined, undefined, skills)
+      else await adapter.prompt(a, session.id, prompt, model)
       return { session, model, locked: false } satisfies AndroidTranslationPromptResult
     }
     case 'androidTranslationLock': {
@@ -651,7 +665,7 @@ void app.whenReady().then(async () => {
   for (const project of workspace.list()) adapter.attach(project.id, project.directory)
   const spritePath = app.isPackaged ? path.join(process.resourcesPath, 'ame-chibi.png') : path.join(app.getAppPath(), 'packages/amekit/src/assets/ame-chibi.png')
   sprite = await loadPetSprite(spritePath).catch(() => '')
-  petHost = createPetHost({ userData: app.getPath('userData'), electron: { BrowserWindow, screen }, sprite, defaultEnabled: false,
+  petHost = createPetHost({ userData: app.getPath('userData'), electron: { BrowserWindow, screen }, sprite, defaultEnabled: true,
     interactionPreload: path.join(here, '../preload/pet.cjs'), onActivate: () => revealPetMainWindow(window),
     hasMainWindow: () => Boolean(window && !window.isDestroyed()), onStateChanged: state => notify({ type: 'pet', state }),
     generateDialogue: (model, signal) => account.generatePetDialogue(model, signal) })

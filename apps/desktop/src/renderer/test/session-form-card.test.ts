@@ -18,7 +18,7 @@ const form: SessionForm = { id: 'f', sessionID: 's', title: 'Dịch strings', fi
   { key: 'conditional', type: 'string', required: true, when: [{ key: 'locale', op: 'eq', value: 'ko' }] },
 ] }
 
-function harness() {
+function harness(inputForm: SessionForm = form) {
   const slots: unknown[] = []; let cursor = 0, tree: ReactNode, error = '', resolved = ''
   const calls: { method: string; args: unknown[] }[] = []
   const hooks = {
@@ -28,12 +28,13 @@ function harness() {
   const exports: Record<string, any> = {}, require = createRequire(import.meta.url)
   const source = readFileSync(new URL('../components/SessionFormCard.tsx', import.meta.url), 'utf8')
   runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText, {
-    exports, window: { ame: Object.fromEntries(['replyForm', 'cancelForm'].map(method => [method, async (...args: unknown[]) => { calls.push({ method, args }); if (error) throw new Error(error) }])) },
+    exports, window: { ame: Object.fromEntries(['replyForm', 'cancelForm', 'openExternal'].map(method => [method, async (...args: unknown[]) => { calls.push({ method, args }); if (error) throw new Error(error) }])) },
+    navigator: { clipboard: { writeText: async (...args: unknown[]) => { calls.push({ method: 'writeText', args }); if (error) throw new Error(error) } } },
     require(id: string) { if (id === 'react') return hooks; if (id.endsWith('/session-form')) return schema; if (id === './Primitives') return { errorText: (e: unknown) => String(e) }; return require(id) },
   })
   const all = (node: ReactNode): ReactElement<any>[] => Array.isArray(node) ? node.flatMap(all) : isValidElement<{ children?: ReactNode }>(node) ? [node, ...all(node.props.children)] : []
   const find = (predicate: (element: ReactElement<any>) => boolean) => { const element = all(tree).find(predicate); assert.ok(element); return element }
-  const render = () => { cursor = 0; tree = exports.SessionFormCard({ projectID: 'p', form, onResolved: (id: string) => { resolved = id } }); return renderToStaticMarkup(tree) }
+    const render = () => { cursor = 0; tree = exports.SessionFormCard({ projectID: 'p', form: inputForm, onResolved: (id: string) => { resolved = id } }); return renderToStaticMarkup(tree) }
   return { render, calls, exports, find, get resolved() { return resolved }, fail(message: string) { error = message },
     submitNow() { find(el => el.type === 'form').props.onSubmit({ preventDefault() {} }); return render() },
     change(label: string, value: string | boolean | number) { find(el => el.props['aria-label'] === label && el.type === 'input').props.onChange({ target: { value: String(value), checked: value, valueAsNumber: value } }); render() },
@@ -87,4 +88,36 @@ test('when conditions, optional/custom options, false booleans and numeric bound
   assert.deepEqual(JSON.parse(JSON.stringify(exports.validateFormAnswer(selection, { files: ['custom'] }))), { files: ['custom'] })
   assert.throws(() => exports.validateFormAnswer(selection, { files: ['a', 'b', 'c'] }), /Tệp/)
   assert.equal(exports.visibleFormField({ key: 'x', type: 'string', when: [{ key: 'confirm', op: 'neq', value: false }] }, { confirm: false }), false)
+})
+
+test('external fields open via IPC and copy the link with accessible feedback', async () => {
+  const url = 'https://example.com/answer'
+  const h = harness({ ...form, fields: [{ key: 'external', type: 'external', url }] })
+  assert.doesNotMatch(h.render(), /target="_blank"/)
+  await h.find(el => el.type === 'button' && el.props.children === 'Mở trang trả lời').props.onClick()
+  await h.find(el => el.type === 'button' && el.props.children === 'Sao chép liên kết').props.onClick()
+  assert.deepEqual(h.calls, [{ method: 'openExternal', args: [url] }, { method: 'writeText', args: [url] }])
+  assert.match(h.render(), /role="status">Đã sao chép/)
+  h.fail('CLIPBOARD_FAILED')
+  await h.find(el => el.type === 'button' && el.props.children === 'Sao chép liên kết').props.onClick()
+  assert.match(h.render(), /CLIPBOARD_FAILED/)
+  assert.doesNotMatch(h.render(), /Đã sao chép/)
+})
+
+test('numeric defaults normalize to finite numbers shared by input and submission', async () => {
+  for (const type of ['integer', 'number'] as const) {
+    for (const value of [12, '12', 0, '0', '-3.5', '3.14', '', ' ', 'abc', 'NaN', 'Infinity', Infinity]) {
+      const valid = value !== '' && value !== ' ' && Number.isFinite(Number(value)) && (type === 'number' || Number.isInteger(Number(value)))
+      const inputForm: SessionForm = { ...form, fields: [{ key: 'count', title: 'Count', type, default: value, required: valid }] }
+      const h = harness(inputForm)
+      const initial = h.exports.initialFormAnswer(inputForm)
+      assert.equal(initial.count, valid ? Number(value) : undefined, `${type}: ${JSON.stringify(value)}`)
+      assert.equal(h.exports.validateFormAnswer(inputForm, initial).count, valid ? Number(value) : undefined)
+      h.render()
+      assert.equal(h.find(el => el.type === 'input').props.value, valid ? Number(value) : '')
+      await h.submit()
+      assert.equal(h.calls[0].method, 'replyForm')
+      assert.equal((h.calls[0].args[3] as Record<string, unknown>).count, valid ? Number(value) : undefined)
+    }
+  }
 })

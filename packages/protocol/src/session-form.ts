@@ -15,6 +15,12 @@ export type SessionFormField = {
 )
 export type SessionForm = { id: string; sessionID: string; title: string; fields: SessionFormField[] }
 
+export function normalizeFormNumber(value: unknown, type: 'number' | 'integer'): number | undefined {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim()))) return undefined
+  const number = Number(value)
+  return Number.isFinite(number) && (type !== 'integer' || Number.isInteger(number)) ? number : undefined
+}
+
 export const sessionFormKeySchema = z.string().min(1).max(200).refine(value =>
   !!value.trim() && !value.includes('\0') && !['__proto__', 'prototype', 'constructor'].includes(value))
 const value = z.union([z.string().max(20000).refine(value => !value.includes('\0')), z.number().finite(), z.boolean(), z.array(z.string().max(20000).refine(value => !value.includes('\0'))).max(100)])

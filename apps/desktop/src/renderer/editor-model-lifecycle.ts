@@ -1,4 +1,4 @@
-import type { Buffer } from './state'
+import { diffID, tabID, type Buffer, type ProjectView } from './state'
 
 export const modelUri = (projectID: string, path: string, mode = 'file') => `ame://${encodeURIComponent(projectID)}/${mode}/${path.split(/[\\/]/).map(encodeURIComponent).join('/')}`
 
@@ -9,6 +9,30 @@ type TextModel = {
   dispose(): void
   getValue(): string
   setValue(value: string): void
+}
+
+type MonacoModels = {
+  Uri: { parse(uri: string): { toString(): string } }
+  editor: { getModels(): readonly TextModel[] }
+}
+export function disposeDiffModels(monaco: MonacoModels, projectID: string, diffTabID: string) {
+  const uris = new Set(['original', 'modified'].map(mode => monaco.Uri.parse(modelUri(projectID, diffTabID, mode)).toString()))
+  for (const model of monaco.editor.getModels()) if (!model.isDisposed() && uris.has(model.uri.toString())) model.dispose()
+}
+export function disposeProjectModels(monaco: MonacoModels, projectID: string) {
+  const prefix = monaco.Uri.parse(modelUri(projectID, '')).toString().replace(/file\/$/, '')
+  for (const model of monaco.editor.getModels()) if (!model.isDisposed() && model.uri.scheme === 'ame' && model.uri.toString().startsWith(prefix)) model.dispose()
+}
+
+// Called after the React commit: editors detach first, then tab-owned resources die.
+export function reconcileDiffResources<T>(monaco: MonacoModels, previous: Record<string, ProjectView>, current: Record<string, ProjectView>, cache: Record<string, T>): Record<string, T> {
+  const retained = new Set(Object.entries(current).flatMap(([project, view]) => view.tabs.filter(tab => tab.mode === 'diff').map(tab => diffID(project, tab))))
+  for (const [project, view] of Object.entries(previous)) {
+    if (!current[project]) { disposeProjectModels(monaco, project); continue }
+    for (const tab of view.tabs) if (tab.mode === 'diff' && !retained.has(diffID(project, tab))) disposeDiffModels(monaco, project, tabID(tab))
+  }
+  const entries = Object.entries(cache).filter(([key]) => retained.has(key))
+  return entries.length === Object.keys(cache).length ? cache : Object.fromEntries(entries)
 }
 
 // Buffers, not mounted panes, own file models: switching tabs/projects or

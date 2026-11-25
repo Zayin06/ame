@@ -1,9 +1,9 @@
 import { useEffect, useId, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react'
-import type { Agent, AndroidTranslationInfo, ChatItem, Model, Permission, PermissionMode, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
+import type { AndroidTranslationInfo, ChatItem, Model, Permission, PermissionMode, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
 import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
 import { type Preferences, type Tab, type TimelineDetailMode } from '../state'
-import { projectChatTimeline } from '../chat-timeline'
+import { extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
 import type { SessionForm } from '../../../../../packages/protocol/src/index'
 import { SessionFormCard } from './SessionFormCard'
 import { ActiveToolsView, LiveTurnStatus, TurnWorkGroup } from './TurnWorkGroup'
@@ -20,8 +20,23 @@ import { ArtifactViewer } from './ArtifactViewer'
 import { applyComposerCompletion, detectComposerTrigger, filterFileMentions, filterSlashEntries, WORKSPACE_DRAG_MIME, readBrowserFileAttachment, splitComposerAttachments, MAX_PROMPT_FILES, type ComposerAttachment, type ComposerTrigger } from '../composer-mentions'
 import { ComposerAttachmentStrip, ComposerDropOverlay, MessageAttachmentList } from './ComposerAttachments'
 
-type ProjectCatalog = { key: string; fetchedAt: number; models: Model[]; agents: Agent[]; commands: SlashCommand[]; skills: SkillSummary[] }
+type ProjectCatalog = { key: string; fetchedAt: number; models: Model[]; commands: SlashCommand[]; skills: SkillSummary[] }
 const projectCatalogCache = new Map<string, ProjectCatalog>()
+type ChatDraft = { text: string; attachments: ComposerAttachment[] }
+type DraftThread = { value: ChatDraft; listeners: Set<() => void> }
+// In-memory only: drafts survive project/New Chat remounts, including inline files.
+const chatDrafts = new Map<string, DraftThread>()
+const draftKey = (project: string | undefined, session: string | undefined, draftID: number) => JSON.stringify([project, session ?? `draft:${draftID}`])
+function chatDraft(key: string): DraftThread {
+  let draft = chatDrafts.get(key)
+  if (!draft) { draft = { value: { text: '', attachments: [] }, listeners: new Set() }; chatDrafts.set(key, draft) }
+  return draft
+}
+function updateDraft(draft: DraftThread, update: (value: ChatDraft) => ChatDraft) {
+  draft.value = update(draft.value)
+  draft.listeners.forEach(listener => listener())
+}
+let attachmentSequence = 0
 const draftPermissionModes = new Map<string, PermissionMode>()
 export const permissionModeOptions: { value: PermissionMode; label: string; description: string }[] = [
   { value: 'default', label: 'Mặc định', description: 'Dùng chính sách quyền mặc định của OpenCode.' },
@@ -99,9 +114,11 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const modelPolicy = useRef({ role, defaultModelID: effectiveDefaultModel })
   modelPolicy.current = { role, defaultModelID: effectiveDefaultModel }
   const permissionScope = JSON.stringify([connectionUrl, projectID, sessionID || draftID])
-  const [modeState, setModeState] = useState<{ scope: string; mode: PermissionMode; loading: boolean }>(() => ({ scope: permissionScope, mode: 'default', loading: !!sessionID }))
+  const [permissionAttempt, setPermissionAttempt] = useState(0)
+  const [modeState, setModeState] = useState<{ scope: string; mode: PermissionMode; status: 'loading' | 'ready' | 'error'; error?: string }>(() => ({ scope: permissionScope, mode: 'default', status: sessionID ? 'loading' : 'ready' }))
   const permissionMode = modeState.scope === permissionScope ? modeState.mode : !sessionID ? draftPermissionModes.get(permissionScope) ?? 'default' : 'default'
-  const permissionLoading = !!sessionID && (modeState.scope !== permissionScope || modeState.loading)
+  const permissionStatus = modeState.scope === permissionScope ? modeState.status : sessionID ? 'loading' : 'ready'
+  const permissionLoading = permissionStatus !== 'ready'
   const [updatingPermission, setUpdatingPermission] = useState(false)
   const permissionRequest = useRef(0)
   const permissionPending = useRef(false)
@@ -111,34 +128,36 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     let alive = true
     const request = ++permissionRequest.current
     if (!sessionID) {
-      setModeState({ scope: permissionScope, mode: draftPermissionModes.get(permissionScope) ?? 'default', loading: false })
+      setModeState({ scope: permissionScope, mode: draftPermissionModes.get(permissionScope) ?? 'default', status: 'ready' })
       return
     }
     if (!projectID || !connected) return
-    setModeState({ scope: permissionScope, mode: 'default', loading: true })
+    setModeState({ scope: permissionScope, mode: 'default', status: 'loading' })
     void window.ame.sessionPermissionMode(projectID, sessionID).then(mode => {
-      if (alive && request === permissionRequest.current) setModeState({ scope: permissionScope, mode, loading: false })
-    }).catch(e => { if (alive) report(e) })
+      if (alive && request === permissionRequest.current) setModeState({ scope: permissionScope, mode, status: 'ready' })
+    }).catch(e => { if (alive && request === permissionRequest.current) setModeState({ scope: permissionScope, mode: 'default', status: 'error', error: errorText(e) }) })
     return () => { alive = false }
-  }, [permissionScope, connected, projectID, sessionID, listedPermissionMode])
+  }, [permissionScope, connected, projectID, sessionID, listedPermissionMode, permissionAttempt])
   const changePermissionMode = async (mode: PermissionMode) => {
     if (!projectID || permissionPending.current || busy || permissionLoading) return
     if (!sessionID) {
       draftPermissionModes.set(permissionScope, mode)
-      setModeState({ scope: permissionScope, mode, loading: false })
+      setModeState({ scope: permissionScope, mode, status: 'ready' })
       return
     }
     permissionPending.current = true; setUpdatingPermission(true)
     try {
       const saved = await window.ame.updateSessionPermissionMode(projectID, sessionID, mode)
-      if (currentPermissionScope.current === permissionScope) setModeState({ scope: permissionScope, mode: saved, loading: false })
+      if (currentPermissionScope.current === permissionScope) setModeState({ scope: permissionScope, mode: saved, status: 'ready' })
     } catch (e) { report(e) }
     finally { permissionPending.current = false; setUpdatingPermission(false) }
   }
-  const [text, setText] = useState('')
+  const draft = chatDraft(draftKey(projectID, sessionID, draftID))
+  const { text, attachments } = useSyncExternalStore(listener => { draft.listeners.add(listener); return () => { draft.listeners.delete(listener) } }, () => draft.value, () => draft.value)
+  const setText = (value: string | ((current: string) => string)) => updateDraft(draft, current => ({ ...current, text: typeof value === 'function' ? value(current.text) : value }))
+  const setAttachments = (value: ComposerAttachment[] | ((current: ComposerAttachment[]) => ComposerAttachment[])) => updateDraft(draft, current => ({ ...current, attachments: typeof value === 'function' ? value(current.attachments) : value }))
   const [commands, setCommands] = useState<SlashCommand[]>(() => initialCatalog?.commands ?? [])
   const [skills, setSkills] = useState<SkillSummary[]>(() => initialCatalog?.skills ?? [])
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
   const dragDepth = useRef(0)
   const [dragActive, setDragActive] = useState(false)
   const canAttach = !lockedTranslation && !translationSession && !!projectID && connected
@@ -148,7 +167,6 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const [attachmentQuery, setAttachmentQuery] = useState('')
   const [completionIndex, setCompletionIndex] = useState(0)
   const composing = useRef(false)
-  const attachmentSequence = useRef(0)
   const popoverID = useId()
   const [busy, setBusy] = useState(false)
   const [replying, setReplying] = useState(false)
@@ -165,31 +183,26 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const currentSession = useRef(sessionID); currentSession.current = sessionID
   const currentProject = useRef(projectID); currentProject.current = projectID
   const createdSession = useRef<string | undefined>(undefined)
+  const submittingDraft = useRef(draft)
   const submit = useRef<ReturnType<typeof chatSubmit> | undefined>(undefined)
   const submitProject = useRef(projectID)
   if (!submit.current || submitProject.current !== projectID) {
     submitProject.current = projectID
     submit.current = chatSubmit(window.ame, session => {
       if (currentProject.current !== projectID) return
+      chatDrafts.set(draftKey(projectID, session.id, draftID), submittingDraft.current)
       createdSession.current = session.id; onCreated(session)
     })
   }
-  const drafts = useRef<Record<string, { text: string; attachments: ComposerAttachment[] }>>({})
-  const draftKey = (project: string | undefined, session: string | undefined) => JSON.stringify([project, session])
   const previousSession = useRef(sessionID)
   const previousProject = useRef(projectID)
   useEffect(() => {
     if (previousSession.current === sessionID && previousProject.current === projectID) return
-    const oldKey = draftKey(previousProject.current, previousSession.current)
-    drafts.current[oldKey] = { text, attachments }
-    if (previousProject.current !== projectID || previousSession.current || sessionID !== createdSession.current) {
-      const draft = drafts.current[draftKey(projectID, sessionID)]
-      setText(draft?.text || ''); setAttachments(draft?.attachments || [])
-    } else delete drafts.current[oldKey]
     if (previousProject.current !== projectID) createdSession.current = undefined
     previousSession.current = sessionID; previousProject.current = projectID
     setTrigger(null); setAttachmentPicker(false)
     setMessages([]); setPermissions([]); setForms([]); setLoaded(false)
+    setLoadErrors({})
   }, [projectID, sessionID])
   useEffect(() => {
     const open = (event: Event) => { setTrigger(null); setAttachmentPicker(false); setDrawer((event as CustomEvent).detail || 'artifacts') }
@@ -200,6 +213,8 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     if (input.current) { input.current.style.height = 'auto'; input.current.style.height = `${Math.max(46, Math.min(160, input.current.scrollHeight))}px` }
   }, [text])
   const [loaded, setLoaded] = useState(false)
+  const [loadErrors, setLoadErrors] = useState<Partial<Record<'messages' | 'permissions' | 'forms', string>>>({})
+  const retryPart = useRef<(part: 'messages' | 'permissions' | 'forms') => void>(() => {})
   const timeline = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   const refresh = useRef<() => void>(() => {})
@@ -240,7 +255,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     const load = async () => {
       if (!projectID || !connected) return
       const current = ++generation, revision = catalogRevision
-      const results = await Promise.allSettled([window.ame.models(projectID), window.ame.agents(projectID), window.ame.commands(projectID), window.ame.skills(projectID)])
+      const results = await Promise.allSettled([window.ame.models(projectID), window.ame.commands(projectID), window.ame.skills(projectID)])
       if (!alive || current !== generation || revision !== catalogRevision) return
       const cached = projectCatalogCache.get(projectID)
       const previous = cached?.key === connectionUrl ? cached : undefined
@@ -248,14 +263,13 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
         key: connectionUrl,
         fetchedAt: results.every(result => result.status === 'fulfilled') ? Date.now() : 0,
         models: results[0].status === 'fulfilled' ? results[0].value.filter(item => item.providerID === 'amecode') : previous?.models ?? [],
-        agents: results[1].status === 'fulfilled' ? results[1].value : previous?.agents ?? [],
-        commands: results[2].status === 'fulfilled' ? results[2].value : previous?.commands ?? [],
-        skills: results[3].status === 'fulfilled' ? results[3].value : previous?.skills ?? [],
+        commands: results[1].status === 'fulfilled' ? results[1].value : previous?.commands ?? [],
+        skills: results[2].status === 'fulfilled' ? results[2].value : previous?.skills ?? [],
       }
       projectCatalogCache.set(projectID, catalog)
       hydrate(catalog)
       for (const [index, result] of results.entries()) if (result.status === 'rejected') {
-        if (index < 2) setError(errorText(result.reason))
+        if (index === 0) setError(errorText(result.reason))
         else report(result.reason)
       }
     }
@@ -284,13 +298,36 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   useEffect(() => {
     if (!projectID || !sessionID || !connected) return
     let alive = true
+    const generations = { messages: 0, permissions: 0, forms: 0 }
+    const loadPart = async (part: keyof typeof generations) => {
+      const generation = ++generations[part]
+      try {
+        // Each response commits immediately; a slow or failed form cannot hide history.
+        if (part === 'messages') {
+          const items = await window.ame.messages(projectID, sessionID)
+          if (!alive || generation !== generations[part]) return
+          setMessages(old => sameChatItems(old, items) ? old : items); setLoaded(true)
+        } else if (part === 'permissions') {
+          const pending = await window.ame.permissions(projectID, sessionID)
+          if (!alive || generation !== generations[part]) return
+          setPermissions(pending)
+        } else {
+          const pending = await window.ame.forms(projectID, sessionID)
+          if (!alive || generation !== generations[part]) return
+          setForms(pending)
+        }
+        setLoadErrors(old => ({ ...old, [part]: undefined }))
+      } catch (e) {
+        if (alive && generation === generations[part]) setLoadErrors(old => ({ ...old, [part]: errorText(e) }))
+      }
+    }
+    retryPart.current = part => { void loadPart(part) }
     const load = async () => {
       if (!alive) return
       clearTimeout(fallbackTimer.current)
       try {
-        const [items, pending, pendingForms] = await Promise.all([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID), window.ame.forms(projectID, sessionID)])
-        if (alive) { permissionsCountRef.current = pending.length + pendingForms.length; setMessages(old => sameChatItems(old, items) ? old : items); setPermissions(pending); setForms(pendingForms); setLoaded(true); setError('') }
-      } catch (e) { if (alive) setError(errorText(e)) }
+        await Promise.allSettled([loadPart('messages'), loadPart('permissions'), loadPart('forms')])
+      }
       finally {
         if (alive) {
           if (runningRef.current || permissionsCountRef.current > 0) {
@@ -304,7 +341,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     refresh.current = () => { clearTimeout(fallbackTimer.current); scheduler.request(true) }
     const unsubscribe = window.ame.onEvent(event => { if (event.type === 'opencode' && event.projectID === projectID && (!event.sessionID || event.sessionID === sessionID)) request() })
     scheduler.request(true)
-    return () => { alive = false; scheduler.dispose(); clearTimeout(fallbackTimer.current); unsubscribe(); refresh.current = () => {} }
+    return () => { alive = false; scheduler.dispose(); clearTimeout(fallbackTimer.current); unsubscribe(); refresh.current = () => {}; retryPart.current = () => {} }
   }, [projectID, sessionID, connected])
   useEffect(() => {
     // Both edges matter: the idle edge must fetch final text and turn metadata.
@@ -352,7 +389,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     restoreCursor(cursor)
   }
   const addAttachment = (path: string) => {
-    setAttachments(current => current.some(item => item.kind === 'file' && item.path === path) ? current : [...current, { id: `file-${++attachmentSequence.current}`, kind: 'file', path }])
+    setAttachments(current => current.some(item => item.kind === 'file' && item.path === path) ? current : [...current, { id: `file-${++attachmentSequence}`, kind: 'file', path }])
     setAttachmentPicker(false); setTrigger(null); input.current?.focus()
   }
   const addResolvedAttachments = (resolved: readonly ResolvedDroppedFile[]) => {
@@ -363,14 +400,14 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
       for (const item of resolved) {
         if (!item.ok) continue
         if (item.kind === 'workspace-file') {
-          if (!next.some(attachment => attachment.kind === 'file' && attachment.path === item.path)) next.push({ id: `file-${++attachmentSequence.current}`, kind: 'file', path: item.path })
+          if (!next.some(attachment => attachment.kind === 'file' && attachment.path === item.path)) next.push({ id: `file-${++attachmentSequence}`, kind: 'file', path: item.path })
         } else {
           if (next.some(attachment => 'dataUrl' in attachment && attachment.dataUrl === item.dataUrl && attachment.name === item.name)) continue
           if (next.filter(attachment => attachment.kind === 'media' || attachment.kind === 'external-text').length >= MAX_PROMPT_FILES) {
             setError([...errors, `Chỉ có thể đính kèm tối đa ${MAX_PROMPT_FILES} tệp ảnh/PDF hoặc văn bản bên ngoài.`].join('\n'))
             continue
           }
-          next.push({ id: `attachment-${++attachmentSequence.current}`, kind: item.kind, name: item.name, mime: item.mime, dataUrl: item.dataUrl, size: item.size, ...('workspacePath' in item && item.workspacePath ? { workspacePath: item.workspacePath } : {}) })
+          next.push({ id: `attachment-${++attachmentSequence}`, kind: item.kind, name: item.name, mime: item.mime, dataUrl: item.dataUrl, size: item.size, ...('workspacePath' in item && item.workspacePath ? { workspacePath: item.workspacePath } : {}) })
         }
       }
       return next
@@ -421,18 +458,14 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     if (!projectID || (!prompt.trim() && !files.length) || busy || permissionPending.current || permissionLoading || !connected || !ready || !selectedModel || translationSession || lockedTranslation || composing.current) return
     const submitted = text, submittedSession = sessionID, submittedProject = projectID, submittedAttachments = attachments
     const submittedIDs = new Set(submittedAttachments.map(item => item.id))
+    submittingDraft.current = draft
     setBusy(true)
     try {
       if (!await submit.current!(projectID, sessionID, prompt, selectedModel, undefined, files.length ? files : undefined, draftID, permissionMode)) return
       if (currentProject.current === submittedProject && (currentSession.current === submittedSession || (!submittedSession && currentSession.current === createdSession.current))) {
-        setText(current => current === submitted ? '' : current)
-        setAttachments(current => current.filter(item => !submittedIDs.has(item.id)))
         setTrigger(null); setAttachmentPicker(false)
       }
-      for (const key of [draftKey(submittedProject, submittedSession), ...(!submittedSession ? [draftKey(submittedProject, createdSession.current)] : [])]) {
-        const draft = drafts.current[key]
-        if (draft) drafts.current[key] = { text: draft.text === submitted ? '' : draft.text, attachments: draft.attachments.filter(item => !submittedIDs.has(item.id)) }
-      }
+      updateDraft(draft, current => ({ text: current.text === submitted ? '' : current.text, attachments: current.attachments.filter(item => !submittedIDs.has(item.id)) }))
       refresh.current(); onActivity()
     } catch (e) { report(e) } finally { setBusy(false) }
   }
@@ -476,16 +509,19 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     <header className="chat-pane__header"><div className="chat-title-group"><span className="status-dot status-dot--active" /><span className="chat-title-text truncate">{title || 'Cuộc trò chuyện'}</span></div><div className="chat-header-actions">{androidInfo?.isAndroid && <button type="button" className="pill-btn android-translate-trigger" data-testid="android-translate-trigger" title="Dịch Android" aria-label="Dịch Android" onClick={() => onOpenAndroidTranslation?.()}><Icon name="globe" /><span className="pill-btn__label">Dịch Android</span></button>}{(['artifacts', 'agents', 'btw'] as const).map(tab => <button key={tab} data-chat-drawer={tab} className={`pill-btn ${drawer === tab ? 'is-active' : ''}`} title={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} aria-label={tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'} onClick={() => { if (drawer !== tab) { setTrigger(null); setAttachmentPicker(false) } setDrawer(value => value === tab ? null : tab) }}><Icon name={tab === 'artifacts' ? 'layers' : tab === 'agents' ? 'agents' : 'message'} /><span className="pill-btn__label">{tab === 'artifacts' ? 'Artifacts' : tab === 'agents' ? 'Agents' : '/btw'}</span></button>)}<IconButton label="Tùy chọn hội thoại" active={menu} onClick={() => setMenu(value => !value)}><Icon name="more" /></IconButton></div></header>
     {!connected && <div className="warning">Đang kết nối OpenCode. Có thể thử lại trong Cài đặt.</div>}
     {error && <div className="inline-error" role="status">{error}</div>}
+    {permissionStatus === 'error' && <div className="warning" role="status" data-testid="permission-mode-error">Không tải được quyền thực thi: {modeState.error} <button type="button" disabled={!connected} onClick={() => setPermissionAttempt(value => value + 1)}>Thử lại</button></div>}
+    {(['messages', 'permissions', 'forms'] as const).map(part => loadErrors[part] && <div key={part} className="warning" role="status" data-testid={`chat-${part}-error`}>Không tải được {part === 'messages' ? 'lịch sử chat' : part === 'permissions' ? 'yêu cầu quyền' : 'biểu mẫu'}: {loadErrors[part]} <button type="button" disabled={!connected} onClick={() => retryPart.current(part)}>Thử lại</button></div>)}
     <div className="chat-pane__body">{menu && <div className="chat-corner-drawer is-open" role="menu"><button className="chat-drawer__row" role="menuitem" onClick={() => { onCreate(); setMenu(false) }}>Cuộc trò chuyện mới</button><button className="chat-drawer__row" role="menuitem" onClick={() => { void navigator.clipboard.writeText(messages.map(item => `${item.role}: ${item.text}`).join('\n\n')).catch(report); setMenu(false) }}>Copy conversation</button></div>}
       <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><div className="chat-drawer__head-actions">{drawer === 'agents' && projectID && sessionID && <button type="button" className="chat-drawer__action" onClick={() => { setDrawer(null); setAgentMapOpen(true) }}>Agent map</button>}<IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? lockedTranslation || translationSession ? <Empty>Dùng Chat chính mới cho /btw; phiên dịch Android chỉ dành cho bản địa hóa.</Empty> : projectID && sessionID ? <BtwPanel key={JSON.stringify([projectID, sessionID])} projectID={projectID} sessionID={sessionID} connected={connected} ready={ready} model={activeModel} onCreated={onCreated} onSelectSession={onSelectSession} onActivity={onActivity} /> : <Empty>Chọn một phiên để mở luồng phụ /btw.</Empty> : <>{drawer === 'artifacts' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={sessionID} /> : <Empty>Mở dự án để xem artifacts.</Empty>)}<button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Mở bảng Artifacts</button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
       <div ref={timeline} className="chat-stream" onScroll={e => { const el = e.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
         {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty>         : projectChatTimeline(messages, { running, mode: timelineDetail }).map(turn => <section key={turn.id} className="chat-turn">
-                 {turn.user && <article className="msg-user"><MessageContent text={turn.user.text || '…'} onOpenFile={onOpenFile} /><MessageAttachmentList attachments={turn.user.attachments} /></article>}
+                 {turn.user && <article className="msg-user"><MessageContent text={extractUserDisplayText(turn.user.text) || '…'} onOpenFile={onOpenFile} /><MessageAttachmentList attachments={turn.user.attachments} /></article>}
                  <div className="msg-turn-body">{turn.blocks.map(block => {
                    const actions = { projectDirectory, onOpenFile, onOpenAgentMap: () => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) } }
                    if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
                    if (block.kind === 'active-tools') return <ActiveToolsView key={block.id} items={block.items} {...actions} />
-                   if (block.kind === 'live-status') return <LiveTurnStatus key={block.id} label={forms.length ? 'Đang chờ bạn trả lời câu hỏi…' : block.label} />
+                    if (block.kind === 'live-status') return <LiveTurnStatus key={block.id} label={forms.length ? 'Đang chờ bạn trả lời câu hỏi…' : block.label} />
+                    if (block.kind === 'error') return <div key={block.id} className="inline-error" role="alert">{block.item.text}{/compaction|token limit|context/i.test(block.item.text) && <p>Ngữ cảnh phiên đã quá dài khiến bước tóm tắt bị vượt giới hạn token. Hãy bấm Phiên dịch mới (hoặc tạo cuộc trò chuyện mới) để tiếp tục.</p>}</div>
                    const item = block.item
                    if (block.kind === 'tool' && item.tool?.name === 'question' && (item.tool.status === 'running' || item.tool.status === 'streaming')) return <ActiveToolsView key={block.id} items={[item]} {...actions} />
                    return <article key={block.id} className="msg-agent">{block.kind === 'tool' && item.tool ? <ToolCard call={item.tool} onOpenFile={onOpenFile} projectDirectory={projectDirectory} /> : block.kind === 'changes' && item.turn && projectID && sessionID ? <TurnChanges key={`${sessionID}:${item.id}`} projectID={projectID} sessionID={sessionID} from={item.turn.from} files={item.turn.files} theme={theme} /> : block.kind === 'tool' ? <details className="tool-card"><summary><Icon name="terminal" /> Công cụ</summary><pre>{item.text || 'Đang cập nhật công cụ…'}</pre></details> : block.kind === 'reasoning' ? <details className="thought-block"><summary>Suy nghĩ</summary><div className="thought-block__content"><MessageContent text={item.text || '…'} onOpenFile={onOpenFile} /></div></details> : <MessageContent text={item.text || '…'} onOpenFile={onOpenFile} />}</article>
@@ -514,9 +550,9 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
           <span className="composer-picker__face" aria-hidden="true"><Icon name="sparkles" /><span className="composer-picker__label">{activeModel?.name || 'Chọn model'}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Mô hình" value={model} onChange={e => { userPickedModel.current = true; setModel(e.target.value) }} disabled={!connected || busy}><option value="">Chọn model</option>{models.map(m => <option key={modelKey(m)} value={modelKey(m)}>{formatModelOptionLabel(m, effectiveModelLevels)}</option>)}</select>
         </label>}</div><div className="composer-toolbar__right"><label className={`composer-picker composer-picker--permission${permissionMode === 'full' ? ' is-full' : ''}`} title={permissionModeOptions.find(option => option.value === permissionMode)?.description}>
-          <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{permissionLoading || updatingPermission ? 'Đang tải quyền…' : permissionModeOptions.find(option => option.value === permissionMode)?.label}</span><Icon name="down" /></span>
+          <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{permissionStatus === 'error' ? 'Lỗi tải quyền' : permissionLoading || updatingPermission ? 'Đang tải quyền…' : permissionModeOptions.find(option => option.value === permissionMode)?.label}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Quyền thực thi" value={permissionMode} onChange={e => void changePermissionMode(e.target.value as PermissionMode)} disabled={!projectID || !connected || busy || permissionLoading || updatingPermission}>{permissionModeOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-        </label>{running && <button className="icon-btn" type="button" disabled={!sessionID || !connected} title="Dừng phản hồi" onClick={() => { if (projectID && sessionID) void window.ame.cancel(projectID, sessionID).then(() => refresh.current()).catch(report) }}><Icon name="stop" /></button>}<button className="send-btn" aria-label="Gửi yêu cầu" disabled={!projectID || !connected || !ready || busy || (!text.trim() && !attachments.length) || !activeModel}><Icon name="send" /></button></div></div>
+        </label>{running && <button className="icon-btn" type="button" disabled={!sessionID || !connected} title="Dừng phản hồi" onClick={() => { if (projectID && sessionID) void window.ame.cancel(projectID, sessionID).then(() => refresh.current()).catch(report) }}><Icon name="stop" /></button>}<button className="send-btn" aria-label="Gửi yêu cầu" disabled={!projectID || !connected || !ready || busy || permissionLoading || updatingPermission || (!text.trim() && !attachments.length) || !activeModel}><Icon name="send" /></button></div></div>
       </form></div></div>}
     </div>
     </div>

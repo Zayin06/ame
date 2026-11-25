@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { SessionInfo, SessionMessageAssistant, SessionMessageInfo } from "@opencode/client"
 import { estimateUsage, readUsagePrices, tokenValues, validTokens, type UsagePrice, type UsageTokens } from "../src/usage-pricing"
-import { aggregateUsageTree, emptyTokens, formatTokenCount, formatUsageCost, summarizeUsage, usageFamily } from "../src/usage"
+import { aggregateUsageTree, cacheHitLevel, cacheHitRate, emptyTokens, formatCacheHitRate, formatTokenCount, formatUsageCost, summarizeUsage, usageFamily } from "../src/usage"
 
 function price(overrides: Partial<UsagePrice> = {}): UsagePrice {
   return { model_id: "catalog-model", upstream_model_id: "model", provider_route: "amecode", status: "priced",
@@ -23,6 +23,43 @@ function summarize(messages: readonly SessionMessageInfo[], overrides: Partial<P
   return summarizeUsage({ id: "root", depth: 0, messages, prices, historyComplete: true, ...overrides })
 }
 function close(actual: number, expected: number) { assert.ok(Math.abs(actual - expected) < 1e-12, `${actual} != ${expected}`) }
+
+test("cache hit helpers use the complete SDK prompt and exclude output/reasoning", () => {
+  for (const [input, read, write, rate, text, level] of [
+    [0, 0, 0, null, "—", "none"],
+    [100, 0, 0, 0, "0%", "low"],
+    [130, 200, 0, 200 / 330, "60.6%", "warn"],
+    [78000, 332500, 0, 332500 / 410500, "81%", "good"],
+    [0, 100, 0, 1, "100%", "good"],
+    [10, 60, 0, 60 / 70, "85.7%", "good"],
+    [10, 60, 30, 0.6, "60%", "warn"],
+    [0, 0, 100, 0, "0%", "low"],
+    [70, 30, 0, 0.3, "30%", "warn"],
+    [30, 70, 0, 0.7, "70%", "good"],
+    [701, 299, 0, 0.299, "29.9%", "low"],
+  ] as const) {
+    const tokens = { input, output: 500, reasoning: 200, cache: { read, write } }
+    const before = JSON.stringify(tokens)
+    assert.equal(cacheHitRate(tokens), rate)
+    assert.equal(formatCacheHitRate(tokens), text)
+    assert.equal(cacheHitLevel(tokens), level)
+    assert.equal(JSON.stringify(tokens), before)
+  }
+})
+
+test("cache hit helpers return no rate for invalid tokens in any category", () => {
+  for (const invalid of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    const base = { input: 10, output: 20, reasoning: 5, cache: { read: 60, write: 30 } }
+    for (const tokens of [
+      ...(["input", "output", "reasoning"] as const).map(key => ({ ...base, [key]: invalid })),
+      ...(["read", "write"] as const).map(key => ({ ...base, cache: { ...base.cache, [key]: invalid } })),
+    ]) {
+      assert.equal(cacheHitRate(tokens), null)
+      assert.equal(formatCacheHitRate(tokens), "—")
+      assert.equal(cacheHitLevel(tokens), "none")
+    }
+  }
+})
 
 test("readUsagePrices accepts strict catalogs, handles prototype keys and ignores invalid/mismatched pricing", () => {
   const invalid = [

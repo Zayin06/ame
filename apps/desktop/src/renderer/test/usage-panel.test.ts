@@ -4,6 +4,7 @@ import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { buildUsagePanelModel, UsagePanel } from "../components/UsagePanel"
 import { emptyTokens, summarizeUsage, type UsageNode } from "../../../../../packages/amekit/src/usage"
+import type { UsageTokens } from "../../../../../packages/amekit/src/usage-pricing"
 
 function node(id: string, depth: number, parentID?: string): UsageNode {
   const result = summarizeUsage({ id, depth, messages: [{ id: `${id}-message`, type: "assistant", agent: "coder",
@@ -29,6 +30,8 @@ test("panel model rolls up four levels and turns BFS input into stable parent-fi
   ])
   assert.equal(model.rows[3].totalTokens, 137)
   assert.equal(model.rows[3].costText, "$0.250000")
+  assert.equal(model.rows[3].cacheHitText, "8.9%")
+  assert.equal(model.rows[3].cacheHitLevel, "low")
   assert.equal(JSON.stringify(tree), before)
 })
 
@@ -85,4 +88,41 @@ test("React markup renders Vietnamese KPIs, state notices, depth indentation and
   assert.ok(!markup.includes("<testing>"))
   const empty = renderToStaticMarkup(createElement(UsagePanel, { nodes: [] }))
   assert.ok(empty.includes("Chưa có dữ liệu usage."))
+})
+
+test("cache hit KPI is prompt-weighted across the tree and badges identify each node and model group", () => {
+  const withTokens = (id: string, depth: number, tokens: UsageTokens, parentID?: string) => {
+    const source = node(id, depth, parentID)
+    return { ...source, tokens, groups: source.groups.map(group => ({ ...group, tokens })) }
+  }
+  const nodes = [
+    withTokens("root", 0, { input: 10, output: 900, reasoning: 300, cache: { read: 60, write: 30 } }),
+    withTokens("child", 1, { input: 77990, output: 20, reasoning: 5, cache: { read: 332440, write: 0 } }, "root"),
+    withTokens("cold", 1, { ...emptyTokens(), input: 100 }, "root"),
+    withTokens("empty", 1, emptyTokens(), "root"),
+  ]
+  const model = buildUsagePanelModel(nodes, new Set(["root"]))
+  assert.equal(model.rows.length, 1)
+  assert.equal(model.summary.tokens.cache.read, 332500)
+  assert.equal(model.rows[0].cacheHitText, "60%")
+  assert.equal(model.rows[0].cacheHitLevel, "warn")
+  const markup = renderToStaticMarkup(createElement(UsagePanel, { nodes }))
+  assert.match(markup, /<span>Cache Hit<\/span><strong class="usage-cache-hit usage-cache-hit-good">81%<\/strong><small>Đọc 332.5K \/ 410.6K prompt · Ghi 30<\/small>/)
+  assert.equal((markup.match(/class="usage-kpi"/g) ?? []).length, 5)
+  for (const [id, text, level] of [["root", "60%", "warn"], ["child", "81%", "good"], ["cold", "0%", "low"], ["empty", "—", "none"]]) {
+    const article = markup.split('<article').find(part => part.includes(`<p class="usage-session-id">${id}</p>`))!
+    assert.ok(article, `Missing session ${id}`)
+    const [session, group] = article.split('<div class="usage-group"')
+    for (const part of [session, group]) {
+      assert.ok(part.includes(`usage-cache-hit-${level}`))
+      assert.ok(part.includes(`Cache hit ${text}`))
+      assert.ok(part.includes(`Hit ${text}`))
+    }
+  }
+})
+
+test("cache hit KPI handles an empty prompt and omits writes when zero", () => {
+  const markup = renderToStaticMarkup(createElement(UsagePanel, { nodes: [] }))
+  assert.match(markup, /<span>Cache Hit<\/span><strong class="usage-cache-hit usage-cache-hit-none">—<\/strong><small>Đọc 0 \/ 0 prompt<\/small>/)
+  assert.ok(!markup.includes("· Ghi"))
 })
