@@ -36,10 +36,14 @@ jobs:
         run: npm run build:server
       - name: Build Electron without private runtime
         if: env.AME_OPENCODE_CLI == ''
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: npx electron-vite build
       - name: Prepare configured trusted OpenCode 2.3.2
         if: env.AME_OPENCODE_CLI != ''
         run: npm run runtime:prepare
       - name: Full build with private runtime
         if: env.AME_OPENCODE_CLI != ''
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: npm run build

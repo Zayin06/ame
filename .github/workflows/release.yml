@@ -128,6 +128,8 @@ jobs:
       - name: Stage and verify exact OpenCode 2.3.2 for target architecture
         run: npm run runtime:prepare
       - run: npm run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
       - name: Package platform artifacts without publishing
         shell: bash
         env:
