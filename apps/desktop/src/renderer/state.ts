@@ -51,7 +51,10 @@ export const tabTitle = (tab: Tab) => {
   return `${name} (${label})`
 }
 export const documentID = (project: string, path: string) => JSON.stringify([project, path])
-export const clampWidth = (pane: Pane, width: number) => Math.round(Math.max(pane === 'stage' ? 300 : 190, Math.min(pane === 'stage' ? 780 : 360, width)))
+export const clampWidth = (pane: Pane, width: number) => Number.isFinite(width)
+  ? Math.round(Math.max(pane === 'stage' ? 300 : 190, pane === 'stage' ? width : Math.min(360, width)))
+  : defaultWidths[pane]
+export const shouldMaximizeStage = (width: number, availableWidth: number) => availableWidth > 0 && availableWidth - width < 320
 export const defaults = (): Preferences => ({ theme: 'dark', widths: { ...defaultWidths }, rail: true, inspector: false, stage: true, terminalOpen: true, inspectorTab: 'files', panel: 'files', layoutMode: 'swe', tint: 'default', chatWidth: 760, timelineDetail: 'compact', projects: {} })
 export function parsePreferences(raw: string | null): Preferences {
   const result = defaults()

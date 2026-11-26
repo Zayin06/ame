@@ -194,6 +194,7 @@ export function createTsLanguageServiceEngine(workspaceRoot: string): TsLanguage
       const valid = await checked(relative)
       await ready()
       if (!sourceFile(valid.target)) throw new Error('LSP_UNSUPPORTED_FILE')
+      if (overlay(valid.target)?.text === content) return
       const previous = overlay(valid.target)?.version ?? 0
       const target = overlayPaths.get(pathKey(valid.target)) ?? path.normalize(valid.target)
       overlayPaths.set(pathKey(target), target)

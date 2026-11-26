@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { activateTab, removeTab, selectedTab, defaults, dirty, documentID, parsePreferences, projectDirtyPaths, reconcileDocument, savedDocument, tabIsDirty, withoutKey, withoutProject, withoutProjectDocuments, type Buffer } from '../state'
+import { activateTab, clampWidth, removeTab, selectedTab, defaults, dirty, documentID, parsePreferences, projectDirtyPaths, reconcileDocument, savedDocument, shouldMaximizeStage, tabIsDirty, withoutKey, withoutProject, withoutProjectDocuments, type Buffer } from '../state'
 
 test('starts with Explorer hidden but preserves an explicitly saved Inspector choice', () => {
   for (const raw of [null, '{}', 'invalid json']) assert.equal(parsePreferences(raw).inspector, false)
@@ -12,11 +12,31 @@ test('restores sticky inspector, widths and per-project tabs without accepting b
   const value = parsePreferences(JSON.stringify({ inspector: false, widths: { rail: -10, stage: 99999 }, project: 'one', projects: { one: { session: 's1', active: 'file:a.ts', tabs: [{ path: 'a.ts', mode: 'file', text: 'unsaved secret' }, { path: 'b.ts', mode: 'bad' }] }, two: { session: 's2', tabs: [{ path: 'b.ts', mode: 'diff' }] } } }))
   assert.equal(value.inspector, false)
   assert.equal(value.widths.rail, 190)
-  assert.equal(value.widths.stage, 780)
+  assert.equal(value.widths.stage, 99999)
   assert.deepEqual(value.projects.one, { session: 's1', active: 'file:a.ts', tabs: [{ path: 'a.ts', mode: 'file' }] })
   assert.equal(value.projects.two.session, 's2')
   assert.equal(JSON.stringify(value).includes('unsaved secret'), false)
   assert.deepEqual(parsePreferences('invalid json'), defaults())
+})
+
+test('file panel widths can exceed the former cap and survive preference restore', () => {
+  for (const width of [800, 1200, 2400]) {
+    assert.equal(clampWidth('stage', width), width)
+    assert.equal(parsePreferences(JSON.stringify({ widths: { stage: width } })).widths.stage, width)
+  }
+  assert.equal(clampWidth('stage', 100), 300)
+  assert.equal(clampWidth('rail', 500), 360)
+  assert.equal(clampWidth('inspector', 100), 190)
+  assert.equal(clampWidth('stage', NaN), defaults().widths.stage)
+})
+
+test('file panel maximizes only when the remaining chat falls below 320px', () => {
+  assert.equal(shouldMaximizeStage(880, 1200), false)
+  assert.equal(shouldMaximizeStage(881, 1200), true)
+  assert.equal(shouldMaximizeStage(1880, 2200), false)
+  assert.equal(shouldMaximizeStage(1881, 2200), true)
+  assert.equal(shouldMaximizeStage(300, 600), true)
+  assert.equal(shouldMaximizeStage(480, 0), false)
 })
 test('restores independent search and terminal state and migrates removed stage tools', () => {
   const restored = parsePreferences('{"inspector":false,"inspectorTab":"search","terminalOpen":false,"panel":"diff"}')

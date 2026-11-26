@@ -42,6 +42,8 @@ async function requestLsp<T>(model: monaco.editor.ITextModel, token: monaco.Canc
   if (!location || token.isCancellationRequested || model.isDisposed()) return null
   const version = model.getVersionId()
   try {
+    await window.ame.lspUpdateDocument(location.projectID, location.relativePath, model.getValue())
+    if (token.isCancellationRequested || model.isDisposed() || model.getVersionId() !== version) return null
     const result = await request(location.projectID, location.relativePath)
     return token.isCancellationRequested || model.isDisposed() || model.getVersionId() !== version ? null : result
   } catch { return null }

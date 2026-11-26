@@ -8,7 +8,8 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: { rollupOptions: { input: {
       index: resolve('apps/desktop/src/main/index.ts'),
-      'ts-lsp-worker': resolve('packages/ide-core/src/ts-lsp-worker.ts')
+      'ts-lsp-worker': resolve('packages/ide-core/src/ts-lsp-worker.ts'),
+      'search-worker': resolve('packages/ide-core/src/search-worker.ts')
     } } }
   },
   preload: {

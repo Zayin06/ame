@@ -10,6 +10,7 @@ import type { BuildNotesRequest, CommitAgentPlan, Project, FileDocument, FileEnt
 import * as workspaceFs from './workspace-fs'
 import { searchWorkspace, replaceInWorkspace } from './search'
 import * as gitOps from './git-ops'
+import { saveFileSafely } from './file-save'
 import type { DiffTarget } from '../../protocol/src/index'
 import { isValidGitCommitHash } from '../../protocol/src/index'
 
@@ -18,6 +19,9 @@ const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf])
 export class Workspaces {
   private projects = new Map<string, Project>()
   private watchers = new Map<string, FSWatcher>()
+  private gitWatchers = new Map<string, FSWatcher[]>()
+  private gitWatchVersions = new Map<string, symbol>()
+  private searchControllers = new Map<string, AbortController>()
   private watchTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private saves = new Map<string, Promise<unknown>>()
   private fileBoms = new Map<string, Map<string, boolean>>()
@@ -44,12 +48,18 @@ export class Workspaces {
       this.projects.set(id, project)
       try {
         const watcher = watch(resolved, { recursive: true }, (_event, file) => {
+          if (file && String(file).replace(/\\/g, '/').toLowerCase() === '.git') {
+            void this.refreshGitWatchers(id, resolved)
+            this.scheduleWatchChange(id)
+            return
+          }
           if (file && /(^|[\\/])(node_modules|\.git|dist|out|build|coverage|release|release-[^\\/]+|\.next|\.nuxt|\.turbo|\.cache|\.plasmo|\.vite|\.parcel-cache|storybook-static|\.venv|venv|__pycache__|target|vendor|\.pm)([\\/]|$)/i.test(String(file))) return
           this.scheduleWatchChange(id)
         })
         watcher.on('error', () => this.scheduleWatchChange(id))
         this.watchers.set(id, watcher)
       } catch { /* Read/save remain available on filesystems without recursive watch. */ }
+      await this.refreshGitWatchers(id, resolved)
       return project
     })
   }
@@ -57,6 +67,39 @@ export class Workspaces {
     const task = this.projectQueue.catch(() => {}).then(operation)
     this.projectQueue = task
     return task
+  }
+  private async refreshGitWatchers(id: string, root: string) {
+    const version = Symbol()
+    this.gitWatchVersions.set(id, version)
+    const directories = new Set<string>()
+    try {
+      const marker = path.join(root, '.git')
+      const info = await stat(marker)
+      let gitDir = marker
+      if (info.isFile()) {
+        const match = /^gitdir: (.+)\s*$/i.exec((await readFile(marker, 'utf8')).trim())
+        if (!match) throw new Error('INVALID_GIT_MARKER')
+        gitDir = path.resolve(root, match[1])
+      }
+      directories.add(await realpath(gitDir))
+      try { directories.add(await realpath(path.resolve(gitDir, (await readFile(path.join(gitDir, 'commondir'), 'utf8')).trim()))) }
+      catch { /* Ordinary checkouts have no separate common directory. */ }
+    } catch { /* Git can be initialized after opening the project. */ }
+    if (!this.projects.has(id) || this.gitWatchVersions.get(id) !== version) return
+    const watchers: FSWatcher[] = []
+    for (const directory of directories) {
+      try {
+        const watcher = watch(directory, { recursive: true }, (_event, file) => {
+          const relative = file && String(file).replace(/\\/g, '/')
+          // Ignore objects, reflogs and transient locks: Git status reads may update them.
+          if (!relative || /^(?:HEAD|index|packed-refs|config|shallow|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD|REBASE_HEAD|CHERRY_PICK_HEAD|REVERT_HEAD|refs(?:\/.*)?|rebase-merge(?:\/.*)?|rebase-apply(?:\/.*)?)$/.test(relative) && !relative.endsWith('.lock')) this.scheduleWatchChange(id)
+        })
+        watcher.on('error', () => this.scheduleWatchChange(id))
+        watchers.push(watcher)
+      } catch { /* Refresh remains available on filesystems without recursive watch. */ }
+    }
+    this.gitWatchers.get(id)?.forEach(watcher => watcher.close())
+    this.gitWatchers.set(id, watchers)
   }
   private scheduleWatchChange(id: string) {
     clearTimeout(this.watchTimers.get(id))
@@ -73,6 +116,11 @@ export class Workspaces {
       this.watchTimers.delete(id)
       this.watchers.get(id)?.close()
       this.watchers.delete(id)
+      this.gitWatchVersions.delete(id)
+      this.gitWatchers.get(id)?.forEach(watcher => watcher.close())
+      this.gitWatchers.delete(id)
+      this.searchControllers.get(id)?.abort()
+      this.searchControllers.delete(id)
       this.projects.delete(id)
       this.fileBoms.delete(id)
     })
@@ -170,9 +218,12 @@ export class Workspaces {
       const hasBom = this.fileBoms.get(id)?.get(JSON.stringify([key, expected])) ?? this.fileBoms.get(id)?.get(JSON.stringify([relative, expected])) ?? current.subarray(0, 3).equals(utf8Bom)
       const bytes = Buffer.from(hasBom && !content.startsWith('\uFEFF') ? '\uFEFF' + content : content, 'utf8')
       if (bytes.length > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
-      await writeFile(target, bytes)
+      await saveFileSafely(target, bytes, current, async () => {
+        const checked = await this.resolve(id, relative)
+        if (checked !== target || await this.fileKey(id, checked) !== key || revision(await readFile(checked)) !== expected) throw new Error('FILE_CONFLICT: File changed while preparing the save.')
+      })
       this.changed(id)
-      return this.read(id, relative)
+      return { path: relative, content: new TextDecoder('utf-8', { fatal: true }).decode(bytes), revision: revision(bytes) }
     })
     this.saves.set(key, task)
     try { return await task } finally { if (this.saves.get(key) === task) this.saves.delete(key) }
@@ -198,7 +249,12 @@ export class Workspaces {
     return result
   }
   async searchProject(id: string, query: SearchQuery): Promise<SearchResponse> {
-    return searchWorkspace(this.get(id).directory, query)
+    const directory = this.get(id).directory
+    this.searchControllers.get(id)?.abort()
+    const controller = new AbortController()
+    this.searchControllers.set(id, controller)
+    try { return await searchWorkspace(directory, query, { signal: controller.signal }) }
+    finally { if (this.searchControllers.get(id) === controller) this.searchControllers.delete(id) }
   }
   async replaceInProject(id: string, options: ReplaceOptions, plan?: ReplaceResult['previews']): Promise<ReplaceResult> {
     const result = await replaceInWorkspace(this.get(id).directory, options, plan)
@@ -413,6 +469,11 @@ export class Workspaces {
     this.changed(id)
   }
   dispose() {
+    for (const controller of this.searchControllers.values()) controller.abort()
+    this.searchControllers.clear()
+    this.gitWatchVersions.clear()
+    for (const watchers of this.gitWatchers.values()) for (const watcher of watchers) watcher.close()
+    this.gitWatchers.clear()
     for (const timer of this.watchTimers.values()) clearTimeout(timer)
     this.watchTimers.clear()
     for (const watcher of this.watchers.values()) watcher.close()

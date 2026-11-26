@@ -82,6 +82,11 @@ function resolveDiffResult(
 ): { fileDiff: FileDiffMetadata; additions: number; deletions: number; eolNormalized?: boolean; eolOnly?: boolean; parseFailed?: boolean } {
   const fallbackAdditions = diff.additions ?? 0
   const fallbackDeletions = diff.deletions ?? 0
+  if (diff.patch && overlappingPatchSections(diff.patch)) {
+    // Consecutive edits use different file versions. Keep every patch visible as raw text
+    // rather than pretending overlapping hunks form a single before/after comparison.
+    return { fileDiff: emptyFileDiff(diff.file), additions: fallbackAdditions, deletions: fallbackDeletions, parseFailed: true }
+  }
   if (diff.patch == null) {
     const before = diff.before ?? ""
     const after = diff.after ?? ""
@@ -255,6 +260,7 @@ function reconstructHunkSides(
 }
 
 function completePatch(patch: string) {
+  if (patchSections(patch).length > 1) return
   const parsed = splitPatch(patch)
 
   if (!parsed) return
@@ -442,8 +448,26 @@ function trimContext(patch: string, context: number) {
     .out.join("\n")
 }
 
+function patchSections(patch: string) {
+  const sections = patch.split(/^(?=diff --git |Index: )/m).filter(section => section.trim())
+  return /^(?:diff --git |Index: )/m.test(patch) ? sections : patch.split(/^(?=--- [^\n]*\n\+\+\+ )/m).filter(section => section.trim())
+}
+
+function overlappingPatchSections(patch: string) {
+  const sections = patchSections(patch)
+  if (sections.length <= 1) return false
+  let oldEnd = -1, newEnd = -1
+  for (const section of sections) for (const match of section.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const oldStart = Number(match[1]), newStart = Number(match[3])
+    if (oldStart < oldEnd || newStart < newEnd) return true
+    oldEnd = oldStart + Number(match[2] ?? 1)
+    newEnd = newStart + Number(match[4] ?? 1)
+  }
+  return false
+}
+
 function collapseConcatenatedHeaders(file: string, patch: string) {
-  const sections = patch.split(/^(?=diff --git )/m)
+  const sections = patchSections(patch)
   if (sections.length <= 1) return patch
   const hunks = sections.flatMap((section) => {
     const at = section.search(/^@@ /m)

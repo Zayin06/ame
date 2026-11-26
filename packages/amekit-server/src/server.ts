@@ -4,6 +4,8 @@ import type { Model } from "@opencode/schema/model"
 import { z } from "zod"
 import { assertModel, managedProvider, modelPolicy, parseModelLevel, providerURL, resolveModelLevel, type ModelLevels } from "../../amekit/src/model-policy"
 import { modelGateway } from "./model-gateway"
+import { OrchestratorConfig } from "../../amekit/src/orchestrator"
+import { applyOrchestrator } from "./orchestrator"
 
 type RuntimePolicy = { models: ReturnType<typeof modelPolicy>["models"]; default_model: string; model_levels: ModelLevels; chat_models?: ReturnType<typeof modelPolicy>["chat_models"]; feature_models?: readonly string[] }
 type AgentModel = { id: string; model?: Model.Ref }
@@ -51,11 +53,12 @@ export function resolveHookModel(input: { kind: string; model: Model.Ref }, poli
 const updateSchema = z.object({
   role: z.enum(["admin", "user"]), catalog: z.unknown(),
   featureModels: z.array(z.string().min(1).max(200)).max(20).optional(),
+  orchestrator: OrchestratorConfig.optional(),
   provider: z.object({ base_url: z.string(), api_key: z.string().min(1) }),
   expires: z.number().finite(),
 }).nullable()
 const key = Symbol.for("amekit.model-policy.v1")
-type State = { policy?: ReturnType<typeof modelPolicy>; provider?: { base_url: string; api_key: string }; expires: number; listeners: Set<() => Promise<void>> }
+type State = { policy?: ReturnType<typeof modelPolicy>; provider?: { base_url: string; api_key: string }; orchestrator?: OrchestratorConfig; expires: number; listeners: Set<() => Promise<void>> }
 const shared = globalThis as typeof globalThis & { [key]?: State }
 const state = shared[key] ??= { expires: 0, listeners: new Set() }
 function active() { return state.expires > Date.now() ? state.policy : undefined }
@@ -70,7 +73,7 @@ export default Plugin.define({
     let timer: ReturnType<typeof setInterval> | undefined
     const cleanup = async () => {
       clearInterval(timer); state.listeners.delete(reload)
-      if (!state.listeners.size) { state.policy = undefined; state.provider = undefined; state.expires = 0 }
+      if (!state.listeners.size) { state.policy = undefined; state.provider = undefined; state.orchestrator = undefined; state.expires = 0 }
       await Promise.all([gateway.close(), ...registrations.reverse().map(registration => registration.dispose())])
     }
     try {
@@ -91,7 +94,11 @@ export default Plugin.define({
       for (const model of editor.list()) if (!policy || model.providerID !== managedProvider || !policy.models.some(entry => entry.id === model.id)) editor.remove(model.providerID, model.id)
       if (policy) editor.default.set(managedProvider, policy.default_model)
     }))
-    registrations.push(await ctx.agent.transform(editor => applyAgentModelTransform(editor, active())))
+    registrations.push(await ctx.agent.transform(editor => {
+      const policy = active()
+      if (policy) applyOrchestrator(editor, state.orchestrator)
+      applyAgentModelTransform(editor, policy)
+    }))
     registrations.push(await ctx.session.hook("context", async input => {
       const policy = active()
       if (policy && !input.system.some(part => part.text.includes("[amecode-model-levels]"))) {
@@ -121,12 +128,12 @@ export default Plugin.define({
       status: { input: z.null(), output: z.object({ authenticated: z.boolean(), models: z.array(z.string()) }) },
     }, events: {} }, {
       update: async value => {
-        state.policy = undefined; state.provider = undefined; state.expires = 0
+        state.policy = undefined; state.provider = undefined; state.orchestrator = undefined; state.expires = 0
         try {
           if (value) {
             const policy = modelPolicy(value.role, value.catalog, { featureModels: value.featureModels }), base_url = providerURL(value.provider.base_url)
             if (value.expires <= Date.now()) throw new Error("AMECODE_LOGIN_REQUIRED")
-            state.policy = policy; state.provider = { ...value.provider, base_url }; state.expires = Math.min(value.expires, Date.now() + 90_000)
+            state.policy = policy; state.provider = { ...value.provider, base_url }; state.orchestrator = value.orchestrator; state.expires = Math.min(value.expires, Date.now() + 90_000)
           }
         } finally {
           await Promise.all([...state.listeners].map(listener => listener()))
@@ -137,7 +144,7 @@ export default Plugin.define({
     }))
     timer = setInterval(() => {
       if (state.policy && !active()) {
-        state.policy = undefined; state.provider = undefined; state.expires = 0
+        state.policy = undefined; state.provider = undefined; state.orchestrator = undefined; state.expires = 0
         void Promise.all([...state.listeners].map(listener => listener())).catch(() => {})
       }
     }, 1000)

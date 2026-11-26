@@ -812,7 +812,12 @@ export async function gitUndoLastCommit(root: string): Promise<{ message: string
   if (parent) {
     if (!await hasRef(git, `${parent}^{commit}`)) throw new Error('GIT_SHALLOW_HISTORY: Fetch more history before undoing this commit.')
     await git.raw(['reset', '--soft', parent])
-  } else await git.raw(['update-ref', '-d', 'HEAD', head])
+  } else {
+    // Deleting a detached HEAD removes .git/HEAD itself and invalidates the repository.
+    const branchRef = (await git.raw(['symbolic-ref', '--quiet', 'HEAD']).catch(() => '')).trim()
+    if (!branchRef.startsWith('refs/heads/')) throw new Error('GIT_DETACHED_ROOT_UNDO_UNSUPPORTED')
+    await git.raw(['update-ref', '-d', branchRef, head])
+  }
   return { message }
 }
 

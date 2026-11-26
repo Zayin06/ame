@@ -336,6 +336,54 @@ async function main() {
       await shot('01-self-healed-open-file.png')
     })
 
+    await run('1A file panel free resize, automatic maximize, and restore', async () => {
+      const handle = '.pane-resizer[data-resize="sidepanel"]'
+      const panelWidth = 'document.querySelector(".side-panel").getBoundingClientRect().width'
+      const maximized = 'document.querySelector(".workspace-body").classList.contains("is-sidepanel-maximized")'
+      const splitWidth = async () => evaluate('document.querySelector(".chat-pane").getBoundingClientRect().width + document.querySelector(".side-panel").getBoundingClientRect().width')
+      const dragToWidth = async width => {
+        const origin = await evaluate(`(() => {const r=document.querySelector(${quote(handle)}).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,width:${panelWidth}}})()`)
+        await command('Input.dispatchMouseEvent', { type: 'mouseMoved', x: origin.x, y: origin.y })
+        await sleep(100)
+        assert.ok(await evaluate(`document.elementFromPoint(${origin.x}, ${origin.y}) === document.querySelector(${quote(handle)})`), 'Resize handle must be unobscured before dragging')
+        await command('Input.dispatchMouseEvent', { type: 'mousePressed', x: origin.x, y: origin.y, button: 'left', clickCount: 1 })
+        const x = origin.x + origin.width - width
+        await command('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y: origin.y, button: 'left', buttons: 1 })
+        await command('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y: origin.y, button: 'left', clickCount: 1 })
+      }
+      await command('Emulation.setDeviceMetricsOverride', { width: 2200, height: 1000, deviceScaleFactor: 1, mobile: false })
+      await until('innerWidth === 2200', 'wide viewport')
+      await dragToWidth(1250)
+      await until(`Math.abs(${panelWidth} - 1250) < 2 && !${maximized}`, 'file panel wider than 780px and half the viewport')
+      await dragToWidth(950)
+      await until(`Math.abs(${panelWidth} - 950) < 2`, 'file panel shrinking freely')
+      await shot('01a-wide-file-panel.png')
+      const available = await splitWidth()
+      await dragToWidth(available - 320)
+      await until(`Math.abs(${panelWidth} - ${available - 320}) < 2 && !${maximized}`, '320px chat remains visible at threshold')
+      await dragToWidth(available - 319)
+      await until(`${maximized} && !document.querySelector(".workspace-body").classList.contains("is-resizing") && getComputedStyle(document.querySelector(".chat-pane")).display === "none"`, 'automatic file panel maximize with drag cleaned up')
+      await shot('01b-auto-maximized-file-panel.png')
+      await click('.stage-actions [aria-label="Phóng to Side Panel"]', 'restore split after automatic maximize')
+      await until(`!${maximized} && Math.abs(${panelWidth} - ${available - 320}) < 2 && document.querySelector(".chat-pane").getBoundingClientRect().width >= 319`, 'restored previous split width and visible chat')
+      await evaluate(`document.querySelector(${quote(handle)}).focus()`)
+      await key('ArrowRight', 'ArrowRight', 39)
+      await until(`Math.abs(${panelWidth} - ${available - 340}) < 2`, 'right arrow moves file boundary right')
+      await key('ArrowLeft', 'ArrowLeft', 37)
+      await until(`Math.abs(${panelWidth} - ${available - 320}) < 2`, 'left arrow moves file boundary left')
+      await key('Home', 'Home', 36)
+      await until(`Math.abs(${panelWidth} - 480) < 2`, 'reset file panel width')
+      await command('Emulation.setDeviceMetricsOverride', { width: 1100, height: 800, deviceScaleFactor: 1, mobile: false })
+      await until('innerWidth === 1100', 'narrow viewport')
+      await dragToWidth(500)
+      await until(`Math.abs(${panelWidth} - 500) < 2 && !${maximized}`, 'file panel can exceed former 40vw limit at narrow viewport')
+      await evaluate(`document.querySelector(${quote(handle)}).focus()`)
+      await key('Home', 'Home', 36)
+      await command('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false })
+      await until(`Math.abs(${panelWidth} - 480) < 2`, 'original layout restored')
+      await noGlobalError()
+    })
+
     await run('2/10 project switching, filter, and Explorer binary open', async () => {
       for (const name of ['beta', 'gamma', 'alpha']) {
         await click(`.project-select[title=${quote(projects.find(project => project.id === name).directory)}]`, `select ${name}`)
@@ -791,6 +839,20 @@ async function main() {
       await noGlobalError()
       await rendererClean()
       assert.deepEqual(mockServer.unexpected, [], 'Timeline and Settings must not request unexpected protocol endpoints')
+    })
+
+    await run('Search worker regression: bundled entry, timeout and responsive IPC', async () => {
+      const file = path.join(alphaDir, 'regex-regression.txt')
+      await writeFile(file, 'a'.repeat(40) + '!')
+      try {
+        await evaluate(`window.__regexRegression = window.ame.searchProject('alpha', {query:'(a+)+$',regex:true,include:['regex-regression.txt']}).then(()=>'unexpected success',error=>String(error)); true`)
+        await sleep(500)
+        assert.equal(await evaluate('window.ame.platform()', 2000), process.platform, 'Main IPC must respond while a regex is computing')
+        assert.match(await evaluate('window.__regexRegression', 15000), /SEARCH_TIMEOUT/)
+        const recovered = await evaluate(`window.ame.searchProject('alpha', {query:'a+',regex:true,include:['regex-regression.txt']})`)
+        assert.equal(recovered.totalMatches, 1, 'A fresh worker must work after timeout')
+        assert.equal(await readFile(file, 'utf8'), 'a'.repeat(40) + '!')
+      } finally { await rm(file, { force: true }) }
     })
 
     await run('10/10 zero runtime/console errors and clean Electron exit', async () => {

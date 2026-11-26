@@ -1289,7 +1289,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     let onFiles!: (projectID: string) => void, releaseDebugger!: () => void
     const debugPending = new Promise<void>(resolve => { releaseDebugger = resolve })
     const lspServices = new Map<string, any>(), debuggers = new Map<string, any>()
-    const pet = { init: async () => { sequence.push('pet:init') }, reconcile: () => { sequence.push('pet:reconcile') }, dispose: () => { sequence.push('pet:dispose'); release() } }
+    const pet = { init: async () => { sequence.push('pet:init') }, reconcile: () => { sequence.push('pet:reconcile') }, dispose: () => { sequence.push('pet:dispose') } }
     class MockWindow {
       options: any; events = new Map<string, (...args: any[]) => any>()
       webContents = { setWindowOpenHandler: () => {}, on: () => {}, mainFrame: {}, send: () => {} }
@@ -1323,7 +1323,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
         async load() {} list() { return [] } dispose() { sequence.push('workspace:dispose') }
       },
       Terminals: class { dispose() { sequence.push('terminals:dispose') } },
-      OpenCodeAdapter: class { dispose() { sequence.push('adapter:dispose') } },
+      OpenCodeAdapter: class { abortRequests() { sequence.push('adapter:abort'); release() } dispose() { sequence.push('adapter:dispose') } },
       PrivateRuntime: class { constructor() { sequence.push('runtime:create') } executable() { return 'opencode' } async stop() { sequence.push('runtime:stop') } },
       PairingHost: class {}, RemotePairing: class { async stop() { sequence.push('pairing:stop') } }, automaticTunnel: () => ({}),
       createAmeKit: (value: any) => { accountOptions = value; return { generatePetDialogue: (model: string, signal: AbortSignal) => ({ model, signal }), dispose: async () => { sequence.push('account:dispose') } } },
@@ -1392,6 +1392,8 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     events.get('will-quit')!({ preventDefault: () => { sequence.push('preventQuit') } })
     await new Promise(resolve => setImmediate(resolve))
     assert.equal(context.shuttingDown, true)
+    assert.ok(sequence.includes('adapter:abort'), 'abort network calls before waiting for authority')
+    assert.ok(sequence.includes('account:dispose'), 'abort Account requests before waiting for authority')
     assert.ok(sequence.includes('lsp:dispose')); assert.ok(sequence.includes('lsp:q:dispose'))
     assert.ok(sequence.includes('debug:dispose')); assert.ok(sequence.includes('debug:q:dispose'))
     assert.equal(lspServices.size, 0)
@@ -1402,7 +1404,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     assert.equal(debuggers.size, 0)
     assert.ok(sequence.indexOf('debug:disposed') < sequence.indexOf('quit'))
     assert.ok(sequence.indexOf('pet:dispose') < sequence.indexOf('pairing:stop'))
-    assert.ok(sequence.indexOf('pet:dispose') < sequence.indexOf('account:dispose'))
+    assert.ok(sequence.indexOf('account:dispose') < sequence.indexOf('quit'))
     assert.equal(sequence.at(-1), 'quit')
   }
 })

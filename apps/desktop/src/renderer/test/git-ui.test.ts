@@ -14,7 +14,8 @@ const codedErrors: [string, string, string?][] = [
   ['CANNOT_DELETE_CURRENT_BRANCH', 'Không thể xóa nhánh đang mở', 'Chuyển sang nhánh khác trước khi xóa.'],
   ['INVALID_BRANCH_NAME', 'Tên nhánh không hợp lệ theo quy tắc Git'],
   ['DETACHED_HEAD_PUSH_UNSUPPORTED', 'Đang ở trạng thái Detached HEAD', 'Tạo hoặc checkout một nhánh cục bộ trước khi Push.'],
-  ['NO_COMMIT_TO_UNDO', 'Chưa có commit nào để hoàn tác']
+  ['NO_COMMIT_TO_UNDO', 'Chưa có commit nào để hoàn tác'],
+  ['GIT_DETACHED_ROOT_UNDO_UNSUPPORTED', 'Không thể hoàn tác commit đầu tiên khi đang Detached HEAD', 'Checkout hoặc tạo một nhánh cục bộ trước khi hoàn tác.']
 ]
 
 for (const [code, title, detail] of codedErrors) {

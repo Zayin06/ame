@@ -10,6 +10,7 @@ import { scanWithSource } from "./bundle/scan"
 import { AiFixError, fixImportFileWithLlm, isFixableTextFile } from "./bundle/ai-fix"
 import * as installer from "./installer"
 import { runtimeDiscovery, type Discover } from "./runtime"
+import type { OrchestratorConfig } from "./orchestrator"
 import { readUsagePrices, type UsagePrices } from "./usage-pricing"
 import { generatePetDialogue as generateDialogue } from "./pet-generation"
 import type { DialogueSet } from "./pet-dialogue"
@@ -33,6 +34,8 @@ export type AmeKit = {
   call(operation: string, payload: Record<string, string>): Promise<unknown>
   /** Main-process only; reads cached account/model snapshot without taking the account mutex. */
   readStatus?(): Promise<unknown>
+  /** Main-only; only a successfully synchronized, unexpired policy can select the root agent. */
+  readOrchestrator?(): Promise<OrchestratorConfig | undefined>
   /** Main-process only; reads cached usage pricing map without taking the account mutex. */
   readUsagePrices?(): Promise<{ origin: string | null; prices: UsagePrices }>
   /** Main-process only; reads verified installed instructions without taking the account mutex. */
@@ -188,7 +191,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       providerURL(api.provider!.provider.base_url)
       if (api.expires <= Date.now()) throw new Error("AMECODE_LOGIN_REQUIRED")
       await persist()
-      await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires, featureModels: [...authorizedFeatureModels] })
+      await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires, featureModels: [...authorizedFeatureModels], ...(api.orchestrator ? { orchestrator: api.orchestrator } : {}) })
       lastBundleAccount = { origin: api.origin, accountId: api.account.id }
       policyReady = true; blocker = undefined; transientFailures = 0
     } catch (error) {
@@ -630,6 +633,15 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       await ready
       if (disposed) throw new Error("AMEKIT_DISPOSED")
       return view()
+    },
+    async readOrchestrator() {
+      await ready
+      // A new Chat must not fall back to build while login/refresh is updating the policy.
+      await inFlight?.catch(() => {})
+      await backgroundInFlight?.catch(() => {})
+      if (disposed) throw new Error("AMEKIT_DISPOSED")
+      if (api?.credential && (!policyReady || !api.account || api.expires <= Date.now())) throw new Error(blocker ?? "ACCOUNT_REFRESH_REQUIRED")
+      return api?.orchestrator
     },
     async readUsagePrices() {
       await ready

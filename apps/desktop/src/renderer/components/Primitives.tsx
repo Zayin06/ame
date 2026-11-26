@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Icon } from './Icon'
-import { clampWidth, defaultWidths, type Pane } from '../state'
+import { clampWidth, defaultWidths, shouldMaximizeStage, type Pane } from '../state'
 
 export const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/, '')
 export function humanizeIdeError(error: unknown): string {
   const text = errorText(error).trim()
   const messages: [RegExp, string][] = [
+    [/\bSEARCH_TIMEOUT\b/, 'Tìm kiếm hoặc thay thế vượt thời gian cho phép. Hãy đơn giản hóa biểu thức hoặc giới hạn phạm vi tệp rồi thử lại.'],
+    [/\bSEARCH_WORKER_FAILED\b/, 'Không thể hoàn tất tìm kiếm hoặc thay thế trong giới hạn tài nguyên. Giới hạn phạm vi tệp rồi thử lại.'],
+    [/\bREPLACE_ABORTED\b/, 'Chưa xử lý tệp này vì thao tác đã dừng sau lỗi trước đó. Preview lại trước khi thử tiếp.'],
+    [/\bINVALID_REGEX\b/, 'Biểu thức tìm kiếm không hợp lệ. Kiểm tra cú pháp regex rồi thử lại.'],
     [/\bAMECODE_REQUEST_TOO_LARGE\b/, 'Tổng yêu cầu sau mã hóa base64 (gồm tệp đính kèm, JSON, prompt và lịch sử trò chuyện) vượt giới hạn 8 MiB của gateway. Hãy bỏ bớt tệp trên bản nháp hoặc rút ngắn nội dung/lịch sử rồi gửi lại.'],
     [/\b(?:IS_DIRECTORY|EISDIR)\b/, 'Không thể mở thư mục như tệp văn bản.'],
     [/\bBINARY_FILE\b/, 'Không thể xem trước tệp nhị phân trong trình soạn thảo.'],
@@ -24,15 +28,39 @@ export function Empty({ children }: { children: ReactNode }) { return <div class
 export function IconButton({ label, children, onClick, active = false, disabled = false }: { label: string; children: ReactNode; onClick: () => void; active?: boolean; disabled?: boolean }) {
   return <button className={`icon-btn ${active ? 'is-active' : ''}`} title={label} aria-label={label} aria-pressed={active} onClick={onClick} disabled={disabled}>{children}</button>
 }
-export function Resizer({ pane, width, onChange }: { pane: Pane; width: number; onChange: (width: number) => void }) {
+export function Resizer({ pane, width, onChange, onMaximize }: { pane: Pane; width: number; onChange: (width: number) => void; onMaximize?: () => void }) {
+  const ref = useRef<HTMLDivElement>(null)
   const start = useRef<{ x: number; width: number } | null>(null)
   const [dragging, setDragging] = useState(false)
+  const [availableWidth, setAvailableWidth] = useState<number>()
+  const stageSpace = (element: HTMLElement) => {
+    const workspace = element.closest('.workspace-body')
+    const panel = workspace?.querySelector('.side-panel')
+    const companion = workspace?.querySelector(workspace.classList.contains('is-git-workspace') ? '.git-workspace' : '.chat-pane')
+    return (panel?.getBoundingClientRect().width ?? 0) + (companion?.getBoundingClientRect().width ?? 0)
+  }
+  useEffect(() => {
+    const element = ref.current, workspace = element?.closest('.workspace-body')
+    if (pane !== 'stage' || !element || !workspace) return
+    const observer = new ResizeObserver(() => setAvailableWidth(stageSpace(element)))
+    observer.observe(workspace)
+    for (const child of workspace.children) observer.observe(child)
+    return () => observer.disconnect()
+  }, [pane])
   const finish = (element: HTMLElement) => { start.current = null; setDragging(false); element.closest('.workspace-body')?.classList.remove('is-resizing') }
-  return <div className={`pane-resizer ${dragging ? 'is-dragging' : ''}`} data-resize={({ rail: 'sidebar', inspector: 'inspector', stage: 'sidepanel' })[pane]} role="separator" aria-label={`Độ rộng ${pane}`} aria-orientation="vertical" aria-valuemin={pane === 'stage' ? 300 : 190} aria-valuemax={pane === 'stage' ? 780 : 360} aria-valuenow={width} tabIndex={0}
+  const resize = (element: HTMLElement, next: number) => {
+    const clamped = clampWidth(pane, next)
+    if (pane === 'stage' && onMaximize && shouldMaximizeStage(clamped, stageSpace(element))) {
+      finish(element)
+      onMaximize()
+    } else onChange(clamped)
+  }
+  const renderedWidth = (element: HTMLElement) => pane === 'stage' ? element.closest('.workspace-body')?.querySelector('.side-panel')?.getBoundingClientRect().width ?? width : width
+  return <div ref={ref} className={`pane-resizer ${dragging ? 'is-dragging' : ''}`} data-resize={({ rail: 'sidebar', inspector: 'inspector', stage: 'sidepanel' })[pane]} role="separator" aria-label={`Độ rộng ${pane}`} aria-orientation="vertical" aria-valuemin={pane === 'stage' ? 300 : 190} aria-valuemax={pane === 'stage' ? availableWidth : 360} aria-valuenow={width} tabIndex={0}
     onDoubleClick={() => onChange(defaultWidths[pane])}
-    onKeyDown={e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); onChange(clampWidth(pane, width + (e.key === 'ArrowRight' ? 20 : -20))) } if (e.key === 'Home') onChange(defaultWidths[pane]) }}
-    onPointerDown={e => { if (e.button !== 0) return; start.current = { x: e.clientX, width }; setDragging(true); e.currentTarget.closest('.workspace-body')?.classList.add('is-resizing'); e.currentTarget.setPointerCapture(e.pointerId) }}
-    onPointerMove={e => { if (start.current) onChange(clampWidth(pane, start.current.width + (e.clientX - start.current.x) * (pane === 'stage' ? -1 : 1))) }}
+    onKeyDown={e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); resize(e.currentTarget, renderedWidth(e.currentTarget) + (e.key === 'ArrowRight' ? 20 : -20) * (pane === 'stage' ? -1 : 1)) } if (e.key === 'Home') { e.preventDefault(); onChange(defaultWidths[pane]) } }}
+    onPointerDown={e => { if (e.button !== 0) return; e.preventDefault(); start.current = { x: e.clientX, width: renderedWidth(e.currentTarget) }; setDragging(true); e.currentTarget.closest('.workspace-body')?.classList.add('is-resizing'); e.currentTarget.setPointerCapture(e.pointerId) }}
+    onPointerMove={e => { if (start.current) resize(e.currentTarget, start.current.width + (e.clientX - start.current.x) * (pane === 'stage' ? -1 : 1)) }}
     onPointerUp={e => { finish(e.currentTarget); if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId) }}
     onPointerCancel={e => finish(e.currentTarget)} onLostPointerCapture={e => finish(e.currentTarget)} />
 }

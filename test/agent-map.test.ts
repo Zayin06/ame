@@ -294,6 +294,7 @@ test('adapter agentMap caps fetched histories at 200 and handles an active sessi
 test('adapter agentMap propagates history deadline cancellation using the 15-second AbortSignal', async t => {
   const originalTimeout = AbortSignal.timeout.bind(AbortSignal)
   let timedSignal: AbortSignal | undefined
+  let requestSignal: AbortSignal | undefined
   t.mock.method(AbortSignal, 'timeout', (ms: number) => {
     const signal = originalTimeout(ms === 15000 ? 10 : ms)
     if (ms === 15000) timedSignal = signal
@@ -303,7 +304,9 @@ test('adapter agentMap propagates history deadline cancellation using the 15-sec
     if (url.pathname === '/api/session/root') return json({ data: { location: { directory: process.cwd() } } })
     if (url.pathname === '/api/session') return json({ data: [session('root')], cursor: {} })
     assert.equal(url.pathname, '/api/session/root/message')
-    assert.equal(init.signal, timedSignal)
+    assert.ok(init.signal instanceof AbortSignal)
+    requestSignal = init.signal
+    requestSignal.throwIfAborted()
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(resolve, 1000)
       init.signal!.addEventListener('abort', () => { clearTimeout(timer); reject(init.signal!.reason) }, { once: true })
@@ -314,6 +317,8 @@ test('adapter agentMap propagates history deadline cancellation using the 15-sec
     await assert.rejects(adapter.agentMap('project', 'root'))
     assert.equal(timedSignal?.aborted, true)
     assert.equal(timedSignal?.reason.name, 'TimeoutError')
+    assert.equal(requestSignal?.aborted, true)
+    assert.equal(requestSignal?.reason, timedSignal?.reason, 'the composed lifetime signal preserves the deadline reason')
   } finally { adapter.dispose() }
 })
 

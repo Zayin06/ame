@@ -6,13 +6,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { OpenCode, type SessionMessageInfo } from '@opencode/client'
 import { PrivateRuntime } from '../packages/opencode-adapter/src/runtime'
+import { OrchestratorConfig } from '../packages/amekit/src/orchestrator'
+import { OpenCodeAdapter } from '../packages/opencode-adapter/src/index'
 
 const runtimeBin = path.resolve('resources', 'opencode', `${process.platform}-${process.arch}`, process.platform === 'win32' ? 'opencode.exe' : 'opencode')
 const serverJs = path.resolve('resources', 'amekit-models', 'server.js')
 const prepared = await Promise.all([access(runtimeBin), access(serverJs)]).then(() => true, () => false)
 
 // A local scripted model exercises the bundled scheduler, tools and completion inbox without external inference.
-test('bundled native subagent runs depths 0–3, rejects depth 4 and delivers final results through every parent', { skip: !prepared, timeout: 90000 }, async () => {
+test('API-configured root runs native depths 0–3, rejects depth 4 and receives every parent completion', { skip: !prepared, timeout: 90000 }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-native-nesting-'))
   const project = path.join(root, 'project')
   await mkdir(path.join(project, '.opencode', 'agents'), { recursive: true })
@@ -61,14 +63,27 @@ test('bundled native subagent runs depths 0–3, rejects depth 4 and delivers fi
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const port = (server.address() as import('node:net').AddressInfo).port
   const runtime = new PrivateRuntime({ resources: path.resolve('resources'), profile: path.join(root, 'profile') })
+  const adapter = new OpenCodeAdapter(() => {})
   try {
     const endpoint = await runtime.start()
     const headers = { authorization: `Basic ${Buffer.from(`${endpoint.username}:${endpoint.password}`).toString('base64')}` }
     const client = OpenCode.make({ baseUrl: endpoint.url, headers })
     const models = Array.from({ length: 4 }, (_, depth) => ({ id: `nesting-${depth}`, name: `Nesting ${depth}`, tool_call: true, vision: false, context: 200000, output: 4096 }))
-    const response = await fetch(`${endpoint.url}/api/rpc/amekit-models/update`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ input: { role: 'admin', catalog: { version: 'fixture', default_model: 'nesting-0', small_model: 'nesting-0', models }, provider: { base_url: `http://127.0.0.1:${port}/v1`, api_key: 'local-test-only' }, expires: Date.now() + 85000 } }) })
+    const orchestrator = OrchestratorConfig.parse({ id: 'ame-orchestrator', version: '1.0.0', description: 'Coordinate installed teams', prompt: 'Use the native catalog to delegate to an installed lead and await its final result.', subagentDepth: 3 })
+    const policyInput = { role: 'admin', catalog: { version: 'fixture', default_model: 'nesting-0', small_model: 'nesting-0', models }, provider: { base_url: `http://127.0.0.1:${port}/v1`, api_key: 'local-test-only' }, expires: Date.now() + 85000, orchestrator }
+    const update = (input: unknown) => fetch(`${endpoint.url}/api/rpc/amekit-models/update`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ input }) })
+    const response = await update(policyInput)
     assert.equal(response.status, 200)
-    const session = await client.session.create({ location: { directory: project }, agent: 'nesting-0', model: { providerID: 'amecode', id: 'nesting-0' } })
+    adapter.attach('project', project)
+    await adapter.connect(endpoint.url, endpoint.username, endpoint.password)
+    const created = await adapter.createSession('project', 'default', orchestrator.id)
+    const available = (await client.agent.list({ location: { directory: project } })).data
+    const registered = available.find(agent => agent.id === orchestrator.id)!
+    assert.ok(registered, `missing API root after initialization: ${available.map(agent => agent.id).join(', ')}`)
+    assert.equal(registered.mode, 'primary')
+    assert.match(registered.system!, /version=1.0.0/)
+    assert.ok(available.some(agent => agent.id === 'nesting-1' && agent.mode === 'all'))
+    const session = await client.session.get({ sessionID: created.id })
     await client.session.prompt({ sessionID: session.id, text: 'Execute the isolated nesting fixture.' })
     let sessions = (await client.session.list({ directory: project })).data
     let messages: SessionMessageInfo[] = []
@@ -84,7 +99,7 @@ test('bundled native subagent runs depths 0–3, rejects depth 4 and delivers fi
     assert.equal(sessions.length, 4, 'depth limit must prevent creation of a fifth session')
     let parent = session
     for (let depth = 0; depth <= 3; depth++) {
-      assert.equal(parent.agent, `nesting-${depth}`)
+      assert.equal(parent.agent, depth === 0 ? orchestrator.id : `nesting-${depth}`)
       assert.equal(sessions.find(s => s.id === parent.id)?.outcome, 'succeeded')
       const history = (await client.message.list({ sessionID: parent.id })).data
       const tools = history.flatMap(m => m.type === 'assistant' ? m.content.filter(c => c.type === 'tool') : [])
@@ -97,7 +112,13 @@ test('bundled native subagent runs depths 0–3, rejects depth 4 and delivers fi
     }
     assert.ok(requests.some(r => r.depth === 3 && r.body.includes('Subagent depth limit reached (3)')))
     assert.deepEqual(errors, [])
+    assert.ok(requests.some(r => r.depth === 0 && r.body.includes(orchestrator.prompt)), 'API instructions reach the model context')
+    assert.equal((await update({ ...policyInput, orchestrator: { ...orchestrator, version: '1.0.1', prompt: 'New team routing guidance.' } })).status, 200)
+    assert.match((await client.agent.list({ location: { directory: project } })).data.find(agent => agent.id === orchestrator.id)!.system!, /New team routing guidance/)
+    assert.equal((await update(null)).status, 200)
+    assert.equal((await client.agent.list({ location: { directory: project } })).data.some(agent => agent.id === orchestrator.id), false, 'logout removes API-owned agent from discovery')
   } finally {
+    adapter.dispose()
     await runtime.stop()
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()))
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })

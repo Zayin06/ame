@@ -51,8 +51,10 @@ export function GitWorkspace(props: GitWorkspaceProps) {
   const [detailLoading, setDetailLoading] = useState(false)
   const mounted = useRef(false)
   const scope = useRef({ projectID, generation })
+  const operationScope = useRef({ projectID })
   const lock = useRef<object | null>(null)
   if (scope.current.projectID !== projectID || scope.current.generation !== generation) scope.current = { projectID, generation }
+  if (operationScope.current.projectID !== projectID) operationScope.current = { projectID }
   const context = scope.current
   const current = () => mounted.current && scope.current === context
   const report = (reason: unknown) => { if (current() && !cancelled(reason)) setError(formatGitError(reason)) }
@@ -68,11 +70,6 @@ export function GitWorkspace(props: GitWorkspaceProps) {
     setCommits([]); setStashes([]); setSelectedHash(''); setDetail(undefined)
     setQuery(''); setStashNote(''); setIncludeUntracked(true); setPendingBaseCommit('')
   }, [projectID])
-
-  useEffect(() => {
-    lock.current = null
-    setPending('')
-  }, [projectID, generation])
 
   useEffect(() => {
     let active = true
@@ -131,14 +128,16 @@ export function GitWorkspace(props: GitWorkspaceProps) {
 
   async function run(label: string, operation: (valid: () => boolean) => Promise<void>, refreshAfter = true) {
     if (!current() || lock.current) return
+    const operationContext = operationScope.current
     const token = {}
     lock.current = token
-    const valid = () => current() && lock.current === token
+    // Watchers invalidate reads, but cannot cancel an already-started Git mutation.
+    const valid = () => mounted.current && operationScope.current === operationContext && lock.current === token
     setPending(label); setError(undefined); setNotice('')
     try {
       await operation(valid)
       if (valid()) setNotice(`${label}: Hoàn tất`)
-    } catch (reason) { if (valid()) report(reason) }
+    } catch (reason) { if (valid() && !cancelled(reason)) setError(formatGitError(reason)) }
     finally {
       if (valid()) {
         lock.current = null

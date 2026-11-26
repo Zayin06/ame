@@ -12,6 +12,34 @@ import type { UsagePrices } from '../packages/amekit/src/usage-pricing'
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 const waitFor = async (check: () => boolean) => { for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)) }; throw new Error('TIMED_OUT') }
 
+test('disposing the adapter aborts an acknowledged connection with a stalled prompt request', async () => {
+  const directory = path.resolve('shutdown-project')
+  let requestSignal: AbortSignal | null | undefined, finish!: () => void
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session/s1') return json({ data: { location: { directory } } })
+    if (url.pathname.endsWith('/prompt')) {
+      requestSignal = init.signal
+      return new Promise<Response>((resolve, reject) => {
+        finish = () => resolve(new Response(null, { status: 204 }))
+        init.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true })
+      })
+    }
+    return new Response(null, { status: 204 })
+  })
+  adapter.attach('p', directory)
+  await adapter.connect('http://localhost:4096')
+  const result = adapter.prompt('p', 's1', 'hello', { id: 'model', providerID: 'amecode', name: 'Model' }).then(() => 'completed', () => 'aborted')
+  try {
+    await waitFor(() => !!finish)
+    adapter.dispose()
+    assert.equal(requestSignal?.aborted, true)
+    assert.equal(await result, 'aborted')
+  } finally { finish?.(); adapter.dispose(); await result }
+})
+
 test('a newer persisted execution resets every recovery flag and invalidates old checkpoints', () => {
   const activity = new SessionActivity()
   const first = { id: 's', title: 'Session', status: 'running' as const, busyAt: 100 }
@@ -454,6 +482,66 @@ test('failed idle only deduplicates an immediately preceding identical error wit
   ] as SessionMessageInfo[])
   assert.deepEqual(items.filter(item => item.kind === 'error').map(item => item.id), ['a1:error', 'idle2:error', 'compact:error', 'a2:error', 'idle4:error'])
 })
+test('new Chat can select the API root without changing native helper sessions or later child prompts', async () => {
+  const directory = process.cwd(), creations: Record<string, unknown>[] = []
+  let switches = 0, pluginReads = 0, agentReads = 0
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/plugin') {
+      assert.equal(url.searchParams.get('location[directory]'), directory)
+      return json({ data: ++pluginReads === 1 ? [] : ['opencode.config.agent', 'amekit-models'].map(id => ({ id, state: { status: 'active' } })) })
+    }
+    if (url.pathname === '/api/agent') { agentReads++; return json({ data: [{ id: 'ame-orchestrator', mode: 'primary' }] }) }
+    if (url.pathname === '/api/session' && init.method === 'POST') {
+      assert.ok(pluginReads >= 2, 'must await lazy project plugin registration')
+      const body = JSON.parse(String(init.body)); creations.push(body)
+      return json({ data: { id: `s${creations.length}`, agent: body.agent ?? 'build', location: { directory } } })
+    }
+    if (url.pathname === '/api/session/child') return json({ data: { id: 'child', agent: 'ios-specialist', parentID: 'root', location: { directory } } })
+    if (url.pathname.endsWith('/agent')) { switches++; return new Response(null, { status: 204 }) }
+    if (url.pathname.endsWith('/model')) return new Response(null, { status: 204 })
+    if (url.pathname.endsWith('/prompt')) return json({ data: { id: 'inbox' } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    assert.equal((await adapter.createSession('p', 'readonly', 'ame-orchestrator')).agent, 'ame-orchestrator')
+    assert.equal(creations[0].agent, 'ame-orchestrator')
+    assert.deepEqual(creations[0].location, { directory })
+    assert.ok((creations[0].permissions as { effect: string }[]).some(rule => rule.effect === 'deny'))
+    assert.equal((await adapter.createSession('p')).agent, 'build')
+    assert.equal(agentReads, 2, 'native helper creation does not wait for a coordinator')
+    assert.equal(Object.hasOwn(creations[1], 'agent'), false)
+    await adapter.prompt('p', 'child', 'Continue this scoped task', { id: 'model', providerID: 'amecode', name: 'Model' })
+    assert.equal(switches, 0, 'opening or continuing a child must not reset it to the coordinator')
+  } finally { adapter.dispose() }
+})
+
+test('failed project orchestrator plugin never silently creates a session with another agent', async () => {
+  let creations = 0
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(controller) {
+      init.signal?.addEventListener('abort', () => controller.close())
+    } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/plugin') return json({ data: [{ id: 'amekit-models', state: { status: 'failed' } }] })
+    if (url.pathname === '/api/agent') return json({ data: [] })
+    creations++; throw new Error('Unexpected session creation')
+  })
+  adapter.attach('p', process.cwd())
+  try {
+    await adapter.connect('http://localhost:4096')
+    await assert.rejects(adapter.createSession('p', 'default', 'ame-orchestrator'), /ORCHESTRATOR_PLUGIN_FAILED/)
+    assert.equal(creations, 0)
+  } finally { adapter.dispose() }
+})
+
 test('detaching a project rejects its API access and stops its event routing without disconnecting other projects', async () => {
   const notifications: IdeEvent[] = []
   const directory = process.cwd(), otherDirectory = directory + '-other'
@@ -648,7 +736,7 @@ test('empty snapshot diffs fall back to completed tool files within whole-sessio
     assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u3'), [running])
     assert.deepEqual(await adapter.sessionDiff('p', 's1', 'missing'), [])
     failHistory = true
-    assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u1'), [])
+    await assert.rejects(adapter.sessionDiff('p', 's1', 'u1'), /SESSION_DIFF_HISTORY_FAILED/)
     primary = [{ file: 'snapshot.ts', patch: 'snapshot patch', additions: 1, deletions: 0, status: 'modified' }]
     calls.length = 0
     assert.deepEqual(await adapter.sessionDiff('p', 's1', 'u1'), primary)
@@ -656,6 +744,43 @@ test('empty snapshot diffs fall back to completed tool files within whole-sessio
     primary = []; rejectDiff = true; calls.length = 0
     await assert.rejects(adapter.sessionDiff('p', 's1', 'u1'))
     assert.equal(calls.some(url => url.pathname.endsWith('/message')), false, 'diff errors must not trigger fallback')
+  } finally { adapter.dispose() }
+})
+
+test('tool diff fallback follows history cursors and finds turns after the first 200 messages', async () => {
+  const directory = path.resolve('long-diff-project'), cursors: (string | null)[] = []
+  let brokenPage = false, repeatedCursor = false
+  const tail = [
+    { id: 'late-user', type: 'user', text: 'edit' },
+    { id: 'late-assistant', type: 'assistant', content: [{ type: 'tool', name: 'write', state: { status: 'completed', metadata: { files: [{ file: 'late.ts', patch: '+late', additions: 1, deletions: 0 }] } } }] },
+    { id: 'idle', type: 'idle' },
+  ]
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session/s1') return json({ data: { location: { directory } } })
+    if (url.pathname.endsWith('/diff')) return json({ data: [] })
+    if (url.pathname.endsWith('/message')) {
+      if (url.searchParams.get('type') === 'user') return json({ data: [tail[0]], cursor: {} })
+      const cursor = url.searchParams.get('cursor'); cursors.push(cursor)
+      if (cursor === 'page2' && brokenPage) throw new Error('page failed')
+      return cursor === 'page2' ? json({ data: tail, cursor: repeatedCursor ? { next: 'page2' } : {} }) : json({ data: Array.from({ length: 200 }, (_, i) => ({ id: `old-${i}`, type: 'idle' })), cursor: { next: 'page2' } })
+    }
+    return json({ data: [] })
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    for (const from of [undefined, 'late-user']) {
+      cursors.length = 0
+      assert.deepEqual(await adapter.sessionDiff('p', 's1', from), [{ file: 'late.ts', patch: '+late', additions: 1, deletions: 0, status: 'modified' }])
+      assert.deepEqual(cursors, [null, 'page2'])
+    }
+    brokenPage = true
+    await assert.rejects(adapter.sessionDiff('p', 's1'), /SESSION_DIFF_HISTORY_FAILED/)
+    brokenPage = false; repeatedCursor = true
+    await assert.rejects(adapter.sessionDiff('p', 's1'), /SESSION_DIFF_HISTORY_FAILED/)
   } finally { adapter.dispose() }
 })
 
@@ -1206,7 +1331,7 @@ test('btwAsk validates owned trimmed questions, switches selected model and gene
     assert.equal(calls[2].init.method, 'POST')
     assert.ok(calls[2].init.signal instanceof AbortSignal)
     assert.equal(calls[2].init.signal.aborted, false)
-    assert.deepEqual(timeouts, [45000])
+    assert.deepEqual(timeouts, [30000, 30000, 45000])
     calls.length = 0
     await adapter.btwAsk('p', 's1', ' ' + 'a'.repeat(20000) + ' ')
     assert.deepEqual(calls.map(c => c.url.pathname), ['/api/session/s1', '/api/session/s1/generate'], 'omitted model retains the session model')
@@ -1253,7 +1378,7 @@ test('btwAsk retries empty answers once with a plain-text no-tool prompt and a f
         { prompt: 'What is the package name?' },
         ...(!first.trim() ? [{ prompt: 'Answer directly in plain text using only the existing conversation context. Do not call any tools; if the information is not present in the conversation, briefly say so.\n\nWhat is the package name?' }] : []),
       ])
-      assert.deepEqual(timeouts, first.trim() ? [45000] : [45000, 45000])
+      assert.deepEqual(timeouts, first.trim() ? [30000, 45000] : [30000, 45000, 45000])
       if (!first.trim()) assert.notEqual(signals[0], signals[1])
     } finally { adapter.dispose() }
   })

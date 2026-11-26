@@ -539,7 +539,10 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       return configurePairing(a)
     case 'pairingCode': return pairing.issue()
     case 'sessions': return adapter.sessions(a)
-    case 'createSession': return adapter.createSession(a, b)
+    case 'createSession': {
+      const orchestrator = await account.readOrchestrator?.()
+      return orchestrator ? adapter.createSession(a, b, orchestrator.id) : adapter.createSession(a, b)
+    }
     case 'sessionPermissionMode': return adapter.sessionPermissionMode(a, b)
     case 'updateSessionPermissionMode': return adapter.updateSessionPermissionMode(a, b, c)
     case 'renameSession': return adapter.renameSession(a, b, c)
@@ -864,7 +867,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
 }
 let authority: Promise<unknown> = Promise.resolve()
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'prompt', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'commitAgentPrompt', 'commitAgentLock', 'commitAgentExecutePlan', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
+  if (!['startBackend', 'connect', 'discover', 'createSession', 'prompt', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'commitAgentPrompt', 'commitAgentLock', 'commitAgentExecutePlan', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
   // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
@@ -962,6 +965,9 @@ app.on('will-quit', event => {
   event.preventDefault(); quitting = true; shuttingDown = true
   screenActive(false)
   terminals?.dispose()
+  adapter.abortRequests()
+  // Start Account disposal now: its abort signal releases work holding authority.
+  const accountDisposal = account.dispose().catch(() => {})
   // Abort in-flight pet generation before waiting for authority; queued calls fail closed.
   void Promise.resolve().then(() => petHost?.dispose()).finally(async () => {
     for (const service of lspServices.values()) { try { service.dispose() } catch { /* Continue disposing other projects. */ } }
@@ -969,5 +975,5 @@ app.on('will-quit', event => {
     await Promise.allSettled([...debuggers.values()].map(async service => service.dispose()))
     debuggers.clear()
   }).finally(() => authority.catch(() => {}))
-    .finally(() => pairing.stop()).finally(() => account.dispose()).finally(async () => { adapter.dispose(); workspace.dispose(); await runtime.stop(); app.quit() })
+    .finally(() => pairing.stop()).finally(() => accountDisposal).finally(async () => { adapter.dispose(); workspace.dispose(); await runtime.stop(); app.quit() })
 })

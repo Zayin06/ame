@@ -13,6 +13,7 @@ import { Icon } from '../components/Icon'
 import * as primitives from '../components/Primitives'
 import type { Inspector } from '../components/Inspector'
 import { BuildNotesPanel } from '../components/BuildNotesPanel'
+import { ProjectSearch } from '../components/ProjectSearch'
 import * as gitUI from '../git-ui'
 import * as scm from '../scm-commit'
 
@@ -359,7 +360,7 @@ test('Inspector stages only the destination of a staged rename with working edit
     useRef: (initial: unknown) => ({ current: initial }),
     useEffect() {},
   }
-  const modules: Record<string, unknown> = { react: hooks, './Icon': { Icon }, './Primitives': primitives }
+  const modules: Record<string, unknown> = { react: hooks, './Icon': { Icon }, './Primitives': primitives, './ProjectSearch': { ProjectSearch } }
   runInNewContext(code, {
     exports,
     window: { ame: { async stage(...args: unknown[]) { stages.push(args) } } },
@@ -469,8 +470,8 @@ test('quick sync publishes untracked branches and formats remote errors', async 
   h.unmount()
 })
 
-test('stale project/generation mutations and unmount completions cannot overwrite newer state or push', async () => {
-  for (const boundary of ['project', 'generation', 'unmount']) {
+test('stale project mutations and unmount completions cannot overwrite newer state or push', async () => {
+  for (const boundary of ['project', 'unmount']) {
     const request = deferred<void>()
     let pushes = 0, refreshes = 0, messages = 0
     const h = harness({ onMessageChange() { messages++ }, refresh() { refreshes++ } }, {
@@ -478,12 +479,31 @@ test('stale project/generation mutations and unmount completions cannot overwrit
     })
     h.render(); await h.flush(); h.invoke(h.byID('git-workspace-commit-push-btn'))
     if (boundary === 'unmount') h.unmount()
-    else { h.render(boundary === 'project' ? { projectID: 'other', message: 'new draft' } : { generation: 1, message: 'new draft' }); await h.flush() }
+    else { h.render({ projectID: 'other', message: 'new draft' }); await h.flush() }
     const writes = h.writes
     request.resolve(); await tick()
     assert.equal(h.writes, writes); assert.equal(pushes, 0); assert.equal(refreshes, 0); assert.equal(messages, 0)
     if (boundary !== 'unmount') h.unmount()
   }
+})
+
+test('watcher refreshes retain an in-flight Git lock and finish Commit & Push', async () => {
+  const request = deferred<void>()
+  let commits = 0, pushes = 0
+  const h = harness({}, {
+    commit() { commits++; return request.promise },
+    async gitPush() { pushes++; return { summary: 'pushed' } },
+  })
+  try {
+    h.render(); await h.flush(); h.invoke(h.byID('git-workspace-commit-push-btn'))
+    h.render({ generation: 1 }); await h.flush()
+    assert.equal(h.byID('git-workspace-commit-push-btn').props.disabled, true)
+    assert.equal(commits, 1)
+    request.resolve(); await h.flush()
+    assert.equal(pushes, 1)
+    assert.equal(h.props.message, '')
+    assert.equal(h.byID('git-workspace-commit-btn').props.disabled, true, 'empty message stays disabled')
+  } finally { request.resolve(); h.unmount() }
 })
 
 test('CANCELLED remains silent, while asynchronous list/detail responses respect selection and project boundaries', async () => {

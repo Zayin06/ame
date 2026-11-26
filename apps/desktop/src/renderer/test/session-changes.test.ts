@@ -182,6 +182,20 @@ for (const { name, value, context } of [
   }
 }
 
+for (const header of ['Index: a.ts\n===================================================================\n', 'diff --git a/a.ts b/a.ts\n', '']) {
+  test(`consecutive edits retain every patch instead of displaying an intermediate version (${header.split('\n')[0] || 'bare headers'})`, () => {
+    const section = (before: string, after: string, line: number) => `${header}--- a.ts\t\n+++ a.ts\t\n@@ -${line} +${line} @@\n-${before}\n+${after}\n`
+    const patch = section('old', 'middle', 1) + '\n' + section('middle', 'new', 1)
+    const view = normalize({ file: 'a.ts', patch, additions: 2, deletions: 2 })
+    assert.equal(view.parseFailed, true, 'raw fallback must retain the complete sequence')
+    assert.equal(completePatchContents(patch), undefined)
+    const disjoint = normalize({ file: 'a.ts', patch: section('old', 'first', 5) + '\n' + section('other', 'last', 20), additions: 2, deletions: 2 })
+    assert.equal(disjoint.parseFailed, undefined)
+    assert.equal(disjoint.fileDiff.hunks.length, 2)
+    assert.equal(disjoint.fileDiff.additionLines.join(''), 'first\nlast\n')
+  })
+}
+
 test('normalize handles concatenated tool patches, flags unparseable patches, and SessionChanges lazy-mounts closed details', () => {
   const concatenated = [
     'diff --git a/multi.ts b/multi.ts',

@@ -1002,6 +1002,20 @@ test('log, commit detail and undo preserve messages, literal paths, UTF-8 and th
   assert.ok(large.patch.endsWith('... (truncated)')); assert.ok(!large.patch.includes('\ufffd'))
 })
 
+test('undoing a detached root commit preserves HEAD, index and working content', async t => {
+  const { root, git, write, read, commit } = await fixture(t)
+  await write('file.txt', 'initial\n'); await commit()
+  const head = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  await git.raw(['checkout', '--detach', head])
+  await write('file.txt', 'working\n')
+  const index = await git.raw(['ls-files', '--stage', '-z'])
+  await assert.rejects(gitUndoLastCommit(root), /GIT_DETACHED_ROOT_UNDO_UNSUPPORTED/)
+  assert.equal((await git.raw(['rev-parse', 'HEAD'])).trim(), head)
+  assert.equal(await git.raw(['ls-files', '--stage', '-z']), index)
+  assert.equal(await read('file.txt'), 'working\n')
+  assert.ok((await git.status()).files.some(file => file.path === 'file.txt'))
+})
+
 test('stash round trips tracked and untracked content, apply retains entries, pop removes and indices validate', async t => {
   const { root, git, write, read, commit } = await fixture(t)
   await write('file.txt', 'initial\n'); await commit()

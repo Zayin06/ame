@@ -40,7 +40,7 @@ async function bundle(mode: "native" | "raw" = "native", commitEnhanceSkill?: st
   const release: Release = { releaseId: "ef2b4502-3b3f-4ac7-a223-81fdb4b77557", version: "1.2.3", channel: "stable", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"], publishedAt: 1, downloadUrl: "/ignored" }
   return { packed, release, latest: { release, revision: 1, activatedAt: 1 } }
 }
-async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; commitEnhanceSkill?: string; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number; autoSync?: boolean; reloadRuntime?: AmeKitOptions["reloadRuntime"]; onBundleChanged?: AmeKitOptions["onBundleChanged"] } = {}) {
+async function fixture(settings: { orchestrator?: unknown; catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; commitEnhanceSkill?: string; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number; autoSync?: boolean; reloadRuntime?: AmeKitOptions["reloadRuntime"]; onBundleChanged?: AmeKitOptions["onBundleChanged"] } = {}) {
   const folder = await area(), project = path.join(folder, "project"), imported = path.join(folder, "source"), data = path.join(folder, "data")
   await mkdir(project); await mkdir(imported)
   for (const file of input()) { const target = path.join(imported, ...file.path.split("/")); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data) }
@@ -48,6 +48,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
   const rpc: unknown[] = [], requests: string[] = [], dialogs: string[] = [], messages: string[] = [], events: string[] = []
   let apiResponse: ((url: URL, init?: RequestInit) => Promise<Response | undefined>) | undefined
   let role: unknown = settings.role ?? "user", plugin = settings.plugin !== false, accepted = settings.confirm !== false, failAuth = false, failStorage = false, pickerCount = 0
+  let orchestrator = settings.orchestrator
   let sessionResponse: (() => Promise<Response | undefined>) | undefined, expiresAt: number | undefined
   let accountId = "1", username = "fixture"
   let pickResponse: (() => Promise<string | null>) | undefined
@@ -87,7 +88,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
     if (url.pathname.endsWith("/activate")) return Response.json(artifact.latest)
     if (url.pathname === "/v1/amekit/bundles/uploads") return Response.json({ uploadId: artifact.release.releaseId })
     if (url.pathname === "/v1/amekit/releases" && init?.method === "POST") return Response.json({ release: artifact.release })
-    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: accountId, name: "Fixture", username, role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog: settings.catalog ?? catalog, registry: {} })
+    return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: accountId, name: "Fixture", username, role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog: settings.catalog ?? catalog, registry: {}, ...(orchestrator === undefined ? {} : { orchestrator }) })
   }
   const dependencies: AmeKitDependencies = {
     fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs,
@@ -106,6 +107,7 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
     role: (value: unknown) => { role = value }, plugin: (value: boolean) => { plugin = value }, confirm: (value: boolean) => { accepted = value }, disable: () => { failAuth = true }, breakStorage: () => { failStorage = true }, pickerCount: () => pickerCount,
     sessionResponse: (value?: () => Promise<Response | undefined>) => { sessionResponse = value }, expiresAt: (value: number) => { expiresAt = value },
     account: (id: string, name = "fixture") => { accountId = id; username = name },
+    orchestrator: (value: unknown) => { orchestrator = value },
     rpcResponse: (value?: () => Promise<Response | undefined>) => { rpcResponse = value },
     pickResponse: (value?: () => Promise<string | null>) => { pickResponse = value },
     dialogueResponse: (value: (signal: AbortSignal) => Promise<Response>) => { dialogueResponse = value },
@@ -113,6 +115,61 @@ async function fixture(settings: { catalog?: unknown; role?: unknown; plugin?: b
     cleanup: async () => { await service.dispose(); await rm(folder, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } }
 }
 const login = (service: AmeKit) => service.call("login", { server: "http://localhost:3211", username: "fixture", password: "fixture-password" })
+
+test("API orchestrator reaches runtime policy and refreshes or revokes with the account", async () => {
+  const config = { id: "ame-orchestrator", version: "1.0.0", description: "Global lead", prompt: "Route using installed agent descriptions.", subagentDepth: 3 }
+  const f = await fixture({ orchestrator: config, autoSync: false })
+  try {
+    assert.equal(await f.service.readOrchestrator!(), undefined)
+    await login(f.service)
+    assert.deepEqual(await f.service.readOrchestrator!(), config)
+    assert.deepEqual((f.rpc.at(-1) as { orchestrator: unknown }).orchestrator, config)
+    const updated = { ...config, version: "1.0.1", prompt: "Updated guidance." }
+    f.orchestrator(updated)
+    await f.service.call("refresh", {})
+    assert.deepEqual(await f.service.readOrchestrator!(), updated)
+    assert.deepEqual((f.rpc.at(-1) as { orchestrator: unknown }).orchestrator, updated)
+    f.orchestrator(undefined)
+    await f.service.call("refresh", {})
+    assert.equal(await f.service.readOrchestrator!(), undefined, "older API must not retain stale instructions")
+    f.orchestrator(config)
+    await f.service.call("refresh", {})
+    await f.service.call("logout", {})
+    assert.equal(await f.service.readOrchestrator!(), undefined)
+    assert.equal(f.rpc.at(-1), null)
+  } finally { await f.cleanup() }
+})
+
+test("invalid API orchestrator fails authentication instead of registering unvalidated instructions", async () => {
+  const f = await fixture({ orchestrator: { id: "unknown", prompt: "Unvalidated" }, autoSync: false })
+  try {
+    await assert.rejects(login(f.service), /INVALID_AUTH_RESPONSE/)
+    assert.equal(await f.service.readOrchestrator!(), undefined)
+    assert.equal(f.rpc.some(value => value && typeof value === "object" && "orchestrator" in value), false)
+  } finally { await f.cleanup() }
+})
+
+test("new Chat waits for orchestrator synchronization instead of falling back during refresh", async () => {
+  const config = { id: "ame-orchestrator", version: "1.0.0", description: "Global lead", prompt: "Use installed agents.", subagentDepth: 3 }
+  const f = await fixture({ orchestrator: config, autoSync: false })
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  try {
+    await login(f.service)
+    let syncing = false, returned = false
+    f.rpcResponse(async () => { syncing = true; await gate; return undefined })
+    const refresh = f.service.call("refresh", {})
+    for (let i = 0; !syncing && i < 100; i++) await delay(1)
+    assert.equal(syncing, true)
+    const read = f.service.readOrchestrator!().then(value => { returned = true; return value })
+    await delay(5)
+    assert.equal(returned, false)
+    release()
+    await refresh
+    assert.deepEqual(await read, config)
+    f.rpcResponse(undefined)
+  } finally { release(); await f.cleanup() }
+})
 
 test("model policy maps explicit tiers for admins and locks every user tier to the default", () => {
   const levels: ModelLevels = { default: "balanced-v2", haiku: "fast-v1", sonnet: "coding-v3", opus: "reasoning-v4" }

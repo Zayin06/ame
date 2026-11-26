@@ -21,7 +21,8 @@ const gitErrors: Record<string, { title: string; detail?: string }> = {
   CANNOT_DELETE_CURRENT_BRANCH: { title: 'Không thể xóa nhánh đang mở', detail: 'Chuyển sang nhánh khác trước khi xóa.' },
   INVALID_BRANCH_NAME: { title: 'Tên nhánh không hợp lệ theo quy tắc Git' },
   DETACHED_HEAD_PUSH_UNSUPPORTED: { title: 'Đang ở trạng thái Detached HEAD', detail: 'Tạo hoặc checkout một nhánh cục bộ trước khi Push.' },
-  NO_COMMIT_TO_UNDO: { title: 'Chưa có commit nào để hoàn tác' }
+  NO_COMMIT_TO_UNDO: { title: 'Chưa có commit nào để hoàn tác' },
+  GIT_DETACHED_ROOT_UNDO_UNSUPPORTED: { title: 'Không thể hoàn tác commit đầu tiên khi đang Detached HEAD', detail: 'Checkout hoặc tạo một nhánh cục bộ trước khi hoàn tác.' }
 }
 
 export function formatGitError(error: unknown): { title: string; detail?: string } {

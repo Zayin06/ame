@@ -158,6 +158,7 @@ export class OpenCodeAdapter {
   private state: Connection = { connected: false, url: '', error: 'Chưa kết nối OpenCode local service.' }
   private credentials?: { url: string; headers: Record<string, string> }
   private stream?: AbortController
+  private requestLifetime = new AbortController()
   private projects = new Map<string, string>()
   private live = new Map<string, Map<string, ChatItem>>()
   private activity = new SessionActivity()
@@ -178,7 +179,11 @@ export class OpenCodeAdapter {
   async connect(value: string, username?: string, password?: string) {
     const url = localURL(value)
     const headers: Record<string, string> = password ? { authorization: `Basic ${Buffer.from(`${username || 'opencode'}:${password}`).toString('base64')}` } : {}
-    const client = OpenCode.make({ baseUrl: url, headers, fetch: this.fetcher })
+    if (this.requestLifetime.signal.aborted) this.requestLifetime = new AbortController()
+    const lifetime = this.requestLifetime.signal
+    const client = OpenCode.make({ baseUrl: url, headers, fetch: (input, init = {}) => this.fetcher(input, {
+      ...init, signal: AbortSignal.any([lifetime, init.signal ?? AbortSignal.timeout(30_000)]),
+    }) })
     const info = await client.server.info({ signal: AbortSignal.timeout(8000) })
     if (info.version !== '2.3.2') throw new Error('UNSUPPORTED_SERVER_VERSION: Requires OpenCode 2.3.2')
     this.stream?.abort(); this.live.clear(); this.activity.clear()
@@ -274,10 +279,33 @@ export class OpenCodeAdapter {
     }))
     return [...sessions.values()].map(s => this.activity.map(s))
   }
-  async createSession(projectID: string, mode: PermissionMode = 'default'): Promise<Session> {
+  async createSession(projectID: string, mode: PermissionMode = 'default', agent?: string): Promise<Session> {
     const permissions = permissionRules(mode)
-    const s = await this.api().session.create({ location: { directory: this.directory(projectID) }, permissions })
+    if (agent) await this.waitForSessionAgent(projectID, agent)
+    const s = await this.api().session.create({ location: { directory: this.directory(projectID) }, permissions, ...(agent ? { agent } : {}) })
     return mapSession(s)
+  }
+  private async waitForSessionAgent(projectID: string, agent: string) {
+    const client = this.api(), directory = this.directory(projectID), signal = AbortSignal.timeout(15_000)
+    // Location plugins initialize lazily. Seeing the root alone does not mean project agents have loaded.
+    while (!signal.aborted) {
+      if (this.api() !== client) throw new Error('OPENCODE_DISCONNECTED')
+      if (this.directory(projectID) !== directory) throw new Error('SESSION_PROJECT_MISMATCH')
+      try {
+        const agents = await client.agent.list({ location: { directory } }, { signal })
+        const plugins = await client.plugin.list({ location: { directory } }, { signal })
+        const required = ['amekit-models', 'opencode.config.agent'].map(id => plugins.data.find(plugin => plugin.id === id))
+        if (required.some(plugin => plugin?.state.status === 'failed')) throw new Error('ORCHESTRATOR_PLUGIN_FAILED')
+        if (required.every(plugin => plugin?.state.status === 'active')) {
+          if (agents.data.some(item => item.id === agent && item.mode !== 'subagent')) return
+        }
+      } catch (error) {
+        if (signal.aborted) break
+        throw error
+      }
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    throw new Error('ORCHESTRATOR_NOT_READY: Agent điều phối chưa sẵn sàng. Hãy thử lại.')
   }
   async sessionPermissionMode(projectID: string, sessionID: string): Promise<PermissionMode> {
     return permissionModeFromSession(await this.owned(projectID, sessionID))
@@ -470,29 +498,32 @@ export class OpenCodeAdapter {
       diffs = await this.api().session.diff({ sessionID, from: first.data[0].id, to: last.data[0].id }, options)
     }
     if (diffs.length) return diffs
+    const files = new Map<string, SessionDiff>(), cursors = new Set<string>()
+    let cursor: string | undefined, started = !from
     try {
-      const history = await this.api().message.list({ sessionID, order: 'asc', limit: 200 }, options)
-      let messages = history.data
-      if (from) {
-        const start = messages.findIndex(message => message.id === from)
-        if (start === -1) return []
-        messages = messages.slice(start)
-        const end = messages.findIndex(message => message.type === 'idle')
-        if (end !== -1) messages = messages.slice(0, end)
-      }
-      const files = new Map<string, SessionDiff>()
-      for (const message of messages) for (const diff of extractToolDiffs(message, this.directory(projectID))) {
-        const previous = files.get(diff.file)
-        files.set(diff.file, previous ? {
-          file: diff.file,
-          patch: [previous.patch, diff.patch].filter(Boolean).join('\n'),
-          additions: previous.additions + diff.additions,
-          deletions: previous.deletions + diff.deletions,
-          status: previous.status === 'added' && diff.status === 'modified' ? 'added' : diff.status,
-        } : diff)
-      }
+      history: do {
+        const page = await this.api().message.list({ sessionID, order: 'asc', limit: 200, cursor }, options)
+        for (const message of page.data) {
+          if (!started && message.id === from) started = true
+          if (!started) continue
+          if (from && message.type === 'idle') break history
+          for (const diff of extractToolDiffs(message, this.directory(projectID))) {
+            const previous = files.get(diff.file)
+            files.set(diff.file, previous ? {
+              file: diff.file,
+              patch: [previous.patch, diff.patch].filter(Boolean).join('\n'),
+              additions: previous.additions + diff.additions,
+              deletions: previous.deletions + diff.deletions,
+              status: previous.status === 'added' && diff.status === 'modified' ? 'added' : diff.status,
+            } : diff)
+          }
+        }
+        cursor = page.cursor.next ?? undefined
+        if (cursor && cursors.has(cursor)) throw new Error('SESSION_DIFF_CURSOR_REPEATED')
+        if (cursor) cursors.add(cursor)
+      } while (cursor)
       return [...files.values()]
-    } catch { return [] }
+    } catch (cause) { throw new Error('SESSION_DIFF_HISTORY_FAILED: Không tải được đầy đủ lịch sử thay đổi. Hãy thử lại.', { cause }) }
   }
   async models(projectID: string): Promise<Model[]> {
     const list = await this.api().model.list({ location: { directory: this.directory(projectID) }, types: ['chat'] })
@@ -617,5 +648,6 @@ export class OpenCodeAdapter {
       if (!directory || path.resolve(directory) === path.resolve(root)) this.notify(sessionID === undefined ? { type: 'opencode', projectID } : { type: 'opencode', projectID, sessionID })
     }
   }
-  dispose() { this.stream?.abort(); this.client = undefined; this.credentials = undefined; this.live.clear(); this.activity.clear() }
+  abortRequests() { this.stream?.abort(); this.requestLifetime.abort(new Error('OPENCODE_REQUEST_CANCELLED')) }
+  dispose() { this.abortRequests(); this.client = undefined; this.credentials = undefined; this.live.clear(); this.activity.clear() }
 }

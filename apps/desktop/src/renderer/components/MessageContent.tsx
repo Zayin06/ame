@@ -17,7 +17,10 @@ function inline(nodes: InlineNode[], onOpenFile?: OpenFile): ReactNode[] {
       case 'strong': return <strong key={index}>{inline(node.children, onOpenFile)}</strong>
       case 'em': return <em key={index}>{inline(node.children, onOpenFile)}</em>
       case 'del': return <del key={index}>{inline(node.children, onOpenFile)}</del>
-      case 'link': return <a key={index} href={node.url} target="_blank" rel="noreferrer">{inline(node.children, onOpenFile)}</a>
+      case 'link': return <a key={index} href={node.url} target="_blank" rel="noreferrer" onClick={event => {
+        event.preventDefault()
+        void window.ame.openExternal(node.url).catch(() => {})
+      }}>{inline(node.children, onOpenFile)}</a>
     }
   })
 }

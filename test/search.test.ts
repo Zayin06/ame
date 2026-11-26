@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { test, type TestContext } from 'node:test'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { findRipgrep, replaceInWorkspace, searchWorkspace } from '../packages/ide-core/src/search'
+import { SearchWorker, type SearchWorkerTask } from '../packages/ide-core/src/search-worker-client'
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(path.join(tmpdir(), 'ame-search-'))
@@ -229,4 +230,91 @@ test('replacement validates every allowlist path before any write, including emp
   }
   assert.equal(await readFile(path.join(root, 'safe.txt'), 'utf8'), 'cat')
   assert.equal(await readFile(path.join(outside, 'outside.txt'), 'utf8'), 'cat')
+})
+
+test('catastrophic regex expires without blocking the host, and subsequent searches recover', { timeout: 10000 }, async t => {
+  const { root, put } = await fixture(t)
+  await put('a.txt', 'a'.repeat(40) + '!')
+  let ticks = 0
+  const heartbeat = setInterval(() => ticks++, 20)
+  try {
+    await assert.rejects(searchWorkspace(root, { query: '(a+)+$', regex: true }, { ...nodeEngine, timeoutMs: 1000 }), /SEARCH_TIMEOUT/)
+    assert.ok(ticks >= 5, 'the main event loop must remain responsive during regex execution')
+    assert.equal((await searchWorkspace(root, { query: 'a+', regex: true }, nodeEngine)).totalMatches, 1)
+  } finally { clearInterval(heartbeat) }
+})
+
+test('in-flight regex cancellation and preview deadlines terminate computation without writing files', { timeout: 10000 }, async t => {
+  const { root, put } = await fixture(t)
+  const original = 'a'.repeat(40) + '!'
+  await put('a.txt', original)
+  const controller = new AbortController()
+  const pending = searchWorkspace(root, { query: '(a+)+$', regex: true }, { ...nodeEngine, signal: controller.signal })
+  const cancel = setTimeout(() => controller.abort(), 500)
+  try { await assert.rejects(pending, { name: 'AbortError' }) } finally { clearTimeout(cancel) }
+  const worker = new SearchWorker()
+  try {
+    await assert.rejects(worker.run({ kind: 'preview', root, options: { query: '(a+)+$', regex: true, replacement: 'changed', dryRun: true } }, undefined, 1000), /SEARCH_TIMEOUT/)
+  } finally { worker.dispose() }
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), original)
+})
+
+test('literal searches also isolate expensive include globs from the host event loop', { timeout: 10000 }, async t => {
+  const { root, put } = await fixture(t)
+  await put('a'.repeat(80) + '.txt', 'needle')
+  let ticks = 0
+  const heartbeat = setInterval(() => ticks++, 20)
+  try {
+    await assert.rejects(searchWorkspace(root, { query: 'needle', include: ['*a'.repeat(30) + 'b'] }, { ...nodeEngine, timeoutMs: 1000 }), /SEARCH_TIMEOUT/)
+    assert.ok(ticks >= 5)
+  } finally { clearInterval(heartbeat) }
+})
+
+test('replacement expansion exceeding the editor byte limit fails before any file is written', async t => {
+  const { root, put } = await fixture(t)
+  const original = 'x'.repeat(300)
+  await put('a.txt', original)
+  for (const regex of [false, true]) {
+    await assert.rejects(replaceInWorkspace(root, { query: 'x', regex, replacement: '界'.repeat(10000) }), /FILE_TOO_LARGE/)
+    assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), original)
+  }
+  const bom = '\uFEFF' + 'x'.repeat(128)
+  await put('a.txt', bom)
+  await assert.rejects(replaceInWorkspace(root, { query: 'x', replacement: 'y'.repeat(32768) }), /FILE_TOO_LARGE/)
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), bom, 'the BOM must count toward the output byte limit')
+})
+
+test('an atomic file replacement with identical bytes during matching is a conflict, not a successful write', async t => {
+  const { root, put } = await fixture(t)
+  await put('a.txt', 'cat')
+  const options = { query: 'cat', regex: true, replacement: 'dog' }
+  const preview = await replaceInWorkspace(root, { ...options, dryRun: true })
+  const run = SearchWorker.prototype.run
+  t.mock.method(SearchWorker.prototype, 'run', async function<T>(this: SearchWorker, task: SearchWorkerTask, signal?: AbortSignal, timeoutMs?: number): Promise<T> {
+    const value = await run.call(this, task, signal, timeoutMs)
+    if (task.kind === 'replacement') {
+      await put('replacement.tmp', 'cat')
+      // Moving the open destination aside also works on Windows, where rename-over-open
+      // is denied; both operations complete before the original matcher resumes.
+      await rename(path.join(root, 'a.txt'), path.join(root, 'previous.tmp'))
+      await rename(path.join(root, 'replacement.tmp'), path.join(root, 'a.txt'))
+    }
+    return value as T
+  })
+  const result = await replaceInWorkspace(root, options, preview.previews)
+  assert.deepEqual(result.conflicts, ['a.txt'])
+  assert.deepEqual(result.writtenFiles, [])
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'cat')
+})
+
+test('a fatal replacement matcher failure reports every unprocessed file without writing any of them', async t => {
+  const { root, put } = await fixture(t)
+  await put('a.txt', 'cat'); await put('b.txt', 'cat')
+  const options = { query: 'cat', regex: true, replacement: 'dog' }
+  const preview = await replaceInWorkspace(root, { ...options, dryRun: true })
+  t.mock.method(SearchWorker.prototype, 'run', async () => { throw Object.assign(new Error('SEARCH_TIMEOUT'), { code: 'SEARCH_TIMEOUT' }) })
+  const result = await replaceInWorkspace(root, options, preview.previews)
+  assert.deepEqual(result.errors, [{ path: 'a.txt', code: 'SEARCH_TIMEOUT' }, { path: 'b.txt', code: 'REPLACE_ABORTED' }])
+  assert.equal(result.filesChanged, 0)
+  for (const file of ['a.txt', 'b.txt']) assert.equal(await readFile(path.join(root, file), 'utf8'), 'cat')
 })

@@ -210,6 +210,10 @@ body {
 .workspace-body.is-resizing .side-panel {
   transition: none !important;
 }
+.workspace-body.is-resizing {
+  user-select: none;
+  cursor: col-resize;
+}
 
 /* ==========================================================================
    4. CỘT 1: PROJECTS & CHATS SIDEBAR
@@ -680,10 +684,10 @@ body {
    8. CỘT 4: FILE & DIFF STAGE (+ INTEGRATED BOTTOM TERMINAL)
    ========================================================================== */
 .side-panel {
-  width: clamp(300px, var(--sidepanel-w), 50vw);
+  width: var(--sidepanel-w);
   flex: 0 1 auto;
   min-width: 300px;
-  max-width: calc(100% - 340px);
+  max-width: none;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -691,8 +695,7 @@ body {
   border: 1px solid var(--border-subtle);
   border-radius: var(--pane-radius);
   overflow: hidden;
-  transition: width var(--dur-base) var(--ease-out),
-              opacity var(--dur-fast) ease;
+  transition: opacity var(--dur-fast) ease;
 }
 
 .workspace-body.is-sidepanel-collapsed .side-panel {
@@ -928,7 +931,6 @@ body {
     min-width: 280px;
   }
   .side-panel {
-    width: clamp(260px, var(--sidepanel-w), 40vw);
     min-width: 260px;
   }
 }
