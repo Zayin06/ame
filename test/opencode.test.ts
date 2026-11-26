@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import path from 'node:path'
-import { OpenCodeAdapter, localURL, normalizeMessages } from '../packages/opencode-adapter/src/index'
+import { OpenCodeAdapter, localURL, normalizeMessages, parseCompletedTodos } from '../packages/opencode-adapter/src/index'
 import { SessionActivity } from '../packages/opencode-adapter/src/session-activity'
 import type { IdeEvent } from '../packages/protocol/src/index'
 import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
@@ -459,7 +459,7 @@ test('normalization exposes compaction, assistant and idle errors with timestamp
     { id: 'compact:error', role: 'assistant', kind: 'error', text: 'Compaction summary reached the output token limit', createdAt: 0 },
     { id: 'assistant:0', role: 'assistant', kind: 'text', text: 'Partial answer', createdAt: 10, completedAt: 20 },
     { id: 'assistant:error', role: 'assistant', kind: 'error', text: 'Provider failed', createdAt: 10, completedAt: 20 },
-    { id: 'idle:error', role: 'assistant', kind: 'error', text: 'Execution failed', createdAt: 30 },
+    { id: 'idle:error', role: 'assistant', kind: 'error', text: 'Execution failed', createdAt: 30, executionOutcome: 'failed' },
     { id: 'type-only:error', role: 'assistant', kind: 'error', text: 'UnknownError' },
     { id: 'fallback:error', role: 'assistant', kind: 'error', text: 'Phiên thực thi gặp lỗi.' },
   ])
@@ -748,7 +748,7 @@ test('empty snapshot diffs fall back to completed tool files within whole-sessio
 })
 
 test('tool diff fallback follows history cursors and finds turns after the first 200 messages', async () => {
-  const directory = path.resolve('long-diff-project'), cursors: (string | null)[] = []
+  const directory = path.resolve('long-diff-project'), pages: URLSearchParams[] = []
   let brokenPage = false, repeatedCursor = false
   const tail = [
     { id: 'late-user', type: 'user', text: 'edit' },
@@ -762,8 +762,9 @@ test('tool diff fallback follows history cursors and finds turns after the first
     if (url.pathname === '/api/session/s1') return json({ data: { location: { directory } } })
     if (url.pathname.endsWith('/diff')) return json({ data: [] })
     if (url.pathname.endsWith('/message')) {
+      if (url.searchParams.has('cursor') && url.searchParams.has('order')) return json({ message: 'Cursor cannot be combined with order' }, 400)
       if (url.searchParams.get('type') === 'user') return json({ data: [tail[0]], cursor: {} })
-      const cursor = url.searchParams.get('cursor'); cursors.push(cursor)
+      const cursor = url.searchParams.get('cursor'); pages.push(url.searchParams)
       if (cursor === 'page2' && brokenPage) throw new Error('page failed')
       return cursor === 'page2' ? json({ data: tail, cursor: repeatedCursor ? { next: 'page2' } : {} }) : json({ data: Array.from({ length: 200 }, (_, i) => ({ id: `old-${i}`, type: 'idle' })), cursor: { next: 'page2' } })
     }
@@ -773,14 +774,49 @@ test('tool diff fallback follows history cursors and finds turns after the first
   try {
     await adapter.connect('http://localhost:4096')
     for (const from of [undefined, 'late-user']) {
-      cursors.length = 0
+      pages.length = 0
       assert.deepEqual(await adapter.sessionDiff('p', 's1', from), [{ file: 'late.ts', patch: '+late', additions: 1, deletions: 0, status: 'modified' }])
-      assert.deepEqual(cursors, [null, 'page2'])
+      assert.equal(pages.length, 2)
+      assert.equal(pages[0].get('order'), 'asc'); assert.equal(pages[0].has('cursor'), false)
+      assert.equal(pages[1].get('cursor'), 'page2'); assert.equal(pages[1].has('order'), false)
     }
     brokenPage = true
     await assert.rejects(adapter.sessionDiff('p', 's1'), /SESSION_DIFF_HISTORY_FAILED/)
     brokenPage = false; repeatedCursor = true
     await assert.rejects(adapter.sessionDiff('p', 's1'), /SESSION_DIFF_HISTORY_FAILED/)
+  } finally { adapter.dispose() }
+})
+
+test('paginated revert boundary lookup omits order after the first user page', async () => {
+  const directory = process.cwd(), pages: URLSearchParams[] = []
+  const files = [{ file: 'before.ts', patch: '+before', additions: 1, deletions: 0, status: 'added' }]
+  const adapter = new OpenCodeAdapter(() => {}, async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    if (url.pathname === '/api/session/s1') return json({ data: { location: { directory }, revert: { messageID: 'reverted-user' } } })
+    if (url.pathname.endsWith('/message')) {
+      pages.push(url.searchParams)
+      if (url.searchParams.has('cursor') && url.searchParams.has('order')) return json({ message: 'Cursor cannot be combined with order' }, 400)
+      return url.searchParams.has('cursor')
+        ? json({ data: [{ id: 'last-before' }, { id: 'reverted-user' }, { id: 'after-boundary' }], cursor: { next: 'unused-page3' } })
+        : json({ data: [{ id: 'first-before' }], cursor: { next: 'user-page2' } })
+    }
+    if (url.pathname.endsWith('/diff')) {
+      assert.equal(url.searchParams.get('from'), 'first-before')
+      assert.equal(url.searchParams.get('to'), 'last-before')
+      return json({ data: files })
+    }
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096')
+    assert.deepEqual(await adapter.sessionDiff('p', 's1'), files)
+    assert.equal(pages.length, 2)
+    for (const page of pages) { assert.equal(page.get('type'), 'user'); assert.equal(page.get('limit'), '200') }
+    assert.equal(pages[0].get('order'), 'asc'); assert.equal(pages[0].has('cursor'), false)
+    assert.equal(pages[1].get('cursor'), 'user-page2'); assert.equal(pages[1].has('order'), false)
   } finally { adapter.dispose() }
 })
 
@@ -804,8 +840,8 @@ test('completed tool metadata emits turn changes without snapshots and preserves
     { id: 'idle2', type: 'idle' },
   ] as unknown as SessionMessageInfo[])
   assert.deepEqual(items.filter(item => item.kind === 'changes'), [
-    { id: 'idle1:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u1', files: ['src/new.ts'] } },
-    { id: 'idle2:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u2', files: ['other/file.ts', 'snapshot\\original.ts'] } },
+    { id: 'idle1:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u1', files: ['src/new.ts'] }, executionID: 'u1', executionOutcome: 'succeeded' },
+    { id: 'idle2:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u2', files: ['other/file.ts', 'snapshot\\original.ts'] }, executionID: 'u2', executionOutcome: 'succeeded' },
   ])
 })
 
@@ -820,13 +856,13 @@ test('user file parts preserve inline base64 and URI references without changing
     { id: 'plain', type: 'user', text: 'unchanged', files: [] },
   ] as unknown as SessionMessageInfo[])
   assert.deepEqual(items, [
-    { id: 'inline', role: 'user', text: '', attachments: [
+    { id: 'inline', role: 'user', text: '', executionID: 'inline', attachments: [
       { name: 'shot.png', mime: 'image/png', dataUrl: 'data:image/png;base64,YQ==' },
       { name: 'report.pdf', mime: 'application/pdf', dataUrl: 'data:application/pdf;base64,cGRm' },
       { name: 'notes.txt', mime: 'text/plain', uri: 'file:///C:/notes.txt', size: 12 },
       { name: 'attachment', mime: 'application/octet-stream', uri: 'file:///C:/unknown.bin', size: 0 },
     ] },
-    { id: 'plain', role: 'user', text: 'unchanged' },
+    { id: 'plain', role: 'user', text: 'unchanged', executionID: 'inline' },
   ])
 })
 
@@ -869,16 +905,16 @@ test('timeline metadata spans an idle-bounded execution without restarting for s
     { id: 'idle2', type: 'idle', time: { created: 130 } },
   ] as SessionMessageInfo[])
   assert.deepEqual(items.slice(0, 3), [
-    { id: 'u1', role: 'user', text: 'first', createdAt: 0 },
-    { id: 'a1:0', role: 'assistant', kind: 'text', text: 'Checking', createdAt: 10, completedAt: 20, phase: 'commentary' },
-    { id: 'a1:1', role: 'assistant', kind: 'reasoning', text: 'Thinking', createdAt: 10, completedAt: 20 },
+    { id: 'u1', role: 'user', text: 'first', createdAt: 0, executionID: 'u1', executionOutcome: 'succeeded' },
+    { id: 'a1:0', role: 'assistant', kind: 'text', text: 'Checking', createdAt: 10, completedAt: 20, phase: 'commentary', executionID: 'u1', executionOutcome: 'succeeded' },
+    { id: 'a1:1', role: 'assistant', kind: 'reasoning', text: 'Thinking', createdAt: 10, completedAt: 20, executionID: 'u1', executionOutcome: 'succeeded' },
   ])
   assert.equal(items[3].createdAt, 10)
   assert.equal(items[3].completedAt, 20)
   assert.equal(Object.hasOwn(items[3], 'phase'), false)
-  assert.deepEqual(items[4], { id: 'steer', role: 'user', text: 'steer', createdAt: 30 })
-  assert.deepEqual(items[5], { id: 'a2:0', role: 'assistant', kind: 'text', text: 'Done', createdAt: 40, completedAt: 50, phase: 'final_answer', workedMs: 60 })
-  assert.deepEqual(items[6], { id: 'idle1:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u1', files: ['a.ts', 'z.ts'] } })
+  assert.deepEqual(items[4], { id: 'steer', role: 'user', text: 'steer', createdAt: 30, executionID: 'u1', executionOutcome: 'succeeded' })
+  assert.deepEqual(items[5], { id: 'a2:0', role: 'assistant', kind: 'text', text: 'Done', createdAt: 40, completedAt: 50, phase: 'final_answer', workedMs: 60, executionID: 'u1', executionOutcome: 'succeeded' })
+  assert.deepEqual(items[6], { id: 'idle1:changes', role: 'assistant', kind: 'changes', text: '', turn: { from: 'u1', files: ['a.ts', 'z.ts'] }, executionID: 'u1', executionOutcome: 'succeeded' })
   assert.equal(items[8].workedMs, 30)
   assert.equal(items.filter(item => item.kind === 'changes').length, 1)
   for (const item of items.filter(item => !['a2:0', 'a3:0'].includes(item.id))) assert.equal(Object.hasOwn(item, 'workedMs'), false)
@@ -891,14 +927,77 @@ test('timeline metadata preserves minimal fixtures and omits unknown text phases
     { id: 'idle', type: 'idle' },
   ] as SessionMessageInfo[])
   assert.deepEqual(items, [
-    { id: 'u', role: 'user', text: 'hello' },
-    { id: 'a:0', role: 'assistant', kind: 'text', text: 'Done' },
-    { id: 'a:1', role: 'assistant', kind: 'reasoning', text: 'Thinking' },
+    { id: 'u', role: 'user', text: 'hello', executionID: 'u', executionOutcome: 'succeeded' },
+    { id: 'a:0', role: 'assistant', kind: 'text', text: 'Done', executionID: 'u', executionOutcome: 'succeeded' },
+    { id: 'a:1', role: 'assistant', kind: 'reasoning', text: 'Thinking', executionID: 'u', executionOutcome: 'succeeded' },
   ])
   const [unknown] = normalizeMessages([{ id: 'a', type: 'assistant', time: { created: 0, completed: 0 }, content: [
     { type: 'text', text: 'Done', native: { phase: 'unknown' } },
   ] }] as unknown as SessionMessageInfo[])
   assert.deepEqual(unknown, { id: 'a:0', role: 'assistant', kind: 'text', text: 'Done', createdAt: 0, completedAt: 0 })
+})
+
+test('execution identity spans followups, stamps all outcomes and resets only at idle', () => {
+  for (const outcome of ['succeeded', 'failed', 'interrupted', undefined] as const) {
+    const items = normalizeMessages([
+      { id: 'u1', type: 'user', text: 'start', time: { created: 0 } },
+      { id: 'a1', type: 'assistant', content: [{ type: 'text', text: 'Working' }] },
+      { id: 'followup', type: 'user', text: 'also this', time: { created: 10 } },
+      { id: 'compact', type: 'compaction', status: 'failed', error: { type: 'Error', message: 'Compaction failed' } },
+      { id: 'a2', type: 'assistant', snapshot: { files: ['changed.ts'] }, content: [{ type: 'reasoning', text: 'Thinking' }], error: { type: 'Error', message: 'Assistant error' } },
+      { id: 'idle', type: 'idle', outcome, time: { created: 20 }, error: { type: 'Error', message: 'Idle error' } },
+      { id: 'orphan', type: 'assistant', content: [{ type: 'text', text: 'Outside execution' }] },
+      { id: 'u2', type: 'user', text: 'new execution' },
+      { id: 'a3', type: 'assistant', content: [{ type: 'text', text: 'Still running' }] },
+    ] as unknown as SessionMessageInfo[])
+    const finished = items.filter(item => item.executionID === 'u1')
+    assert.deepEqual(finished.map(item => item.id), ['u1', 'a1:0', 'followup', 'compact:error', 'a2:0', 'a2:error', ...(outcome === 'failed' ? ['idle:error'] : []), 'idle:changes'])
+    for (const item of finished) assert.equal(item.executionOutcome, outcome ?? 'succeeded')
+    assert.equal(items.find(item => item.id === 'a2:error')?.workedMs, 20)
+    const orphan = items.find(item => item.id === 'orphan:0')!
+    assert.equal(Object.hasOwn(orphan, 'executionID'), false)
+    assert.equal(Object.hasOwn(orphan, 'executionOutcome'), false)
+    for (const item of items.slice(-2)) {
+      assert.equal(item.executionID, 'u2')
+      assert.equal(Object.hasOwn(item, 'executionOutcome'), false)
+    }
+  }
+})
+
+test('completed todowrite accepts structured snapshots from metadata, output and input including empty arrays', () => {
+  const todos = [
+    { content: '  Plan  ', status: 'pending', priority: 'high' },
+    { content: 'Implement', status: 'in_progress' },
+    { content: 'Verify', status: 'completed' },
+    { content: 'Optional', status: 'cancelled' },
+  ]
+  const expected = todos.map(({ content, status }) => ({ content: content.trim(), status }))
+  for (const source of ['metadata', 'output', 'input']) for (const value of [todos, []]) {
+    const part = { type: 'tool', name: ' TodoWrite ', state: { status: 'completed', [source]: { todos: value } } }
+    assert.deepEqual(parseCompletedTodos(part), value.length ? expected : [])
+    const [item] = normalizeMessages([{ id: 'a', type: 'assistant', content: [part] }] as unknown as SessionMessageInfo[])
+    assert.deepEqual(item.todos, value.length ? expected : [])
+  }
+  const part = (state: object) => ({ type: 'tool', name: 'todowrite', state: { status: 'completed', ...state } })
+  assert.deepEqual(parseCompletedTodos(part({ metadata: { todos: [] }, output: { todos }, input: { todos } })), [])
+  assert.deepEqual(parseCompletedTodos(part({ output: { todos: [] }, input: { todos } })), [])
+  assert.deepEqual(parseCompletedTodos(part({ output: 'prose', input: { todos } })), expected)
+  assert.equal(parseCompletedTodos(part({ metadata: { todos: 'malformed' }, input: { todos } })), undefined, 'malformed authoritative snapshots do not fall back')
+})
+
+test('todo normalization ignores noncompleted tools, prose and malformed snapshots without partial results', () => {
+  class Todo { content = 'Class instance'; status = 'pending' }
+  const valid = { content: 'Valid', status: 'pending' }
+  const parts: unknown[] = [
+    ...['running', 'streaming', 'error'].map(status => ({ type: 'tool', name: 'todowrite', state: { status, input: { todos: [valid] } } })),
+    { type: 'tool', name: 'read', state: { status: 'completed', metadata: { todos: [valid] } } },
+    { type: 'text', text: 'todos: [{content: "Done", status: "completed"}]' },
+    ...[undefined, null, '[]', {}, [null], [[]], [new Todo()], [valid, {}], [{ content: ' ', status: 'pending' }], [{ content: 1, status: 'pending' }], [{ content: 'Task', status: 'unknown' }], [{ content: 'Task' }]].map(todos => ({ type: 'tool', name: 'todowrite', state: { status: 'completed', metadata: { todos }, content: [{ type: 'text', text: 'All tasks completed' }] } })),
+    { type: 'tool', name: 'todowrite', state: { status: 'completed', output: JSON.stringify({ todos: [valid] }) } },
+  ]
+  for (const part of [null, [], {}, ...parts]) assert.equal(parseCompletedTodos(part), undefined)
+  const items = normalizeMessages([{ id: 'a', type: 'assistant', content: parts }] as unknown as SessionMessageInfo[])
+  for (const item of items) assert.equal(Object.hasOwn(item, 'todos'), false)
 })
 
 test('worked time requires a valid idle boundary and does not leak across turns', () => {
@@ -1104,7 +1203,7 @@ test('live text merges field-by-field and completed history retires stale live e
     history = [{ id: 'u', type: 'user', text: 'go', time: { created: 0 } }, assistant('Saved', 20), { id: 'idle', type: 'idle', time: { created: 30 } }]
     const completed = normalizeMessages(history as SessionMessageInfo[])
     assert.deepEqual(await adapter.messages('p', 's1'), completed, 'completed history wins over longer stale live text')
-    assert.deepEqual(completed[1], { id: 'a:0', role: 'assistant', kind: 'text', text: 'Saved', phase: 'final_answer', createdAt: 10, completedAt: 20, workedMs: 30 })
+    assert.deepEqual(completed[1], { id: 'a:0', role: 'assistant', kind: 'text', text: 'Saved', phase: 'final_answer', createdAt: 10, completedAt: 20, workedMs: 30, executionID: 'u', executionOutcome: 'succeeded' })
     history = []
     assert.deepEqual(await adapter.messages('p', 's1'), [], 'retired live entry cannot reappear when history is absent')
     history = [assistant('Saved', 0)]

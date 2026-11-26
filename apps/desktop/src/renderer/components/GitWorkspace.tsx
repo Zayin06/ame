@@ -23,6 +23,7 @@ export type GitWorkspaceProps = {
   noVerify: boolean
   onNoVerifyChange: (value: boolean) => void
   commitEnhanceSkill: string
+  commitEnhanceModel?: string
   onDiff: (path: string, target?: DiffTarget) => void
   onOpenFile?: (path: string, line?: number) => void
   onOpenCommitAgent?: () => void
@@ -120,6 +121,8 @@ export function GitWorkspace(props: GitWorkspaceProps) {
   const busy = !!pending
   const changes = git?.changes ?? []
   const stagedChanges = changes.filter(file => !!file.index.trim() && !['?', '!'].includes(file.index))
+  // App refreshes installed feature settings on account and bundle updates.
+  const enhanceTitle = !props.connected ? 'Chưa kết nối OpenCode' : !stagedChanges.length ? 'Stage ít nhất một tệp để tạo thông điệp commit' : busy ? 'Đang xử lý…' : `Tạo thông điệp commit bằng AI từ thay đổi đã stage${props.commitEnhanceSkill ? ` (Skill /${props.commitEnhanceSkill})` : ''}${props.commitEnhanceModel ? ` · Model: ${props.commitEnhanceModel}` : ''}`
   const workingChanges = changes.filter(file => (!!file.working.trim() && file.working !== '!') || file.index === '?')
   const commitState = { busy, message, changes, amend }
   const stats = analyzeCommitMessage(message)
@@ -219,7 +222,7 @@ export function GitWorkspace(props: GitWorkspaceProps) {
             <span>{stats.lineCount} dòng</span><span>{props.commitEnhanceSkill ? `/ ${props.commitEnhanceSkill}` : 'Conventional Commits'}</span>
           </div>
           <div className="git-composer__toolbar">
-            <button type="button" data-testid="git-workspace-enhance-btn" disabled={!props.connected || busy || !stagedChanges.length} aria-busy={pending === 'Enhance bằng AI'} onClick={enhance}>
+            <button type="button" data-testid="git-workspace-enhance-btn" disabled={!props.connected || busy || !stagedChanges.length} title={enhanceTitle} aria-busy={pending === 'Enhance bằng AI'} onClick={enhance}>
               {pending === 'Enhance bằng AI' ? <span className="amekit-spinner" aria-hidden="true" /> : <Icon name="wand" />}Enhance bằng AI
             </button>
             <button type="button" data-testid="git-workspace-commit-agent-btn" disabled={!props.connected || busy || !changes.length || !props.onOpenCommitAgent} title="Mở phiên agent có tool để đọc đủ diff, hỏi xác nhận và tách nhiều commit" onClick={() => props.onOpenCommitAgent?.()}><Icon name="wand" />Trợ lý Commit AI</button>

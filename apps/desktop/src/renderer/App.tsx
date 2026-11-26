@@ -93,6 +93,7 @@ export function App() {
   const [gitWorkspaceTab, setGitWorkspaceTab] = useState<GitWorkspaceTab>('commit')
   const [commitDrafts, setCommitDrafts] = useState<Record<string, { message: string; amend: boolean; noVerify: boolean }>>({})
   const [commitEnhanceSkill, setCommitEnhanceSkill] = useState('')
+  const [commitEnhanceModel, setCommitEnhanceModel] = useState('')
   const [generation, setGeneration] = useState(0)
   const [sessionGeneration, setSessionGeneration] = useState(0)
   const [error, setError] = useState('')
@@ -163,15 +164,20 @@ export function App() {
     const load = async () => {
       const request = ++revision
       setCommitEnhanceSkill('')
+      setCommitEnhanceModel('')
       if (!projectID) return
       try {
-        const installed = await window.ame?.account?.('installed', {}) as { features?: { commitEnhanceSkill?: string } } | null
-        if (alive && request === revision) setCommitEnhanceSkill(installed?.features?.commitEnhanceSkill ?? '')
-      } catch { if (alive && request === revision) setCommitEnhanceSkill('') }
+        const installed = await window.ame?.account?.('installed', {}) as { features?: { commitEnhanceSkill?: string; commitEnhanceModel?: string } } | null
+        if (alive && request === revision) {
+          setCommitEnhanceSkill(installed?.features?.commitEnhanceSkill ?? '')
+          setCommitEnhanceModel(installed?.features?.commitEnhanceModel ?? '')
+        }
+      } catch { if (alive && request === revision) { setCommitEnhanceSkill(''); setCommitEnhanceModel('') } }
     }
     void load()
     window.addEventListener('ame-account-changed', load)
-    return () => { alive = false; window.removeEventListener('ame-account-changed', load) }
+    window.addEventListener('ame-bundle-updated', load)
+    return () => { alive = false; window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-bundle-updated', load) }
   }, [projectID])
   const git = projectID ? gitCache[projectID] : undefined
   const sessions = projectID ? sessionCache[projectID] || [] : []
@@ -756,6 +762,7 @@ export function App() {
     const buffer = projectID && tab ? buffers[documentID(projectID, tab.path)] : undefined
     return <div key={group} className={`editor-group ${splitState.focused === group ? 'is-focused' : ''}`} onFocusCapture={() => { if (projectID && !diffMode) updateSplit(projectID, current => focusGroup(current, group)) }} onPointerDownCapture={() => { if (projectID && !diffMode) updateSplit(projectID, current => focusGroup(current, group)) }}>
       <EditorStage projectID={projectID || ''} target={group === splitState.focused || diffMode ? navigation : undefined} dirtyPaths={projectDirtyPaths(buffers, projectID)} tabs={diffMode ? view.tabs.filter(tab => tab.mode === 'diff') : editorGroup?.tabs || []} active={tab} buffer={buffer} loadError={projectID && tab ? readErrors[documentID(projectID, tab.path)] : undefined} diff={projectID && tab ? diffs[diffID(projectID, tab)] : undefined} theme={preferences.theme}
+        isMac={isMac} onReveal={path => { if (projectID) void window.ame.revealPath(projectID, path).catch(report) }}
         diagnostics={diagnostics} breakpoints={projectID && tab ? breakpointsByProject[projectID]?.[tab.path] ?? [] : []}
         pausedLine={tab?.path === pausedFrame?.path ? pausedFrame?.line : undefined}
         onToggleBreakpoint={line => { if (tab?.mode === 'file') toggleBreakpoint(tab.path, line) }}
@@ -772,7 +779,7 @@ export function App() {
     {error && <div className="error-banner" role="alert"><span>{error}</span><IconButton label="Đóng thông báo" onClick={() => setError('')}><Icon name="close" /></IconButton></div>}
     <div className={`workspace-body ${!preferences.rail ? 'is-sidebar-collapsed' : ''} ${!preferences.inspector ? 'is-inspector-collapsed' : ''} ${!preferences.stage ? 'is-sidepanel-collapsed' : ''} ${maximized && preferences.stage ? 'is-sidepanel-maximized' : ''} ${gitWorkspaceOpen && projectID ? 'is-git-workspace' : ''}`} style={{ '--sidebar-w': `${preferences.widths.rail}px`, '--inspector-w': `${preferences.widths.inspector}px`, '--sidepanel-w': `${preferences.widths.stage}px` } as CSSProperties}>
       {preferences.rail && <><ProjectRail projects={projects} projectID={projectID} sessions={sessions} sessionCache={sessionCache} onRemove={id => void removeProject(id)} onSessionRemoved={sessionRemoved} onSessions={(id, items) => { setSessionCache(current => removedProjects.current.has(id) ? current : ({ ...current, [id]: items })); updateView(id, current => ({ ...current, session: !current.session && (draftProjects.current.has(id) || sessionCacheRef.current[id] !== undefined) ? undefined : items.some(item => item.id === current.session) ? current.session : items[0]?.id })) }} sessionID={view.session} loading={projectsLoading} sessionsLoading={sessionsLoading} error={sessionError} connected={connection.connected} creating={creating} git={git} generation={generation} onSelect={id => setPreferences(p => ({ ...p, project: id }))} onSession={(id, session) => { setGitWorkspaceOpen(false); draftProjects.current.delete(id); setPreferences(p => ({ ...p, project: id })); updateView(id, current => ({ ...current, session })) }} onTool={(id, tab) => setPreferences(p => ({ ...p, project: id, inspector: true, inspectorTab: tab }))} onCreate={id => void createSession(id)} onPick={() => void pickProject()} onRetry={refreshSessions} /><Resizer pane="rail" width={preferences.widths.rail} onChange={w => setWidth('rail', w)} /></>}
-      {preferences.inspector && <><Inspector projectID={projectID} name={project?.name} connected={connection.connected} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={(path, line, column) => openTab(path, 'file', line, column, undefined, { literal: true })} onRename={(from, to) => { if (projectID) renameOpenPath(projectID, from, to) }} onDelete={path => { if (projectID) deleteOpenPath(projectID, path) }} onDiff={(path, target) => openTab(path, 'diff', undefined, undefined, target, { literal: true })} onHide={() => toggle('inspector')} report={report}
+      {preferences.inspector && <><Inspector projectID={projectID} name={project?.name} connected={connection.connected} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={(path, line, column) => openTab(path, 'file', line, column, undefined, { literal: true })} onRename={(from, to) => { if (projectID) renameOpenPath(projectID, from, to) }} onDelete={(path, targetProjectID) => { const id = targetProjectID ?? projectID; if (id) deleteOpenPath(id, path) }} onDiff={(path, target) => openTab(path, 'diff', undefined, undefined, target, { literal: true })} onHide={() => toggle('inspector')} report={report}
         commitMessage={currentCommitDraft.message} onCommitMessageChange={message => updateCommitDraft({ message })}
         onOpenCommitAgent={() => setCommitAgentModal({ open: true })}
         gitWorkspaceOpen={gitWorkspaceOpen} onOpenGitWorkspace={(tab = 'commit') => {
@@ -789,7 +796,7 @@ export function App() {
         message={currentCommitDraft.message} onMessageChange={message => updateCommitDraft({ message })}
         amend={currentCommitDraft.amend} onAmendChange={amend => updateCommitDraft({ amend })}
         noVerify={currentCommitDraft.noVerify} onNoVerifyChange={noVerify => updateCommitDraft({ noVerify })}
-        commitEnhanceSkill={commitEnhanceSkill} onDiff={(path, target) => openTab(path, 'diff', undefined, undefined, target, { literal: true })}
+        commitEnhanceSkill={commitEnhanceSkill} commitEnhanceModel={commitEnhanceModel} onDiff={(path, target) => openTab(path, 'diff', undefined, undefined, target, { literal: true })}
         onOpenFile={(path, line) => openTab(path, 'file', line)}
         onClose={() => setGitWorkspaceOpen(false)} refresh={refresh}
       />}

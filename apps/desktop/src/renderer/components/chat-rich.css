@@ -62,3 +62,63 @@
 .tool-card__panel h4 { margin: 0 0 4px; font-size: 12px; font-weight: 600; }
 .tool-card--rich .tool-card__panel pre { max-height: 240px; overflow: auto; margin: 6px 0 0; padding: 10px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-code); color: var(--text-primary); white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 var(--font-mono); }
 .tool-card__panel--error h4 { color: var(--danger); }
+
+.todo-progress { min-width: 0; margin: 0; color: var(--text-primary); font-size: 13px; }
+.todo-progress__trigger { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; max-width: 100%; padding: 3px 6px; margin-left: -6px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); font: inherit; font-size: 12.5px; line-height: 1.45; text-align: left; cursor: pointer; }
+.todo-progress__trigger:hover { background: var(--bg-hover); color: var(--text-primary); }
+.todo-progress__trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.todo-progress__label { font-weight: 500; }
+.todo-progress__chevron { display: inline-flex; align-items: center; color: var(--text-muted); transition: transform 140ms ease; }
+.todo-progress__chevron > svg { width: 13px; height: 13px; }
+.todo-progress__trigger[aria-expanded="true"] .todo-progress__chevron { transform: rotate(90deg); }
+.todo-progress__ring { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; flex-shrink: 0; color: var(--text-muted); }
+.todo-progress__ring > svg { width: 14px; height: 14px; display: block; }
+.todo-progress__ring-track { opacity: 0.25; }
+.todo-progress__ring--live { color: var(--accent); }
+.todo-progress__ring--done { color: var(--success); }
+.todo-progress__ring--paused { color: var(--warning); }
+.todo-progress__count { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.todo-progress__status { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+.todo-progress__status--live { color: var(--accent); }
+.todo-progress__status--paused { color: var(--warning); }
+.todo-progress__status--cancelled { color: var(--text-muted); }
+.todo-progress__list { display: flex; flex-direction: column; gap: 10px; max-height: 260px; overflow-y: auto; list-style: none; margin: 8px 0 0; padding: 12px 14px; border: 1px solid var(--border-subtle); border-radius: 10px; background: var(--bg-canvas-subtle); }
+.todo-item { display: flex; align-items: flex-start; gap: 10px; min-width: 0; font-size: 13px; color: var(--text-primary); line-height: 1.45; }
+.todo-item__content { overflow-wrap: anywhere; white-space: pre-wrap; }
+.todo-item__icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 16px; width: 16px; height: 16px; margin-top: 2px; border: 1.25px solid currentColor; border-radius: 50%; box-sizing: border-box; color: var(--text-muted); }
+.todo-item__icon > svg { width: 10px; height: 10px; }
+.todo-item--completed { color: var(--text-secondary); }
+.todo-item--completed .todo-item__icon { color: var(--success); background: var(--success-soft); }
+.todo-item--in_progress.is-live .todo-item__content { color: var(--text-primary); font-weight: 500; }
+.todo-item--in_progress.is-live .todo-item__icon { color: var(--accent); border-width: 1.75px; border-right-color: transparent; animation: todo-progress-spin 1s linear infinite; }
+.todo-item--in_progress.is-paused { color: var(--text-secondary); }
+.todo-item--in_progress.is-paused .todo-item__icon { color: var(--warning); background: var(--warning-soft); }
+.todo-item--pending { color: var(--text-primary); }
+.todo-item--pending .todo-item__icon { color: var(--text-muted); }
+.todo-item--cancelled { color: var(--text-muted); }
+.todo-item--cancelled .todo-item__content { text-decoration: line-through; }
+@keyframes todo-progress-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .todo-progress__chevron { transition: none; }
+  .todo-item--in_progress.is-live .todo-item__icon { animation: none; }
+}
+
+.rewind-turn-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; margin: 4px 0 12px; }
+.rewind-trigger { border: 0; background: transparent; color: var(--text-secondary); font-size: 11px; padding: 5px 8px; border-radius: var(--radius-md); cursor: pointer; }
+.rewind-trigger:hover { background: var(--bg-hover); color: var(--text-primary); }
+.rewind-chooser { max-width: 100%; padding: 12px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); color: var(--text-secondary); font-size: 12px; }
+.rewind-chooser p, .rewind-banner p { margin: 6px 0 10px; line-height: 1.5; }
+.rewind-chooser .button-row, .rewind-banner .button-row { flex-wrap: wrap; }
+.rewind-chooser button, .rewind-banner button { padding: 5px 8px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-canvas-subtle); color: var(--text-primary); cursor: pointer; }
+.rewind-chooser button:hover, .rewind-banner button:hover { background: var(--bg-hover); }
+.rewind-turn-actions button:disabled, .rewind-banner button:disabled { opacity: .5; cursor: not-allowed; }
+.rewind-turn-actions button:focus-visible, .rewind-banner button:focus-visible, .rewind-banner summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rewind-banner { padding: 12px; margin-bottom: 10px; border: 1px solid var(--warning); border-radius: var(--radius-md); background: var(--warning-soft); color: var(--text-primary); font-size: 12px; }
+.rewind-banner > strong:first-child { color: var(--warning); }
+.rewind-banner p { color: var(--text-secondary); }
+.rewind-banner__files { margin: 8px 0 12px; max-height: 180px; overflow: auto; }
+.rewind-banner__files summary { cursor: pointer; padding: 4px 0; }
+.rewind-file-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--border-default); }
+.rewind-file-row button { flex: 1; min-width: 0; overflow-wrap: anywhere; text-align: left; }
+.rewind-file-row > span:last-child { flex-shrink: 0; }
+.rewind-file-status { font-size: 10px; color: var(--text-secondary); background: var(--bg-elevated); border-radius: var(--radius-md); padding: 2px 5px; }

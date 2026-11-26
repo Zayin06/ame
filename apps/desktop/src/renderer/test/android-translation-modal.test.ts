@@ -6,8 +6,9 @@ import { runInNewContext } from 'node:vm'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
-import type { AndroidTranslationInfo, ChatItem, IdeEvent, Permission, Session, SessionForm, SkillSummary } from '../../../../../packages/protocol/src/index'
-import { extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
+import type { AndroidTranslationInfo, ChatItem, IdeEvent, Model, Permission, Session, SessionForm, SkillSummary } from '../../../../../packages/protocol/src/index'
+import { extractCommitMessagesFromText, extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
+import { projectSessionTodos } from '../chat-todo'
 import * as modelSelection from '../model-selection'
 import * as amekitUI from '../amekit-ui'
 import { detectComposerTrigger, filterSlashEntries } from '../composer-mentions'
@@ -16,13 +17,15 @@ const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 const model = { id: 'gemini', modelID: 'gemini', providerID: 'amecode', name: 'Gemini Translation' }
 const baseInfo: AndroidTranslationInfo = { configured: true, isAndroid: true, skill: 'android-strings-translation', effectiveModelID: 'gemini', effectiveModelName: 'Gemini Translation', fallbackToDefault: false, stringsFiles: ['app/src/main/res/values/strings.xml'], translationSessionIDs: [], lockedSessionIDs: [] }
 
-function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 'AndroidTranslationModal' | 'Chat'; props?: Record<string, unknown>; onSubscribe?: (emit: (event: IdeEvent) => void) => void } = {}) {
+function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 'AndroidTranslationModal' | 'CommitAgentModal' | 'Chat'; props?: Record<string, unknown>; onSubscribe?: (emit: (event: IdeEvent) => void) => void } = {}) {
   const slots: unknown[] = [], effects: { deps: unknown[]; cleanup?: () => void }[] = [], pending: (() => void)[] = []
   let cursor = 0, effectIndex = 0, writes = 0, tree: ReactNode, closed = 0, activity = 0, focused = 0
   let info = { ...baseInfo, ...options.info }, items: ChatItem[] = [], permissions: Permission[] = [], sessions: Session[] = []
   const calls: { method: string; args: unknown[] }[] = [], listeners = new Map<string, Set<(event: Event) => void>>(), events = new Set<(event: IdeEvent) => void>()
   let promptError = '', lockError = '', formsError = '', nextPrompt: Promise<unknown> | undefined
   let sessionModel: string | undefined
+  let models: Model[] = [{ id: 'default', providerID: 'amecode', name: 'Default' }, model]
+  let infoLoads = 0, modelLoads = 0, agentMapLoads = 0
   let forms: SessionForm[] = []
   let skills: SkillSummary[] = [], skillsLoads = 0
   const hooks = {
@@ -43,7 +46,9 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     },
   }
   const api = {
-    async androidTranslationInfo() { return info },
+    async androidTranslationInfo() { infoLoads++; return info },
+    async commitAgentInfo() { infoLoads++; return { ...info, commitSessionIDs: options.component === 'CommitAgentModal' ? info.translationSessionIDs : [], lockedSessionIDs: options.component === 'CommitAgentModal' ? info.lockedSessionIDs : [] } },
+    async commitAgentPrompt(...args: unknown[]) { return api.androidTranslationPrompt(...args) },
     async androidTranslationPrompt(...args: unknown[]) {
       calls.push({ method: 'prompt', args })
       if (nextPrompt) return nextPrompt
@@ -65,12 +70,12 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     async forms() { if (formsError) throw new Error(formsError); return forms },
     async sessionPermissionMode() { return 'default' },
     async sessions() { return sessions },
-    async agentMap(_projectID: string, sessionID: string) { return { nodes: sessionModel ? [{ id: sessionID, model: sessionModel, providerID: 'amecode' }] : [] } },
+    async agentMap(_projectID: string, sessionID: string) { agentMapLoads++; return { nodes: sessionModel ? [{ id: sessionID, model: sessionModel, providerID: 'amecode' }] : [] } },
     async replyPermission(...args: unknown[]) { calls.push({ method: 'permission', args }); permissions = []; return undefined },
     async cancel(...args: unknown[]) { calls.push({ method: 'cancel', args }); sessions = sessions.map(session => session.id === args[1] ? { ...session, status: 'idle' } : session); forms = [] },
     onEvent(fn: (event: IdeEvent) => void) { events.add(fn); options.onSubscribe?.(fn); return () => events.delete(fn) },
     async account() { return { account: { role: 'user' }, models: { default_model: 'default' } } },
-    async models() { return [{ id: 'default', providerID: 'amecode', name: 'Default' }, model] },
+    async models() { modelLoads++; return models },
     async agents() { return [] }, async commands() { return [] }, async skills() { skillsLoads++; return skills },
     async prompt(...args: unknown[]) { calls.push({ method: 'regularPrompt', args }) },
   }
@@ -86,9 +91,11 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     './Icon': { Icon: marker }, './MessageContent': { MessageContent: ({ text }: { text: string }) => text },
     './Primitives': { errorText: (e: unknown) => String(e).replace(/^Error: /, ''), IconButton: marker, Empty: marker },
     './SessionChanges': { TurnChanges: marker }, './ToolCard': { ToolCard: marker },
+    './TodoProgressCard': { TodoProgressCard: marker },
     './SessionFormCard': { SessionFormCard: ({ form }: { form: SessionForm }) => `Pending form: ${form.title}` },
     './TurnWorkGroup': { TurnWorkGroup: marker, ActiveToolsView: ({ items }: { items: ChatItem[] }) => `Active tools: ${items.map(item => item.tool?.name).join(', ')}`, LiveTurnStatus: ({ label }: { label: string }) => label },
-    '../chat-timeline': { extractUserDisplayText, projectChatTimeline }, '../model-selection': modelSelection, '../amekit-ui': amekitUI,
+    '../chat-timeline': { extractCommitMessagesFromText, extractUserDisplayText, projectChatTimeline }, '../model-selection': modelSelection, '../amekit-ui': amekitUI,
+    '../chat-todo': { projectSessionTodos },
     './AgentList': { AgentList: marker }, './AgentMap': { AgentMap: marker },
     '../agent-map-model': { familySummaryFromSessions: () => ({ runningCount: 0, subagentCount: 0 }) },
     './ArtifactViewer': { ArtifactViewer: marker },
@@ -141,6 +148,8 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     updateInfo(value: Partial<AndroidTranslationInfo>) { info = { ...info, ...value } },
     updateSession(value: Session) { sessions = [value] },
     updateSessionModel(value: string) { sessionModel = value },
+    updateModels(value: Model[]) { models = value },
+    get loads() { return { info: infoLoads, models: modelLoads, agentMap: agentMapLoads } },
     updateMessages(value: ChatItem[]) { items = value },
     updatePermissions(value: Permission[]) { permissions = value },
     updateForms(value: SessionForm[]) { forms = value },
@@ -454,10 +463,60 @@ test('double submission is gated and Escape closes without locking or cancelling
 test('resumed sessions display their pinned model rather than a changed feature default', async () => {
   const h = harness({ info: { translationSessionIDs: ['translation-old'], effectiveModelID: 'new-default', effectiveModelName: 'New default' } })
   h.updateSessionModel('previous-pinned-model')
+  h.updateModels([{ id: 'previous-pinned-model', name: 'previous-pinned-model', providerID: 'amecode' }])
   h.render(); const html = await h.flush()
   assert.match(html, /Model: previous-pinned-model/)
   assert.doesNotMatch(html, /Model: New default/)
   h.unmount()
+})
+
+test('feature modals refresh info and active session pins on account and bundle updates without blocking continuation', async () => {
+  for (const component of ['AndroidTranslationModal', 'CommitAgentModal'] as const) for (const event of ['ame-account-changed', 'ame-bundle-updated']) {
+    const h = harness({ component, info: { translationSessionIDs: ['old'], effectiveModelID: 'default', effectiveModelName: 'Default' } })
+    try {
+      h.updateSession({ id: 'old', title: 'Existing', status: 'idle' })
+      h.updateSessionModel('gemini')
+      h.render(); let html = await h.flush()
+      assert.match(html, /Model: Gemini Translation/)
+      assert.doesNotMatch(html, /Model trước đó của phiên/)
+      const before = h.loads
+      // A matching ID from another provider must not keep the disabled pin alive.
+      h.updateModels([{ ...model, providerID: 'external' }, { id: 'replacement', providerID: 'amecode', name: 'Replacement' }])
+      h.updateInfo({ effectiveModelID: 'replacement', effectiveModelName: 'Replacement' })
+      h.dispatch(event); html = await h.flush()
+      assert.equal(h.loads.info, before.info + 1)
+      assert.equal(h.loads.models, before.models + 1)
+      assert.equal(h.loads.agentMap, before.agentMap + 1)
+      assert.match(html, /Model: Replacement/)
+      assert.doesNotMatch(html, /Model: Gemini Translation|Model: gemini/)
+      assert.match(html, /role="status">Model trước đó của phiên đã bị vô hiệu hóa từ API\. Lượt tiếp theo sẽ tự động dùng model đang hoạt động: Replacement/)
+      assert.equal(h.find(node => node.type === 'textarea').props.disabled, false)
+      h.change('Tiếp tục'); h.render(); h.submit(); await h.flush()
+      assert.equal(h.calls.find(call => call.method === 'prompt')?.args[1], 'old')
+    } finally { h.unmount() }
+    const after = h.loads
+    h.dispatch(event); await tick()
+    assert.deepEqual(h.loads, after, 'unmount removes info and model refresh listeners')
+  }
+})
+
+test('active pins survive refreshes and missing pins use the effective model ID when its name is absent', async () => {
+  for (const component of ['AndroidTranslationModal', 'CommitAgentModal'] as const) {
+    const h = harness({ component, info: { translationSessionIDs: ['old'], effectiveModelID: 'replacement', effectiveModelName: undefined } })
+    try {
+      h.updateSessionModel('gemini')
+      h.render(); await h.flush()
+      h.dispatch('ame-bundle-updated'); let html = await h.flush()
+      assert.match(html, /Model: Gemini Translation/)
+      assert.doesNotMatch(html, /Model trước đó của phiên/)
+      h.updateSessionModel('disabled-id')
+      h.dispatch('ame-bundle-updated'); html = await h.flush()
+      assert.match(html, /Model: replacement/)
+      assert.doesNotMatch(html, /disabled-id/)
+      h.click(component === 'AndroidTranslationModal' ? 'Phiên dịch mới' : 'Phiên mới')
+      assert.doesNotMatch(h.render(), /Model trước đó của phiên/)
+    } finally { h.unmount() }
+  }
 })
 
 test('unlocked translation session hides regular composer and routes continuation back to translation', async () => {

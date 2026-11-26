@@ -2,6 +2,8 @@ import { createServer, request, type IncomingMessage, type ServerResponse, type 
 import type { Socket } from 'node:net'
 import { OpenCode } from '@opencode/client'
 import type { PairingCode, PairingSettings } from '../../protocol/src/index'
+import { randomBytes } from 'node:crypto'
+import { PairingDeviceStore } from './pairing-store'
 
 export function tunnelAddress(value: string) {
   let url: URL
@@ -25,15 +27,21 @@ function forwardHeaders(input: IncomingMessage['headers']) {
   return headers
 }
 
-/** Loopback-only tunnel target. Never supplies the private master password. */
+/** Loopback-only tunnel target. Permanent devices use master credentials only on the private loopback hop. */
 export class PairingHost {
   private server?: Server
   private sockets = new Set<Socket>()
   private target?: URL
+  private pendingCodes = new Map<string, { expiresAt: number }>()
+  private deviceSockets = new Map<string, Set<Socket>>()
+  private generation = 0
+  private revoking = false
+  private connecting = new Set<Promise<void>>()
   private settings: PairingSettings = { enabled: false, publicURL: '', port: 4097, keepScreenActive: false }
-  constructor(private endpoint: () => { url: string; headers: Record<string, string> } | undefined) {}
-  status(): PairingSettings { return { ...this.settings } }
+  constructor(private endpoint: () => { url: string; headers: Record<string, string> } | undefined, private store?: PairingDeviceStore) {}
+  status(): PairingSettings { return { ...this.settings, ...(this.store ? { devices: this.store.list() } : {}) } }
   async configure(settings: PairingSettings) {
+    await this.store?.ready()
     if (!Number.isInteger(settings.port) || (settings.port !== 0 && settings.port < 1024) || settings.port > 65535) throw new Error('PAIRING_INVALID_PORT')
     const publicURL = settings.publicURL ? tunnelAddress(settings.publicURL) : ''
     if (settings.enabled && !publicURL) throw new Error('PAIRING_HTTPS_REQUIRED')
@@ -49,9 +57,13 @@ export class PairingHost {
       const target = new URL(endpoint!.url)
       if (target.protocol !== 'http:' || target.hostname !== '127.0.0.1' || target.pathname !== '/' || target.search || target.hash || target.username || target.password) throw new Error('PAIRING_PRIVATE_BACKEND_REQUIRED')
       this.target = target
-      const server = createServer((req, res) => this.forward(req, res))
-      server.on('connection', socket => { this.sockets.add(socket); socket.once('close', () => this.sockets.delete(socket)) })
-      server.on('upgrade', (req, socket, head) => this.upgrade(req, socket as Socket, head))
+      const server = createServer((req, res) => {
+        const pending = this.forward(req, res).catch(() => { if (!res.headersSent) res.writeHead(500).end(); else res.destroy() })
+        this.connecting.add(pending)
+        void pending.finally(() => this.connecting.delete(pending))
+      })
+      server.on('connection', socket => { this.sockets.add(socket); socket.on('error', () => socket.destroy()); socket.once('close', () => this.sockets.delete(socket)) })
+      server.on('upgrade', (req, socket, head) => { try { this.upgrade(req, socket as Socket, head) } catch { socket.destroy() } })
       try {
         await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(settings.port, '127.0.0.1', () => { server.off('error', reject); resolve() }) })
         this.server = server
@@ -63,7 +75,15 @@ export class PairingHost {
   }
   async issue(): Promise<PairingCode> {
     const endpoint = this.endpoint()
-    if (!this.server || !this.settings.enabled || !endpoint || this.target?.origin !== endpoint.url) throw new Error('PAIRING_NOT_READY')
+    if (!this.server || !this.settings.enabled || this.revoking || !endpoint || this.target?.origin !== endpoint.url) throw new Error('PAIRING_NOT_READY')
+    if (this.store) {
+      const now = Date.now()
+      for (const [code, value] of this.pendingCodes) if (value.expiresAt <= now) this.pendingCodes.delete(code)
+      while (this.pendingCodes.size >= 20) this.pendingCodes.delete(this.pendingCodes.keys().next().value!)
+      const code = randomBytes(24).toString('base64url'), expiresAt = now + 300000
+      this.pendingCodes.set(code, { expiresAt })
+      return { ...pairingPayload(this.settings.publicURL, code), expiresAt }
+    }
     const code = await OpenCode.make({ baseUrl: endpoint.url, headers: endpoint.headers }).server.pair({ signal: AbortSignal.timeout(15000) })
     if (!Number.isInteger(code.expires_in) || code.expires_in <= 0) throw new Error('PAIRING_INVALID_EXPIRY')
     return { ...pairingPayload(this.settings.publicURL, code.code), expiresAt: Date.now() + code.expires_in * 1000 }
@@ -71,16 +91,96 @@ export class PairingHost {
   private current() {
     return this.target && this.endpoint()?.url === this.target.origin ? this.target : undefined
   }
-  private forward(req: IncomingMessage, res: ServerResponse) {
+  private cookieName(req: IncomingMessage) {
+    const port = URL.parse(`http://${req.headers.host}`)?.port
+    return `opencode_session${port ? `_${port}` : ''}`
+  }
+  private authenticate(req: IncomingMessage, url: URL) {
+    const basic = (value: string | null | undefined) => {
+      if (!value?.startsWith('Basic ')) return
+      const decoded = Buffer.from(value.slice(6), 'base64').toString()
+      return decoded.startsWith('opencode:') ? decoded.slice(9) : undefined
+    }
+    const query = url.searchParams.get('auth_token')
+    const header = req.headers.authorization
+    for (const token of [basic(query ? `Basic ${query}` : undefined), basic(header)]) {
+      const device = token ? this.store!.authenticate(token) : undefined
+      if (device) return device
+    }
+    {
+      const cookie = req.headers.cookie?.split(';').map(value => value.trim()).find(value => value.startsWith(`${this.cookieName(req)}=`))
+      if (cookie) {
+        if (req.headers.origin !== undefined) {
+          try { if (new URL(req.headers.origin).host !== req.headers.host) return } catch { return }
+        }
+        return this.store!.authenticate(cookie.slice(cookie.indexOf('=') + 1))
+      }
+    }
+  }
+  private privateHeaders(req: IncomingMessage) {
+    const headers = forwardHeaders(req.headers)
+    delete headers.authorization
+    if (headers.cookie) {
+      headers.cookie = headers.cookie.split(';').filter(cookie => !/^opencode_session(?:_[^=;]*)?=/i.test(cookie.trim())).join(';')
+      if (!headers.cookie) delete headers.cookie
+    }
+    return { ...headers, ...this.endpoint()!.headers }
+  }
+  private responseHeaders(headers: IncomingMessage['headers']) {
+    const filtered = forwardHeaders(headers)
+    if (this.store && filtered['set-cookie']) filtered['set-cookie'] = filtered['set-cookie'].filter(value => !/^opencode_session(?:_[^=;]*)?=/i.test(value.trim()))
+    return filtered
+  }
+  private track(socket: Socket, deviceID: string) {
+    this.sockets.add(socket)
+    let sockets = this.deviceSockets.get(deviceID)
+    if (!sockets) this.deviceSockets.set(deviceID, sockets = new Set())
+    if (sockets.has(socket)) return
+    sockets.add(socket)
+    socket.once('close', () => {
+      this.sockets.delete(socket); sockets!.delete(socket)
+      if (!sockets!.size && this.deviceSockets.get(deviceID) === sockets) this.deviceSockets.delete(deviceID)
+    })
+  }
+  private async forward(req: IncomingMessage, res: ServerResponse) {
     const target = this.current()
     if (!target) { res.writeHead(503).end(); return }
     // Keep the path as a path: never interpret an incoming absolute URL as an outbound destination.
     if (!req.url?.startsWith('/') || req.url.startsWith('//')) { res.writeHead(400).end(); return }
-    const upstream = request({ hostname: target.hostname, port: target.port, method: req.method, path: req.url, headers: { ...forwardHeaders(req.headers), host: target.host } }, response => {
-      res.writeHead(response.statusCode ?? 502, forwardHeaders(response.headers))
+    let requestPath = req.url, deviceID: string | undefined
+    if (this.store) {
+      if (this.revoking) { res.writeHead(401, { 'cache-control': 'no-store' }).end(); return }
+      const url = new URL(req.url, 'http://127.0.0.1')
+      if (req.method === 'POST' && url.pathname.replace(/\/+$/, '') === '/api/pair') { res.writeHead(403, { 'cache-control': 'no-store', 'content-type': 'application/json' }).end(JSON.stringify({ message: 'Remote pairing code creation is disabled' })); return }
+      if (req.method === 'GET' && /^\/auth\/connect\/[A-Za-z0-9_-]+$/.test(url.pathname)) {
+        res.setHeader('cache-control', 'no-store')
+        const code = url.pathname.slice('/auth/connect/'.length), expiry = this.pendingCodes.get(code)
+        this.pendingCodes.delete(code)
+        if (!expiry || expiry.expiresAt <= Date.now()) {
+          const html = req.headers.accept?.includes('text/html')
+          res.writeHead(401, { 'content-type': html ? 'text/plain; charset=utf-8' : 'application/json' }).end(html ? 'Liên kết ghép nối đã hết hạn hoặc đã được sử dụng.' : JSON.stringify({ message: 'Pairing link expired or already used' }))
+          return
+        }
+        const generation = this.generation
+        const { token, device } = await this.store.create(req.headers['user-agent'])
+        if (generation !== this.generation || !this.server) { await this.store.revoke(device.id); res.writeHead(401).end(); return }
+        if (req.headers.accept?.includes('text/html')) {
+          res.writeHead(302, { location: '/', 'set-cookie': `${this.cookieName(req)}=${token}; Path=/; HttpOnly; SameSite=Lax${this.settings.publicURL.startsWith('https://') ? '; Secure' : ''}; Max-Age=315360000` }).end()
+        } else { res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ token })) }
+        return
+      }
+      const device = this.authenticate(req, url)
+      if (!device) { res.writeHead(401, { 'cache-control': 'no-store', 'content-type': 'application/json' }).end(JSON.stringify({ message: 'Authentication required' })); return }
+      deviceID = device.id
+      this.track(req.socket, deviceID)
+      url.searchParams.delete('auth_token'); requestPath = url.pathname + url.search
+    }
+    const upstream = request({ hostname: target.hostname, port: target.port, method: req.method, path: requestPath, headers: { ...(this.store ? this.privateHeaders(req) : forwardHeaders(req.headers)), host: target.host } }, response => {
+      res.writeHead(response.statusCode ?? 502, this.responseHeaders(response.headers))
       response.pipe(res)
       response.on('error', () => res.destroy())
     })
+    if (deviceID) upstream.on('socket', socket => this.track(socket, deviceID!))
     upstream.on('error', () => { if (!res.headersSent) res.writeHead(502).end(); else res.destroy() })
     req.on('aborted', () => upstream.destroy())
     res.on('close', () => upstream.destroy())
@@ -89,12 +189,24 @@ export class PairingHost {
   private upgrade(req: IncomingMessage, socket: Socket, head: Buffer) {
     const target = this.current()
     if (!target || !req.url?.startsWith('/') || req.url.startsWith('//')) { socket.destroy(); return }
-    const upstream = request({ hostname: target.hostname, port: target.port, method: req.method, path: req.url, headers: { ...forwardHeaders(req.headers), host: target.host, connection: 'Upgrade', upgrade: req.headers.upgrade } })
+    let requestPath = req.url, deviceID: string | undefined
+    if (this.store) {
+      if (this.revoking) { socket.destroy(); return }
+      const url = new URL(req.url, 'http://127.0.0.1'), device = this.authenticate(req, url)
+      if (!device) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return }
+      deviceID = device.id; this.track(socket, deviceID)
+      url.searchParams.delete('auth_token'); requestPath = url.pathname + url.search
+    }
+    const upstream = request({ hostname: target.hostname, port: target.port, method: req.method, path: requestPath, headers: { ...(this.store ? this.privateHeaders(req) : forwardHeaders(req.headers)), host: target.host, connection: 'Upgrade', upgrade: req.headers.upgrade } })
+    if (deviceID) upstream.on('socket', remote => this.track(remote, deviceID!))
     upstream.on('upgrade', (response, remote, received) => {
       this.sockets.add(remote)
       remote.once('close', () => this.sockets.delete(remote))
       socket.write(`HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\n`)
-      for (let i = 0; i < response.rawHeaders.length; i += 2) socket.write(`${response.rawHeaders[i]}: ${response.rawHeaders[i + 1]}\r\n`)
+      for (let i = 0; i < response.rawHeaders.length; i += 2) {
+        if (this.store && response.rawHeaders[i].toLowerCase() === 'set-cookie' && /^opencode_session(?:_[^=;]*)?=/i.test(response.rawHeaders[i + 1])) continue
+        socket.write(`${response.rawHeaders[i]}: ${response.rawHeaders[i + 1]}\r\n`)
+      }
       socket.write('\r\n')
       if (received.length) socket.write(received)
       if (head.length) remote.write(head)
@@ -114,11 +226,33 @@ export class PairingHost {
     upstream.end()
   }
   async stop() {
+    this.generation++
+    this.pendingCodes.clear()
     const server = this.server
     this.server = undefined; this.target = undefined
     this.settings = { ...this.settings, enabled: false }
     for (const socket of this.sockets) socket.destroy()
     this.sockets.clear()
+    this.deviceSockets.clear()
     if (server) await new Promise<void>(resolve => server.close(() => resolve()))
+    await Promise.all([...this.connecting])
+    await this.store?.flush()
+  }
+  async revokeDevice(id: string) {
+    await this.store?.revoke(id)
+    for (const socket of this.deviceSockets.get(id) ?? []) socket.destroy()
+    this.deviceSockets.delete(id)
+    return this.status()
+  }
+  async revokeAll() {
+    this.revoking = true
+    this.generation++; this.pendingCodes.clear()
+    try {
+      await Promise.all([...this.connecting])
+      await this.store?.revokeAll()
+      for (const socket of this.sockets) socket.destroy()
+      this.sockets.clear(); this.deviceSockets.clear()
+    } finally { this.revoking = false }
+    return this.status()
   }
 }

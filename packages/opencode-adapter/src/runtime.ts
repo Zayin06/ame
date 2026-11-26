@@ -47,7 +47,7 @@ export class PrivateRuntime {
     for (const folder of ['config/opencode', 'data', 'cache', 'state', 'home', 'workspace']) await mkdir(path.join(profile, folder), { recursive: true })
     await writeFile(path.join(profile, 'config', 'opencode', 'opencode.json'), JSON.stringify({
       plugins: [pathToFileURL(path.join(this.options.resources, 'amekit-models')).href],
-      experimental: { subagent_depth: 3, artifacts: true },
+      experimental: { subagent_depth: 3, artifacts: true, todo: true },
     }), { mode: 0o600 })
     if (this.stopping) throw new Error('RUNTIME_STOPPING')
     const password = randomBytes(32).toString('base64url')

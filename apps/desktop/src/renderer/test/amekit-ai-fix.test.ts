@@ -428,6 +428,128 @@ test('all-failed batch preserves the blocking preview without claiming a success
   h.unmount()
 })
 
+test('version formatters normalize catalog and semver versions and preserve missing values', () => {
+  for (const [input, expected] of [['registry.22', 'v22'], ['REGISTRY.5', 'v5'], ['catalog-42', 'catalog-42'], [undefined, '—'], ['', '—'], ['  registry.22  ', 'v22'], ['   ', '—']] as const) {
+    assert.equal(amekitUI.formatCatalogVersion(input), expected)
+  }
+  for (const [input, expected] of [['1.0.3', 'v1.0.3'], ['v1.0.7', 'v1.0.7'], ['V2.0.0', 'v2.0.0'], [undefined, '—'], ['', '—'], ['  V2.0.0  ', 'v2.0.0'], ['   ', '—']] as const) {
+    assert.equal(amekitUI.formatSemverVersion(input), expected)
+  }
+})
+
+test('version summary combines model, orchestrator and optional bundle versions', () => {
+  assert.equal(amekitUI.formatVersionSummaryLine({ modelVersion: 'registry.22', orchestratorVersion: '1.0.3', bundleVersion: '1.0.7' }), 'Model v22 · Điều phối v1.0.3 · Bundle v1.0.7')
+  assert.equal(amekitUI.formatVersionSummaryLine({ modelVersion: 'registry.22', orchestratorVersion: '1.0.3' }), 'Model v22 · Điều phối v1.0.3 · Bundle Chưa cài')
+  assert.equal(amekitUI.formatVersionSummaryLine({ bundleVersion: '   ' }), 'Model — · Điều phối — · Bundle Chưa cài')
+})
+
+test('Account displays snapshot catalog, installed/latest bundle versions, refresh epoch and background sync warning', async () => {
+  const refreshedAt = new Date('2026-11-26T08:09:10Z').getTime()
+  const h = harness('Account', { embedded: true, close() {} }, async operation => {
+    assert.equal(operation, 'status')
+    return {
+      account: { name: 'User', username: 'user' }, ready: true, models: { ...accountModels, version: 'catalog-42' },
+      orchestrator: { id: 'ame-orchestrator', version: '1.0.3' },
+      refreshedAt, bundle: { installedVersion: '1.2.0', latestVersion: '1.3.0' }, bundleAutoSyncError: 'NETWORK_ERROR',
+    }
+  })
+  h.render(); const html = await h.flush()
+  const versions = renderToStaticMarkup(h.find(node => node.props['data-testid'] === 'amekit-account-versions'))
+  assert.match(versions, /<h4>Cấu hình AME<\/h4>/)
+  assert.match(versions, /class="amekit-pill amekit-readiness--blocked" data-testid="amekit-version-status">Có bản cập nhật mới/)
+  const details = h.find(node => node.props['data-testid'] === 'amekit-version-details')
+  assert.equal(details.type, 'details')
+  assert.equal(details.props.open, undefined)
+  assert.match(renderToStaticMarkup(details), /<summary>Chi tiết phiên bản \(Model catalog-42 · Điều phối v1\.0\.3 · Bundle v1\.2\.0\)<\/summary>/)
+  assert.match(versions, /<dt>Model \(Catalog API\)<\/dt><dd>catalog-42<\/dd>/)
+  assert.match(versions, /<dt>Agent điều phối<\/dt><dd>v1\.0\.3<\/dd>/)
+  assert.match(versions, /<dt>Bundle đã cài<\/dt><dd>v1\.2\.0<\/dd>/)
+  assert.match(versions, /<dt>Bundle mới nhất<\/dt><dd>v1\.3\.0<\/dd>/)
+  assert.match(versions, /<time dateTime="2026-11-26T08:09:10\.000Z">/)
+  assert.ok(versions.includes(new Date(refreshedAt).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })))
+  assert.match(html, /amekit-alert--warning" role="status"><strong>Tự đồng bộ nền chưa thể áp dụng bundle:/)
+  assert.ok(html.includes(amekitUI.formatAmeKitError('NETWORK_ERROR').title))
+  assert.match(html, /Mở Bundle để thử Đồng bộ \/ Cập nhật ngay/)
+  assert.doesNotMatch(html, /Đã làm mới phiên lúc/)
+  h.unmount()
+})
+
+test('Account uses loaded installed bundle as a fallback and omits matching latest versions', async () => {
+  for (const installedVersion of [undefined, '2.0.0']) {
+    const h = harness('Account', { embedded: true, close() {} }, async operation => {
+      if (operation === 'status') return { account: { name: 'User', username: 'user' }, ready: true, bundle: { installedVersion, latestVersion: '2.0.0' } }
+      if (operation === 'installed') return { version: '2.0.0', releaseId: 'active' }
+      if (operation === 'latest') return { release: { version: '2.0.0', releaseId: 'active' } }
+      throw new Error(`Unexpected operation ${operation}`)
+    })
+    h.render(); let html = await h.flush()
+    assert.match(html, /<dt>Model \(Catalog API\)<\/dt><dd>—<\/dd>/)
+    assert.match(html, /<dt>Agent điều phối<\/dt><dd>—<\/dd>/)
+    assert.match(html, /Chưa làm mới/)
+    if (!installedVersion) assert.match(html, /<dt>Bundle đã cài<\/dt><dd>Chưa cài<\/dd>/)
+    h.click('Bundle'); h.render(); await h.flush(); h.click('Tài khoản'); html = h.render()
+    assert.match(html, /<dt>Bundle đã cài<\/dt><dd>v2\.0\.0<\/dd>/)
+    assert.match(html, /class="amekit-pill amekit-readiness--ready" data-testid="amekit-version-status">Đã mới nhất/)
+    assert.match(html, /<summary>Chi tiết phiên bản \(Model — · Điều phối — · Bundle v2\.0\.0\)<\/summary>/)
+    assert.doesNotMatch(html, /Bundle mới nhất|undefined|null/)
+    h.unmount()
+  }
+})
+
+test('Account refresh banner waits for completion, reports returned versions and clears on logout', async () => {
+  const refresh = deferred(), calls: string[] = []
+  const loggedIn = { account: { name: 'User', username: 'user' }, ready: true, models: { ...accountModels, version: 'old-catalog' }, orchestrator: { id: 'ame-orchestrator', version: '1.0.2' }, bundle: { installedVersion: '1.0.0' } }
+  const h = harness('Account', { embedded: true, close() {} }, async operation => {
+    calls.push(operation)
+    if (operation === 'status' || operation === 'login') return loggedIn
+    if (operation === 'refresh') return refresh.promise
+    if (operation === 'logout') return null
+    throw new Error(`Unexpected operation ${operation}`)
+  })
+  h.render(); await h.flush(); h.click('Làm mới phiên')
+  let html = h.render()
+  assert.equal(h.button('Làm mới phiên').props.disabled, true)
+  assert.doesNotMatch(html, /Đã làm mới phiên lúc/)
+  const refreshedAt = new Date('2026-11-26T12:34:56Z').getTime()
+  refresh.resolve({ ...loggedIn, models: { ...accountModels, version: 'registry.22' }, orchestrator: { id: 'ame-orchestrator', version: '1.0.3' }, bundle: { installedVersion: '2.0.0', latestVersion: '2.0.0' }, refreshedAt })
+  html = await h.flush()
+  const notice = h.find(node => node.props['data-testid'] === 'amekit-refresh-notice')
+  assert.equal(notice.props.role, 'status')
+  assert.equal(notice.props.className, 'amekit-alert amekit-alert--success')
+  assert.equal(notice.props.children, `Đã làm mới phiên lúc ${new Date(refreshedAt).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })} · Model v22 · Điều phối v1.0.3 · Bundle v2.0.0`)
+  assert.match(html, /data-testid="amekit-version-status">Đã mới nhất/)
+  assert.match(html, /<summary>Chi tiết phiên bản \(Model v22 · Điều phối v1\.0\.3 · Bundle v2\.0\.0\)<\/summary>/)
+  assert.match(html, /<dt>Agent điều phối<\/dt><dd>v1\.0\.3<\/dd>/)
+  assert.doesNotMatch(html, /old-catalog|v1\.0\.0|Bundle mới nhất/)
+  assert.equal(h.button('Làm mới phiên').props.disabled, false)
+  assert.deepEqual(calls, ['status', 'refresh'])
+  h.click('Đăng xuất'); html = await h.flush()
+  assert.doesNotMatch(html, /Đã làm mới phiên lúc|amekit-account-versions/)
+  const login = h.find(node => node.type === 'form')
+  ;(login.props.onSubmit as (event: unknown) => void)({ preventDefault() {} })
+  html = await h.flush()
+  assert.match(html, /old-catalog/)
+  assert.doesNotMatch(html, /Đã làm mới phiên lúc|Model v22/)
+  h.unmount()
+})
+
+test('Account failed refresh does not claim success or replace displayed versions', async () => {
+  const h = harness('Account', { embedded: true, close() {} }, async operation => {
+    if (operation === 'status') return { account: { name: 'User', username: 'user' }, ready: true, models: { version: 'catalog-42' }, orchestrator: { id: 'ame-orchestrator', version: 'V1.0.3' }, bundle: { installedVersion: '1.0.0' }, bundleAutoSyncError: 'NETWORK_ERROR' }
+    throw new Error('NETWORK_ERROR')
+  })
+  h.render(); await h.flush(); h.click('Làm mới phiên'); const html = await h.flush()
+  assert.match(html, /role="alert"/)
+  assert.match(html, /catalog-42/)
+  assert.match(html, /v1\.0\.0/)
+  assert.match(html, /class="amekit-pill" data-testid="amekit-version-status">Cần kiểm tra đồng bộ/)
+  assert.match(html, /<summary>Chi tiết phiên bản \(Model catalog-42 · Điều phối v1\.0\.3 · Bundle v1\.0\.0\)<\/summary>/)
+  assert.match(html, /<dt>Agent điều phối<\/dt><dd>v1\.0\.3<\/dd>/)
+  assert.doesNotMatch(html, /Đã làm mới phiên lúc/)
+  assert.equal(h.button('Làm mới phiên').props.disabled, false)
+  h.unmount()
+})
+
 test('Account shows all API tiers and prefers the default tier mapping over the catalog default', async () => {
   const h = admin({ models: { ...accountModels, default_model: 'legacy-default' } })
   h.render(); let html = await h.flush()

@@ -70,7 +70,7 @@ test('API-configured root runs native depths 0–3, rejects depth 4 and receives
     const client = OpenCode.make({ baseUrl: endpoint.url, headers })
     const models = Array.from({ length: 4 }, (_, depth) => ({ id: `nesting-${depth}`, name: `Nesting ${depth}`, tool_call: true, vision: false, context: 200000, output: 4096 }))
     const orchestrator = OrchestratorConfig.parse({ id: 'ame-orchestrator', version: '1.0.0', description: 'Coordinate installed teams', prompt: 'Use the native catalog to delegate to an installed lead and await its final result.', subagentDepth: 3 })
-    const policyInput = { role: 'admin', catalog: { version: 'fixture', default_model: 'nesting-0', small_model: 'nesting-0', models }, provider: { base_url: `http://127.0.0.1:${port}/v1`, api_key: 'local-test-only' }, expires: Date.now() + 85000, orchestrator }
+    const policyInput = { role: 'admin', catalog: { version: 'fixture', default_model: 'nesting-0', small_model: 'nesting-0', models }, managedCatalog: { agents: ['nesting-0', 'nesting-1', 'nesting-2', 'nesting-3'], skills: [] }, provider: { base_url: `http://127.0.0.1:${port}/v1`, api_key: 'local-test-only' }, expires: Date.now() + 85000, orchestrator }
     const update = (input: unknown) => fetch(`${endpoint.url}/api/rpc/amekit-models/update`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ input }) })
     const response = await update(policyInput)
     assert.equal(response.status, 200)

@@ -47,6 +47,19 @@ export function Pairing() {
     catch (e) { if (mounted.current) setError(errorText(e)) }
     finally { if (mounted.current) setBusy(false) }
   }
+  const revokeDevice = async (deviceID: string) => {
+    setBusy(true); setError('')
+    try { const value = await window.ame.pairingRevokeDevice(deviceID); if (mounted.current) setSettings(value) }
+    catch (e) { const text = errorText(e); if (mounted.current && text !== 'Action canceled' && text !== 'USER_CANCELED') setError(text) }
+    finally { if (mounted.current) setBusy(false) }
+  }
+  const revokeAll = async () => {
+    setBusy(true); setError('')
+    try { const value = await window.ame.pairingRevokeAll(); if (mounted.current) setSettings(value) }
+    catch (e) { const text = errorText(e); if (mounted.current && text !== 'Action canceled' && text !== 'USER_CANCELED') setError(text) }
+    finally { if (mounted.current) setBusy(false) }
+  }
+  const devices = settings?.devices ?? []
   const remaining = Math.max(0, Math.ceil(((code?.expiresAt ?? now) - now) / 1000))
   return <section className="settings-content pairing-settings" aria-label="Pairing">
     <h3>Pair a device</h3>
@@ -58,7 +71,16 @@ export function Pairing() {
     </div>}
     {settings?.connecting && !dialog && <p role="status">Đang tạo kết nối bảo mật… Lần đầu có thể mất vài phút.</p>}
     {!dialog && (error || settings?.error) && <p className="inline-error" role="alert">{error || settings?.error}</p>}
-    <p className="muted pairing-warning">Chỉ chia sẻ mã với thiết bị của bạn: thiết bị ghép nối có toàn quyền OpenCode. Tắt Remote access chặn truy cập; khởi động lại Ame IDE thu hồi token thiết bị.</p>
+    <section className="pairing-devices" aria-label="Thiết bị đã ghép nối">
+      <div className="pairing-devices__header"><h4>Thiết bị đã ghép nối ({devices.length})</h4>{devices.length > 0 && <button type="button" className="pairing-revoke-btn" disabled={busy} onClick={() => void revokeAll()}>Ngắt tất cả</button>}</div>
+      {devices.length === 0 ? <p className="muted">Chưa có thiết bị nào được ghép nối. Sau khi quét mã QR, thiết bị sẽ tự kết nối lại mỗi khi Ame IDE đang mở.</p> : <ul className="pairing-device-list">
+        {devices.map(device => <li key={device.id} className="pairing-device-row">
+          <div className="pairing-device-info"><div className="pairing-device-name">{device.label}</div><div className="pairing-device-meta">Ghép nối {new Date(device.createdAt).toLocaleString('vi-VN')} · Hoạt động {new Date(device.lastUsedAt).toLocaleString('vi-VN')}</div></div>
+          <button type="button" className="pairing-revoke-btn" disabled={busy} onClick={() => void revokeDevice(device.id)}>Ngắt kết nối</button>
+        </li>)}
+      </ul>}
+    </section>
+    <p className="muted pairing-warning">Chỉ chia sẻ mã với thiết bị của bạn: thiết bị ghép nối có toàn quyền OpenCode và được lưu kết nối vĩnh viễn cho tới khi bạn bấm Ngắt kết nối. Tắt Remote access sẽ tạm chặn mọi truy cập từ xa mà không xóa danh sách thiết bị.</p>
     {dialog && <div className="pairing-dialog-shade" onMouseDown={e => { if (e.target === e.currentTarget) close() }} onKeyDown={e => {
       if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close() }
       if (e.key === 'Tab') {

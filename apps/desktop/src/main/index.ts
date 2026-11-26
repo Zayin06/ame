@@ -1,12 +1,15 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, powerSaveBlocker, screen, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerSaveBlocker, screen, shell } from 'electron'
+import * as fs from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { PairingHost } from '../../../../packages/opencode-adapter/src/pairing'
+import { PairingDeviceStore } from '../../../../packages/opencode-adapter/src/pairing-store'
 import { RemotePairing, automaticTunnel } from '../../../../packages/opencode-adapter/src/remote-pairing'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
 import { rendererSource, isRendererDocument } from './renderer-source'
+import { readOsClipboardFiles } from './os-clipboard-files'
 import { Workspaces } from '../../../../packages/ide-core/src/workspace'
 import { validateWorkspacePath } from '../../../../packages/ide-core/src/workspace-fs'
 import { resolveDroppedPaths } from '../../../../packages/ide-core/src/dropped-attachments'
@@ -16,6 +19,7 @@ import { createNodeDebugger, type NodeDebugger } from '../../../../packages/ide-
 import { OpenCodeAdapter } from '../../../../packages/opencode-adapter/src/index'
 import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtime'
 import { createAmeKit } from '../../../../packages/amekit/src/index'
+import { resolveModelLevel, type ModelLevels } from '../../../../packages/amekit/src/model-policy'
 import { buildCommitAgentPrompt, createCommitAgentLockStore, extractCommitSnapshotID, parseCommitAgentPlan, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH } from '../../../../packages/amekit/src/commit-agent'
 import { canonicalWorkspaceScope, detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore } from '../../../../packages/amekit/src/android-translation'
 import { createPetHost } from '../../../../packages/amekit/src/pet-host'
@@ -70,9 +74,26 @@ async function startBackend() {
   }
 }
 const text = z.string().max(200000)
+// Support both Electron's legacy raw-format API and its newer ClipboardItem API.
+async function osClipboardFiles(): Promise<string[]> {
+  const legacy = clipboard as unknown as Parameters<typeof readOsClipboardFiles>[0]
+  if (legacy.availableFormats || legacy.readBuffer) return readOsClipboardFiles(legacy, fs.existsSync)
+  const buffers = new Map<string, Buffer>()
+  for (const item of await clipboard.read()) {
+    for (const type of item.types) {
+      const raw = /^electron application\/osclipboard;format="([^"]+)"$/.exec(type)?.[1] ?? type
+      if (!['cf_hdrop', 'filenamew', 'nsfilenamespboardtype', 'public.file-url', 'text/uri-list'].includes(raw.toLowerCase())) continue
+      try {
+        const blob = await item.getType(type)
+        if ('arrayBuffer' in blob) buffers.set(raw, Buffer.from(await blob.arrayBuffer()))
+      } catch { /* Another advertised format may still be readable. */ }
+    }
+  }
+  return readOsClipboardFiles({ availableFormats: () => [...buffers.keys()], readBuffer: format => buffers.get(format) ?? Buffer.alloc(0) }, fs.existsSync)
+}
 const id = z.string().min(1).max(512)
-const relative = z.string().max(4096)
-const workspacePath = relative.min(1).refine(value => !value.includes('\0'))
+const relative = z.string().max(4096).refine(value => !value.includes('\0'))
+const workspacePath = relative.refine(value => value.length > 0)
 const branchName = z.string().min(1).max(512).refine(value => !value.includes('\0'))
 const commitOptionsSchema = z.object({ amend: z.boolean().optional(), noVerify: z.boolean().optional() }).strict()
 const commitHashSchema = z.string().regex(GIT_COMMIT_HASH_PATTERN)
@@ -157,6 +178,8 @@ const diffTargetSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('commits'), commits: z.array(commitHashSchema).min(1).max(50), includeWorking: z.boolean().optional(), from: workspacePath.optional() }).strict()
 ])
 const schema = {
+  stageRevert: z.tuple([id, id, z.string().min(1).max(200), z.boolean()]),
+  clearRevert: z.tuple([id, id]),
   openExternal: z.tuple([z.string().min(1).max(2048).refine(value => {
     if (/[\u0000-\u0020\u007f-\u009f]/.test(value) || !/^https?:\/\//i.test(value)) return false
     try { const parsed = new URL(value); return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && !!parsed.hostname } catch { return false }
@@ -191,6 +214,8 @@ const schema = {
   save: z.tuple([id, relative, z.string().max(4 * 1024 * 1024), z.string().regex(/^[a-f0-9]{64}$/)]),
   createFile: z.tuple([id, workspacePath, content.optional()]), createDirectory: z.tuple([id, workspacePath]),
   renamePath: z.tuple([id, workspacePath, workspacePath]), deletePath: z.tuple([id, workspacePath]),
+  copyPath: z.tuple([id, id, workspacePath, relative]), movePath: z.tuple([id, id, workspacePath, relative]),
+  clipboardFiles: z.tuple([]), pasteClipboardFiles: z.tuple([id, relative]),
   revealPath: z.tuple([id, relative.refine(value => !value.includes('\0'))]),
   searchProject: z.tuple([id, searchQuery]), replaceInProject: z.tuple([id, replaceOptions]),
   stageAll: z.tuple([id]), unstageAll: z.tuple([id]), discardFile: z.tuple([id, workspacePath]),
@@ -228,6 +253,7 @@ const schema = {
   forms: z.tuple([boundedID, boundedID]), replyForm: z.tuple([boundedID, boundedID, boundedID, formAnswer]),
   cancelForm: z.tuple([boundedID, boundedID, boundedID, z.string().max(2000).refine(value => !value.includes('\0')).optional()]),
   pairingStatus: z.tuple([]), pairingConfigure: z.tuple([pairingSchema]), pairingCode: z.tuple([]),
+  pairingRevokeDevice: z.tuple([boundedID]), pairingRevokeAll: z.tuple([]),
   account: z.tuple([z.string().max(64), z.record(z.string(), z.string().max(8192))]), pickImport: z.tuple([]), window: z.tuple([z.enum(['minimize', 'maximize', 'close'])])
 } as const
 const lspServices = new Map<string, TsLanguageService>()
@@ -255,9 +281,14 @@ async function pickImport() {
   return selected.canceled ? null : selected.filePaths[0] ?? null
 }
 async function resolveModel(projectID: string, requested?: Model | string, requireRequested = false): Promise<Model> {
-  const models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')
+  let models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')
+  let status = await account.call('status', {}) as { account?: { role?: string }; reconnecting?: boolean; models?: { default_model?: string; models?: { id: string }[] } } | null
+  if (!models.length && (status?.reconnecting || status?.account)) {
+    const refreshed = await account.call('refresh', {}) as typeof status
+    if (refreshed) status = refreshed
+    models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')
+  }
   if (!models.length) throw new Error('AMEKIT_MODEL_REQUIRED')
-  const status = await account.call('status', {}) as { account?: { role?: string }; models?: { default_model?: string; models?: { id: string }[] } } | null
   if (!status?.account) throw new Error('AMECODE_LOGIN_REQUIRED')
   const role = status.account.role, catalog = status.models
   if (!['user', 'admin'].includes(role ?? '') || !catalog?.models?.length || !catalog.default_model) throw new Error('MODEL_POLICY_UNAVAILABLE')
@@ -273,7 +304,17 @@ async function resolveModel(projectID: string, requested?: Model | string, requi
   if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
   return selected
 }
+type FeatureCatalog = { default_model?: string; model_levels?: ModelLevels; active_models?: { id: string; name?: string }[]; models?: { id: string; name?: string }[] }
+function resolveCatalogFeatureModel(catalog: FeatureCatalog | undefined, configuredId?: string) {
+  if (!configuredId) return undefined
+  const id = catalog?.model_levels ? resolveModelLevel({ default_model: catalog.default_model ?? '', model_levels: catalog.model_levels }, configuredId) : configuredId
+  return (catalog?.active_models ?? catalog?.models ?? []).find(model => model.id === id)
+}
 async function resolveFeatureModel(projectID: string, selected: Model, configured?: string): Promise<Model> {
+  if (configured && (account.readStatus || /^(?:amecode\/)?(default|haiku|sonnet|opus)$/i.test(configured.trim()))) {
+    const status = await (account.readStatus ? account.readStatus() : account.call('status', {})) as { models?: FeatureCatalog } | null
+    if (status?.models) configured = resolveCatalogFeatureModel(status.models, configured)?.id
+  }
   if (!configured || configured === (selected.modelID ?? selected.id)) return selected
   const authorized = await account.authorizeFeatureModel?.(configured)
   if (shuttingDown) throw new Error('APP_SHUTTING_DOWN')
@@ -284,24 +325,37 @@ async function resolveFeatureModel(projectID: string, selected: Model, configure
 }
 const translationModels = new Map<string, string>()
 function translationKey(projectID: string, sessionID: string) { return JSON.stringify([projectID, sessionID]) }
-async function resolveTranslationModel(projectID: string, sessionID: string, selected: Model): Promise<Model> {
+async function resolveTranslationModel(projectID: string, sessionID: string, selected: Model, configuredFeatureModel?: string): Promise<Model> {
   const key = translationKey(projectID, sessionID)
   let pinned = translationModels.get(key)
   if (!pinned) {
-    const map = await adapter.agentMap(projectID, sessionID)
-    const session = map.nodes.find(node => node.id === sessionID)
-    if (session?.providerID !== 'amecode' || !session.model) throw new Error('TRANSLATION_MODEL_UNAVAILABLE')
-    const models = await adapter.models(projectID)
-    const model = models.find(model => model.providerID === 'amecode' && (model.id === session.model || model.modelID === session.model))
-    pinned = model?.modelID ?? session.model
-    translationModels.set(key, pinned)
+    const map = await adapter.agentMap(projectID, sessionID).catch(() => null)
+    const session = map?.nodes?.find(node => node.id === sessionID)
+    const models = await adapter.models(projectID).catch(() => [])
+    const model = models.find(model => model.providerID === 'amecode' && (model.id === session?.model || model.modelID === session?.model))
+    pinned = session?.providerID === 'amecode' ? model?.modelID ?? session.model : undefined
   }
-  const model = await resolveFeatureModel(projectID, selected, pinned)
-  if ((model.modelID ?? model.id) !== pinned) throw new Error('TRANSLATION_MODEL_UNAVAILABLE')
+  const model = await recoverFeatureSessionModel(projectID, selected, pinned, configuredFeatureModel, 'TRANSLATION_MODEL_UNAVAILABLE')
+  translationModels.set(key, model.modelID ?? model.id)
   return model
 }
 function lockScopes(projectID: string, directory = workspace.get(projectID).directory) {
   return { scope: canonicalWorkspaceScope(directory), legacy: projectID }
+}
+async function recoverFeatureSessionModel(projectID: string, selected: Model, pinned: string | undefined, configured: string | undefined, unavailable: string): Promise<Model> {
+  if (pinned === (selected.modelID ?? selected.id)) return selected
+  if (pinned) {
+    try {
+      const model = await resolveFeatureModel(projectID, selected, pinned)
+      if ((model.modelID ?? model.id) === pinned) return model
+    } catch { if (shuttingDown) throw new Error('APP_SHUTTING_DOWN') }
+  }
+  try { return await resolveFeatureModel(projectID, selected, configured) }
+  catch {
+    if (shuttingDown) throw new Error('APP_SHUTTING_DOWN')
+    if (selected.providerID === 'amecode' && (selected.modelID ?? selected.id)) return selected
+    throw new Error(unavailable)
+  }
 }
 function assertRegularSession(projectID: string, sessionID: string) {
   const { scope, legacy } = lockScopes(projectID)
@@ -322,20 +376,18 @@ async function ensureCommitAgentReadonly(projectID: string, session: { id: strin
   } catch { /* Fail closed: never send a planning prompt with unconfirmed permissions. */ }
   throw new Error('COMMIT_AGENT_READONLY_REQUIRED')
 }
-async function resolveCommitAgentModel(projectID: string, sessionID: string, selected: Model): Promise<Model> {
+async function resolveCommitAgentModel(projectID: string, sessionID: string, selected: Model, configuredFeatureModel?: string): Promise<Model> {
   const key = translationKey(projectID, sessionID)
   let pinned = commitAgentModels.get(key)
   if (!pinned) {
-    const map = await adapter.agentMap(projectID, sessionID)
-    const session = map.nodes.find(node => node.id === sessionID)
-    if (session?.providerID !== 'amecode' || !session.model) throw new Error('COMMIT_AGENT_MODEL_UNAVAILABLE')
-    const models = await adapter.models(projectID)
-    const model = models.find(model => model.providerID === 'amecode' && (model.id === session.model || model.modelID === session.model))
-    pinned = model?.modelID ?? session.model
-    commitAgentModels.set(key, pinned)
+    const map = await adapter.agentMap(projectID, sessionID).catch(() => null)
+    const session = map?.nodes?.find(node => node.id === sessionID)
+    const models = await adapter.models(projectID).catch(() => [])
+    const model = models.find(model => model.providerID === 'amecode' && (model.id === session?.model || model.modelID === session?.model))
+    pinned = session?.providerID === 'amecode' ? model?.modelID ?? session.model : undefined
   }
-  const model = await resolveFeatureModel(projectID, selected, pinned)
-  if ((model.modelID ?? model.id) !== pinned) throw new Error('COMMIT_AGENT_MODEL_UNAVAILABLE')
+  const model = await recoverFeatureSessionModel(projectID, selected, pinned, configuredFeatureModel, 'COMMIT_AGENT_MODEL_UNAVAILABLE')
+  commitAgentModels.set(key, model.modelID ?? model.id)
   return model
 }
 function commitAgentLockState(projectID: string) {
@@ -478,6 +530,17 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'createFile': return workspace.createFile(a, b, c)
     case 'createDirectory': return workspace.createDirectory(a, b)
     case 'renamePath': return workspace.renamePath(a, b, c)
+    case 'copyPath': return workspace.copyPath(a, b, c, d)
+    case 'movePath': return workspace.movePath(a, b, c, d)
+    case 'clipboardFiles': {
+      const files = await osClipboardFiles()
+      return { hasFiles: files.length > 0, count: files.length, names: files.map(file => path.basename(file)) }
+    }
+    case 'pasteClipboardFiles': {
+      const files = await osClipboardFiles()
+      if (!files.length) throw Object.assign(new Error('CLIPBOARD_EMPTY'), { code: 'CLIPBOARD_EMPTY' })
+      return workspace.pasteExternalPaths(a, files, b)
+    }
     case 'deletePath':
       await confirmation(`Xóa ${b} khỏi ổ đĩa? Hành động này không thể hoàn tác.`)
       return workspace.deletePath(a, b)
@@ -538,6 +601,12 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       if (a.enabled && !pairing.status().enabled) await confirmation('Bật Remote access qua OpenTunnel? Máy chủ sẽ có địa chỉ Internet; lưu lượng được mã hóa đầu cuối tại Ame IDE. Thiết bị có mã QR hoặc link sẽ có toàn quyền OpenCode tích hợp. Không chia sẻ mã ghép nối.')
       return configurePairing(a)
     case 'pairingCode': return pairing.issue()
+    case 'pairingRevokeDevice':
+      await confirmation('Ngắt kết nối thiết bị này? Thiết bị sẽ không thể truy cập Ame IDE cho tới khi ghép nối lại.')
+      return pairing.revokeDevice(a)
+    case 'pairingRevokeAll':
+      await confirmation('Ngắt kết nối tất cả thiết bị đã ghép nối? Mọi thiết bị từ xa sẽ mất quyền truy cập ngay lập tức.')
+      return pairing.revokeAll()
     case 'sessions': return adapter.sessions(a)
     case 'createSession': {
       const orchestrator = await account.readOrchestrator?.()
@@ -572,10 +641,9 @@ async function call(method: keyof typeof schema, args: unknown[]) {
         account.readBuildNotesFeature?.(a).catch(() => null),
         (account.readStatus ? account.readStatus() : account.call('status', {})).catch(() => null),
       ])
-      const catalog = (status as { models?: { default_model?: string; active_models?: { id: string }[]; models?: { id: string }[] } } | null)?.models
-      const active = catalog?.active_models ?? catalog?.models ?? []
-      const configured = feature?.model && active.find(model => model.id === feature.model)
-      const effective = configured || active.find(model => model.id === catalog?.default_model)
+      const catalog = (status as { models?: FeatureCatalog } | null)?.models
+      const configured = resolveCatalogFeatureModel(catalog, feature?.model)
+      const effective = configured ?? resolveCatalogFeatureModel(catalog, catalog?.default_model)
       const skillName = feature?.skill?.name ?? feature?.rawSkillName
       return {
         branch: summary.branch,
@@ -613,13 +681,14 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'commitAgentSessionState': return commitAgentLockState(a)
     case 'commitAgentInfo': {
       const [git, feature, status] = await Promise.all([
-        commitAgentGitStatus(a), commitAgentFeature(a),
+        commitAgentGitStatus(a), commitAgentFeature(a).catch(() => null),
         (account.readStatus ? account.readStatus() : account.call('status', {})).catch(() => null),
       ])
-      const catalog = (status as { models?: { default_model?: string; active_models?: { id: string; name?: string }[]; models?: { id: string; name?: string }[] } } | null)?.models
-      const active = catalog?.active_models ?? catalog?.models ?? []
-      const configured = feature?.model && active.find(model => model.id === feature.model)
-      const effective = configured || active.find(model => model.id === catalog?.default_model)
+      const catalog = (status as { models?: FeatureCatalog } | null)?.models
+      const configured = resolveCatalogFeatureModel(catalog, feature?.model)
+      const fallback = configured ?? resolveCatalogFeatureModel(catalog, catalog?.default_model)
+      const runtime = !fallback ? (await adapter.models(a).catch(() => [])).find(model => model.providerID === 'amecode') : undefined
+      const effective = fallback ?? (runtime ? { id: runtime.modelID ?? runtime.id, name: runtime.name } : undefined)
       return {
         configured: true, skill: feature?.skill?.name ?? feature?.rawSkillName,
         configuredModelID: feature?.model, effectiveModelID: effective?.id, effectiveModelName: effective?.name ?? effective?.id,
@@ -635,8 +704,11 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       if (b && commitAgentLocks.isLocked(scope, b, legacy)) throw new Error('COMMIT_AGENT_SESSION_LOCKED')
       if (b && !commitAgentLocks.isSession(scope, b, legacy)) throw new Error('COMMIT_AGENT_SESSION_REQUIRED')
       const feature = await commitAgentFeature(a)
-      const selected = await resolveModel(a)
-      const model = b ? await resolveCommitAgentModel(a, b, selected) : await resolveFeatureModel(a, selected, feature?.model)
+      const selected = await resolveModel(a).catch(error => {
+        if (b && error instanceof Error && error.message === 'AMEKIT_MODEL_REQUIRED') throw new Error('COMMIT_AGENT_MODEL_UNAVAILABLE')
+        throw error
+      })
+      const model = b ? await resolveCommitAgentModel(a, b, selected, feature?.model) : await resolveFeatureModel(a, selected, feature?.model)
       const git = await commitAgentGitStatus(a)
       const session = b ? (await adapter.sessions(a)).find(session => session.id === b) : await adapter.createSession(a, 'readonly')
       if (!session) throw new Error('SESSION_NOT_FOUND')
@@ -767,13 +839,14 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       const { directory } = workspace.get(a)
       const [detected, feature, status] = await Promise.all([
         detectAndroidProject(directory),
-        account.readAndroidTranslationFeature?.(a),
+        account.readAndroidTranslationFeature?.(a).catch(() => null),
         (account.readStatus ? account.readStatus() : account.call('status', {})).catch(() => null)
       ])
-      const catalog = (status as { models?: { default_model?: string; active_models?: { id: string; name?: string }[]; models?: { id: string; name?: string }[] } } | null)?.models
-      const active = catalog?.active_models ?? catalog?.models ?? []
-      const configured = feature?.model && active.find(model => model.id === feature.model)
-      const effective = configured || active.find(model => model.id === catalog?.default_model)
+      const catalog = (status as { models?: FeatureCatalog } | null)?.models
+      const configured = resolveCatalogFeatureModel(catalog, feature?.model)
+      const fallback = configured ?? resolveCatalogFeatureModel(catalog, catalog?.default_model)
+      const runtime = !fallback ? (await adapter.models(a).catch(() => [])).find(model => model.providerID === 'amecode') : undefined
+      const effective = fallback ?? (runtime ? { id: runtime.modelID ?? runtime.id, name: runtime.name } : undefined)
       return {
         configured: !!(feature?.rawSkillName || feature?.skill), isAndroid: detected.isAndroid,
         skill: feature?.skill?.name ?? feature?.rawSkillName, configuredModelID: feature?.model,
@@ -789,8 +862,11 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       if (b && !translationLocks.isTranslationSession(scope, b, legacy)) throw new Error('ANDROID_TRANSLATION_SESSION_REQUIRED')
       const feature = await account.readAndroidTranslationFeature?.(a)
       if (!feature?.skill) throw new Error('ANDROID_TRANSLATION_NOT_CONFIGURED')
-      const selected = await resolveModel(a)
-      const model = b ? await resolveTranslationModel(a, b, selected) : await resolveFeatureModel(a, selected, feature.model)
+      const selected = await resolveModel(a).catch(error => {
+        if (b && error instanceof Error && error.message === 'AMEKIT_MODEL_REQUIRED') throw new Error('TRANSLATION_MODEL_UNAVAILABLE')
+        throw error
+      })
+      const model = b ? await resolveTranslationModel(a, b, selected, feature.model) : await resolveFeatureModel(a, selected, feature.model)
       const detected = await detectAndroidProject(directory)
       const session = b ? (await adapter.sessions(a)).find(session => session.id === b) : await adapter.createSession(a)
       if (!session) throw new Error('SESSION_NOT_FOUND')
@@ -825,6 +901,8 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'messages': return adapter.messages(a, b)
     case 'agentMap': return adapter.agentMap(a, b)
     case 'sessionDiff': return adapter.sessionDiff(a, b, c)
+    case 'stageRevert': assertRegularSession(a, b); return adapter.stageRevert(a, b, c, d)
+    case 'clearRevert': assertRegularSession(a, b); return adapter.clearRevert(a, b)
     case 'sessionUsage': {
       const pricing = await (account.readUsagePrices ? account.readUsagePrices() : account.call('usage-prices', {})).catch(() => ({ origin: null, prices: {} })) as { origin: string | null; prices: UsagePrices }
       return adapter.sessionUsage(a, b, pricing.prices, pricing.origin)
@@ -867,7 +945,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
 }
 let authority: Promise<unknown> = Promise.resolve()
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'createSession', 'prompt', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'commitAgentPrompt', 'commitAgentLock', 'commitAgentExecutePlan', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure'].includes(method)) return call(method, args)
+  if (!['startBackend', 'connect', 'discover', 'createSession', 'prompt', 'stageRevert', 'clearRevert', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'commitAgentPrompt', 'commitAgentLock', 'commitAgentExecutePlan', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure', 'pairingRevokeDevice', 'pairingRevokeAll'].includes(method)) return call(method, args)
   // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
@@ -920,7 +998,10 @@ void app.whenReady().then(async () => {
   runtime = new PrivateRuntime({ resources: app.isPackaged ? process.resourcesPath : path.join(app.getAppPath(), 'resources'), profile: path.join(app.getPath('userData'), 'backend'), onExit: () => {
     if (managed && !shuttingDown) { void pairing?.stop(); adapter.disconnected('OpenCode tích hợp đã dừng. Mở Cài đặt để thử lại.') }
   } })
-  pairing = new RemotePairing(new PairingHost(() => managed ? adapter.endpoint() : undefined), automaticTunnel(path.join(app.getPath('userData'), 'remote-access')))
+  const pairingDir = path.join(app.getPath('userData'), 'remote-access')
+  const deviceStore = new PairingDeviceStore(path.join(pairingDir, 'devices.json'))
+  await deviceStore.ready()
+  pairing = new RemotePairing(new PairingHost(() => managed ? adapter.endpoint() : undefined, deviceStore), automaticTunnel(pairingDir))
   account = createAmeKit({
     userData: app.getPath('userData'),
     globalConfigDir: path.join(app.getPath('userData'), 'backend', 'config', 'opencode'),

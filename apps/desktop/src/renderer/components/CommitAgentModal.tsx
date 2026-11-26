@@ -31,6 +31,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
   const [planSnapshots, setPlanSnapshots] = useState<Record<string, CommitAgentStoredPlan>>({})
   const [session, setSession] = useState<Session | undefined>(initialSessionID !== undefined ? { id: initialSessionID, title: 'Trợ lý Commit AI' } : undefined)
   const [model, setModel] = useState<Model>()
+  const [disabledSessionModel, setDisabledSessionModel] = useState(false)
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
   const [forms, setForms] = useState<SessionForm[]>([])
@@ -104,9 +105,10 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
     }
     void load()
     window.addEventListener('ame-account-changed', load)
+    window.addEventListener('ame-bundle-updated', load)
     window.addEventListener('ame-commit-agent-changed', load)
     const unsubscribe = window.ame.onEvent(event => { if (event.type === 'opencode' && event.projectID === projectID) { clearTimeout(timer); timer = setTimeout(() => void load(), 300) } })
-    return () => { alive = false; clearTimeout(timer); unsubscribe(); window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-commit-agent-changed', load) }
+    return () => { alive = false; clearTimeout(timer); unsubscribe(); window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-bundle-updated', load); window.removeEventListener('ame-commit-agent-changed', load) }
   }, [projectID, connected])
 
   useEffect(() => {
@@ -142,14 +144,24 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
     previous.current = { id: sessionID, running: session?.status === 'running' }
   }, [sessionID, session?.status])
   useEffect(() => {
-    if (!sessionID || !connected) return
-    let alive = true
-    void Promise.all([window.ame.agentMap(projectID, sessionID), window.ame.models(projectID)]).then(([map, models]) => {
-      const root = map.nodes.find(node => node.id === sessionID)
-      if (alive && root?.model) setModel(models.find(model => model.providerID === (root.providerID || 'amecode') && (model.id === root.model || model.modelID === root.model)) ?? { id: root.model, name: root.model, providerID: root.providerID || 'amecode' })
-    }).catch(() => {})
-    return () => { alive = false }
-  }, [projectID, sessionID, connected])
+    if (!sessionID || !connected) { setModel(undefined); setDisabledSessionModel(false); return }
+    let alive = true, generation = 0
+    const load = async () => {
+      const request = ++generation
+      try {
+        const [map, models] = await Promise.all([window.ame.agentMap(projectID, sessionID), window.ame.models(projectID)])
+        if (!alive || request !== generation) return
+        const root = map.nodes.find(node => node.id === sessionID)
+        const active = models.find(model => model.providerID === 'amecode' && model.providerID === (root?.providerID || 'amecode') && (model.id === root?.model || model.modelID === root?.model))
+        setModel(root?.model ? active : undefined)
+        setDisabledSessionModel(!!root?.model && !active)
+      } catch {}
+    }
+    void load()
+    window.addEventListener('ame-account-changed', load)
+    window.addEventListener('ame-bundle-updated', load)
+    return () => { alive = false; window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-bundle-updated', load) }
+  }, [projectID, sessionID, connected, revision])
   useEffect(() => { if (follow.current) stream.current?.scrollTo({ top: stream.current.scrollHeight }) }, [messages, permissions, forms])
   const formIDs = forms.map(form => form.id).join(',')
   useEffect(() => { if (forms.length) { follow.current = true; stream.current?.scrollTo({ top: stream.current.scrollHeight }) } }, [formIDs])
@@ -162,7 +174,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
       const result = await window.ame.commitAgentPrompt(projectID, sessionID, value.trim(), mode)
       notify(); callbacks.current.onActivity()
       if (!mounted.current || request !== epoch.current) return
-      setSession(result.session); currentSession.current = result.session.id; setModel(result.model)
+      setSession(result.session); currentSession.current = result.session.id; setModel(result.model); setDisabledSessionModel(false)
       if (result.planID && result.snapshot) mergePlans({ [result.planID]: { planID: result.planID, snapshot: result.snapshot, status: 'active' } })
       setText(''); setLoaded(false); setRevision(value => value + 1)
       if (result.locked) setInfo(current => current ? { ...current, lockedSessionIDs: [...new Set([...current.lockedSessionIDs, result.session.id])] } : current)
@@ -234,6 +246,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
       <div className="translation-modal__metadata"><span className="amekit-pill">{info?.skill ? `Skill: /${info.skill}` : 'Conventional Commits'}</span><span className="amekit-pill"><Icon name="lock" /> Model: {model?.name || info?.effectiveModelName || info?.effectiveModelID || 'Chưa có model'}</span>{info?.branch && <span className="amekit-pill">{info.branch}</span>}{info && <span className="amekit-pill">{info.stagedCount} staged · {info.workingCount} chưa stage</span>}</div>
       {!connected && <div className="warning" role="status">Chưa kết nối OpenCode. Kết nối lại để tiếp tục phiên commit.</div>}
       {info?.fallbackToDefault && <div className="warning" role="status">Phiên mới dùng model mặc định: {info.effectiveModelName || info.effectiveModelID}.</div>}
+      {disabledSessionModel && <div className="warning" role="status">Model trước đó của phiên đã bị vô hiệu hóa từ API. Lượt tiếp theo sẽ tự động dùng model đang hoạt động: {info?.effectiveModelName || info?.effectiveModelID}.</div>}
       {error && <div className="inline-error" role="alert">{error}</div>}
       {applied && <div role="status">{applied}</div>}
       <div ref={stream} className="chat-stream translation-modal__timeline" onScroll={event => { const el = event.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">

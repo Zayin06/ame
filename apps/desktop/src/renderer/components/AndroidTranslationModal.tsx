@@ -33,6 +33,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
   const [info, setInfo] = useState<AndroidTranslationInfo>()
   const [session, setSession] = useState<Session>()
   const [pinnedModel, setPinnedModel] = useState<Model>()
+  const [disabledSessionModel, setDisabledSessionModel] = useState(false)
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
   const [forms, setForms] = useState<SessionForm[]>([])
@@ -94,11 +95,12 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
     }
     void load()
     window.addEventListener('ame-account-changed', load)
+    window.addEventListener('ame-bundle-updated', load)
     window.addEventListener('ame-translation-changed', load)
     const unsubscribe = window.ame.onEvent(event => {
       if (event.type === 'opencode' && event.projectID === projectID) { clearTimeout(timer); timer = setTimeout(() => void load(), 300) }
     })
-    return () => { alive = false; clearTimeout(timer); unsubscribe(); window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-translation-changed', load) }
+    return () => { alive = false; clearTimeout(timer); unsubscribe(); window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-bundle-updated', load); window.removeEventListener('ame-translation-changed', load) }
   }, [projectID, connected])
 
   useEffect(() => {
@@ -130,15 +132,24 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
   }, [projectID, sessionID, connected, revision])
 
   useEffect(() => {
-    if (!sessionID || !connected) return
-    let alive = true
-    void Promise.all([window.ame.agentMap(projectID, sessionID), window.ame.models(projectID)]).then(([map, models]) => {
-      const root = map.nodes.find(node => node.id === sessionID)
-      if (!alive || !root?.model) return
-      setPinnedModel(models.find(model => model.providerID === (root.providerID || 'amecode') && (model.id === root.model || model.modelID === root.model)) ?? { id: root.model, name: root.model, providerID: root.providerID || 'amecode' })
-    }).catch(() => {})
-    return () => { alive = false }
-  }, [projectID, sessionID, connected])
+    if (!sessionID || !connected) { setPinnedModel(undefined); setDisabledSessionModel(false); return }
+    let alive = true, generation = 0
+    const load = async () => {
+      const request = ++generation
+      try {
+        const [map, models] = await Promise.all([window.ame.agentMap(projectID, sessionID), window.ame.models(projectID)])
+        if (!alive || request !== generation) return
+        const root = map.nodes.find(node => node.id === sessionID)
+        const active = models.find(model => model.providerID === 'amecode' && model.providerID === (root?.providerID || 'amecode') && (model.id === root?.model || model.modelID === root?.model))
+        setPinnedModel(root?.model ? active : undefined)
+        setDisabledSessionModel(!!root?.model && !active)
+      } catch {}
+    }
+    void load()
+    window.addEventListener('ame-account-changed', load)
+    window.addEventListener('ame-bundle-updated', load)
+    return () => { alive = false; window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-bundle-updated', load) }
+  }, [projectID, sessionID, connected, revision])
 
   useEffect(() => { if (follow.current) stream.current?.scrollTo({ top: stream.current.scrollHeight }) }, [messages, permissions, forms])
   const formIDs = forms.map(form => form.id).join(',')
@@ -152,7 +163,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
       const result = await window.ame.androidTranslationPrompt(projectID, sessionID, value.trim(), preset)
       notifyTranslation(); callbacks.current.onActivity()
       if (!mounted.current || request !== epoch.current) return
-      setSession(result.session); currentSession.current = result.session.id; setPinnedModel(result.model)
+      setSession(result.session); currentSession.current = result.session.id; setPinnedModel(result.model); setDisabledSessionModel(false)
       setText(''); setMode('custom'); setLoaded(false); setRevision(value => value + 1)
       if (result.locked) setInfo(current => current ? { ...current, lockedSessionIDs: [...new Set([...current.lockedSessionIDs, result.session.id])] } : current)
     } catch (e) {
@@ -203,6 +214,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
       {!connected && <div className="warning" role="status">Chưa kết nối OpenCode. Kết nối lại để tiếp tục phiên dịch.</div>}
       {info && (!info.configured || !info.skill) && <div className="warning" role="status">Nhờ Admin cấu hình Skill cho Dịch Android trong Cài đặt → AmeKit trước khi dịch.</div>}
       {info?.fallbackToDefault && <div className="warning" role="status">Model dịch chưa được cấu hình hoặc không còn hoạt động. Phiên mới dùng model mặc định từ API: {info.effectiveModelName || info.effectiveModelID}.</div>}
+      {disabledSessionModel && <div className="warning" role="status">Model trước đó của phiên đã bị vô hiệu hóa từ API. Lượt tiếp theo sẽ tự động dùng model đang hoạt động: {info?.effectiveModelName || info?.effectiveModelID}.</div>}
       {error && <div className="inline-error" role="alert">{formatAmeKitError(error).title}{formatAmeKitError(error).detail && <p>{formatAmeKitError(error).detail}</p>}</div>}
       <div ref={stream} className="chat-stream translation-modal__timeline" onScroll={event => { const el = event.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
         {!info ? <p role="status">Đang tải cấu hình dịch…</p> : sessionID && !loaded ? <p role="status">Đang tải phiên dịch…</p> : !messages.length && !locked ? <div className="translation-presets"><h3>Chỉ dịch Android Strings</h3><p>Chỉ bản địa hóa res/values*/strings.xml và i18n/translation-context.md. Dùng Chat chính cho yêu cầu lập trình khác.</p><div className="translation-presets__grid"><button type="button" disabled={!available} onClick={() => void send(updatePrompt, 'update')}><strong>Cập nhật string mới (Update)</strong><span>Đồng bộ key mới và thay đổi với các locale hiện có.</span></button><button type="button" disabled={!available} onClick={() => { setText(fullPrompt); setMode('full'); input.current?.focus() }}><strong>Thêm ngôn ngữ mới (Full)</strong><span>Chọn mã locale và ngữ cảnh trước khi gửi.</span></button><button type="button" disabled={!available} onClick={() => void send(scanPrompt, 'scan')}><strong>Quét key thiếu / lỗi (Scan)</strong><span>Chỉ báo cáo, chưa sửa tệp.</span></button></div></div> : projectChatTimeline(messages, { running, mode: timelineDetail, pendingForms: forms.length > 0 }).map(turn => <section key={turn.id} className="chat-turn">

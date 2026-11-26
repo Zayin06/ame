@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { Inspector } from '../components/Inspector'
 import { FileTypeIcon } from '../components/FileTypeIcon'
 import { fileTypeMeta, gitStatusMeta, splitFilePath } from '../scm-display'
+import { languageFor } from '../state'
 
 test('gitStatusMeta normalizes display codes while retaining semantic status and fallback', () => {
   for (const [raw, code, dataStatus, label] of [
@@ -44,6 +45,74 @@ test('fileTypeMeta resolves test suffixes before language extensions using only 
   }
   assert.deepEqual(fileTypeMeta('.env'), { kind: 'config', glyph: '⚙', label: 'Config' })
   for (const path of ['unknown.bin', 'LICENSE', 'directory.test.ts/file', 'src.json\\file']) {
+    assert.deepEqual(fileTypeMeta(path), { kind: 'file', label: 'File' })
+  }
+})
+
+test('languageFor recognizes normalized mobile, web, native and configuration filenames', () => {
+  const languages: Record<string, string[]> = {
+    kotlin: ['kt', 'kts'], java: ['java'], groovy: ['gradle', 'groovy'],
+    xml: ['xml', 'svg', 'xaml', 'xsl', 'xsd', 'pom', 'plist', 'entitlements', 'storyboard', 'xib', 'xcscheme', 'xcworkspacedata'],
+    properties: ['properties', 'pro'], proto: ['proto'], swift: ['swift'], 'objective-c': ['m'], 'objective-cpp': ['mm'],
+    ini: ['ini', 'cfg', 'conf', 'xcconfig'], c: ['c', 'h', 'pbxproj'], ruby: ['rb', 'podspec'],
+    json: ['json', 'webmanifest', 'xcstrings', 'arb'], dart: ['dart'], typescript: ['ts', 'mts', 'cts'], tsx: ['tsx'],
+    javascript: ['js', 'mjs', 'cjs'], jsx: ['jsx'], jsonc: ['jsonc', 'json5'], css: ['css'], scss: ['scss'], sass: ['sass'], less: ['less'],
+    html: ['html', 'htm'], vue: ['vue'], svelte: ['svelte'], astro: ['astro'], markdown: ['md'], mdx: ['mdx'], graphql: ['graphql', 'gql'],
+    python: ['py', 'pyi'], rust: ['rs'], go: ['go'], cpp: ['cpp', 'cc', 'cxx', 'hpp', 'hh', 'hxx'], csharp: ['cs'], php: ['php'], sql: ['sql'],
+    shellscript: ['sh', 'bash', 'zsh', 'ksh'], powershell: ['ps1', 'psm1', 'psd1'], bat: ['bat', 'cmd'], yaml: ['yaml', 'yml'], toml: ['toml'],
+    makefile: ['mk'], cmake: ['cmake'], hcl: ['tf', 'hcl'], lua: ['lua'], r: ['r'], scala: ['scala'], elixir: ['ex', 'exs'], dockerfile: ['dockerfile'],
+  }
+  for (const [language, extensions] of Object.entries(languages)) {
+    for (const extension of extensions) {
+      for (const path of [`src/file.${extension}`, `src\\FILE.${extension.toUpperCase()}`]) {
+        assert.equal(languageFor(path), language, path)
+      }
+    }
+  }
+  const basenames: Record<string, string[]> = {
+    dotenv: ['.env', '.env.local', '.env.production'], dockerfile: ['Dockerfile', 'Dockerfile.dev'],
+    makefile: ['Makefile', 'GNUMakefile'], cmake: ['CMakeLists.txt'],
+    ruby: ['Podfile', 'Fastfile', 'Gemfile', 'Appfile', 'Matchfile', 'Rakefile'], shellscript: ['gradlew'],
+    ini: ['.editorconfig', '.gitconfig', '.gitignore', '.gitattributes', '.dockerignore', '.npmignore'],
+    plaintext: ['', 'LICENSE', 'unknown.bin', 'dockerfileish', '.envish', 'ts', 'src.ts/file', 'src.json\\file'],
+  }
+  for (const [language, names] of Object.entries(basenames)) {
+    for (const name of names) {
+      assert.equal(languageFor(name), language, name)
+      assert.equal(languageFor(`src\\${name.toUpperCase()}`), language, name)
+    }
+  }
+})
+
+test('fileTypeMeta provides glyph-backed mobile and additional source icons without CSS dependencies', () => {
+  const types: [string[], string, string, string][] = [
+    [['file.swift'], 'swift', 'SW', 'Swift'], [['file.dart'], 'dart', 'DT', 'Dart'],
+    [['build.gradle', 'file.groovy'], 'groovy', 'GR', 'Groovy'],
+    [['file.m'], 'objc', 'OC', 'Objective-C'], [['file.mm'], 'objcpp', 'OC++', 'Objective-C++'],
+    [['Info.plist', 'Main.storyboard', 'View.xib', 'app.entitlements', 'app.xcscheme', 'contents.xcworkspacedata'], 'markup', '<>', 'Markup'],
+    [['file.rb', 'app.podspec', 'Podfile', 'Fastfile', 'Gemfile', 'Appfile', 'Matchfile', 'Rakefile'], 'ruby', 'RB', 'Ruby'],
+    [['Dockerfile', 'Dockerfile.dev', 'app.dockerfile'], 'docker', 'DK', 'Dockerfile'],
+    [['file.proto'], 'proto', 'PB', 'Protocol Buffers'], [['file.c', 'file.h', 'project.pbxproj'], 'c', 'C', 'C'],
+    [['file.cpp', 'file.cc', 'file.cxx', 'file.hpp', 'file.hh', 'file.hxx'], 'cpp', 'C++', 'C++'],
+    [['file.cs'], 'csharp', 'C#', 'C#'], [['file.php'], 'php', 'PHP', 'PHP'], [['file.sql'], 'sql', 'SQL', 'SQL'],
+    [['file.bat', 'file.cmd'], 'bat', '>_', 'Batch'], [['file.properties', 'file.pro'], 'properties', '⚙', 'Properties'],
+    [['file.vue'], 'vue', 'V', 'Vue'], [['file.svelte'], 'svelte', 'S', 'Svelte'],
+    [['strings.xcstrings', 'strings.arb', 'app.webmanifest', 'file.json5'], 'json', '{}', 'JSON'],
+    [['.env.local', '.editorconfig', '.gitignore', 'app.xcconfig', 'Makefile', 'CMakeLists.txt'], 'config', '⚙', 'Config'],
+    [['gradlew', 'file.bash', 'file.zsh', 'file.ksh', 'file.psm1', 'file.psd1'], 'shell', '>_', 'Shell'],
+  ]
+  for (const [names, kind, glyph, label] of types) {
+    for (const name of names) {
+      for (const path of [`src/${name}`, `src\\${name.toUpperCase()}`]) {
+        assert.deepEqual(fileTypeMeta(path), { kind, glyph, label }, path)
+        const html = renderToStaticMarkup(createElement(FileTypeIcon, { path }))
+        assert.ok(html.includes(`file-type-icon--${kind}" aria-hidden="true"`), path)
+        assert.match(html, /class="file-type-icon__glyph"/)
+        assert.doesNotMatch(html, /<svg/)
+      }
+    }
+  }
+  for (const path of ['Dockerfile.ts/file', 'Podfile/file', 'folder.swift\\unknown', '.env.local/file']) {
     assert.deepEqual(fileTypeMeta(path), { kind: 'file', label: 'File' })
   }
 })

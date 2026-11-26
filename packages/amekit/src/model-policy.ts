@@ -39,22 +39,26 @@ export function modelPolicy(role: Role | undefined, value: unknown, options: { f
   const parsed = catalogSchema.safeParse(value)
   if (!parsed.success) throw new Error("INVALID_MODEL_CATALOG")
   const catalog = parsed.data
-  const model_levels: ModelLevels = role === "admin" ? {
+  const model_levels: ModelLevels = {
     default: catalog.default_model,
     haiku: catalog.model_levels?.haiku ?? catalog.small_model,
     sonnet: catalog.model_levels?.sonnet ?? catalog.default_model,
     opus: catalog.model_levels?.opus ?? catalog.default_model,
-  } : { default: catalog.default_model, haiku: catalog.default_model, sonnet: catalog.default_model, opus: catalog.default_model }
+  }
   const active_models = catalog.models
   const chat_models = role === "admin" ? catalog.models : catalog.models.filter(model => model.id === catalog.default_model)
   const feature_models = [...new Set(options.featureModels ?? [])].filter(id => id !== catalog.default_model && catalog.models.some(model => model.id === id))
-  const allowedIds = new Set([...chat_models.map(model => model.id), ...feature_models])
+  const allowedIds = new Set([...chat_models.map(model => model.id), ...Object.values(model_levels), ...feature_models])
   const models = catalog.models.filter(model => allowedIds.has(model.id))
   return { ...catalog, model_levels, active_models, chat_models, feature_models, models }
 }
 export function assertModel(policy: ReturnType<typeof modelPolicy> | undefined, model: { providerID: string; id: string }) {
   if (!policy) throw new Error("AMECODE_LOGIN_REQUIRED")
   if (model.providerID !== managedProvider || !policy.models.some(entry => entry.id === model.id)) throw new Error("AMECODE_MODEL_NOT_ALLOWED")
+}
+export function assertChatModel(policy: ReturnType<typeof modelPolicy> | undefined, model: { providerID: string; id: string }) {
+  if (!policy) throw new Error("AMECODE_LOGIN_REQUIRED")
+  if (model.providerID !== managedProvider || !policy.chat_models.some(entry => entry.id === model.id)) throw new Error("AMECODE_MODEL_NOT_ALLOWED")
 }
 export function providerURL(value: string) {
   const url = new URL(value)

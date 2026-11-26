@@ -115,6 +115,28 @@ export function savedDocument(current: Buffer, saved: FileDocument, submitted: s
   return { ...current, ...saved, text: current.text === submitted ? saved.content : current.text, conflict: false }
 }
 export const languageFor = (path: string) => {
-  const ext = path.split('.').pop()?.toLowerCase()
-  return ({ ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript', json: 'json', css: 'css', html: 'html', md: 'markdown', py: 'python', rs: 'rust', go: 'go', yaml: 'yaml', yml: 'yaml', sh: 'shell', ps1: 'powershell', sql: 'sql', xml: 'xml', cs: 'csharp', java: 'java', c: 'c', h: 'c', cpp: 'cpp' } as Record<string, string>)[ext || ''] || 'plaintext'
+  const name = path.replace(/\\/g, '/').split('/').pop()!.toLowerCase()
+  if (name === '.env' || name.endsWith('.env') || name.startsWith('.env.')) return 'dotenv'
+  if (name === 'dockerfile' || name.startsWith('dockerfile.') || name.endsWith('.dockerfile')) return 'dockerfile'
+  if (['makefile', 'gnumakefile'].includes(name)) return 'makefile'
+  if (name === 'cmakelists.txt') return 'cmake'
+  if (['podfile', 'fastfile', 'gemfile', 'appfile', 'matchfile', 'rakefile'].includes(name)) return 'ruby'
+  if (name === 'gradlew') return 'shellscript'
+  if (['.editorconfig', '.gitconfig', '.gitignore', '.gitattributes', '.dockerignore', '.npmignore'].includes(name)) return 'ini'
+  const ext = name.includes('.') ? name.split('.').pop()! : ''
+  const languages: Record<string, string> = {
+    kt: 'kotlin', kts: 'kotlin', java: 'java', gradle: 'groovy', groovy: 'groovy',
+    xml: 'xml', svg: 'xml', xaml: 'xml', xsl: 'xml', xsd: 'xml', pom: 'xml',
+    plist: 'xml', entitlements: 'xml', storyboard: 'xml', xib: 'xml', xcscheme: 'xml', xcworkspacedata: 'xml',
+    properties: 'properties', pro: 'properties', proto: 'proto', swift: 'swift', m: 'objective-c', mm: 'objective-cpp',
+    xcconfig: 'ini', pbxproj: 'c', podspec: 'ruby', rb: 'ruby', xcstrings: 'json', dart: 'dart', arb: 'json',
+    ts: 'typescript', mts: 'typescript', cts: 'typescript', tsx: 'tsx', js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'jsx',
+    json: 'json', webmanifest: 'json', jsonc: 'jsonc', json5: 'jsonc', css: 'css', scss: 'scss', sass: 'sass', less: 'less',
+    html: 'html', htm: 'html', vue: 'vue', svelte: 'svelte', astro: 'astro', md: 'markdown', mdx: 'mdx', graphql: 'graphql', gql: 'graphql',
+    py: 'python', pyi: 'python', rs: 'rust', go: 'go', c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp', hh: 'cpp', hxx: 'cpp',
+    cs: 'csharp', php: 'php', sql: 'sql', sh: 'shellscript', bash: 'shellscript', zsh: 'shellscript', ksh: 'shellscript',
+    ps1: 'powershell', psm1: 'powershell', psd1: 'powershell', bat: 'bat', cmd: 'bat', yaml: 'yaml', yml: 'yaml', toml: 'toml',
+    ini: 'ini', cfg: 'ini', conf: 'ini', mk: 'makefile', cmake: 'cmake', tf: 'hcl', hcl: 'hcl', lua: 'lua', r: 'r', scala: 'scala', ex: 'elixir', exs: 'elixir',
+  }
+  return Object.hasOwn(languages, ext) ? languages[ext] : 'plaintext'
 }

@@ -4,6 +4,9 @@ import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
 import { type Preferences, type Tab, type TimelineDetailMode } from '../state'
 import { extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
+import { projectSessionTodos } from '../chat-todo'
+import { describeRevertSummary, formatRevertError, partitionRevertedMessages, type RevertState } from '../chat-rewind'
+import { TodoProgressCard } from './TodoProgressCard'
 import type { SessionForm } from '../../../../../packages/protocol/src/index'
 import { SessionFormCard } from './SessionFormCard'
 import { ActiveToolsView, LiveTurnStatus, TurnWorkGroup } from './TurnWorkGroup'
@@ -89,6 +92,7 @@ function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
     return item.id === next.id && item.role === next.role && item.text === next.text && item.kind === next.kind
       && item.createdAt === next.createdAt && item.completedAt === next.completedAt && item.phase === next.phase && item.workedMs === next.workedMs
       && sameValue(item.tool, next.tool) && sameValue(item.turn, next.turn) && sameValue(item.attachments, next.attachments)
+      && item.executionID === next.executionID && item.executionOutcome === next.executionOutcome && sameValue(item.todos, next.todos)
   })
 }
 
@@ -219,6 +223,15 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const composing = useRef(false)
   const popoverID = useId()
   const [busy, setBusy] = useState(false)
+  const [rewinding, setRewinding] = useState(false)
+  const rewindingRef = useRef(false)
+  const [rewindPickerTurnID, setRewindPickerTurnID] = useState<string | null>(null)
+  const [rewindRequestedFiles, setRewindRequestedFiles] = useState<Record<string, boolean>>({})
+  const [pendingPromptRestore, setPendingPromptRestore] = useState<{ sessionID: string; messageID: string; text: string } | null>(null)
+  const [rewindError, setRewindError] = useState('')
+  const mounted = useRef(true)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+  useEffect(() => { setRewindPickerTurnID(null); setRewindError(''); setPendingPromptRestore(null) }, [projectID, sessionID])
   const [replying, setReplying] = useState(false)
   const [error, setError] = useState('')
   const [drawer, setDrawer] = useState<'artifacts' | 'agents' | 'btw' | null>(null)
@@ -274,6 +287,13 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const follow = useRef(true)
   const refresh = useRef<() => void>(() => {})
   const running = forms.length > 0 || sessions.some(session => session.id === sessionID && session.status === 'running')
+  const activeSession = sessions.find(session => session.id === sessionID)
+  const activeRevert = (activeSession as (Session & { revert?: RevertState }) | undefined)?.revert
+  const { active: activeMessages, revertedTurnCount } = partitionRevertedMessages(messages, activeRevert)
+  const canRewindSession = Boolean(projectID && sessionID && !activeSession?.parentID && !translationSession && !lockedTranslation && !commitSession && !lockedCommit)
+  const rewindSummary = activeRevert ? describeRevertSummary(activeRevert, rewindRequestedFiles[`${sessionID}:${activeRevert.messageID}`]) : undefined
+  useEffect(() => { setRewindPickerTurnID(null) }, [running, activeRevert?.messageID])
+  const todoView = projectSessionTodos(activeMessages, { running, sessionOutcome: activeSession?.outcome, isChildSession: !!activeSession?.parentID })
   const runningRef = useRef(running); runningRef.current = running
   const permissionsCountRef = useRef(permissions.length + forms.length); permissionsCountRef.current = permissions.length + forms.length
   const fallbackTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -507,10 +527,48 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); return true }
     return false
   }
+  const startRewind = async (messageID: string, files: boolean) => {
+    if (!projectID || !sessionID || !connected || running || busy || rewindingRef.current || !canRewindSession) return
+    rewindingRef.current = true; setRewinding(true); setRewindError(''); setRewindPickerTurnID(null)
+    const isCurrent = () => mounted.current && currentProject.current === projectID && currentSession.current === sessionID
+    try {
+      await window.ame.stageRevert(projectID, sessionID, messageID, files)
+      if (isCurrent()) {
+        setRewindRequestedFiles(current => ({ ...current, [`${sessionID}:${messageID}`]: files }))
+        const candidate = partitionRevertedMessages(messages, { messageID }).targetPromptText
+        if (candidate) {
+          // Read the live draft after the RPC: typing while it is in flight must never be lost.
+          if (!draft.value.text.trim()) { setText(candidate); setPendingPromptRestore(null) }
+          else setPendingPromptRestore({ sessionID, messageID, text: candidate })
+        }
+      }
+    } catch (e) { if (isCurrent()) setRewindError(formatRevertError(e)) }
+    finally {
+      if (isCurrent()) refresh.current()
+      onActivity()
+      rewindingRef.current = false
+      if (mounted.current) setRewinding(false)
+    }
+  }
+  const cancelRewind = async () => {
+    if (!projectID || !sessionID || !connected || running || busy || rewindingRef.current || !activeRevert) return
+    rewindingRef.current = true; setRewinding(true); setRewindError('')
+    const isCurrent = () => mounted.current && currentProject.current === projectID && currentSession.current === sessionID
+    try {
+      await window.ame.clearRevert(projectID, sessionID)
+      if (isCurrent()) setPendingPromptRestore(null)
+    } catch (e) { if (isCurrent()) setRewindError(formatRevertError(e)) }
+    finally {
+      if (isCurrent()) refresh.current()
+      onActivity()
+      rewindingRef.current = false
+      if (mounted.current) setRewinding(false)
+    }
+  }
   const send = async () => {
     const selectedModel = activeModel
     const { text: prompt, files } = splitComposerAttachments(text, attachments)
-    if (!projectID || (!prompt.trim() && !files.length) || busy || permissionPending.current || permissionLoading || !connected || !ready || !selectedModel || translationSession || lockedTranslation || commitSession || lockedCommit || composing.current) return
+    if (!projectID || (!prompt.trim() && !files.length) || busy || rewindingRef.current || permissionPending.current || permissionLoading || !connected || !ready || !selectedModel || translationSession || lockedTranslation || commitSession || lockedCommit || composing.current) return
     const submitted = text, submittedSession = sessionID, submittedProject = projectID, submittedAttachments = attachments
     const submittedIDs = new Set(submittedAttachments.map(item => item.id))
     submittingDraft.current = draft
@@ -522,11 +580,17 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
       if (!await submit.current!(projectID, sessionID, prompt, selectedModel, undefined, files.length ? files : undefined, draftID, permissionMode)) return
       if (currentProject.current === submittedProject && (currentSession.current === submittedSession || (!submittedSession && currentSession.current === createdSession.current))) {
         setTrigger(null); setAttachmentPicker(false)
+        setPendingPromptRestore(null); setRewindError('')
       }
       updateDraft(draft, current => ({ text: current.text === submitted ? '' : current.text, attachments: current.attachments.filter(item => !submittedIDs.has(item.id)) }))
       if (!submittedSession) cleanupAbandonedNewChatDraft(submittedProject, draftID)
       refresh.current(); onActivity()
-    } catch (e) { report(e) } finally {
+    } catch (e) {
+      if (activeRevert) {
+        if (currentProject.current === submittedProject && currentSession.current === submittedSession) { setRewindError(formatRevertError(e)); refresh.current() }
+        onActivity()
+      } else report(e)
+    } finally {
       for (const flightKey of [...inFlightDraftKeys]) {
         if (flightKey !== key && chatDrafts.get(flightKey) !== draft) continue
         inFlightDraftKeys.delete(flightKey)
@@ -581,9 +645,16 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     <div className="chat-pane__body">{menu && <div className="chat-corner-drawer is-open" role="menu"><button className="chat-drawer__row" role="menuitem" onClick={() => { onCreate(); setMenu(false) }}>Cuộc trò chuyện mới</button><button className="chat-drawer__row" role="menuitem" onClick={() => { void navigator.clipboard.writeText(messages.map(item => `${item.role}: ${item.text}`).join('\n\n')).catch(report); setMenu(false) }}>Copy conversation</button></div>}
       <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><div className="chat-drawer__head-actions">{drawer === 'agents' && projectID && sessionID && <button type="button" className="chat-drawer__action" onClick={() => { setDrawer(null); setAgentMapOpen(true) }}>Agent map</button>}<IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? lockedTranslation || translationSession ? <Empty>Dùng Chat chính mới cho /btw; phiên dịch Android chỉ dành cho bản địa hóa.</Empty> : projectID && sessionID ? <BtwPanel key={JSON.stringify([projectID, sessionID])} projectID={projectID} sessionID={sessionID} connected={connected} ready={ready} model={activeModel} onCreated={onCreated} onSelectSession={onSelectSession} onActivity={onActivity} /> : <Empty>Chọn một phiên để mở luồng phụ /btw.</Empty> : <>{drawer === 'artifacts' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={sessionID} /> : <Empty>Mở dự án để xem artifacts.</Empty>)}<button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Mở bảng Artifacts</button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
       <div ref={timeline} className="chat-stream" onScroll={e => { const el = e.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
-        {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty>         : projectChatTimeline(messages, { running, mode: timelineDetail }).map(turn => <section key={turn.id} className="chat-turn">
-                 {turn.user && <article className="msg-user"><MessageContent text={extractUserDisplayText(turn.user.text) || '…'} onOpenFile={onOpenFile} /><MessageAttachmentList attachments={turn.user.attachments} /></article>}
-                 <div className="msg-turn-body">{turn.blocks.map(block => {
+        {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty>         : projectChatTimeline(activeMessages, { running, mode: timelineDetail }).map(turn => <section key={turn.id} className="chat-turn">
+                  {turn.user && <article className="msg-user"><MessageContent text={extractUserDisplayText(turn.user.text) || '…'} onOpenFile={onOpenFile} /><MessageAttachmentList attachments={turn.user.attachments} /></article>}
+                  {turn.user && canRewindSession && <div className="rewind-turn-actions">
+                    <button type="button" className="rewind-trigger" data-testid="rewind-trigger" aria-expanded={rewindPickerTurnID === turn.user.id} disabled={!connected || running || busy || rewinding} onClick={() => setRewindPickerTurnID(current => current === turn.user!.id ? null : turn.user!.id)}>Quay lại từ đây</button>
+                    {rewindPickerTurnID === turn.user.id && <div className="rewind-chooser" data-testid="rewind-chooser">
+                      <div className="button-row"><button type="button" disabled={!connected || running || busy || rewinding} onClick={() => void startRewind(turn.user!.id, false)}>Chỉ quay lui hội thoại</button><button type="button" disabled={!connected || running || busy || rewinding} onClick={() => void startRewind(turn.user!.id, true)}>Quay lui hội thoại &amp; tệp</button><button type="button" onClick={() => setRewindPickerTurnID(null)}>Đóng</button></div>
+                      <p>Tạm quay lui tới trước lượt này (chưa xóa vĩnh viễn cho tới khi gửi tin nhắn mới). Khôi phục tệp phụ thuộc Git/snapshot và không hoàn tác DB, tiến trình, commit hay tệp ngoài snapshot.</p>
+                    </div>}
+                  </div>}
+                 <div className="msg-turn-body">{todoView.byTurnID[turn.id] && <TodoProgressCard key={`${sessionID}:${turn.id}:todo`} snapshot={todoView.byTurnID[turn.id]} />}{turn.blocks.map(block => {
                    const actions = { projectDirectory, onOpenFile, onOpenAgentMap: () => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) } }
                    if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
                    if (block.kind === 'active-tools') return <ActiveToolsView key={block.id} items={block.items} {...actions} />
@@ -598,7 +669,18 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
         {permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
       {commitSession || lockedCommit ? <div className="translation-locked-banner" role="status" data-testid="commit-agent-locked-banner"><Icon name="lock" /><p>{lockedCommit ? 'Phiên Trợ lý Commit AI này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Trợ lý Commit AI riêng. Mở Trợ lý Commit AI để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p><button type="button" onClick={() => onOpenCommitAgent?.(sessionID)}>Trợ lý Commit AI</button><button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <>
-      {lockedTranslation || translationSession ? <div className="translation-locked-banner" role="status" data-testid="translation-locked-banner"><Icon name="lock" /><p>{lockedTranslation ? 'Phiên dịch Android này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Dịch Android riêng. Mở Dịch Android để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p>{!lockedTranslation && <button type="button" onClick={() => onOpenAndroidTranslation?.()}>Dịch Android</button>}<button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <div className="composer-dock"><div className="composer-dock__inner">{(projectName || sessionID) && <div className="composer-context-strip">{sessionID ? <button className="ctx-strip-chip" onClick={() => onOpenPanel('changes')} title="Thay đổi của toàn bộ session, từ OpenCode snapshots"><Icon name="diff" /><span>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files changed`}</span>{changesStatus === 'ready' && projectName && <span className="ctx-strip-chip__meta">· {projectName}</span>}</button> : <span>Project: <strong>{projectName}</strong>{branch ? ` (${branch})` : ''}</span>}{sessionID && <button type="button" className="agent-map-trigger" data-testid="agent-map-trigger" title="Mở Agent map (sơ đồ subagents, skill, prompt và output)" onClick={() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }}><span className={`agent-map-dot ${agentFamily.runningCount > 0 ? 'agent-map-dot--running' : agentFamily.subagentCount > 0 ? 'agent-map-dot--succeeded' : 'agent-map-dot--idle'}`} aria-hidden="true" /><span>{agentFamily.subagentCount > 0 ? `${agentFamily.subagentCount} subagent` : 'Agent map'}</span></button>}</div>}      <form className="composer-card" onSubmit={e => { e.preventDefault(); void send() }} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) { setTrigger(null); setAttachmentPicker(false) } }}>
+      {lockedTranslation || translationSession ? <div className="translation-locked-banner" role="status" data-testid="translation-locked-banner"><Icon name="lock" /><p>{lockedTranslation ? 'Phiên dịch Android này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Dịch Android riêng. Mở Dịch Android để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p>{!lockedTranslation && <button type="button" onClick={() => onOpenAndroidTranslation?.()}>Dịch Android</button>}<button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <div className="composer-dock"><div className="composer-dock__inner">{(projectName || sessionID) && <div className="composer-context-strip">{sessionID ? <button className="ctx-strip-chip" onClick={() => onOpenPanel('changes')} title="Thay đổi của toàn bộ session, từ OpenCode snapshots"><Icon name="diff" /><span>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files changed`}</span>{changesStatus === 'ready' && projectName && <span className="ctx-strip-chip__meta">· {projectName}</span>}</button> : <span>Project: <strong>{projectName}</strong>{branch ? ` (${branch})` : ''}</span>}{sessionID && <button type="button" className="agent-map-trigger" data-testid="agent-map-trigger" title="Mở Agent map (sơ đồ subagents, skill, prompt và output)" onClick={() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }}><span className={`agent-map-dot ${agentFamily.runningCount > 0 ? 'agent-map-dot--running' : agentFamily.subagentCount > 0 ? 'agent-map-dot--succeeded' : 'agent-map-dot--idle'}`} aria-hidden="true" /><span>{agentFamily.subagentCount > 0 ? `${agentFamily.subagentCount} subagent` : 'Agent map'}</span></button>}</div>}
+              {rewindError && <div className="inline-error" role="alert" data-testid="rewind-error">{rewindError}</div>}
+              {activeRevert && rewindSummary && <div className="rewind-banner" data-testid="rewind-banner" role="status">
+                <strong>Đang quay lui · {revertedTurnCount} lượt</strong>
+                <p>Gửi yêu cầu mới để tiếp tục từ mốc này, hoặc hủy để khôi phục lại.</p>
+                <strong>{rewindSummary.headline}</strong><p>{rewindSummary.detail}</p>
+                {!!rewindSummary.files.length && <details className="rewind-banner__files"><summary>{rewindSummary.files.length} tệp · +{rewindSummary.totalAdditions} −{rewindSummary.totalDeletions}</summary>{rewindSummary.files.map(file => <div className="rewind-file-row" key={file.file}><span className="rewind-file-status">{file.status}</span><button type="button" onClick={() => onOpenFile(file.file)}>{file.file}</button><span>+{file.additions} −{file.deletions}</span></div>)}</details>}
+                <div className="button-row"><button type="button" data-testid="rewind-clear" disabled={!connected || running || busy || rewinding} onClick={() => void cancelRewind()}>Hủy quay lui</button>
+                  {pendingPromptRestore?.sessionID === sessionID && pendingPromptRestore?.text && <button type="button" disabled={rewinding || busy || running} onClick={() => { setText(pendingPromptRestore.text); setPendingPromptRestore(null) }}>Nạp lại prompt đã quay lui</button>}
+                </div>
+              </div>}
+              <form className="composer-card" onSubmit={e => { e.preventDefault(); void send() }} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) { setTrigger(null); setAttachmentPicker(false) } }}>
               <ComposerAttachmentStrip attachments={attachments} onRemove={id => setAttachments(current => current.filter(attachment => attachment.id !== id))} />
               <ComposerDropOverlay active={dragActive} />
               {popoverOpen && <div className="composer-popover is-open">

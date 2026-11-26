@@ -3,6 +3,9 @@ import { test } from 'node:test'
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
+import * as fs from 'node:fs'
+import { pathToFileURL } from 'node:url'
+import { readOsClipboardFiles } from '../apps/desktop/src/main/os-clipboard-files'
 import { tmpdir } from 'node:os'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
@@ -22,8 +25,11 @@ import * as composerMentions from '../apps/desktop/src/renderer/composer-mention
 import { chatSubmit } from '../apps/desktop/src/renderer/chat-submit'
 import * as modelSelection from '../apps/desktop/src/renderer/model-selection'
 import * as chatTimeline from '../apps/desktop/src/renderer/chat-timeline'
+import * as chatTodo from '../apps/desktop/src/renderer/chat-todo'
+import * as chatRewind from '../apps/desktop/src/renderer/chat-rewind'
 import { familySummaryFromSessions } from '../apps/desktop/src/renderer/agent-map-model'
 import { z } from 'zod'
+import { resolveModelLevel } from '../packages/amekit/src/model-policy'
 import { rendererSource, isRendererDocument } from '../apps/desktop/src/main/renderer-source'
 import { replaceInWorkspace } from '../packages/ide-core/src/search'
 import { validateWorkspacePath } from '../packages/ide-core/src/workspace-fs'
@@ -37,6 +43,8 @@ import { buildCommitAgentPrompt, createCommitAgentLockStore, extractCommitSnapsh
 
 type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
+  { method: 'stageRevert', args: ['p', 's', 'message-2', true] },
+  { method: 'clearRevert', args: ['p', 's'] },
   { method: 'forms', args: ['p', 's'] },
   { method: 'replyForm', args: ['p', 's', 'f', { locale: 'ja', multiple: ['a', 'b'], enabled: true, count: 2 }] },
   { method: 'cancelForm', args: ['p', 's', 'f', 'skip'] },
@@ -48,6 +56,10 @@ const examples: Invocation[] = [
   { method: 'createFile', args: ['p', 'new.txt', 'hello'] },
   { method: 'createDirectory', args: ['p', 'folder'] },
   { method: 'renamePath', args: ['p', 'old.txt', 'new.txt'] },
+  { method: 'copyPath', args: ['p', 'q', 'old.txt', ''] },
+  { method: 'movePath', args: ['p', 'q', 'old.txt', 'folder'] },
+  { method: 'clipboardFiles', args: [] },
+  { method: 'pasteClipboardFiles', args: ['p', ''] },
   { method: 'deletePath', args: ['p', 'old.txt'] },
   { method: 'revealPath', args: ['p', 'new.txt'] },
   { method: 'searchProject', args: ['p', { query: 'hello', include: ['**/*.txt'], exclude: ['out/**'], caseSensitive: true, wholeWord: true, regex: false, maxFiles: 10, maxMatches: 20 }] },
@@ -81,6 +93,113 @@ const examples: Invocation[] = [
 ]
 
 const buildNotesRequest: BuildNotesRequest = { mode: 'range', baseCommit: 'abcdef0', includeWorking: true }
+
+test('workspace transfer IPC rejects malformed tuples and NUL target directories', async () => {
+  const h = await harness()
+  for (const method of ['copyPath', 'movePath']) {
+    for (const args of [['p', '', 'file', ''], ['p', 'q', '', ''], ['p', 'q', 'file\0', ''], ['p', 'q', 'file', 'dir\0'], ['p', 'q', 'file', 1]]) {
+      await assert.rejects(h.dispatch(method, args))
+    }
+  }
+  for (const args of [['p', 'dir\0'], ['p'], ['p', '', '/host/path']]) await assert.rejects(h.dispatch('pasteClipboardFiles', args))
+  await assert.rejects(h.dispatch('clipboardFiles', ['/host/path']))
+  assert.deepEqual(h.calls, [])
+})
+
+test('Rewind IPC validates schemas, delegates, and rejects protected sessions', async () => {
+  const h = await harness()
+  h.setAdapterMethod('stageRevert', async (...args) => { h.calls.push({ method: 'stageRevert', args }); return { messageID: args[2] } })
+  h.setAdapterMethod('clearRevert', async (...args) => { h.calls.push({ method: 'clearRevert', args }) })
+  assert.deepEqual(plain(await h.dispatch('stageRevert', ['p', 's', 'm', false])), { messageID: 'm' })
+  await h.dispatch('clearRevert', ['p', 's'])
+  assert.deepEqual(plain(h.calls), [{ method: 'stageRevert', args: ['p', 's', 'm', false] }, { method: 'clearRevert', args: ['p', 's'] }])
+  h.calls.length = 0
+  for (const args of [['p', 's', '', true], ['p', 's', 'x'.repeat(201), true], ['p', 's', 'm', 'true'], ['p', 's', 'm'], ['', 's', 'm', true]]) await assert.rejects(h.dispatch('stageRevert', args))
+  for (const args of [['p'], ['p', ''], ['p', 's', true]]) await assert.rejects(h.dispatch('clearRevert', args))
+  for (const method of ['stageRevert', 'clearRevert']) {
+    const session = `locked-${method}`
+    const args = method === 'stageRevert' ? ['p', session, 'm', true] : ['p', session]
+    await h.translationLocks.lockSession('p', session)
+    await assert.rejects(h.dispatch(method, args), /TRANSLATION_SESSION_LOCKED/)
+    await h.commitAgentLocks.lockSession('p', session)
+    await assert.rejects(h.dispatch(method, args), /COMMIT_AGENT_SESSION_LOCKED/)
+  }
+  assert.deepEqual(h.calls, [])
+})
+
+test('Rewind mutations share authority with prompts and session creation', async () => {
+  const h = await harness()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const order: string[] = []
+  h.setAdapterMethod('stageRevert', async () => { order.push('stage'); await gate; order.push('staged') })
+  h.setAdapterMethod('clearRevert', async () => { order.push('clear') })
+  h.setAdapterMethod('createSession', async () => { order.push('create'); return { id: 'new' } })
+  const stage = h.dispatch('stageRevert', ['p', 's', 'm', true])
+  const clear = h.dispatch('clearRevert', ['p', 's'])
+  const create = h.dispatch('createSession', ['p'])
+  try {
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    assert.deepEqual(order, ['stage'])
+  } finally { release() }
+  await Promise.all([stage, clear, create])
+  assert.deepEqual(order, ['stage', 'staged', 'clear', 'create'])
+})
+
+test('clipboard IPC exposes names only and pastes current OS files through workspace validation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ame-clipboard-ipc-'))
+  const workspaces = new Workspaces(path.join(root, 'projects.json'))
+  try {
+    const target = path.join(root, 'target'), external = path.join(root, 'external')
+    await mkdir(target); await mkdir(external)
+    const file = path.join(external, 'photo.bin')
+    const bytes = Buffer.from([0, 255, 1, 128])
+    await writeFile(file, bytes)
+    const project = await workspaces.add(target)
+    const h = await harness(target)
+    h.setWorkspaceMethod('pasteExternalPaths', (_id, files, dir) => workspaces.pasteExternalPaths(project.id, files, dir))
+    assert.deepEqual(plain(await h.dispatch('clipboardFiles', [])), { hasFiles: false, count: 0, names: [] })
+    await assert.rejects(h.dispatch('pasteClipboardFiles', ['p', '']), /CLIPBOARD_EMPTY/)
+    h.setClipboardPaths([file, file, path.join(external, 'missing')])
+    assert.deepEqual(plain(await h.dispatch('clipboardFiles', [])), { hasFiles: true, count: 1, names: ['photo.bin'] })
+    assert.deepEqual(plain(await h.dispatch('pasteClipboardFiles', ['p', ''])), { paths: ['photo.bin'] })
+    assert.deepEqual(plain(await h.dispatch('pasteClipboardFiles', ['p', ''])), { paths: ['photo copy.bin'] })
+    assert.deepEqual(await readFile(path.join(target, 'photo copy.bin')), bytes)
+    for (const dir of ['../external', '.git']) await assert.rejects(h.dispatch('pasteClipboardFiles', ['p', dir]))
+    // Read again at paste time, not from a previously cached preview.
+    h.setClipboardPaths([])
+    await assert.rejects(h.dispatch('pasteClipboardFiles', ['p', '']), /CLIPBOARD_EMPTY/)
+    h.setClipboardApi({ read: async () => [{ types: ['electron application/osclipboard;format="text/uri-list"'], getType: async () => ({ arrayBuffer: async () => Buffer.from(pathToFileURL(file).href) }) }] })
+    assert.deepEqual(plain(await h.dispatch('clipboardFiles', [])), { hasFiles: true, count: 1, names: ['photo.bin'] })
+    assert.deepEqual(plain(await h.dispatch('pasteClipboardFiles', ['p', ''])), { paths: ['photo copy 2.bin'] })
+  } finally { workspaces.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('copy and cut IPC integrate across projects without overwriting and reject unsafe paths', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ame-transfer-ipc-'))
+  const workspaces = new Workspaces(path.join(root, 'projects.json'))
+  try {
+    const source = path.join(root, 'source'), target = path.join(root, 'target')
+    await mkdir(source); await mkdir(target)
+    await mkdir(path.join(source, 'folder')); await mkdir(path.join(source, 'folder', 'child'))
+    await writeFile(path.join(source, 'file.txt'), 'source')
+    await writeFile(path.join(target, 'file.txt'), 'keep')
+    const s = await workspaces.add(source), t = await workspaces.add(target)
+    const h = await harness(target)
+    h.setWorkspaceMethod('copyPath', (a, b, c, d) => workspaces.copyPath(a, b, c, d))
+    h.setWorkspaceMethod('movePath', (a, b, c, d) => workspaces.movePath(a, b, c, d))
+    assert.deepEqual(plain(await h.dispatch('copyPath', [t.id, s.id, 'file.txt', ''])), { path: 'file copy.txt', directory: false })
+    const cut = plain(await h.dispatch('movePath', [t.id, s.id, 'file.txt', '']))
+    assert.deepEqual(cut, { from: 'file.txt', to: 'file copy 2.txt', directory: false, sameProject: false, moved: true })
+    await assert.rejects(readFile(path.join(source, 'file.txt')), { code: 'ENOENT' })
+    assert.equal(await readFile(path.join(target, 'file.txt'), 'utf8'), 'keep')
+    assert.deepEqual(plain(await h.dispatch('movePath', [t.id, t.id, 'file.txt', ''])), { from: 'file.txt', to: 'file.txt', directory: false, sameProject: true, moved: false })
+    for (const method of ['copyPath', 'movePath']) {
+      await assert.rejects(h.dispatch(method, [s.id, s.id, 'folder', 'folder/child']))
+      for (const relative of ['../escape', '.git/config']) await assert.rejects(h.dispatch(method, [t.id, s.id, relative, '']))
+    }
+  } finally { workspaces.dispose(); await rm(root, { recursive: true, force: true }) }
+})
 
 test('openExternal IPC opens canonical HTTP URLs only and rejects unsafe or malformed URLs', async () => {
   const h = await harness()
@@ -177,6 +296,7 @@ async function harness(directory = 'workspace') {
   const calls: Invocation[] = []
   const messages: string[] = []
   let response = 1
+  let clipboardText = ''
   let onConfirm: (() => Promise<void>) | undefined
   let picked = { canceled: true, filePaths: [] as string[] }
   const resolved = [{ ok: true, kind: 'workspace-file', path: 'src/app.ts', name: 'app.ts' }]
@@ -200,6 +320,7 @@ async function harness(directory = 'workspace') {
   }
   let models = [{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }]
   let status: any = { account: { role: 'admin' }, models: { default_model: 'server-model', models: [{ id: 'server-model' }] } }
+  let refreshAccount: (() => unknown) | undefined
   let operationGate: Promise<void> | undefined
   let summary = { diff: '+change', files: ['new.txt'], truncated: false }
   let pricing = { origin: 'https://usage.example', prices: { model: { revision: 1 } } }
@@ -214,6 +335,7 @@ async function harness(directory = 'workspace') {
     if (method === 'prompt' && extractCommitSnapshotID(String(args[2]))) sessionMessages = [...sessionMessages, { id: randomUUID(), role: 'user', text: args[2] }]
     return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
   }]))
+  for (const method of ['stageRevert', 'clearRevert']) adapter[method] = async (...args: unknown[]) => { calls.push({ method, args }); if (operationGate) await operationGate; return method }
   adapter.sessionPermissionMode = async (...args: unknown[]) => { calls.push({ method: 'sessionPermissionMode', args }); return 'readonly' }
   adapter.generateBuildNotes = async (...args: unknown[]) => {
     calls.push({ method: 'generateBuildNotes', args })
@@ -238,6 +360,7 @@ async function harness(directory = 'workspace') {
     if (policyGate && args[0] !== 'status') await policyGate
     if (policyError && args[0] !== 'status') throw new Error(policyError)
     if (args[0] === 'status') return status
+    if (args[0] === 'refresh') return refreshAccount ? refreshAccount() : status
     if (args[0] === 'usage-prices') return pricing
   } }
   const services: { kind: string; directory: string; methods: Record<string, (...args: any[]) => any>; emit?: (event: unknown) => void }[] = []
@@ -294,7 +417,9 @@ async function harness(directory = 'workspace') {
   adapter.sessions = async (...args: unknown[]) => { calls.push({ method: 'sessions', args }); return sessions }
   adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
-    z, URL, Buffer, process, randomUUID, Error, GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
+    z, URL, Buffer, process, randomUUID, Error, resolveModelLevel, GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
+    fs, path, readOsClipboardFiles,
+    clipboard: { availableFormats: () => ['text/uri-list'], read: () => clipboardText },
     window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
     translationLocks, buildAndroidTranslationPrompt, commitAgentLocks, buildCommitAgentPrompt, extractCommitSnapshotID, parseCommitAgentPlan, canonicalWorkspaceScope,
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
@@ -304,7 +429,11 @@ async function harness(directory = 'workspace') {
     createTsLanguageService: (directory: string) => serviceFactory('lsp', directory),
     createNodeDebugger: (directory: string, emit: (event: unknown) => void) => serviceFactory('debug', directory, emit),
     terminals: { closeProject: (...args: unknown[]) => { calls.push({ method: 'terminal:closeProject', args }) } },
-    pairing: { status: () => ({ enabled: false }) },
+    pairing: {
+      status: () => ({ enabled: false }),
+      revokeDevice: async (...args: unknown[]) => { calls.push({ method: 'pairingRevokeDevice', args }); return { enabled: false, devices: [] } },
+      revokeAll: async (...args: unknown[]) => { calls.push({ method: 'pairingRevokeAll', args }); return { enabled: false, devices: [] } },
+    },
     configurePairing: async (settings: unknown) => { calls.push({ method: 'configurePairing', args: [settings] }); return settings },
     shell: { showItemInFolder: (target: string) => calls.push({ method: 'shell', args: [target] }), openExternal: async (url: string) => { calls.push({ method: 'shell:openExternal', args: [url] }) } },
     dialog: { showOpenDialog: async (window: unknown, options: unknown) => {
@@ -330,6 +459,8 @@ async function harness(directory = 'workspace') {
   }
   return {
     call, dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState, resolved,
+    setClipboardPaths: (files: string[]) => { clipboardText = files.map(file => pathToFileURL(file).href).join('\r\n') },
+    setClipboardApi: (api: unknown) => { (context as Record<string, unknown>).clipboard = api },
     setReplacement: (replace: (...args: any[]) => Promise<unknown>) => { workspace.replaceInProject = replace },
     onConfirm: (callback: () => Promise<void>) => { onConfirm = callback },
     setPicked: (value: typeof picked) => { picked = value },
@@ -356,7 +487,7 @@ async function harness(directory = 'workspace') {
     failRemove: () => { workspace.remove = async (...args: unknown[]) => { calls.push({ method: 'remove', args }); throw new Error('REMOVE_FAILED') } },
     setProjectDirectory: (id: string, value: string) => { const previous = workspace.get; workspace.get = key => key === id ? { directory: value } : previous(key) },
     invalidateProject: () => { workspace.get = () => { throw new Error('UNKNOWN_PROJECT') } }, setPricing: (value: typeof pricing) => { pricing = value },
-    setStatus: (value: unknown) => { status = value }, setProjects: (value: { id: string; directory: string }[]) => { workspace.list = () => value },
+    setStatus: (value: unknown) => { status = value }, setAccountRefresh: (handler: () => unknown) => { refreshAccount = handler }, setProjects: (value: { id: string; directory: string }[]) => { workspace.list = () => value },
     gateOperation: (value: Promise<void>) => { operationGate = value }, shutdown: () => { context.shuttingDown = true },
     setModels: (value: typeof models) => {
       models = value
@@ -422,7 +553,7 @@ async function rendererModule(file: string, hooks: ReturnType<typeof rendererHoo
     './pet-sessions': petSessionMapping, '../chat-refresh': chatRefresh, './editor-model-lifecycle': editorModelLifecycle,
     'monaco-editor': { editor: { getModels: () => [] }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } },
     '../composer-mentions': composerMentions, '../chat-submit': { chatSubmit }, '../model-selection': modelSelection,
-    '../chat-timeline': chatTimeline, '../agent-map-model': { familySummaryFromSessions }
+    '../chat-timeline': chatTimeline, '../chat-todo': chatTodo, '../chat-rewind': chatRewind, '../agent-map-model': { familySummaryFromSessions }
   }
   const components = new Map<string, React.ComponentType<any>>()
   const exports: Record<string, any> = {}
@@ -1325,7 +1456,20 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
       Terminals: class { dispose() { sequence.push('terminals:dispose') } },
       OpenCodeAdapter: class { abortRequests() { sequence.push('adapter:abort'); release() } dispose() { sequence.push('adapter:dispose') } },
       PrivateRuntime: class { constructor() { sequence.push('runtime:create') } executable() { return 'opencode' } async stop() { sequence.push('runtime:stop') } },
-      PairingHost: class {}, RemotePairing: class { async stop() { sequence.push('pairing:stop') } }, automaticTunnel: () => ({}),
+      PairingHost: class {
+        constructor(_endpoint: unknown, store: unknown) {
+          assert.ok(store)
+          assert.ok(sequence.includes('pairing-devices:ready'))
+          sequence.push('pairing:create')
+        }
+      }, RemotePairing: class { async stop() { sequence.push('pairing:stop') } }, automaticTunnel: (directory: string) => {
+        assert.equal(directory, path.join('userData', 'remote-access'))
+        return {}
+      },
+      PairingDeviceStore: class {
+        constructor(file: string) { assert.equal(file, path.join('userData', 'remote-access', 'devices.json')) }
+        async ready() { sequence.push('pairing-devices:ready') }
+      },
       createAmeKit: (value: any) => { accountOptions = value; return { generatePetDialogue: (model: string, signal: AbortSignal) => ({ model, signal }), dispose: async () => { sequence.push('account:dispose') } } },
       setTimeout: (callback: () => void, ms: number) => { assert.equal(ms, 500); bundleTimers.push(callback); return { unref() {} } },
       loadPetSprite: async (value: string) => { spritePath = value; throw new Error('missing sprite') },
@@ -1412,7 +1556,7 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
 test('all new IPC tuples reject malformed requests before dispatch or confirmation', async () => {
   const { dispatch, calls, messages } = await harness()
   for (const { method, args } of examples) {
-    for (const invalid of [[], ['', ...args.slice(1)], [42, ...args.slice(1)], ['x'.repeat(513), ...args.slice(1)], [...args, 'extra']]) {
+    for (const invalid of args.length ? [[], ['', ...args.slice(1)], [42, ...args.slice(1)], ['x'.repeat(513), ...args.slice(1)], [...args, 'extra']] : [['extra']]) {
       await assert.rejects(dispatch(method, invalid), method)
     }
   }
@@ -1472,7 +1616,7 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
 
 test('new IPC dispatch preserves arguments and optional defaults without stage or dry-run dialogs', async () => {
   const { dispatch, calls, messages } = await harness()
-  for (const { method, args } of examples.filter(({ method }) => !['deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage', 'sessionUsage', 'gitDeleteBranch', 'gitStashDrop'].includes(method))) {
+  for (const { method, args } of examples.filter(({ method }) => !['clipboardFiles', 'pasteClipboardFiles', 'deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage', 'sessionUsage', 'gitDeleteBranch', 'gitStashDrop'].includes(method))) {
     calls.length = 0
     const result = await dispatch(method, args)
     assert.deepEqual(plain(calls), [{ method, args }])
@@ -1994,8 +2138,9 @@ test('translation followups keep their initial model despite configuration/defau
   await assert.rejects(h.dispatch('btwAsk', ['p', 'translation-1', 'Code', featureModel]), /ANDROID_TRANSLATION_SESSION_REQUIRED/)
   assert.equal(h.calls.length, 0)
   h.setFeatureAuthorizer(async () => null)
-  await assert.rejects(h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue']), /TRANSLATION_MODEL_UNAVAILABLE/)
-  assert.equal((h.calls as Invocation[]).some(call => call.method === 'prompt'), false)
+  const migrated = await h.dispatch('androidTranslationPrompt', ['p', 'translation-1', 'Continue']) as any
+  assert.equal(migrated.model.modelID, 'server-model')
+  assert.equal((h.calls as Invocation[]).some(call => call.method === 'prompt'), true)
 })
 
 test('a translation started on API default stays on that model after the default changes', async () => {
@@ -2579,6 +2724,103 @@ test('commit agent info reports feature policy, Git counts and independent lock 
   assert.equal((await defaults.dispatch('commitAgentInfo', ['p']) as any).skill, commitSkill.name)
 })
 
+test('feature info endpoints resolve haiku aliases and survive unreadable bundles or missing status', async () => {
+  for (const endpoint of ['buildNotesPreview', 'commitAgentInfo', 'androidTranslationInfo']) {
+    const h = await harness()
+    const read = endpoint === 'buildNotesPreview' ? h.setBuildNotesFeatureReader : endpoint === 'commitAgentInfo' ? h.setCommitEnhanceFeatureReader : h.setAndroidTranslationReader
+    read(async () => ({ skill: null, model: 'amecode/haiku' }))
+    h.setReadStatus(async () => ({ models: { default_model: 'server-model', model_levels: { default: 'server-model', haiku: 'fast', sonnet: 'server-model', opus: 'server-model' }, active_models: [{ id: 'server-model' }, { id: 'fast', name: 'Fast' }] } }) as any)
+    const args = endpoint === 'buildNotesPreview' ? ['p', buildNotesRequest] : ['p']
+    const info = await h.dispatch(endpoint, args) as any
+    assert.equal(info.configuredModelID, 'amecode/haiku', endpoint)
+    assert.equal(info.effectiveModelID, 'fast', endpoint)
+    assert.equal(info.fallbackToDefault, false, endpoint)
+    read(async () => { throw new Error('BUNDLE_UNREADABLE') })
+    assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, 'server-model', endpoint)
+    h.setReadStatus(async () => { throw new Error('STATUS_UNAVAILABLE') })
+    h.setModels([{ id: 'foreign', modelID: 'foreign', name: 'Foreign', providerID: 'external' }, { id: 'runtime-default', modelID: 'api-default', name: 'API default', providerID: 'amecode' }])
+    const fallback = await h.dispatch(endpoint, args) as any
+    assert.equal(fallback.effectiveModelID, endpoint === 'buildNotesPreview' ? undefined : 'api-default', endpoint)
+    assert.equal(fallback.fallbackToDefault, true, endpoint)
+    if (endpoint !== 'buildNotesPreview') assert.equal(fallback.effectiveModelName, 'API default', endpoint)
+    for (const status of [null, {}]) {
+      h.setReadStatus(async () => status as any)
+      assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, endpoint === 'buildNotesPreview' ? undefined : 'api-default', `${endpoint}: missing status catalog`)
+    }
+    h.setReadStatus(async () => ({ models: { default_model: 'server-model', active_models: [], models: [{ id: 'server-model' }] } }) as any)
+    assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, endpoint === 'buildNotesPreview' ? undefined : 'api-default', `${endpoint}: empty active list must not use stale catalog models`)
+    h.setAdapterMethod('models', async () => { throw new Error('RUNTIME_UNAVAILABLE') })
+    assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, undefined, endpoint)
+  }
+})
+
+test('feature generation authorizes canonical haiku models rather than tier aliases', async () => {
+  const h = await harness()
+  const fast = { id: 'fast-runtime', modelID: 'fast', name: 'Fast', providerID: 'amecode' }
+  h.setModels([{ ...selectedModel, modelID: 'server-model' }, fast])
+  h.setReadStatus(async () => ({ models: { default_model: 'server-model', model_levels: { default: 'server-model', haiku: 'fast', sonnet: 'server-model', opus: 'server-model' }, active_models: [{ id: 'server-model' }, { id: 'fast' }] } }) as any)
+  h.setBuildNotesFeatureReader(async () => ({ skill: null, model: 'haiku' }))
+  h.setFeatureAuthorizer(async id => { assert.equal(id, 'fast'); return id })
+  assert.equal((await h.dispatch('generateBuildNotes', ['p', buildNotesRequest]) as any).modelID, 'fast')
+})
+
+test('feature followups migrate disabled pins to the configured model and persist the new session pin', async () => {
+  for (const kind of ['translation', 'commit']) {
+    const h = await harness()
+    const endpoint = kind === 'translation' ? 'androidTranslationPrompt' : 'commitAgentPrompt'
+    const read = kind === 'translation' ? h.setAndroidTranslationReader : h.setCommitEnhanceFeatureReader
+    const skill = kind === 'translation' ? translationSkill : commitSkill
+    const original = { id: 'old-runtime', modelID: 'old', name: 'Old', providerID: 'amecode' }
+    const replacement = { id: 'new-runtime', modelID: 'new', name: 'New', providerID: 'amecode' }
+    const defaultModel = { ...selectedModel, modelID: 'server-model' }
+    h.setModels([defaultModel, original, replacement])
+    read(async () => ({ skill, model: 'old' }))
+    h.setFeatureAuthorizer(async id => id)
+    await h.dispatch(endpoint, ['p', undefined, 'Start'])
+    read(async () => ({ skill, model: 'new' }))
+    const authorized: string[] = []
+    // Even stale successful authorization cannot preserve a pin absent from runtime models.
+    h.setFeatureAuthorizer(async id => { authorized.push(id); return id })
+    h.setModels([defaultModel, replacement])
+    assert.equal((await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any).model.modelID, 'new')
+    assert.deepEqual(authorized, ['old', 'new'])
+    read(async () => ({ skill, model: 'changed-again' }))
+    authorized.length = 0
+    assert.equal((await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any).model.modelID, 'new')
+    assert.deepEqual(authorized, ['new'], 'the session map must contain the migrated canonical pin')
+  }
+})
+
+test('feature followups retain pins equal to the selected API default without feature authorization', async () => {
+  for (const endpoint of ['androidTranslationPrompt', 'commitAgentPrompt']) {
+    const h = await harness()
+    h.setAndroidTranslationReader(async () => ({ skill: translationSkill }))
+    h.setFeatureAuthorizer(async () => { assert.fail('The selected API default is already authorized') })
+    await h.dispatch(endpoint, ['p', undefined, 'Start'])
+    assert.equal((await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any).model.modelID, 'server-model')
+  }
+})
+
+test('feature followups recover metadata and authorization failures but report unavailable when no API models remain', async () => {
+  for (const kind of ['translation', 'commit']) {
+    for (const metadata of ['missing', 'failed', 'disabled']) {
+      const h = await harness()
+      const endpoint = kind === 'translation' ? 'androidTranslationPrompt' : 'commitAgentPrompt'
+      if (kind === 'translation') await h.translationLocks.recordSession('p', 'translation-1')
+      else await h.commitAgentLocks.recordSession('p', 'translation-1')
+      const read = kind === 'translation' ? h.setAndroidTranslationReader : h.setCommitEnhanceFeatureReader
+      read(async () => ({ skill: kind === 'translation' ? translationSkill : commitSkill, model: 'broken-config' }))
+      if (metadata === 'failed') h.setAdapterMethod('agentMap', async () => { throw new Error('READ_FAILED') })
+      if (metadata === 'disabled') h.setSessionModel('disabled')
+      h.setFeatureAuthorizer(async () => { throw new Error('AUTHORIZATION_FAILED') })
+      const result = await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any
+      assert.equal(result.model.modelID, 'server-model', `${kind}/${metadata}`)
+      h.setModels([])
+      await assert.rejects(h.dispatch(endpoint, ['p', 'translation-1', 'Continue']), kind === 'translation' ? /TRANSLATION_MODEL_UNAVAILABLE/ : /COMMIT_AGENT_MODEL_UNAVAILABLE/)
+    }
+  }
+})
+
 test('commit agent creates its own session, pins the authorized feature model and attaches native skills only on first turns', async () => {
   for (const matchBy of ['name', 'id']) {
     const h = await harness()
@@ -2628,7 +2870,7 @@ test('commit agent defaults work without custom skills and native lookup failure
   }
 })
 
-test('commit agent recovers model pins on restart, rejects foreign sessions and never silently changes an unavailable pin', async () => {
+test('commit agent recovers model pins on restart, rejects foreign sessions and migrates unavailable pins to the API default', async () => {
   const h = await harness()
   h.setSessions([{ id: 'commit-1', title: 'Commit' }])
   await h.commitAgentLocks.recordSession('p', 'commit-1')
@@ -2644,8 +2886,9 @@ test('commit agent recovers model pins on restart, rejects foreign sessions and 
   h.setSessions([])
   await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /SESSION_NOT_FOUND/)
   h.setModels([{ id: 'other', modelID: 'other', name: 'Other', providerID: 'amecode' }])
+  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
   h.setFeatureAuthorizer(async () => null)
-  await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /COMMIT_AGENT_MODEL_UNAVAILABLE/)
+  assert.equal((await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any).model.modelID, 'other')
 })
 
 test('commit agent preserves legacy verified skill instructions without guessing a directory and pins the API default', async () => {
@@ -2712,12 +2955,32 @@ test('commit agent IPC rejects malformed IDs, text, modes and extra arguments be
   assert.deepEqual(h.calls, [])
 })
 
+test('model resolution refreshes an expired runtime catalog before prompting or generating a commit', async () => {
+  for (const reconnecting of [true, false]) for (const method of ['prompt', 'generateCommitMessage']) {
+    const h = await harness()
+    const recovered = { id: 'amecode/recovered', modelID: 'recovered', name: 'Recovered', providerID: 'amecode' }
+    h.setModels([])
+    h.setStatus(reconnecting ? { reconnecting: true } : { account: { role: 'user' } })
+    h.setAccountRefresh(() => {
+      h.setModels([recovered])
+      return { account: { role: 'user' }, models: { default_model: 'recovered', models: [{ id: 'recovered' }] } }
+    })
+    const result = await h.dispatch(method, method === 'prompt' ? ['p', 's', 'question', selectedModel] : ['p'])
+    assert.ok(result)
+    assert.deepEqual(h.calls.slice(0, 5).map(call => call.method), ['models', 'account', 'account', 'models', 'account'])
+    assert.deepEqual(plain(h.calls[2]), { method: 'account', args: ['refresh', {}] })
+    assert.deepEqual(plain(h.calls[4]), { method: 'account', args: ['assert-model', { modelID: 'recovered', providerID: 'amecode' }] })
+    assert.equal(h.calls.at(-1)?.method, method)
+    assert.deepEqual(plain(h.calls.at(-1)?.args[method === 'prompt' ? 3 : 1]), recovered)
+  }
+})
+
 test('AI commit fails closed for unavailable models, rejected policy, or no staged changes', async () => {
   const h = await harness()
   for (const models of [[], [{ id: 'model', modelID: 'model', name: 'Model', providerID: 'external' }]]) {
     h.setModels(models); h.calls.length = 0
     await assert.rejects(h.dispatch('generateCommitMessage', ['p']), /AMEKIT_MODEL_REQUIRED/)
-    assert.deepEqual(h.calls.map(call => call.method), ['models'])
+    assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account', 'models'])
   }
   h.setModels([{ id: 'model', modelID: 'server-model', name: 'Model', providerID: 'amecode' }])
   h.calls.length = 0
@@ -2849,6 +3112,27 @@ test('commit skips confirmation while pairing, branch deletion and stash drop re
   }
 })
 
+test('pairing revocation IPC validates IDs and requires native confirmation', async () => {
+  const h = await harness()
+  for (const args of [[], [''], [' '], ['bad\0id'], ['x'.repeat(513)]]) await assert.rejects(h.dispatch('pairingRevokeDevice', args))
+  await assert.rejects(h.dispatch('pairingRevokeAll', ['unexpected']))
+  assert.equal(h.calls.length, 0)
+  for (const [method, args, message] of [
+    ['pairingRevokeDevice', ['device-id'], 'Ngắt kết nối thiết bị này? Thiết bị sẽ không thể truy cập Ame IDE cho tới khi ghép nối lại.'],
+    ['pairingRevokeAll', [], 'Ngắt kết nối tất cả thiết bị đã ghép nối? Mọi thiết bị từ xa sẽ mất quyền truy cập ngay lập tức.'],
+  ] as const) {
+    h.cancel()
+    await assert.rejects(h.dispatch(method, [...args]), /CANCELLED/)
+    assert.equal(h.messages.at(-1), message)
+    assert.equal(h.calls.at(-1)?.method, 'confirm')
+    h.approve()
+    h.calls.length = 0
+    assert.deepEqual(plain(await h.dispatch(method, [...args])), { enabled: false, devices: [] })
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm', method])
+    assert.deepEqual(plain(h.calls.at(-1)?.args), args)
+  }
+})
+
 test('shell reveal validates the actual workspace path including root, metadata, escapes and junctions', async t => {
   const root = await mkdtemp(path.join(process.cwd(), '.ame-ipc-test-'))
   t.after(() => rm(root, { recursive: true, force: true }))
@@ -2941,6 +3225,8 @@ test('preload forwards all new methods, optional arguments, return values and re
     { method: 'diff', args: ['p', 'new.txt', { kind: 'staged', from: 'old.txt' }] },
     { method: 'commitAgentExecutePlan', args: ['p', 'commit-1', approvedPlan] },
     { method: 'openExternal', args: ['https://example.com/answer'] },
+    { method: 'pairingRevokeDevice', args: ['device-id'] },
+    { method: 'pairingRevokeAll', args: [] },
     { method: 'confirmProjectRemoval', args: ['p', ['visible.txt', 'hidden.txt']] },
     { method: 'removeProject', args: ['p'] },
     { method: 'removeProject', args: ['p', randomUUID()] },

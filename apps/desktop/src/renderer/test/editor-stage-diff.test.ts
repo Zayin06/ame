@@ -9,28 +9,81 @@ import * as state from '../state'
 import * as lifecycle from '../editor-model-lifecycle'
 import type { DiffContent } from '../../../../../packages/protocol/src/index'
 
-function render(diff?: DiffContent, tabs: state.Tab[] = [{ path: 'README.md', mode: 'file' }, { path: 'assets/data.bin', mode: 'diff', target: { kind: 'commit', commit: 'abcdef1' } }]) {
+function render(diff?: DiffContent, tabs: state.Tab[] = [{ path: 'README.md', mode: 'file' }, { path: 'assets/data.bin', mode: 'diff', target: { kind: 'commit', commit: 'abcdef1' } }], props: { active?: state.Tab; loadError?: string; isMac?: boolean; onReveal?: (path: string) => void; onReload?: () => void; onClose?: (tab: state.Tab) => void } = {}) {
   const require = createRequire(import.meta.url), exports: Record<string, any> = {}
   let diffMounts = 0
+  let diffProps: Record<string, any> | undefined
   const source = readFileSync(new URL('../components/EditorStage.tsx', import.meta.url), 'utf8')
   const noop = () => {}
   runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText, {
     exports, self: {},
     require(id: string) {
       if (id === 'react') return { useRef: (current: unknown) => ({ current }), useEffect: noop, useState: (value: unknown) => [value, noop] }
-      if (id === '@monaco-editor/react') return { default: () => null, loader: { config: noop }, DiffEditor: () => { diffMounts++; return 'DiffEditor' } }
+      if (id === '@monaco-editor/react') return { default: () => null, loader: { config: noop }, DiffEditor: (props: Record<string, any>) => { diffMounts++; diffProps = props; return 'DiffEditor' } }
       if (id === 'monaco-editor') return { languages: { CompletionItemKind: {} }, typescript: { typescriptDefaults: { setDiagnosticsOptions: noop }, javascriptDefaults: { setDiagnosticsOptions: noop } } }
       if (id.includes('?worker')) return { default: class {} }
       if (id === '../state') return state
       if (id === '../editor-model-lifecycle') return lifecycle
+      if (id === '../monaco-shiki') return { ensureMonacoShikiLanguage: async () => true, shikiThemeName: (theme: string, ready: boolean) => ready ? `ame-${theme}` : theme === 'dark' ? 'vs-dark' : 'light' }
       if (id === '../workspace-paths') return { navigationPosition: noop }
       if (id === './Primitives') return { Empty: ({ children }: any) => children, IconButton: () => null }
+      if (id === './Icon') return { Icon: ({ name }: any) => name }
       return require(id)
     },
   })
-  const html = renderToStaticMarkup(exports.EditorStage({ projectID: 'p', tabs, active: tabs.find(tab => tab.mode === 'diff'), diff, dirtyPaths: new Set(), theme: 'dark' }))
-  return { html, diffMounts }
+  const tree = exports.EditorStage({ projectID: 'p', tabs, active: tabs.find(tab => tab.mode === 'diff'), diff, dirtyPaths: new Set(), theme: 'dark', ...props })
+  const html = renderToStaticMarkup(tree)
+  return { html, tree, diffMounts, diffProps }
 }
+
+function findElements(tree: any, matches: (element: any) => boolean): any[] {
+  if (Array.isArray(tree)) return tree.flatMap(child => findElements(child, matches))
+  if (!tree || typeof tree !== 'object' || !tree.props) return []
+  return [...(matches(tree) ? [tree] : []), ...findElements(tree.props.children, matches)]
+}
+
+test('unreadable files reveal the active path with platform labels between retry and close', () => {
+  const active: state.Tab = { path: 'assets/unreadable.bin', mode: 'file' }
+  for (const isMac of [false, true]) {
+    const revealed: string[] = [], closed: state.Tab[] = []
+    let reloads = 0
+    const { html, tree } = render(undefined, [active], { active, loadError: 'Cannot read file', isMac, onReveal: path => revealed.push(path), onReload: () => reloads++, onClose: tab => closed.push(tab) })
+    const label = isMac ? 'Show in Finder' : 'Show in File Explorer'
+    assert.match(html, /class="editor-load-error"/)
+    assert.ok(html.includes(`data-testid="editor-reveal-btn">folder<span>${label}</span>`))
+    const [error] = findElements(tree, element => element.props.className === 'editor-load-error')
+    const buttons = findElements(error, element => element.type === 'button')
+    assert.equal(buttons.length, 3)
+    assert.equal(buttons[0].props.children, 'Thử lại')
+    assert.equal(buttons[1].props['data-testid'], 'editor-reveal-btn')
+    assert.equal(buttons[2].props.children, 'Đóng tab')
+    buttons.forEach(button => button.props.onClick())
+    assert.equal(reloads, 1)
+    assert.deepEqual(revealed, [active.path])
+    assert.deepEqual(closed, [active])
+  }
+  assert.doesNotMatch(render(undefined, [active], { active, loadError: 'Cannot read file' }).html, /editor-reveal-btn/)
+})
+
+test('binary and too-large diffs reveal the active path with platform labels without Monaco', () => {
+  const active: state.Tab = { path: 'assets/data.bin', mode: 'diff', target: { kind: 'working' } }
+  for (const metadata of [{ binary: true }, { tooLarge: true }]) {
+    for (const isMac of [false, true]) {
+      const revealed: string[] = []
+      const diff = { original: '', modified: '', ...metadata }
+      const { html, tree, diffMounts } = render(diff, [active], { isMac, onReveal: path => revealed.push(path) })
+      const label = isMac ? 'Show in Finder' : 'Show in File Explorer'
+      assert.equal(diffMounts, 0)
+      assert.match(html, /Không có bản xem trước/)
+      assert.ok(html.includes(`<div class="button-row"><button type="button" class="editor-reveal-btn" data-testid="editor-reveal-btn">folder<span>${label}</span></button></div>`))
+      const buttons = findElements(tree, element => element.props['data-testid'] === 'editor-reveal-btn')
+      assert.equal(buttons.length, 1)
+      buttons[0].props.onClick()
+      assert.deepEqual(revealed, [active.path])
+      assert.doesNotMatch(render(diff, [active]).html, /editor-reveal-btn/)
+    }
+  }
+})
 
 test('unpreviewable diff names the file, both sizes and reason without mounting Monaco', () => {
   for (const metadata of [{ binary: true, reason: 'Tệp nhị phân' }, { tooLarge: true, reason: 'Vượt giới hạn 4 MiB' }]) {
@@ -146,5 +199,21 @@ test('non-patch staged, working, commit and range diffs still mount DiffEditor w
     assert.equal(diffMounts, 1)
     assert.match(html, /Chế độ diff/)
     assert.doesNotMatch(html, /diff-patch-view/)
+  }
+})
+
+test('diff language and fallback theme preserve both retained model paths', () => {
+  for (const path of ['view.tsx', 'view.jsx', 'main.ts', 'main.js', 'notes.md']) {
+    const tab: state.Tab = { path, mode: 'diff', target: { kind: 'working' } }
+    const { diffProps } = render({ original: 'before', modified: 'after' }, [tab])
+    assert.ok(diffProps)
+    assert.equal(diffProps.language, state.languageFor(path))
+    assert.equal(diffProps.theme, 'vs-dark')
+    assert.equal(diffProps.keepCurrentOriginalModel, true)
+    assert.equal(diffProps.keepCurrentModifiedModel, true)
+    assert.equal(diffProps.originalModelPath, lifecycle.modelUri('p', state.tabID(tab), 'original'))
+    assert.equal(diffProps.modifiedModelPath, lifecycle.modelUri('p', state.tabID(tab), 'modified'))
+    assert.equal(diffProps.options.readOnly, true)
+    assert.equal(diffProps.options.originalEditable, false)
   }
 })

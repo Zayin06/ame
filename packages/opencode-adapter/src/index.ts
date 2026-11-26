@@ -6,7 +6,7 @@ import { permissionModeSchema, type PermissionMode } from '../../protocol/src/pe
 import path from 'node:path'
 import { summarizeUsage, usageFamily, type UsageNode } from '../../amekit/src/usage'
 import type { UsagePrices } from '../../amekit/src/usage-pricing'
-import type { Agent, AgentMapView, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SkillSummary, SlashCommand, ToolCallInfo } from '../../protocol/src/index'
+import type { Agent, AgentMapView, ArtifactDetail, ArtifactSummary, ChatItem, Connection, IdeEvent, Model, Session, SessionDiff, SessionRevert, SkillSummary, SlashCommand, TodoItem, TodoStatus, ToolCallInfo } from '../../protocol/src/index'
 import { buildAgentMap, resolveAgentMapFamily } from './agent-map'
 import { SessionActivity } from './session-activity'
 import { MAX_PROMPT_FILES, type ChatAttachment, type PromptFileAttachment } from '../../ide-core/src/dropped-attachments'
@@ -46,13 +46,27 @@ function extractToolDiffs(message: SessionMessageInfo, projectRoot: string): Ses
 function sessionErrorMessage(error?: SessionStructuredError): string {
   return error?.message || error?.type || 'Phiên thực thi gặp lỗi.'
 }
+export function parseCompletedTodos(part: unknown): TodoItem[] | undefined {
+  const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+  if (!object(part) || part.type !== 'tool' || typeof part.name !== 'string' || part.name.trim().toLowerCase() !== 'todowrite' || !object(part.state) || part.state.status !== 'completed') return undefined
+  const { metadata, output, input } = part.state
+  const todos = (object(metadata) ? metadata.todos : undefined) ?? (object(output) ? output.todos : undefined) ?? (object(input) ? input.todos : undefined)
+  if (!Array.isArray(todos)) return undefined
+  const statuses: TodoStatus[] = ['pending', 'in_progress', 'completed', 'cancelled']
+  const result: TodoItem[] = []
+  for (const item of todos) {
+    if (!object(item) || ![Object.prototype, null].includes(Object.getPrototypeOf(item)) || typeof item.content !== 'string' || !item.content.trim() || !statuses.includes(item.status as TodoStatus)) return undefined
+    result.push({ content: item.content.trim(), status: item.status as TodoStatus })
+  }
+  return result
+}
 export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
-  let execution: { opener: string; files: Set<string>; startedAt?: number; lastAssistant?: ChatItem } | undefined
+  let execution: { opener: string; files: Set<string>; startedAt?: number; lastAssistant?: ChatItem; items: ChatItem[] } | undefined
   let lastItem: ChatItem | undefined
   return messages.flatMap<ChatItem>(message => {
     if (message.type === 'user') {
       lastItem = undefined
-      execution ??= { opener: message.id, files: new Set(), startedAt: message.time?.created }
+      execution ??= { opener: message.id, files: new Set(), startedAt: message.time?.created, items: [] }
       const attachments: ChatAttachment[] = 'files' in message && Array.isArray(message.files) && message.files.length
         ? message.files.map(file => {
           const mime = typeof file.mime === 'string' ? file.mime : 'application/octet-stream'
@@ -66,10 +80,13 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
           }
           return attachment
         }) : []
-      return [{ id: message.id, role: 'user', text: message.text, ...(attachments.length ? { attachments } : {}), ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }]
+      const item: ChatItem = { id: message.id, role: 'user', text: message.text, executionID: execution.opener, ...(attachments.length ? { attachments } : {}), ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }
+      execution.items.push(item)
+      return [item]
     }
     if (message.type === 'compaction' && message.status === 'failed') {
       lastItem = { id: `${message.id}:error`, role: 'assistant', kind: 'error', text: sessionErrorMessage(message.error), ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) }
+      if (execution) { lastItem.executionID = execution.opener; execution.items.push(lastItem) }
       return [lastItem]
     }
     if (message.type === 'idle') {
@@ -77,6 +94,8 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
         execution.lastAssistant.workedMs = message.time.created - execution.startedAt
       }
       const turn = execution
+      const outcome = message.outcome === 'failed' || message.outcome === 'interrupted' ? message.outcome : 'succeeded'
+      if (turn) for (const item of turn.items) item.executionOutcome = outcome
       execution = undefined
       const items: ChatItem[] = []
       if (message.outcome === 'failed' && 'error' in message && message.error) {
@@ -84,6 +103,10 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
         if (lastItem?.kind !== 'error' || lastItem.text !== text) items.push({ id: `${message.id}:error`, role: 'assistant', kind: 'error', text, ...(message.time?.created !== undefined ? { createdAt: message.time.created } : {}) })
       }
       if (turn?.files.size) items.push({ id: `${message.id}:changes`, role: 'assistant', kind: 'changes', text: '', turn: { from: turn.opener, files: [...turn.files].sort() } })
+      for (const item of items) {
+        item.executionOutcome = outcome
+        if (turn) { item.executionID = turn.opener; turn.items.push(item) }
+      }
       lastItem = undefined
       return items
     }
@@ -127,20 +150,37 @@ export function normalizeMessages(messages: SessionMessageInfo[]): ChatItem[] {
         error: error === undefined ? undefined : typeof error === 'string' ? error : error.message || JSON.stringify(error),
         durationMs: part.time?.completed === undefined ? undefined : Math.max(0, part.time.completed - (part.time.ran ?? part.time.created)),
       }
-      return { id, role: 'assistant', kind: 'tool', text: `${part.name} · ${part.state.status}`, tool, ...time }
+      const todos = parseCompletedTodos(part)
+      return { id, role: 'assistant', kind: 'tool', text: `${part.name} · ${part.state.status}`, tool, ...time, ...(todos !== undefined ? { todos } : {}) }
     })
     if (message.error) items.push({ id: `${message.id}:error`, role: 'assistant', kind: 'error', text: sessionErrorMessage(message.error), ...time })
+    if (execution) for (const item of items) { item.executionID = execution.opener; execution.items.push(item) }
     if (items.length) lastItem = items[items.length - 1]
     if (execution && items.length) execution.lastAssistant = items[items.length - 1]
     return items
   })
 }
-function mapSession(s: SessionInfo): Session {
+function mapRevert(revert: SessionInfo['revert'] | undefined, projectRoot?: string): SessionRevert | undefined {
+  if (!revert?.messageID) return undefined
+  return {
+    messageID: revert.messageID,
+    ...(revert.partID !== undefined ? { partID: revert.partID } : {}),
+    ...(revert.snapshot !== undefined ? { snapshot: revert.snapshot } : {}),
+    ...(revert.files !== undefined ? { files: revert.files.map(file => ({
+      ...file, file: projectRoot ? normalizeToolDiffPath(file.file, projectRoot) : file.file,
+      additions: Number.isFinite(file.additions) ? Math.max(0, file.additions) : 0,
+      deletions: Number.isFinite(file.deletions) ? Math.max(0, file.deletions) : 0,
+      ...(file.more === true ? { more: true as const } : {}),
+    })) } : {}),
+  }
+}
+function mapSession(s: SessionInfo, projectRoot?: string): Session {
   return {
     id: s.id, title: s.title || 'Untitled', updatedAt: s.time?.updated, parentID: s.parentID, agent: s.agent,
     status: s.time ? s.time.busy !== undefined && (s.time.idle === undefined || s.time.busy > s.time.idle) ? 'running' : 'idle' : undefined,
     busyAt: s.time?.busy, idleAt: s.time?.idle,
     outcome: s.outcome, ...(s.permissions !== undefined ? { permissionMode: permissionModeFromSession(s) } : {}),
+    ...(s.revert ? { revert: mapRevert(s.revert, projectRoot) } : {}),
   }
 }
 function mapArtifact(info: ArtifactInfo): ArtifactSummary {
@@ -235,7 +275,7 @@ export class OpenCodeAdapter {
     let cursor: string | undefined
     do {
       const list = await this.api().session.list({ directory: this.directory(projectID), archived: false, limit: 100, cursor })
-      for (const s of list.data) sessions.set(s.id, mapSession(s))
+      for (const s of list.data) sessions.set(s.id, mapSession(s, this.directory(projectID)))
       cursor = list.cursor.next ?? undefined
       if (cursor && cursors.has(cursor)) throw new Error('SESSION_CURSOR_REPEATED')
       if (cursor) cursors.add(cursor)
@@ -283,7 +323,7 @@ export class OpenCodeAdapter {
     const permissions = permissionRules(mode)
     if (agent) await this.waitForSessionAgent(projectID, agent)
     const s = await this.api().session.create({ location: { directory: this.directory(projectID) }, permissions, ...(agent ? { agent } : {}) })
-    return mapSession(s)
+    return mapSession(s, this.directory(projectID))
   }
   private async waitForSessionAgent(projectID: string, agent: string) {
     const client = this.api(), directory = this.directory(projectID), signal = AbortSignal.timeout(15_000)
@@ -320,7 +360,7 @@ export class OpenCodeAdapter {
   }
   async forkSession(projectID: string, sessionID: string): Promise<Session> {
     await this.owned(projectID, sessionID)
-    return mapSession(await this.api().session.fork({ sessionID }))
+    return mapSession(await this.api().session.fork({ sessionID }), this.directory(projectID))
   }
   async btwAsk(projectID: string, sessionID: string, question: string, model?: Model): Promise<{ answer: string }> {
     await this.owned(projectID, sessionID)
@@ -483,12 +523,51 @@ export class OpenCodeAdapter {
     }
     return buildAgentMap({ family, activeSessionID: sessionID, messagesBySession, historyCompleteBySession, liveTextBySession, now: Date.now() })
   }
+  async stageRevert(projectID: string, sessionID: string, messageID: string, files: boolean): Promise<SessionRevert> {
+    if (typeof messageID !== 'string' || !messageID.trim() || messageID.trim().length > 200) throw new Error('INVALID_MESSAGE_ID')
+    if (typeof files !== 'boolean') throw new Error('INVALID_REVERT_OPTIONS')
+    const session = await this.owned(projectID, sessionID)
+    if (session.parentID) throw new Error('REVERT_CHILD_UNSUPPORTED: Không hỗ trợ quay lui trực tiếp trên phiên con.')
+    if (mapSession(session).status === 'running') throw new Error('SESSION_BUSY: Phiên đang chạy, hãy dừng phản hồi trước khi quay lui.')
+    const revert = mapRevert(await this.api().session.revert.stage({ sessionID, messageID: messageID.trim(), files }), this.directory(projectID))
+    if (!revert) throw new Error('REVERT_STAGE_FAILED')
+    this.live.delete(sessionID)
+    this.notify({ type: 'opencode', projectID, sessionID })
+    if (files || revert.files?.length) this.notify({ type: 'files', projectID })
+    return revert
+  }
+  async clearRevert(projectID: string, sessionID: string): Promise<void> {
+    const session = await this.owned(projectID, sessionID)
+    if (session.parentID) throw new Error('REVERT_CHILD_UNSUPPORTED: Không hỗ trợ hủy quay lui trên phiên con.')
+    if (mapSession(session).status === 'running') throw new Error('SESSION_BUSY: Phiên đang chạy, hãy dừng phản hồi trước khi hủy quay lui.')
+    const hadFileRevert = Boolean(session.revert?.snapshot || session.revert?.files?.length)
+    await this.api().session.revert.clear({ sessionID })
+    this.live.delete(sessionID)
+    this.notify({ type: 'opencode', projectID, sessionID })
+    if (hadFileRevert) this.notify({ type: 'files', projectID })
+  }
   async sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]> {
-    await this.owned(projectID, sessionID)
+    const session = await this.owned(projectID, sessionID)
     const options = { signal: AbortSignal.timeout(15000) }
     let diffs: SessionDiff[]
     if (from) diffs = await this.api().session.diff({ sessionID, from }, options)
-    else {
+    else if (session.revert?.messageID) {
+      let firstBefore: string | undefined, lastBefore: string | undefined, cursor: string | undefined
+      const cursors = new Set<string>()
+      boundary: do {
+        const page = await this.api().message.list(cursor ? { sessionID, type: 'user', limit: 200, cursor } : { sessionID, type: 'user', order: 'asc', limit: 200 }, options)
+        for (const message of page.data) {
+          if (message.id === session.revert.messageID) break boundary
+          firstBefore ??= message.id
+          lastBefore = message.id
+        }
+        cursor = page.cursor.next ?? undefined
+        if (cursor && cursors.has(cursor)) throw new Error('SESSION_DIFF_CURSOR_REPEATED')
+        if (cursor) cursors.add(cursor)
+      } while (cursor)
+      if (!firstBefore || !lastBefore) return []
+      diffs = await this.api().session.diff({ sessionID, from: firstBefore, to: lastBefore }, options)
+    } else {
       // An unbounded session.diff means the latest turn, not the whole session.
       const [first, last] = await Promise.all([
         this.api().message.list({ sessionID, type: 'user', order: 'asc', limit: 1 }, options),
@@ -502,8 +581,9 @@ export class OpenCodeAdapter {
     let cursor: string | undefined, started = !from
     try {
       history: do {
-        const page = await this.api().message.list({ sessionID, order: 'asc', limit: 200, cursor }, options)
+        const page = await this.api().message.list(cursor ? { sessionID, limit: 200, cursor } : { sessionID, order: 'asc', limit: 200 }, options)
         for (const message of page.data) {
+          if (message.id === session.revert?.messageID) break history
           if (!started && message.id === from) started = true
           if (!started) continue
           if (from && message.type === 'idle') break history
@@ -614,6 +694,7 @@ export class OpenCodeAdapter {
   }
   private accept(event: OpenCodeEvent) {
     this.activity.accept(event)
+    if (event.type === 'session.revert.staged' || event.type === 'session.revert.cleared' || event.type === 'session.revert.committed') this.live.delete(event.data.sessionID)
     if (event.type === 'session.idle' || event.type === 'session.execution.succeeded' || event.type === 'session.execution.failed' || event.type === 'session.execution.interrupted' || event.type === 'session.status' && event.data.status.type === 'idle') {
       this.live.delete(event.data.sessionID)
     }
@@ -645,7 +726,10 @@ export class OpenCodeAdapter {
     const sessionID = event.type === 'form.created' ? event.data.form.sessionID : 'data' in event && event.data && typeof event.data === 'object' && 'sessionID' in event.data ? String(event.data.sessionID) : undefined
     const directory = 'location' in event ? event.location?.directory : undefined
     for (const [projectID, root] of this.projects) {
-      if (!directory || path.resolve(directory) === path.resolve(root)) this.notify(sessionID === undefined ? { type: 'opencode', projectID } : { type: 'opencode', projectID, sessionID })
+      if (!directory || path.resolve(directory) === path.resolve(root)) {
+        this.notify(sessionID === undefined ? { type: 'opencode', projectID } : { type: 'opencode', projectID, sessionID })
+        if (event.type === 'session.revert.cleared' || (event.type === 'session.revert.staged' && Array.isArray(event.data.revert?.files) && event.data.revert.files.length > 0)) this.notify({ type: 'files', projectID })
+      }
     }
   }
   abortRequests() { this.stream?.abort(); this.requestLifetime.abort(new Error('OPENCODE_REQUEST_CANCELLED')) }

@@ -3,6 +3,25 @@ import { errorText } from './components/Primitives'
 export type IssueSeverity = 'error' | 'warning' | 'change' | 'excluded'
 export type AmeKitIssue = { path: string; severity: IssueSeverity; reason: string }
 
+export function formatCatalogVersion(version?: string): string {
+  const trimmed = version?.trim() ?? ''
+  if (!trimmed) return '—'
+  const match = /^registry\.(\d+)$/i.exec(trimmed)
+  if (match) return 'v' + match[1]
+  return trimmed
+}
+
+export function formatSemverVersion(version?: string): string {
+  const trimmed = version?.trim() ?? ''
+  if (!trimmed) return '—'
+  if (/^v\d/i.test(trimmed)) return 'v' + trimmed.slice(1)
+  return 'v' + trimmed
+}
+
+export function formatVersionSummaryLine(versions: { modelVersion?: string; orchestratorVersion?: string; bundleVersion?: string }): string {
+  return `Model ${formatCatalogVersion(versions.modelVersion)} · Điều phối ${formatSemverVersion(versions.orchestratorVersion)} · Bundle ${versions.bundleVersion?.trim() ? formatSemverVersion(versions.bundleVersion) : 'Chưa cài'}`
+}
+
 export function groupIssues(rawIssues: unknown[], mode?: string) {
   const groups: Record<IssueSeverity, AmeKitIssue[]> = { error: [], warning: [], change: [], excluded: [] }
   for (const value of rawIssues) {

@@ -657,3 +657,34 @@ test('advanced Git delegates preserve index, branch defaults and mutation notifi
   await assert.rejects(workspaces.stageAll('missing'), /UNKNOWN_PROJECT/)
   assert.equal(changes.length, before)
 })
+
+test('workspace copy/move/paste delegates report project identity and notify only actual affected projects', async t => {
+  const changes: string[] = []
+  const { root, directory, workspaces, project } = await fixture(t, id => changes.push(id))
+  const otherDirectory = path.join(root, 'other'); await mkdir(otherDirectory)
+  const other = await workspaces.add(otherDirectory)
+  workspaces.dispose()
+  await writeFile(path.join(directory, 'seed.bin'), Buffer.from([0, 255, 1]))
+  await mkdir(path.join(directory, 'dest'))
+  assert.deepEqual(await workspaces.copyPath(other.id, project.id, 'seed.bin', ''), { path: 'seed.bin', directory: false })
+  assert.deepEqual(changes.splice(0), [other.id])
+  assert.deepEqual(await workspaces.movePath(project.id, project.id, 'seed.bin', ''), { from: 'seed.bin', to: 'seed.bin', directory: false, sameProject: true, moved: false })
+  assert.deepEqual(changes, [])
+  assert.deepEqual(await workspaces.movePath(project.id, project.id, 'seed.bin', 'dest'), { from: 'seed.bin', to: 'dest/seed.bin', directory: false, sameProject: true, moved: true })
+  assert.deepEqual(changes.splice(0), [project.id])
+  assert.deepEqual(await workspaces.movePath(other.id, project.id, 'dest/seed.bin', ''), { from: 'dest/seed.bin', to: 'seed copy.bin', directory: false, sameProject: false, moved: true })
+  assert.deepEqual(changes.splice(0), [other.id, project.id])
+  const external = path.join(root, 'external.bin'); await writeFile(external, Buffer.from([0, 128]))
+  assert.deepEqual(await workspaces.pasteExternalPaths(project.id, [external], ''), { paths: ['external.bin'] })
+  assert.deepEqual(changes.splice(0), [project.id])
+  assert.deepEqual(await workspaces.pasteExternalPaths(project.id, [], ''), { paths: [] })
+  for (const operation of [
+    () => workspaces.copyPath(other.id, project.id, 'missing', ''),
+    () => workspaces.movePath(other.id, project.id, 'missing', ''),
+    () => workspaces.pasteExternalPaths(project.id, [path.join(root, 'missing')], ''),
+    () => workspaces.copyPath('missing', project.id, 'external.bin', ''),
+    () => workspaces.movePath(other.id, 'missing', 'external.bin', ''),
+    () => workspaces.pasteExternalPaths('missing', [external], ''),
+  ]) await assert.rejects(operation())
+  assert.deepEqual(changes, [])
+})

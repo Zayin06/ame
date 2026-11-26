@@ -23,14 +23,14 @@ test('native snapshot API isolates whole-session and per-turn edits from pre-exi
   execFileSync('git', ['add', '.'], { cwd: project })
   execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', '-c', 'core.hooksPath=', 'commit', '--quiet', '-m', 'Fixture'], { cwd: project })
   await writeFile(path.join(project, 'unrelated.ts'), 'pre-existing Git change\n')
-  let turn = 0, calls = 0
+  let turn = 0, calls = 0, readonly = false
   const errors: Error[] = []
   const server = createServer(async (req, res) => {
     try {
       const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk))
       const input = JSON.parse(Buffer.concat(chunks).toString())
       const name = input.tools?.find((tool: { function: { name: string } }) => tool.function.name === 'write')?.function.name
-      const useTool = input.tools && calls++ === 0
+      const useTool = !readonly && input.tools && calls++ === 0
       if (useTool) assert.ok(name, 'native write tool is available')
       const tool = { id: `write-${turn}`, type: 'function', function: { name, arguments: JSON.stringify({ path: `turn-${turn}.ts`, content: `export const turn${turn} = ${turn}\n` }) } }
       const delta = useTool ? { role: 'assistant', tool_calls: [{ index: 0, ...tool }] } : { role: 'assistant', content: input.tools ? `DONE_${turn}` : 'Snapshot fixture' }
@@ -46,6 +46,7 @@ test('native snapshot API isolates whole-session and per-turn edits from pre-exi
     const endpoint = await runtime.start()
     const headers = { authorization: `Basic ${Buffer.from(`${endpoint.username}:${endpoint.password}`).toString('base64')}` }
     const client = OpenCode.make({ baseUrl: endpoint.url, headers })
+    assert.equal((await (await fetch(`${endpoint.url}/api/info`, { headers })).json()).version, '2.3.2')
     const response = await fetch(`${endpoint.url}/api/rpc/amekit-models/update`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ input: { role: 'admin', catalog: { version: 'fixture', default_model: 'changes-fixture', small_model: 'changes-fixture', models: [{ id: 'changes-fixture', name: 'Fixture', tool_call: true, vision: false, context: 200000, output: 4096 }] }, provider: { base_url: `http://127.0.0.1:${port}/v1`, api_key: 'local-test-only' }, expires: Date.now() + 85000 } }) })
     assert.equal(response.status, 200)
     adapter.attach('p', project); await adapter.connect(endpoint.url, endpoint.username, endpoint.password)
@@ -73,6 +74,31 @@ test('native snapshot API isolates whole-session and per-turn edits from pre-exi
       assert.match(diffs[0].patch, new RegExp(`export const turn${index + 1}`))
     }
     assert.deepEqual((await client.session.diff({ sessionID: session.id })).map(file => path.basename(file.file)), ['turn-2.ts'], 'unbounded upstream API is only the latest turn')
+    const firstUserPage = await client.message.list({ sessionID: session.id, type: 'user', order: 'asc', limit: 1 })
+    assert.ok(firstUserPage.cursor.next, 'real runtime supplies a cursor for filtered user history')
+    const secondUserPage = await client.message.list({ sessionID: session.id, type: 'user', limit: 1, cursor: firstUserPage.cursor.next })
+    assert.equal(secondUserPage.data[0]?.id, summaries[1].turn!.from, 'cursor + type=user resolves the next user on real 2.3.2')
+    assert.ok(secondUserPage.data.every(message => message.type === 'user'))
+
+    readonly = true
+    const readonlySession = await client.session.create({ location: { directory: project }, agent: 'changes-fixture', model: { providerID: 'amecode', id: 'changes-fixture' } })
+    await client.session.prompt({ sessionID: readonlySession.id, text: 'Reply with text only. Do not edit any files.' })
+    const deadline = Date.now() + 25000
+    let readonlyHistory: SessionMessageInfo[] = []
+    for (;;) {
+      if (errors.length) throw errors[0]
+      readonlyHistory = (await client.message.list({ sessionID: readonlySession.id, order: 'asc' })).data
+      if (readonlyHistory.some(message => message.type === 'idle')) break
+      if (Date.now() > deadline) throw new Error(`Read-only fixture timeout: ${JSON.stringify(readonlyHistory)}`)
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    assert.deepEqual(readonlyHistory.map(message => message.type), ['user', 'assistant', 'idle'])
+    const firstPage = await client.message.list({ sessionID: readonlySession.id, order: 'asc', limit: 1 })
+    assert.ok(firstPage.cursor.next, 'three-message read-only history supplies a pagination cursor')
+    const nextPage = await client.message.list({ sessionID: readonlySession.id, limit: 1, cursor: firstPage.cursor.next })
+    assert.equal(nextPage.data[0]?.id, readonlyHistory[1].id)
+    assert.deepEqual(await adapter.sessionDiff('p', readonlySession.id), [])
+    assert.deepEqual(await adapter.sessionDiff('p', readonlySession.id, readonlyHistory[0].id), [])
     const empty = await client.session.create({ location: { directory: project } })
     assert.deepEqual(await adapter.sessionDiff('p', empty.id), [])
     assert.deepEqual(errors, [])

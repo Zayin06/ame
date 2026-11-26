@@ -2,9 +2,10 @@ import path from "node:path"
 import { lstat, open, realpath } from "node:fs/promises"
 import { constants } from "node:fs"
 import { AmeApi, ClientError, isTransientError } from "./api"
-import { assertModel, managedProvider, modelPolicy, providerURL } from "./model-policy"
+import { assertModel, assertChatModel, resolveModelLevel, managedProvider, modelPolicy, providerURL } from "./model-policy"
 import { openSessionVault, type Encryption } from "./session-vault"
 import { bundlePreferences, type BundleAccount } from "./bundle-preferences"
+import { dailySyncStore } from "./daily-sync"
 import { pack, preview, safePath, verifiedFiles, type ImportOptions, type InputFile, type Issue, type Preview } from "./bundle/package"
 import { scanWithSource } from "./bundle/scan"
 import { AiFixError, fixImportFileWithLlm, isFixableTextFile } from "./bundle/ai-fix"
@@ -62,13 +63,18 @@ type ImportSession = {
   savedToDisk: Set<string>
 }
 type ElectronMain = { safeStorage: Encryption; dialog: Pick<typeof import("electron")["dialog"], "showMessageBox"> }
+const MAX_POLICY_LEASE_MS = 24 * 60 * 60_000
+const LEASE_RENEW_LEAD_MS = 15 * 60_000
+const LEASE_RETRY_MS = 5 * 60_000
 /** Main-process test seams; never accept these dependencies over renderer IPC. */
-export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number }
+export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number; now?: () => number }
 
 export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDependencies = {}): AmeKit {
   const globalConfigDir = options.globalConfigDir ?? path.join(options.userData, "backend", "config", "opencode")
   const globalManagedDir = path.join(options.userData, "amekit", "global")
   const preferences = bundlePreferences(options.userData)
+  const dailySync = dailySyncStore(options.userData)
+  const now = dependencies.now ?? Date.now
   let lastBundleAccount: BundleAccount | undefined
   const bundleAccount = (): BundleAccount | undefined => api?.account ? { origin: api.origin, accountId: api.account.id } : lastBundleAccount
   const fetcher = dependencies.fetch ?? fetch
@@ -81,6 +87,27 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   let inFlight: Promise<unknown> | undefined, backgroundInFlight: Promise<void> | undefined, disposal: Promise<void> | undefined
   let localBundleWriteInFlight: Promise<unknown> | undefined, autoSyncInFlight: Promise<void> | undefined
   let lastAutoSyncError: string | undefined, lastAutoSyncFailedReleaseId: string | undefined
+  let refreshedAt: number | undefined
+  let bundleSnapshot: { installedVersion?: string; installedReleaseId?: string; installedFeatures?: import("./api").BundleFeatures; latestVersion?: string; latestReleaseId?: string; checkedAt?: number } | undefined
+  const snapshotInstalledBundle = async () => {
+    const state = await installer.installedGlobal(globalConfigDir, globalManagedDir).catch(() => undefined)
+    if (state || bundleSnapshot) bundleSnapshot = { ...bundleSnapshot, installedVersion: state?.version, installedReleaseId: state?.releaseId, installedFeatures: state?.features }
+  }
+  const readManagedCatalog = async () => {
+    const state = await installer.installedGlobal(globalConfigDir, globalManagedDir).catch(() => undefined)
+    return { agents: state ? [...state.agents] : [], skills: state ? [...state.skills] : [] }
+  }
+  const checkLatestBundle = async (accountApi: AmeApi) => {
+    bundleSnapshot = { ...bundleSnapshot, checkedAt: Date.now() }
+    try {
+      const latest = await accountApi.latest(signal)
+      bundleSnapshot = { ...bundleSnapshot, latestVersion: latest.release.version, latestReleaseId: latest.release.releaseId }
+      return latest
+    } catch (error) {
+      if (error instanceof ClientError && error.code === "NO_ACTIVE_RELEASE") bundleSnapshot = { ...bundleSnapshot, latestVersion: undefined, latestReleaseId: undefined }
+      throw error
+    }
+  }
   const trackLocalWrite = async <T>(write: () => Promise<T>): Promise<T> => {
     while (localBundleWriteInFlight) await localBundleWriteInFlight.catch(() => {})
     const task = write()
@@ -178,7 +205,23 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     const result = await response.json().catch(() => null) as { output?: unknown } | null
     if (result?.output !== true) throw new Error("MODEL_POLICY_UNAVAILABLE")
   }
-  const revoke = async (cleanup = false) => { policyReady = false; if (!api?.credential) authorizedFeatureModels.clear(); await rpc(null, cleanup).catch(() => {}) }
+  let leaseTimer: ReturnType<typeof setTimeout> | undefined
+  const clearLeaseTimer = () => { if (leaseTimer) { clearTimeout(leaseTimer); leaseTimer = undefined } }
+  const scheduleLeaseRenewal = (delayOverrideMs?: number) => {
+    clearLeaseTimer()
+    if (timer || disposed || !api?.account || !policyReady) return
+    const currentNow = now()
+    const leaseExpiresAt = Math.min(api.expires, currentNow + MAX_POLICY_LEASE_MS)
+    const remaining = leaseExpiresAt - currentNow
+    if (remaining <= 0) return
+    const lead = Math.min(LEASE_RENEW_LEAD_MS, Math.floor(remaining / 4))
+    const defaultDelay = Math.max(1_000, remaining - lead)
+    const maxRetryDelay = Math.max(1_000, Math.floor(remaining / 2))
+    const delay = delayOverrideMs !== undefined ? Math.max(1_000, Math.min(delayOverrideMs, maxRetryDelay)) : defaultDelay
+    leaseTimer = setTimeout(() => { leaseTimer = undefined; backgroundRefresh("lease") }, delay)
+    leaseTimer.unref?.()
+  }
+  const revoke = async (cleanup = false) => { clearLeaseTimer(); policyReady = false; if (!api?.credential) authorizedFeatureModels.clear(); await rpc(null, cleanup).catch(() => {}) }
   const persist = async () => {
     try { if (!api?.credential) authorizedFeatureModels.clear(); if (!vault) throw new Error(); await vault.save(api?.credential) }
     catch { storageError = "SESSION_STORAGE_UNAVAILABLE"; api?.suspend(); resetImport(); await revoke(); throw new Error(storageError) }
@@ -189,11 +232,14 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       if (!api?.account) { await rpc(null); return }
       modelPolicy(api.account.role, api.provider?.catalog, { featureModels: [...authorizedFeatureModels] })
       providerURL(api.provider!.provider.base_url)
-      if (api.expires <= Date.now()) throw new Error("AMECODE_LOGIN_REQUIRED")
+      if (api.expires <= now()) throw new Error("AMECODE_LOGIN_REQUIRED")
       await persist()
-      await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires, featureModels: [...authorizedFeatureModels], ...(api.orchestrator ? { orchestrator: api.orchestrator } : {}) })
+      const managedCatalog = await readManagedCatalog()
+      await rpc({ role: api.account.role, catalog: api.provider!.catalog, provider: api.provider!.provider, expires: api.expires, featureModels: [...authorizedFeatureModels], managedCatalog, ...(api.orchestrator ? { orchestrator: api.orchestrator } : {}) })
       lastBundleAccount = { origin: api.origin, accountId: api.account.id }
       policyReady = true; blocker = undefined; transientFailures = 0
+      await snapshotInstalledBundle()
+      scheduleLeaseRenewal()
     } catch (error) {
       blocker = code(error); api?.suspend(); resetImport(); await revoke()
       throw error
@@ -210,7 +256,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     if (api?.account && api.expires <= Date.now()) { api.suspend(); resetImport(); policyReady = false; blocker = "AMECODE_LOGIN_REQUIRED" }
     if (api?.account) {
       const models = modelPolicy(api.account.role, api.provider?.catalog, { featureModels: [...authorizedFeatureModels] })
-      return { origin: api.origin, account: { ...api.account }, models: { ...models, small_model: api.account.role === "user" ? models.default_model : models.small_model }, ready: policyReady, ...bundleWarning(), ...(blocker ? { blocker } : {}) }
+      return { origin: api.origin, account: { ...api.account }, models: { ...models, small_model: models.small_model }, refreshedAt, ...(api.orchestrator ? { orchestrator: { id: api.orchestrator.id, version: api.orchestrator.version } } : {}), ...(bundleSnapshot ? { bundle: { ...bundleSnapshot, autoSyncError: lastAutoSyncError } } : {}), ready: policyReady, ...bundleWarning(), ...(blocker ? { blocker } : {}) }
     }
     return api?.credential ? { origin: api.origin, reconnecting: true, ready: false, ...bundleWarning(), blocker: storageError ?? blocker ?? "ACCOUNT_REFRESH_REQUIRED" } : null
   }
@@ -222,6 +268,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         api = new AmeApi(credential.origin, fetcher)
         await api.resume(credential.token, signal)
         await synchronize()
+        refreshedAt = Date.now()
         scheduleAutoSync("ready")
       } else if (!disposed) await rpc(null)
     } catch (error) {
@@ -262,6 +309,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     if (operation === "status") return { ...viewOrEmpty(), ...(storageError ? { ready: false, blocker: storageError } : {}) }
     if (operation === "usage-prices") return { origin: api?.account ? api.origin : null, prices: readUsagePrices(api?.provider?.catalog) }
     if (operation === "logout") {
+      clearLeaseTimer()
+      refreshedAt = undefined; bundleSnapshot = undefined
       activeArchiveCache = undefined
       clearAutoSyncError()
       authorizedFeatureModels.clear()
@@ -294,6 +343,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         return installer.uninstallGlobal(globalConfigDir, globalManagedDir, signal)
       })
       clearAutoSyncError()
+      await snapshotInstalledBundle()
       if (changed) {
         await reloadAndRestorePolicy()
         options.onBundleChanged?.({ version: "", releaseId: "", auto: false, action: "uninstalled" })
@@ -302,26 +352,34 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     }
     if (storageError) throw new Error(storageError)
     if (operation === "login") {
+      refreshedAt = undefined; bundleSnapshot = undefined; clearAutoSyncError()
       authorizedFeatureModels.clear()
       api?.clear(); resetImport(); await persist(); await rpc(null)
       api = new AmeApi(payload.server || undefined, fetcher)
       await api.login(payload.username, payload.password, signal)
       await synchronize()
+      refreshedAt = Date.now()
       scheduleAutoSync("login")
       return view()
     }
     if (!api) throw new Error("SIGNED_OUT")
     switch (operation) {
-      case "refresh": await api.refresh(signal); await synchronize(); scheduleAutoSync("refresh"); return view()
+      case "refresh": {
+        await api.refresh(signal); await synchronize()
+        refreshedAt = Date.now()
+        await synchronizeBundle("refresh")
+        await snapshotInstalledBundle()
+        return view()
+      }
       case "assert-ready":
       case "assert-model": {
         await api.refresh(signal); await synchronize()
         const modelID = payload.modelID || modelPolicy(api.account?.role, api.provider?.catalog).default_model
         const providerID = payload.providerID || managedProvider
-        assertModel(modelPolicy(api.account?.role, api.provider?.catalog), { providerID, id: modelID })
+        assertChatModel(modelPolicy(api.account?.role, api.provider?.catalog), { providerID, id: modelID })
         return { providerID, modelID }
       }
-      case "latest": return api.latest(signal)
+      case "latest": return checkLatestBundle(api)
       case "active-features": {
         await api.guard(true, signal)
         const active = await loadActiveServerArchive(false)
@@ -514,11 +572,14 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       }
       case "install":
       case "sync": {
-        const latest = await api.latest(signal); await synchronize()
+        const latest = await checkLatestBundle(api); await synchronize()
         const bytes = await api.download(latest.release, signal)
         const result = await trackLocalWrite(() => installer.installGlobal(globalConfigDir, globalManagedDir, api!.origin, latest.release, bytes, discover, signal, { allowRaw: true }))
         await preferences.enable({ origin: api.origin, accountId: api.account!.id })
+        const account = bundleAccount()
+        if (account) await dailySync.markChecked(account, now()).catch(() => {})
         clearAutoSyncError()
+        await snapshotInstalledBundle()
         if (result.changed) {
           await reloadAndRestorePolicy()
           options.onBundleChanged?.({ version: result.state.version, releaseId: result.state.releaseId, auto: false, action: "synced" })
@@ -531,7 +592,18 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   const viewOrEmpty = () => view() ?? { ready: false, ...bundleWarning(), ...(blocker ? { blocker } : {}) }
   function scheduleAutoSync(reason: string) {
     if (options.autoSync !== true || disposed || storageError || !api?.account || !policyReady || autoSyncInFlight) return
-    const accountApi = api, initiatingCall = ["ready", "heartbeat"].includes(reason) ? undefined : inFlight
+    const initiatingCall = ["ready", "heartbeat", "lease"].includes(reason) ? undefined : inFlight
+    const task = (async () => {
+      await ready
+      await initiatingCall?.catch(() => {})
+      await synchronizeBundle(reason)
+    })().finally(() => { if (autoSyncInFlight === task) autoSyncInFlight = undefined })
+    autoSyncInFlight = task
+    void task.catch(() => {})
+  }
+  async function synchronizeBundle(reason: string) {
+    if (options.autoSync !== true || disposed || storageError || !api?.account || !policyReady) return
+    const accountApi = api
     const active = () => !disposed && api === accountApi && !!accountApi.account && policyReady
     const stopOnAuthFailure = async (error: unknown) => {
       if (!(error instanceof ClientError) || error.status !== 401 && error.status !== 403) return false
@@ -541,18 +613,23 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       }
       return true
     }
-    const task = (async () => {
-      await ready
-      await initiatingCall?.catch(() => {})
+    try {
       if (!active()) return
       const account = { origin: accountApi.origin, accountId: accountApi.account!.id }
       if (await preferences.optedOut(account) || !active()) return
-      let latest: Awaited<ReturnType<AmeApi["latest"]>>
-      try { latest = await accountApi.latest(signal) }
-      catch (error) { await stopOnAuthFailure(error); return }
-      if (!active()) return
       const current = await installer.installedGlobal(globalConfigDir, globalManagedDir).catch(() => undefined)
-      if (current?.releaseId === latest.release.releaseId && current.sha256 === latest.release.sha256) { clearAutoSyncError(); return }
+      if ((reason === "ready" || reason === "lease") && current && await dailySync.checkedToday(account, now())) return
+      let latest: Awaited<ReturnType<AmeApi["latest"]>>
+      try { latest = await checkLatestBundle(accountApi) }
+      catch (error) {
+        if (!await stopOnAuthFailure(error) && active() && !signal.aborted && (reason === "refresh" || !isTransientError(error) && !(error instanceof ClientError && error.code === "NO_ACTIVE_RELEASE"))) lastAutoSyncError = code(error)
+        return
+      }
+      if (!active()) return
+      if (current?.releaseId === latest.release.releaseId && current.sha256 === latest.release.sha256) {
+        await dailySync.markChecked(account, now()).catch(() => {})
+        clearAutoSyncError(); return
+      }
       if (lastAutoSyncFailedReleaseId === latest.release.releaseId && reason === "heartbeat") return
       try {
         const bytes = await accountApi.download(latest.release, signal)
@@ -562,18 +639,20 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
           return installer.installGlobal(globalConfigDir, globalManagedDir, accountApi.origin, latest.release, bytes, discover, signal, { allowRaw: true })
         })
         if (!result) return
+        await dailySync.markChecked(account, now()).catch(() => {})
         clearAutoSyncError()
+        await snapshotInstalledBundle()
         if (result.changed) {
           await reloadAndRestorePolicy()
           options.onBundleChanged?.({ version: result.state.version, releaseId: result.state.releaseId, auto: true, action: "synced" })
         }
       } catch (error) {
-        if (await stopOnAuthFailure(error) || !active() || signal.aborted || isTransientError(error)) return
+        if (await stopOnAuthFailure(error) || !active() || signal.aborted || reason !== "refresh" && isTransientError(error)) return
         lastAutoSyncError = code(error); lastAutoSyncFailedReleaseId = latest.release.releaseId
       }
-    })().finally(() => { if (autoSyncInFlight === task) autoSyncInFlight = undefined })
-    autoSyncInFlight = task
-    void task.catch(() => {})
+    } catch (error) {
+      if (!await stopOnAuthFailure(error) && active() && !signal.aborted) lastAutoSyncError = code(error)
+    }
   }
   const call: AmeKit["call"] = (operation, payload) => {
     if (disposed) return Promise.reject(new Error("AMEKIT_DISPOSED"))
@@ -584,7 +663,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       try {
         if (backgroundInFlight) await backgroundInFlight.catch(() => {})
         await ready
-        if (["installed", "offline", "sync", "install", "uninstall"].includes(operation) && autoSyncInFlight) await autoSyncInFlight.catch(() => {})
+        if (["refresh", "installed", "offline", "sync", "install", "uninstall"].includes(operation) && autoSyncInFlight) await autoSyncInFlight.catch(() => {})
         result = await execute(operation, payload)
       }
       catch (error) { failure = error }
@@ -602,21 +681,24 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     inFlight = task
     return task
   }
-  const backgroundRefresh = () => {
-    if (disposed || busy || backgroundInFlight || storageError || !api?.credential) return
+  const backgroundRefresh = (reason: "heartbeat" | "lease" = "heartbeat") => {
+    if (disposed || storageError || !api?.credential) return
+    if (busy || backgroundInFlight) { if (reason === "lease") scheduleLeaseRenewal(LEASE_RETRY_MS); return }
     const task = (async () => {
       await ready
       if (disposed) return
       try {
         await api!.refresh(signal, { preserveOnTransient: true })
         await synchronize()
+        refreshedAt = now()
         await persist()
-        scheduleAutoSync("heartbeat")
+        scheduleAutoSync(reason)
       } catch (error) {
         blocker = code(error)
         if (isTransientError(error) && api?.account && api.expires > Date.now() && transientFailures < 2) {
           // Preserve the existing lease only; a missed heartbeat must never renew it.
           transientFailures++
+          if (!timer) scheduleLeaseRenewal(LEASE_RETRY_MS)
           return
         }
         api?.suspend(); resetImport(); transientFailures = 0; await revoke()
@@ -625,8 +707,10 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
     backgroundInFlight = task
     void task.catch(() => {})
   }
-  const timer = setInterval(backgroundRefresh, dependencies.refreshIntervalMs ?? 30_000)
-  timer.unref?.()
+  const timer = dependencies.refreshIntervalMs && dependencies.refreshIntervalMs > 0
+    ? setInterval(() => backgroundRefresh("heartbeat"), dependencies.refreshIntervalMs)
+    : undefined
+  timer?.unref?.()
   return {
     call,
     async readStatus() {
@@ -689,15 +773,16 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       while (busy) await inFlight?.catch(() => {})
       if (disposed) throw new Error("AMEKIT_DISPOSED")
       if (!api?.account || !api.provider || api.expires <= Date.now() || !policyReady) return null
-      const policy = modelPolicy(api.account.role, api.provider.catalog)
-      if (!policy.active_models.some(model => model.id === modelID)) return null
-      if (api.account.role !== "user" || modelID === policy.default_model || authorizedFeatureModels.has(modelID)) return modelID
+      const policy = modelPolicy(api.account.role, api.provider.catalog, { featureModels: [...authorizedFeatureModels] })
+      const resolvedID = resolveModelLevel(policy, modelID)
+      if (policy.models.some(model => model.id === resolvedID)) return resolvedID
+      if (!policy.active_models.some(model => model.id === resolvedID)) return null
       if (authorizedFeatureModels.size >= 20) return null
       busy = true
       const task = (async () => {
-        authorizedFeatureModels.add(modelID)
-        try { await synchronize(); return modelID }
-        catch { authorizedFeatureModels.delete(modelID); return null }
+        authorizedFeatureModels.add(resolvedID)
+        try { await synchronize(); return resolvedID }
+        catch { authorizedFeatureModels.delete(resolvedID); return null }
       })().finally(() => { busy = false; if (inFlight === task) inFlight = undefined })
       inFlight = task
       return task
@@ -709,13 +794,19 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       generationSignal.throwIfAborted()
       if (!api?.account || !api.provider) throw new Error("AMECODE_LOGIN_REQUIRED")
       if (!policyReady) throw new Error(blocker ?? "MODEL_POLICY_UNAVAILABLE")
-      assertModel(modelPolicy(api.account.role, api.provider.catalog), { providerID: managedProvider, id: model })
+      assertChatModel(modelPolicy(api.account.role, api.provider.catalog), { providerID: managedProvider, id: model })
       providerURL(api.provider.provider.base_url)
-      return generateDialogue(api, model, generationSignal, fetcher)
+      // The generator refreshes authentication itself. Recheck chat scope at the
+      // provider boundary as well, so a demotion during that refresh cannot use
+      // the broader agent/feature model policy in the shared generator.
+      return generateDialogue(api, model, generationSignal, (request, init) => {
+        assertChatModel(modelPolicy(api?.account?.role, api?.provider?.catalog), { providerID: managedProvider, id: model })
+        return fetcher(request, init)
+      })
     },
     dispose() {
       return disposal ??= (async () => {
-        disposed = true; activeArchiveCache = undefined; clearInterval(timer); lifetime.abort()
+        disposed = true; activeArchiveCache = undefined; clearLeaseTimer(); if (timer) clearInterval(timer); lifetime.abort()
         await ready; await Promise.all([inFlight?.catch(() => {}), backgroundInFlight?.catch(() => {}), autoSyncInFlight?.catch(() => {})])
         authorizedFeatureModels.clear(); api?.clear(); resetImport(); await revoke(true)
       })()

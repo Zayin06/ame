@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
 import { createAmeKit, type AmeKitDependencies, type AmeKit, type AmeKitOptions } from "../src/index"
 import { openSessionVault, type Encryption } from "../src/session-vault"
+import { dailySyncStore, localDayKey } from "../src/daily-sync"
 import { zipSync, unzipSync } from "fflate"
 import { pack, preview, safePath, secretFindings } from "../src/bundle/package"
 import { sha256, validate } from "../src/bundle/manifest"
@@ -13,7 +14,7 @@ import { MAX_ZIP } from "../src/bundle/limits"
 import { scan, scanWithSource } from "../src/bundle/scan"
 import { AiFixError, buildCompactDiff, fixImportFileWithLlm, isFixableTextFile, redactSecretsForLlm } from "../src/bundle/ai-fix"
 import { AmeApi } from "../src/api"
-import { assertModel, catalogSchema, MODEL_LEVELS, modelPolicy, parseModelLevel, resolveModelLevel, type ModelLevels } from "../src/model-policy"
+import { assertModel, assertChatModel, catalogSchema, MODEL_LEVELS, modelPolicy, parseModelLevel, resolveModelLevel, type ModelLevels } from "../src/model-policy"
 import { parse, stringify } from "yaml"
 import { installed, install, installedGlobal, installGlobal, offlineGlobal, uninstallGlobal, legacyProjectInstalled, cleanLegacyProject, readGlobalCommitEnhanceSkill, readGlobalBundleFeatures, readGlobalAndroidTranslationFeature, readAndroidTranslationFeature, readBuildNotesFeature, readGlobalBuildNotesFeature, readBundleFeatures, readCommitEnhanceSkill, uninstall } from "../src/installer"
 import { buildAndroidTranslationPrompt, createTranslationLockStore, detectAndroidProject } from "../src/android-translation"
@@ -121,22 +122,56 @@ test("API orchestrator reaches runtime policy and refreshes or revokes with the 
   const f = await fixture({ orchestrator: config, autoSync: false })
   try {
     assert.equal(await f.service.readOrchestrator!(), undefined)
-    await login(f.service)
+    const metadata = (value: unknown, version: string) => {
+      const status = value as { orchestrator: unknown }
+      assert.deepEqual(status.orchestrator, { id: "ame-orchestrator", version })
+      assert.equal(JSON.stringify(status).includes(config.prompt), false)
+      assert.equal(JSON.stringify(status).includes(config.description), false)
+    }
+    metadata(await login(f.service), "1.0.0")
+    metadata(await f.service.call("status", {}), "1.0.0")
+    metadata(await f.service.readStatus!(), "1.0.0")
     assert.deepEqual(await f.service.readOrchestrator!(), config)
     assert.deepEqual((f.rpc.at(-1) as { orchestrator: unknown }).orchestrator, config)
     const updated = { ...config, version: "1.0.1", prompt: "Updated guidance." }
     f.orchestrator(updated)
-    await f.service.call("refresh", {})
+    metadata(await f.service.call("refresh", {}), "1.0.1")
+    metadata(await f.service.call("status", {}), "1.0.1")
     assert.deepEqual(await f.service.readOrchestrator!(), updated)
     assert.deepEqual((f.rpc.at(-1) as { orchestrator: unknown }).orchestrator, updated)
     f.orchestrator(undefined)
-    await f.service.call("refresh", {})
+    assert.equal("orchestrator" in (await f.service.call("refresh", {}) as object), false)
+    assert.equal("orchestrator" in (await f.service.call("status", {}) as object), false)
     assert.equal(await f.service.readOrchestrator!(), undefined, "older API must not retain stale instructions")
     f.orchestrator(config)
     await f.service.call("refresh", {})
     await f.service.call("logout", {})
     assert.equal(await f.service.readOrchestrator!(), undefined)
     assert.equal(f.rpc.at(-1), null)
+  } finally { await f.cleanup() }
+})
+
+test("runtime policy includes only the verified installed global managed catalog", async () => {
+  const f = await fixture({ autoSync: false })
+  const managedCatalog = () => (f.rpc.at(-1) as { managedCatalog: { agents: string[]; skills: string[] } }).managedCatalog
+  try {
+    await login(f.service)
+    assert.deepEqual(managedCatalog(), { agents: [], skills: [] })
+    await f.service.call("sync", {})
+    assert.deepEqual(managedCatalog(), { agents: ["helper"], skills: ["fixture"] })
+    for (const file of input()) {
+      const target = path.join(f.globalConfigDir, ...file.path.split("/"))
+      await writeFile(target, "Tampered installed instructions.")
+      await f.service.call("refresh", {})
+      assert.deepEqual(managedCatalog(), { agents: [], skills: [] })
+      assert.equal((await f.service.call("status", {}) as { ready: boolean }).ready, true)
+      await writeFile(target, file.data)
+      await f.service.call("refresh", {})
+      assert.deepEqual(managedCatalog(), { agents: ["helper"], skills: ["fixture"] })
+    }
+    await f.service.call("uninstall", {})
+    await f.service.call("refresh", {})
+    assert.deepEqual(managedCatalog(), { agents: [], skills: [] })
   } finally { await f.cleanup() }
 })
 
@@ -171,7 +206,7 @@ test("new Chat waits for orchestrator synchronization instead of falling back du
   } finally { release(); await f.cleanup() }
 })
 
-test("model policy maps explicit tiers for admins and locks every user tier to the default", () => {
+test("model policy preserves API tiers for agents while locking user chat to the default", () => {
   const levels: ModelLevels = { default: "balanced-v2", haiku: "fast-v1", sonnet: "coding-v3", opus: "reasoning-v4" }
   const value = { ...catalog, default_model: levels.default, small_model: levels.haiku, model_levels: levels,
     models: Object.values(levels).map(id => ({ ...catalog.models[0], id, name: id })) }
@@ -179,18 +214,21 @@ test("model policy maps explicit tiers for admins and locks every user tier to t
   assert.deepEqual(admin.model_levels, levels)
   assert.deepEqual(admin.models.map(model => model.id), Object.values(levels))
   const user = modelPolicy("user", value)
-  assert.deepEqual(user.models.map(model => model.id), [levels.default])
-  assert.deepEqual(user.model_levels, { default: levels.default, haiku: levels.default, sonnet: levels.default, opus: levels.default })
+  assert.deepEqual(user.models.map(model => model.id), Object.values(levels))
+  assert.deepEqual(user.chat_models.map(model => model.id), [levels.default])
+  assert.deepEqual(user.model_levels, levels)
   for (const level of MODEL_LEVELS) {
     assert.equal(resolveModelLevel(admin, `amecode/${level}`), levels[level])
-    assert.equal(resolveModelLevel(user, level), levels.default)
+    assert.equal(resolveModelLevel(user, level), levels[level])
   }
   assertModel(user, { providerID: "amecode", id: levels.default })
+  assertChatModel(user, { providerID: "amecode", id: levels.default })
+  for (const id of [levels.haiku, levels.sonnet, levels.opus]) assertModel(user, { providerID: "amecode", id })
   for (const id of [levels.haiku, levels.sonnet, levels.opus, "haiku", "amecode/opus"])
-    assert.throws(() => assertModel(user, { providerID: "amecode", id }), /AMECODE_MODEL_NOT_ALLOWED/)
+    assert.throws(() => assertChatModel(user, { providerID: "amecode", id }), /AMECODE_MODEL_NOT_ALLOWED/)
   assert.throws(() => assertModel(admin, { providerID: "other", id: levels.default }), /AMECODE_MODEL_NOT_ALLOWED/)
   assert.deepEqual(modelPolicy("admin", catalog).model_levels, { default: "default", haiku: "other", sonnet: "default", opus: "default" })
-  assert.deepEqual(modelPolicy("user", catalog).model_levels, { default: "default", haiku: "default", sonnet: "default", opus: "default" })
+  assert.deepEqual(modelPolicy("user", catalog).model_levels, { default: "default", haiku: "other", sonnet: "default", opus: "default" })
 })
 
 test("active model catalog is complete while chat and explicitly authorized feature models stay separate", () => {
@@ -208,7 +246,7 @@ test("active model catalog is complete while chat and explicitly authorized feat
 })
 
 test("feature authorization reloads runtime policy without unlocking regular prompts or pet models", async () => {
-  const f = await fixture()
+  const f = await fixture({ catalog: { ...catalog, small_model: "default" } })
   try {
     assert.equal(await f.service.authorizeFeatureModel!("other"), null)
     await login(f.service)
@@ -232,6 +270,75 @@ test("feature authorization reloads runtime policy without unlocking regular pro
     await login(f.service)
     assert.deepEqual((f.rpc.at(-1) as { featureModels: string[] }).featureModels, [])
   } finally { await f.cleanup() }
+})
+
+test("feature tier aliases and already-allowed models need no policy RPC", async () => {
+  const levels = { default: "default", haiku: "other", sonnet: "other", opus: "other" }
+  const f = await fixture({ catalog: { ...catalog, model_levels: levels } })
+  try {
+    await login(f.service)
+    const before = f.rpc.length
+    for (const id of ["haiku", "amecode/sonnet", "opus", "other"])
+      assert.equal(await f.service.authorizeFeatureModel!(id), "other")
+    assert.equal(await f.service.authorizeFeatureModel!("amecode/default"), "default")
+    assert.equal(f.rpc.length, before)
+    await assert.rejects(f.service.call("assert-ready", { modelID: "other" }), /AMECODE_MODEL_NOT_ALLOWED/)
+    await login(f.service)
+    await assert.rejects(f.service.generatePetDialogue("other", new AbortController().signal), /AMECODE_MODEL_NOT_ALLOWED/)
+  } finally { await f.cleanup() }
+})
+
+test("refresh awaits the new global bundle and returns catalog, refresh time and bundle metadata", async () => {
+  const f = await fixture({ autoSync: true, commitEnhanceSkill: "fixture" })
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  try {
+    const loggedIn = await login(f.service) as { refreshedAt: number }
+    assert.ok(loggedIn.refreshedAt > 0)
+    await f.service.call("installed", {})
+    const packed = await pack(preview(input()), "1.2.4", undefined, { commitEnhanceSkill: "fixture" })
+    const next = { ...f.artifact.release, releaseId: randomUUID(), version: "1.2.4", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"] }
+    let entered!: () => void
+    const downloading = new Promise<void>(resolve => { entered = resolve })
+    f.apiResponse(async url => {
+      if (url.pathname.endsWith("/latest")) return Response.json({ ...f.artifact.latest, release: next })
+      if (url.pathname.endsWith("/download")) { entered(); await gate; return new Response(Uint8Array.from(packed.bytes)) }
+    })
+    let settled = false
+    const refreshing = f.service.call("refresh", {}).then(value => { settled = true; return value })
+    await downloading
+    assert.equal(settled, false, "refresh must not return before download/install")
+    release()
+    const result = await refreshing as { refreshedAt: number; models: { version: string }; bundle: Record<string, unknown> }
+    assert.equal(result.models.version, "fixture")
+    assert.ok(result.refreshedAt >= loggedIn.refreshedAt)
+    assert.equal(result.bundle.installedVersion, "1.2.4")
+    assert.equal(result.bundle.installedReleaseId, next.releaseId)
+    assert.deepEqual(result.bundle.installedFeatures, { commitEnhanceSkill: "fixture" })
+    assert.equal(result.bundle.latestVersion, "1.2.4")
+    assert.equal(result.bundle.latestReleaseId, next.releaseId)
+    assert.ok(Number(result.bundle.checkedAt) > 0)
+    assert.equal(result.bundle.autoSyncError, undefined)
+  } finally { release(); await f.cleanup() }
+})
+
+test("refresh bundle checks fail non-fatally and expose a sanitized warning", async t => {
+  for (const failure of ["NO_ACTIVE_RELEASE", "NETWORK_ERROR"]) await t.test(failure, async () => {
+    const f = await fixture({ autoSync: true })
+    try {
+      await login(f.service); await f.service.call("installed", {})
+      f.apiResponse(async url => {
+        if (!url.pathname.endsWith("/latest")) return undefined
+        if (failure === "NETWORK_ERROR") throw new Error("private network details")
+        return Response.json({ error: { code: failure } }, { status: 404 })
+      })
+      const result = await f.service.call("refresh", {}) as { ready: boolean; bundleAutoSyncError?: string; bundle: { installedVersion: string; autoSyncError?: string } }
+      assert.equal(result.ready, true)
+      assert.equal(result.bundleAutoSyncError, failure)
+      assert.equal(result.bundle.autoSyncError, failure)
+      assert.equal(result.bundle.installedVersion, "1.2.3")
+    } finally { await f.cleanup() }
+  })
 })
 
 test("model policy rejects invalid roles and incomplete or inconsistent tier catalogs", () => {
@@ -267,8 +374,8 @@ test("AmeKit account role views, fresh prompt authorization, encryption and logo
   try {
     const status = await login(f.service) as { ready: boolean; models: typeof catalog }
     assert.equal(status.ready, true)
-    assert.deepEqual(status.models.models.map(model => model.id), ["default"])
-    assert.equal(status.models.small_model, "default")
+    assert.deepEqual(status.models.models.map(model => model.id), ["default", "other"])
+    assert.equal(status.models.small_model, "other")
     assert.doesNotMatch(JSON.stringify(status), /fixture-(session-token|provider-key|password)/)
     assert.equal((f.rpc.at(-1) as { role: string }).role, "user")
     assert.doesNotMatch((await readFile(path.join(f.data, "amekit-session.enc"))).toString(), /fixture-session-token/)
@@ -294,7 +401,7 @@ test("account login, status and refresh expose role-aware API model levels", asy
     assert.deepEqual(status.models.model_levels, levels)
     f.role("user")
     const refreshed = await f.service.call("refresh", {}) as typeof loggedIn
-    assert.deepEqual(refreshed.models.model_levels, { default: "default", haiku: "default", sonnet: "default", opus: "default" })
+    assert.deepEqual(refreshed.models.model_levels, levels)
   } finally { await f.cleanup() }
 })
 
@@ -1440,6 +1547,7 @@ test("changed sync and uninstall reload before restoring policy and notifying, w
   const order: string[] = []
   let pluginPolicy: unknown, expectedPolicy: unknown, reloads = 0, reloadFinished = false, failReload = false
   const f = await fixture({
+    catalog: { ...catalog, small_model: "default" },
     reloadRuntime: async () => {
       reloads++; order.push("reload"); reloadFinished = false
       pluginPolicy = null
@@ -1464,12 +1572,14 @@ test("changed sync and uninstall reload before restoring policy and notifying, w
     await f.service.authorizeFeatureModel!("other")
     expectedPolicy = structuredClone(f.rpc.at(-1))
     assert.deepEqual((expectedPolicy as { featureModels: string[] }).featureModels, ["other"])
+    Object.assign(expectedPolicy as object, { managedCatalog: { agents: ["helper"], skills: ["fixture"] } })
     assert.equal((await f.service.call("sync", {}) as { changed: boolean }).changed, true)
     assert.deepEqual(order.slice(0, 4), ["reload", "reloaded", "policy", "synced"])
     const before = reloads
     assert.equal((await f.service.call("sync", {}) as { changed: boolean }).changed, false)
     assert.equal(reloads, before)
     order.length = 0; failReload = true
+    Object.assign(expectedPolicy as object, { managedCatalog: { agents: [], skills: [] } })
     assert.deepEqual(await f.service.call("uninstall", {}), { changed: true })
     assert.deepEqual(order, ["reload", "reloaded", "policy", "uninstalled"], "uninstall restores policy even when reload rejects and call skips synchronize")
     assert.deepEqual(await f.service.call("uninstall", {}), { changed: false })
@@ -1519,6 +1629,7 @@ test("auto sync reloads and restores current policy before notification, and ski
       await f.service.call("installed", {})
       await f.service.authorizeFeatureModel!("other")
       expectedPolicy = structuredClone(f.rpc.at(-1)); active = true
+      Object.assign(expectedPolicy as object, { managedCatalog: { agents: ["helper"], skills: ["fixture"] } })
       await f.service.call("refresh", {})
       await f.service.call("installed", {})
       assert.ok(await installedGlobal(f.globalConfigDir, f.globalManagedDir))
@@ -1973,6 +2084,173 @@ test("bundle opt-out is isolated by account ID and API origin, and another accou
       assert.equal(await restored.call("installed", {}), null, "A's opt-out survives B's explicit sync")
     } finally { await other?.dispose(); await restored?.dispose(); await f.cleanup() }
   })
+})
+
+test("default refresh interval makes no background session or latest requests", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
+  const f = await fixture({ autoSync: true })
+  try {
+    await login(f.service)
+    assert.ok(await f.service.call("installed", {})) // Drain the login auto-sync first.
+    const requests = f.requests.length
+    t.mock.timers.tick(600_000)
+    await settledStatus(f.service)
+    await f.service.call("installed", {})
+    assert.deepEqual(f.requests.slice(requests), [], "no periodic session, latest, download or RPC calls")
+  } finally { await f.cleanup() }
+})
+
+test("single-shot policy leases renew past 24h without polling and honor daily bundle checks", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: new Date(2026, 6, 15, 0, 5).getTime() })
+  const hour = 60 * 60_000, minute = 60_000
+  const f = await fixture({ autoSync: true })
+  const count = (suffix: string) => f.requests.filter(request => request.endsWith(suffix)).length
+  // Session lifetime exceeds the runtime's maximum 24h policy lease.
+  f.expiresAt(Date.now() + 7 * 24 * hour)
+  try {
+    await login(f.service); await f.service.call("installed", {})
+    const sessions = count("/v1/session"), policies = f.rpc.length, latest = count("/latest")
+    t.mock.timers.tick(23 * hour)
+    await settledStatus(f.service)
+    assert.equal(count("/v1/session"), sessions, "no 30s polling or early refresh")
+    t.mock.timers.tick(46 * minute)
+    assert.equal((await settledStatus(f.service)).ready, true)
+    await f.service.call("installed", {})
+    assert.equal(count("/v1/session"), sessions + 1)
+    assert.equal(f.rpc.length, policies + 1)
+    assert.ok(f.rpc.at(-1))
+    assert.equal(count("/latest"), latest, "same local day is already checked")
+    t.mock.timers.tick(15 * minute)
+    assert.ok((await settledStatus(f.service)).account, "account remains ready past 24h")
+    assert.equal((await f.service.readStatus!() as { ready: boolean }).ready, true)
+    t.mock.timers.tick(23 * hour + 31 * minute)
+    assert.equal((await settledStatus(f.service)).ready, true)
+    await f.service.call("installed", {})
+    assert.equal(count("/v1/session"), sessions + 3, "next lease refresh plus the next-day latest endpoint's authentication guard")
+    assert.equal(count("/latest"), latest + 1, "next local day checks once")
+    assert.equal(count("/download"), 1, "unchanged bundle is not downloaded again")
+  } finally { await f.cleanup() }
+})
+
+test("scheduled policy lease retries transient failures twice then revokes without dangling timers", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() })
+  const hour = 60 * 60_000, minute = 60_000
+  const f = await fixture()
+  f.expiresAt(Date.now() + 7 * 24 * hour)
+  const sessions = () => f.requests.filter(request => request === "/v1/session").length
+  try {
+    await login(f.service)
+    const before = sessions(), policies = f.rpc.length
+    f.sessionResponse(transientResponse(503))
+    t.mock.timers.tick(23 * hour + 45 * minute)
+    assert.equal((await settledStatus(f.service)).ready, true)
+    assert.equal(sessions(), before + 1)
+    assert.equal(f.rpc.length, policies, "transient failures cannot renew the policy")
+    for (let failure = 2; failure <= 3; failure++) {
+      t.mock.timers.tick(5 * minute - 1)
+      assert.equal(sessions(), before + failure - 1)
+      t.mock.timers.tick(1)
+      const status = await settledStatus(f.service)
+      assert.equal(sessions(), before + failure)
+      assert.equal(status.ready, failure < 3)
+      assert.equal(!!status.account, failure < 3)
+    }
+    assert.equal(f.rpc.at(-1), null)
+    const revoked = sessions()
+    t.mock.timers.tick(48 * hour); await settledStatus(f.service)
+    assert.equal(sessions(), revoked, "revocation clears renewal")
+    f.sessionResponse()
+    await login(f.service)
+    await f.service.call("logout", {})
+    const loggedOut = f.requests.length
+    t.mock.timers.tick(48 * hour); await settledStatus(f.service)
+    assert.equal(f.requests.length, loggedOut, "logout clears renewal")
+    f.expiresAt(Date.now() + 7 * 24 * hour)
+    await login(f.service)
+    await f.service.dispose()
+    const disposed = f.requests.length
+    t.mock.timers.tick(48 * hour)
+    assert.equal(f.requests.length, disposed, "dispose clears renewal")
+  } finally { await f.cleanup() }
+})
+
+test("ready checks once per local day while manual refresh and sync bypass the daily gate", async () => {
+  const f = await fixture()
+  let service = f.service
+  const day = new Date(2026, 6, 15, 12).getTime()
+  let now = day
+  const account = { origin: "http://localhost:3211", accountId: "1" }
+  const store = dailySyncStore(f.data)
+  const count = (suffix: string) => f.requests.filter(request => request.endsWith(suffix)).length
+  const restart = async () => {
+    await service.dispose()
+    service = createAmeKit({ ...f.options, autoSync: true }, { ...f.dependencies, now: () => now })
+  }
+  try {
+    await login(service)
+    await restart()
+    assert.ok(await service.call("installed", {}), "fresh ready must install even without a prior bundle")
+    assert.equal(count("/latest"), 1)
+    assert.equal(count("/download"), 1)
+    assert.equal(await store.checkedToday(account, now), true)
+
+    await restart()
+    const status = await service.call("status", {}) as { bundle?: { installedVersion?: string } }
+    assert.equal(status.bundle?.installedVersion, "1.2.3", "startup snapshot survives a skipped ready sync")
+    await service.call("installed", {}) // Wait for the scheduled ready gate to finish.
+    assert.equal(count("/latest"), 1)
+    assert.equal(count("/download"), 1)
+
+    now += 24 * 60 * 60_000
+    await restart()
+    await service.call("installed", {})
+    assert.equal(count("/latest"), 2)
+    assert.equal(count("/download"), 1, "current release does not download again")
+    assert.equal(await store.checkedToday(account, now), true, "matching release marks the next day")
+
+    await service.call("refresh", {})
+    assert.equal(count("/latest"), 3)
+    await service.call("sync", {})
+    assert.equal(count("/latest"), 4)
+    assert.equal(await store.checkedToday(account, now), true)
+
+    await uninstallGlobal(f.globalConfigDir, f.globalManagedDir)
+    await restart()
+    assert.ok(await service.call("installed", {}), "a daily marker cannot block a missing bundle's installation")
+    assert.equal(count("/latest"), 5)
+    assert.equal(count("/download"), 3)
+  } finally { await service.dispose(); await f.cleanup() }
+})
+
+test("daily sync markers use local dates, isolate accounts and fail open for invalid files", async () => {
+  const data = await area(), store = dailySyncStore(data)
+  const account = { origin: "http://localhost:3211", accountId: "1" }
+  const now = new Date(2026, 0, 2, 12).getTime()
+  assert.equal(localDayKey(now), "2026-01-02")
+  assert.throws(() => localDayKey(NaN), /INVALID_SYNC_DATE/)
+  assert.equal(await store.checkedToday(account, now), false)
+  await store.markChecked(account, now)
+  assert.equal(await store.checkedToday(account, now), true)
+  assert.equal(await store.checkedToday(account, now + 24 * 60 * 60_000), false)
+  assert.equal(await store.checkedToday({ ...account, accountId: "2" }, now), false)
+  assert.equal(await store.checkedToday({ ...account, origin: "http://localhost:3213" }, now), false)
+  const directory = path.join(data, "amekit", "daily-sync")
+  const files = await readdir(directory)
+  assert.equal(files.length, 1, "atomic write leaves no pending files")
+  assert.match(files[0], /^[a-f0-9]{64}\.json$/)
+  const file = path.join(directory, files[0])
+  for (const content of ["{", "null", JSON.stringify({ ...account, accountId: "2", lastCheckedDay: localDayKey(now) }), " ".repeat(64 * 1024 + 1)]) {
+    await writeFile(file, content)
+    assert.equal(await store.checkedToday(account, now), false)
+  }
+  await store.markChecked(account, now)
+  const alias = path.join(data, "marker-link")
+  await link(file, alias)
+  assert.equal(await store.checkedToday(account, now), false, "hard-linked markers are unsafe")
+  await rm(alias)
+  await rm(file)
+  await mkdir(file)
+  assert.equal(await store.checkedToday(account, now), false, "directories are not markers")
 })
 
 test("auto sync restores a saved session at ready and skips downloads for an already-current global release", async () => {

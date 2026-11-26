@@ -204,6 +204,40 @@ test('Commit Agent opens for unstaged changes and respects connection, busy stat
   } finally { h.unmount() }
 })
 
+test('Enhance tooltip explains readiness, active configuration and every disabled state', async () => {
+  const request = deferred<{ message: string }>()
+  const h = harness({ commitEnhanceSkill: 'team-commit', commitEnhanceModel: 'haiku' }, { generateCommitMessage() { return request.promise } })
+  const title = () => String(h.byID('git-workspace-enhance-btn').props.title)
+  try {
+    h.render(); await h.flush()
+    assert.match(title(), /Skill \/team-commit/)
+    assert.match(title(), /Model: haiku/)
+    h.render({ connected: false }); assert.match(title(), /Chưa kết nối/)
+    h.render({ connected: true, git: { branch: 'main', changes: [] } }); assert.match(title(), /Stage ít nhất một tệp/)
+    h.render({ git: base.git }); h.invoke(h.byID('git-workspace-enhance-btn')); h.render()
+    assert.match(title(), /Đang xử lý/)
+    request.resolve({ message: 'feat: ready' }); await h.flush()
+    h.render({ commitEnhanceSkill: 'updated-skill', commitEnhanceModel: 'sonnet' })
+    assert.match(title(), /Skill \/updated-skill/); assert.match(title(), /Model: sonnet/)
+    h.render({ commitEnhanceSkill: '', commitEnhanceModel: '' })
+    assert.match(title(), /thay đổi đã stage/)
+    assert.doesNotMatch(title(), /Skill|Model:/)
+  } finally { h.unmount() }
+})
+
+test('installed Enhance settings refresh on both account and bundle changes', () => {
+  for (const path of ['../App.tsx', '../components/Inspector.tsx']) {
+    const source = readFileSync(new URL(path, import.meta.url), 'utf8')
+    const installedIndex = source.indexOf("account?.('installed', {})")
+    assert.ok(installedIndex >= 0, `${path} reads installed features`)
+    const installedEffect = source.slice(installedIndex, source.indexOf('}, [projectID', installedIndex))
+    for (const event of ['ame-account-changed', 'ame-bundle-updated']) {
+      assert.ok(installedEffect.includes(`window.addEventListener('${event}', load)`), `${path} listens for ${event}`)
+      assert.ok(installedEffect.includes(`window.removeEventListener('${event}', load)`), `${path} cleans up ${event}`)
+    }
+  }
+})
+
 test('Commit and Commit & Push forward options, clear message and refresh in order', async () => {
   for (const push of [false, true]) {
     const calls: unknown[][] = []

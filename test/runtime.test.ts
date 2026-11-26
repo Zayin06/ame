@@ -203,10 +203,12 @@ test('bundled backend auto-starts once, authenticates, loads policy, persists se
     assert.equal(config.plugins.length, 1)
     assert.equal(config.experimental.subagent_depth, 3)
     assert.equal(config.experimental.artifacts, true)
+    assert.equal(config.experimental.todo, true)
     const entries = await client.config.get({ location: { directory: project } })
     const experimental = entries.flatMap(entry => entry.type === 'document' && entry.info.experimental ? [entry.info.experimental] : []).at(-1)
     assert.equal(experimental?.subagent_depth, 3, 'native backend receives the three-generation limit')
     assert.equal(experimental?.artifacts, true, 'native backend enables artifacts in the private profile')
+    assert.equal(experimental?.todo, true, 'native backend enables todo in the private profile')
     let parentID = session.id
     for (let depth = 1; depth <= 3; depth++) {
       const child = await client.session.create({ parentID, title: `Native depth ${depth}`, agent: 'private-test', location: { directory: project } })

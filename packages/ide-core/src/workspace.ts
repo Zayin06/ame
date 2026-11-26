@@ -276,6 +276,25 @@ export class Workspaces {
     this.changed(id)
     return result
   }
+  async copyPath(targetID: string, sourceID: string, sourceRelative: string, targetDir: string) {
+    const result = await workspaceFs.copyEntry(this.get(sourceID).directory, sourceRelative, this.get(targetID).directory, targetDir)
+    this.changed(targetID)
+    return result
+  }
+  async movePath(targetID: string, sourceID: string, sourceRelative: string, targetDir: string) {
+    const { sameRoot: _sameRoot, ...result } = await workspaceFs.moveEntry(this.get(sourceID).directory, sourceRelative, this.get(targetID).directory, targetDir)
+    const sameProject = sourceID === targetID
+    if (result.moved) {
+      this.changed(targetID)
+      if (!sameProject) this.changed(sourceID)
+    }
+    return { ...result, sameProject }
+  }
+  async pasteExternalPaths(targetID: string, absolutePaths: readonly string[], targetDir: string) {
+    const result = await workspaceFs.copyExternalEntries(absolutePaths, this.get(targetID).directory, targetDir)
+    if (result.paths.length) this.changed(targetID)
+    return result
+  }
   async buildNotesSummary(id: string, request: BuildNotesRequest, maxDiffBytes?: number) {
     return gitOps.buildNotesSummary(this.get(id).directory, request, maxDiffBytes)
   }

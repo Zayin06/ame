@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { errorText, Modal } from './Primitives'
-import { formatAmeKitError, formatBundleSize, groupIssues, suggestNextVersion, type IssueSeverity } from '../amekit-ui'
+import { formatAmeKitError, formatBundleSize, formatCatalogVersion, formatSemverVersion, formatVersionSummaryLine, groupIssues, suggestNextVersion, type IssueSeverity } from '../amekit-ui'
 
 import type { BundleFeatures } from '../../../../../packages/amekit/src/api'
 
 type ActiveModel = { id: string; name: string; vision?: boolean; reasoning?: boolean }
-type AccountState = { origin?: string; account?: { name: string; username: string; role?: string }; models?: { default_model?: string; small_model?: string; model_levels?: Partial<Record<'default' | 'haiku' | 'sonnet' | 'opus', string>>; active_models?: ActiveModel[] }; ready?: boolean; reconnecting?: boolean; blocker?: string; bundleAutoSyncError?: string } | null
+type AccountState = { origin?: string; account?: { name: string; username: string; role?: string }; orchestrator?: { id?: string; version?: string }; models?: { version?: string; default_model?: string; small_model?: string; model_levels?: Partial<Record<'default' | 'haiku' | 'sonnet' | 'opus', string>>; active_models?: ActiveModel[] }; refreshedAt?: number; bundle?: { installedVersion?: string; installedReleaseId?: string; installedFeatures?: BundleFeatures; latestVersion?: string; latestReleaseId?: string; checkedAt?: number; autoSyncError?: string }; ready?: boolean; reconnecting?: boolean; blocker?: string; bundleAutoSyncError?: string } | null
 type Features = BundleFeatures
 type Release = { releaseId?: string; id?: string; version?: string; channel?: string; size?: number; features?: Features; manifest?: { agents?: number; skills?: number; compatibility?: { mode?: string }; features?: Features } }
 type Bundle = { version?: string; releaseId?: string; verification?: string; compatibilityWarnings?: unknown[]; compatibilityMode?: string; agents?: string[]; skills?: string[]; fileCount?: number; features?: Features } | null
@@ -72,6 +72,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   const [installed, setInstalled] = useState<Bundle>(null)
   const [legacyInfo, setLegacyInfo] = useState<LegacyProjectBundle>(null)
   const [bundleNotice, setBundleNotice] = useState('')
+  const [refreshNotice, setRefreshNotice] = useState('')
   const [editingVersion, setEditingVersion] = useState(false)
   const [customVersion, setCustomVersion] = useState('')
   const [activateNow, setActivateNow] = useState(true)
@@ -128,6 +129,16 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     opus: account?.models?.model_levels?.opus || defaultModelID,
   }
   const activeModels = account?.models?.active_models ?? []
+  const installedVersion = account?.bundle?.installedVersion || installed?.version
+  const latestVersion = account?.bundle?.latestVersion
+  const modelVersionLabel = formatCatalogVersion(account?.models?.version)
+  const orchestratorVersionLabel = formatSemverVersion(account?.orchestrator?.version)
+  const bundleVersionLabel = installedVersion ? formatSemverVersion(installedVersion) : 'Chưa cài'
+  const versionSummaryLine = formatVersionSummaryLine({ modelVersion: account?.models?.version, orchestratorVersion: account?.orchestrator?.version, bundleVersion: installedVersion })
+  const hasBundleUpdate = Boolean(latestVersion && latestVersion !== installedVersion)
+  const statusPillLabel = hasBundleUpdate ? 'Có bản cập nhật mới' : account?.bundleAutoSyncError ? 'Cần kiểm tra đồng bộ' : account?.ready ? 'Đã mới nhất' : 'Chưa đồng bộ'
+  const statusPillClass = hasBundleUpdate ? 'amekit-pill amekit-readiness--blocked' : !account?.bundleAutoSyncError && account?.ready ? 'amekit-pill amekit-readiness--ready' : 'amekit-pill'
+  const refreshTime = (epoch: number) => new Date(epoch).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
   const selectableModels = account?.models?.active_models ?? [...new Set(Object.values(modelLevels).filter(Boolean))].map(id => ({ id, name: id }))
   const modelOptions = (selected: string) => <><option value="">Mặc định theo API (default · {defaultModelID || '—'})</option>{selected && !selectableModels.some(model => model.id === selected) && <option value={selected}>{selected} · Không còn hoạt động</option>}{selectableModels.map(model => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}</>
   const resetFeatures = () => { setCommitEnhanceSkill(''); setCommitEnhanceModel(''); setAndroidTranslationSkill(''); setAndroidTranslationModel(''); setBuildNotesSkill(''); setBuildNotesModel('') }
@@ -252,11 +263,19 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     if (importOperation) setFixNotice('')
     if (operation === 'package') setPackaged(null)
     if (operation === 'update-features') setServerFeaturesNotice('')
+    if (operation === 'refresh') setRefreshNotice('')
     try {
       const value = await request(operation, payload)
       if (['status', 'login', 'refresh', 'logout'].includes(operation)) {
         setAccount(value as AccountState); setPassword('')
+        if (operation === 'refresh') {
+          const refreshed = value as AccountState
+          const version = refreshed?.bundle?.installedVersion || installed?.version
+          const refreshedSummary = formatVersionSummaryLine({ modelVersion: refreshed?.models?.version, orchestratorVersion: refreshed?.orchestrator?.version, bundleVersion: version })
+          setRefreshNotice(`Đã làm mới phiên lúc ${refreshTime(refreshed?.refreshedAt ?? Date.now())} · ${refreshedSummary}`)
+        }
         if (operation === 'logout') {
+          setRefreshNotice('')
           setBundleLoaded(false); setHistoryLoaded(false); setBundleLoading(false); setHistoryLoading(false)
           serverFeaturesGeneration.current++
           setServerFeaturesRelease(null); setServerSkills([]); setServerBaseFeatures({}); applyServerSelections({})
@@ -398,6 +417,25 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
       </section>
       <div className={`amekit-alert ${account.ready ? 'amekit-alert--success' : 'amekit-alert--warning'}`} role="status"><strong>{account.ready ? 'Tài khoản sẵn sàng' : blockerInfo?.title || (account.reconnecting ? 'Đang kết nối lại…' : 'Tài khoản chưa sẵn sàng')}</strong>{!account.ready && blockerInfo?.detail && <p>{blockerInfo.detail}</p>}</div>
       <div className="button-row"><button disabled={busy} onClick={() => void execute('refresh')}>Làm mới phiên</button><button disabled={busy} onClick={() => void execute('logout')}>Đăng xuất</button></div>
+      {refreshNotice && <div className="amekit-alert amekit-alert--success" role="status" data-testid="amekit-refresh-notice">{refreshNotice}</div>}
+      <section className="amekit-card" data-testid="amekit-account-versions">
+        <div className="amekit-card-heading">
+          <h4>Cấu hình AME</h4>
+          <span className={statusPillClass} data-testid="amekit-version-status">{statusPillLabel}</span>
+        </div>
+        <p className="muted">Tự kiểm tra khi mở ứng dụng lần đầu trong ngày hoặc khi bấm <strong>Làm mới phiên</strong>. {account.refreshedAt !== undefined ? <>Đồng bộ gần nhất: <time dateTime={new Date(account.refreshedAt).toISOString()}>{refreshTime(account.refreshedAt)}</time>.</> : <>Chưa làm mới.</>}</p>
+        <details className="amekit-details" data-testid="amekit-version-details">
+          <summary>Chi tiết phiên bản ({versionSummaryLine})</summary>
+          <dl>
+            <div><dt>Model (Catalog API)</dt><dd>{modelVersionLabel}</dd></div>
+            <div><dt>Agent điều phối</dt><dd>{orchestratorVersionLabel}</dd></div>
+            <div><dt>Bundle đã cài</dt><dd>{bundleVersionLabel}</dd></div>
+            {hasBundleUpdate && <div><dt>Bundle mới nhất</dt><dd>{formatSemverVersion(latestVersion)}</dd></div>}
+            <div><dt>Làm mới gần nhất</dt><dd>{account.refreshedAt !== undefined ? <time dateTime={new Date(account.refreshedAt).toISOString()}>{refreshTime(account.refreshedAt)}</time> : 'Chưa làm mới'}</dd></div>
+          </dl>
+        </details>
+      </section>
+      {account.bundleAutoSyncError && <div className="amekit-alert amekit-alert--warning" role="status"><strong>Tự đồng bộ nền chưa thể áp dụng bundle: {formatAmeKitError(account.bundleAutoSyncError).title}</strong><p>{formatAmeKitError(account.bundleAutoSyncError).detail} Mở Bundle để thử Đồng bộ / Cập nhật ngay.</p></div>}
       {(account.models?.model_levels || account.models?.default_model) && <section className="amekit-card amekit-model-levels"><h4>Phân cấp Model từ API</h4><dl>{Object.entries(modelLevels).map(([level, id]) => <div key={level}><dt><code>{level}</code></dt><dd><code>{id || '—'}</code></dd></div>)}</dl></section>}
       {activeModels.length > 0 && <details className="amekit-details amekit-active-models" data-testid="amekit-active-models"><summary>Tất cả Model đang hoạt động từ API ({activeModels.length})</summary><ul>{activeModels.map(model => <li key={model.id}><strong>{model.name}</strong> <code>{model.id}</code>{model.vision && <span className="amekit-pill">Vision</span>}{model.reasoning && <span className="amekit-pill">Reasoning</span>}</li>)}</ul></details>}
     </> : <form onSubmit={e => { e.preventDefault(); void execute('login', { ...(server.trim() ? { server: server.trim() } : {}), username, password }) }}>
@@ -410,7 +448,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     </form>}</> : tab === 'bundle' ? <>
       <section className="amekit-card" data-testid="amekit-global-bundle">
         <h3>Bundle toàn ứng dụng</h3>
-        <p className="muted">Agents &amp; Skills dùng chung toàn ứng dụng (tự đồng bộ nền, không thêm tệp vào Git dự án).</p>
+        <p className="muted">Agents &amp; Skills dùng chung toàn ứng dụng (tự kiểm tra lần mở đầu tiên trong ngày hoặc khi bấm làm mới/đồng bộ, không thêm tệp vào Git dự án).</p>
         {installed ? <>
           <div className="amekit-badges"><strong>Đang dùng: v{installed.version || installed.releaseId}</strong><span className="amekit-pill">{installed.compatibilityMode || 'native'}</span><span className={`amekit-pill ${latest && installed.releaseId === releaseID(latest) ? 'amekit-readiness--ready' : ''}`}>{latest && installed.releaseId === releaseID(latest) ? 'Đã mới nhất' : latest ? `Có bản mới v${latest.version || releaseID(latest)}` : 'Đã cài cục bộ'}</span><EnhanceSummary features={installed.features} /></div>
           <p className="amekit-stats">{installed.verification === 'runtime-ready' ? 'Sẵn sàng OpenCode' : 'Đã xác minh chữ ký/byte'} · {installed.agents?.length ?? 0} agents · {installed.skills?.length ?? 0} skills · {installed.fileCount ?? 0} tệp</p>

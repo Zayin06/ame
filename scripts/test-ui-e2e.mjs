@@ -409,7 +409,7 @@ async function main() {
       assert.match(message, /Không thể xem trước tệp nhị phân/, 'Binary error must be humanized in Vietnamese')
       assert.doesNotMatch(message, /BINARY_FILE|INVALID_PATH/, 'Binary error must not expose raw error codes')
       assert.equal(await evaluate('document.querySelector(".editor-surface").textContent.includes("Đang đọc tệp…")'), false, 'Binary read must not remain stuck loading')
-      assert.deepEqual(await evaluate('[...document.querySelectorAll(".editor-load-error button")].map(e=>e.textContent)'), ['Thử lại', 'Đóng tab'], 'Inline read error must expose retry and close recovery actions')
+      assert.deepEqual(await evaluate('[...document.querySelectorAll(".editor-load-error button")].map(e=>e.textContent)'), ['Thử lại', process.platform === 'darwin' ? 'Show in Finder' : 'Show in File Explorer', 'Đóng tab'], 'Inline read error must expose retry, reveal and close recovery actions')
       await click('.editor-load-error .button-row button:first-child', 'Thử lại binary read')
       await until('document.querySelector(".editor-load-error")?.textContent.includes("Không thể xem trước tệp nhị phân") && !document.querySelector(".editor-surface").textContent.includes("Đang đọc tệp…")', 'friendly inline binary error after forced retry')
       await noGlobalError()

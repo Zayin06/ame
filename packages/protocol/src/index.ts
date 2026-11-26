@@ -69,7 +69,8 @@ export type ReplacePreview = { path: string; revision: string; count: number; sa
 export type ReplaceResult = { filesChanged: number; replacements: number; previews: ReplacePreview[]; writtenFiles: string[]; conflicts: string[]; errors: { path: string; code: string }[] }
 export type { PermissionMode } from './permission-mode'
 import type { PermissionMode } from './permission-mode'
-export type Session = { id: string; title: string; permissionMode?: PermissionMode; updatedAt?: number; parentID?: string; agent?: string; status?: 'running' | 'idle'; activity?: 'thinking' | 'working' | 'waiting'; busyAt?: number; idleAt?: number; outcome?: 'succeeded' | 'failed' | 'interrupted' }
+export type SessionRevert = { messageID: string; partID?: string; snapshot?: string; files?: SessionDiff[] }
+export type Session = { id: string; title: string; revert?: SessionRevert; permissionMode?: PermissionMode; updatedAt?: number; parentID?: string; agent?: string; status?: 'running' | 'idle'; activity?: 'thinking' | 'working' | 'waiting'; busyAt?: number; idleAt?: number; outcome?: 'succeeded' | 'failed' | 'interrupted' }
 export type SessionUsageView = {
   origin: string | null
   nodes: import('../../amekit/src/usage').UsageNode[]
@@ -87,6 +88,8 @@ export type ToolCallInfo = {
 }
 export type SlashCommand = { name: string; description?: string }
 export type SkillSummary = { id: string; name: string; description?: string; path: string }
+export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled'
+export type TodoItem = { content: string; status: TodoStatus }
 export type ChatItem = {
   id: string
   role: string
@@ -99,6 +102,9 @@ export type ChatItem = {
   completedAt?: number
   phase?: 'commentary' | 'final_answer'
   workedMs?: number
+  executionID?: string
+  executionOutcome?: 'succeeded' | 'failed' | 'interrupted'
+  todos?: TodoItem[]
 }
 export type Model = { id: string; modelID?: string; name: string; providerID: string }
 export type SessionLockState = { lockedSessionIDs: string[]; translationSessionIDs: string[] }
@@ -143,7 +149,8 @@ export type { SessionForm, SessionFormField, SessionFormOption, SessionFormWhen,
 import type { SessionForm, SessionFormAnswer } from './session-form'
 export type Connection = { connected: boolean; url: string; version?: string; error?: string }
 export type PairingPreferences = { enabled: boolean; keepScreenActive: boolean }
-export type PairingSettings = PairingPreferences & { publicURL: string; port: number; connecting?: boolean; error?: string }
+export type PairedDevice = { id: string; label: string; createdAt: number; lastUsedAt: number }
+export type PairingSettings = PairingPreferences & { publicURL: string; port: number; connecting?: boolean; error?: string; devices?: PairedDevice[] }
 export type PairingCode = { url: string; qr: string; expiresAt: number }
 export type AccountView = { origin?: string; account?: { name: string; username: string; role?: string }; models?: unknown; reconnecting?: boolean } | null
 export type TerminalProfile = { id: string; name: string; executable: string; args: string[] }
@@ -256,6 +263,10 @@ export interface DesktopApi {
   createFile(projectID: string, relative: string, content?: string): Promise<{ path: string }>
   createDirectory(projectID: string, relative: string): Promise<{ path: string }>
   renamePath(projectID: string, fromRelative: string, toRelative: string): Promise<{ from: string; to: string }>
+  copyPath(targetProjectID: string, sourceProjectID: string, sourceRelative: string, targetDir: string): Promise<{ path: string; directory: boolean }>
+  movePath(targetProjectID: string, sourceProjectID: string, sourceRelative: string, targetDir: string): Promise<{ from: string; to: string; directory: boolean; sameProject: boolean; moved: boolean }>
+  clipboardFiles(): Promise<{ hasFiles: boolean; names: string[]; count: number }>
+  pasteClipboardFiles(targetProjectID: string, targetDir: string): Promise<{ paths: string[] }>
   deletePath(projectID: string, relative: string): Promise<{ path: string; directory: boolean }>
   revealPath(projectID: string, relative: string): Promise<void>
   searchProject(projectID: string, query: SearchQuery): Promise<SearchResponse>
@@ -288,6 +299,8 @@ export interface DesktopApi {
   pairingStatus(): Promise<PairingSettings>
   pairingConfigure(settings: PairingPreferences): Promise<PairingSettings>
   pairingCode(): Promise<PairingCode>
+  pairingRevokeDevice(deviceID: string): Promise<PairingSettings>
+  pairingRevokeAll(): Promise<PairingSettings>
   connect(url: string, username?: string, password?: string): Promise<Connection>
   discover(): Promise<Connection>
   sessions(projectID: string): Promise<Session[]>
@@ -310,6 +323,8 @@ export interface DesktopApi {
   commitAgentExecutePlan(projectID: string, sessionID: string, plan: CommitAgentPlan): Promise<CommitAgentExecuteResult>
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
+  stageRevert(id: string, session: string, messageID: string, files: boolean): Promise<SessionRevert>
+  clearRevert(id: string, session: string): Promise<void>
   sessionUsage(projectID: string, sessionID: string): Promise<SessionUsageView>
   agentMap(projectID: string, sessionID: string): Promise<AgentMapView>
   models(projectID: string): Promise<Model[]>
