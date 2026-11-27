@@ -23,7 +23,7 @@ function redact(text: string, removed: string[] = []) {
   }
   let redactedText = text.replace(/-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED|PGP) )?PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED|PGP) )?PRIVATE KEY(?: BLOCK)?-----|$)/gi, value => placeholder("PRIVATE_KEY", value))
   redactedText = redactedText.replace(/\b(?:sk-[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[A-Z0-9]{16}|(?:gh[pousr]_|github_pat_|glpat-)[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{35}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/gi, value => placeholder("PROVIDER_KEY", value))
-  redactedText = redactedText.replace(/(\bBearer\s+)(?!\[REDACTED_)([A-Za-z0-9._~+\/-]+=*)/gi, (match, prefix: string, value: string) => /^(?:YOUR_[A-Z0-9_]+|INSERT_[A-Z0-9_]+_HERE)$/.test(value) ? match : prefix + placeholder("SECRET", value))
+  redactedText = redactedText.replace(/(\bBearer\s+)(?!\[REDACTED_)(?=[A-Za-z0-9._~+\/=-]{16,})([A-Za-z0-9._~+\/-]+=*)/gi, (match, prefix: string, value: string) => /^(?:YOUR_[A-Z0-9_]+|INSERT_[A-Z0-9_]+_HERE|your_[a-z_]+)$/.test(value) ? match : prefix + placeholder("SECRET", value))
   redactedText = redactedText.replace(/((?:api[_-]?key|password|secret|token)\s*[:=]\s*)(["']?)([A-Za-z0-9_+/=-]{16,})/gi, (match: string, prefix: string, quote: string, value: string, offset: number, source: string) => {
     const rest = source.slice(offset + match.length)
     const boundary = quote ? rest.startsWith(quote) : /^(?:\s|$|[,;}\]"'])/.test(rest)

@@ -2799,6 +2799,14 @@ test("expanded credential families are redacted and blocked in bundles", () => {
     assert.equal(redactSecretsForLlm(token).redactedText.includes(token), false)
     assert.ok(secretFindings(token).some(finding => finding.classification === "blocked"), token)
   }
+  for (const prose of ["REST API with Bearer token", "Use Bearer authentication", "Authorization: Bearer auth"]) {
+    assert.equal(secretFindings(prose).length, 0, prose)
+    assert.equal(redactSecretsForLlm(prose).redactionCount, 0, prose)
+  }
+  for (const template of ["Bearer YOUR_API_TOKEN_HERE", "Bearer INSERT_OAUTH2_ACCESS_TOKEN_HERE"]) {
+    assert.equal(secretFindings(template).some(finding => finding.classification === "blocked"), false, template)
+    assert.equal(redactSecretsForLlm(template).redactionCount, 0, template)
+  }
 })
 
 test("AI fix rejects introduced or modified permission and system blocks", async () => {

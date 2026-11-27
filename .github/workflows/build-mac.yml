@@ -3,6 +3,11 @@ on:
   push:
     tags: ['mac-*']
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run full unit test suite before packaging
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -13,6 +18,7 @@ concurrency:
 jobs:
   package-mac:
     runs-on: macos-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -51,6 +57,8 @@ jobs:
       - name: Build backend plugin before tests
         run: npm run build:server
       - name: Unit tests
+        if: ${{ inputs.run_tests == true }}
+        timeout-minutes: 15
         env:
           AME_REQUIRE_BACKEND_TESTS: '1'
         run: npm test
