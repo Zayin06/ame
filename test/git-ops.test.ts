@@ -8,7 +8,54 @@ import { simpleGit } from 'simple-git'
 import { parseDocument } from 'yaml'
 import { buildNotesSummary, checkoutBranch, createBranch, deleteBranch, discardFile, executeCommitPlan, gitCommitPlanSnapshot, gitFetch, gitPull, gitPush, gitLog, gitCommitDetail, gitUndoLastCommit, gitStashList, gitStashPush, gitStashApply, gitStashDrop, hasRemote, mapGitNetworkError, listBranches, stageAll, stagedDiffSummary, unstageAll, validateBranchName } from '../packages/ide-core/src/git-ops'
 import type { CommitAgentPlan } from '../packages/protocol/src/index'
-import { gitFileCommitPatch } from '../packages/ide-core/src/git-ops'
+import { gitFileCommitPatch, safeReadOnlyGitConfig, detectUntrustedGitConfig, isHeadPushed } from '../packages/ide-core/src/git-ops'
+
+test('stage-all excludes active atomic-save temporary files', async t => {
+  const { root, git, write } = await fixture(t)
+  await mkdir(path.join(root, 'nested'))
+  await write('keep.txt', 'keep\n')
+  await write('.ame-save-active.tmp', 'in-progress\n')
+  await write('nested/.ame-save-active.bak', 'backup\n')
+  await stageAll(root)
+  assert.deepEqual((await git.raw(['diff', '--cached', '--name-only', '-z'])).split('\0').filter(Boolean), ['keep.txt'])
+})
+
+test('network errors distinguish local permissions, authentication and remote policy rejection', () => {
+  assert.doesNotMatch(mapGitNetworkError(new Error('EACCES: permission denied, open .git/index.lock')).message, /GIT_AUTH_FAILED/)
+  for (const message of ['Permission denied (publickey)', 'Permission denied (keyboard-interactive)', 'Authentication failed', 'could not read username']) assert.match(mapGitNetworkError(new Error(message)).message, /^GIT_AUTH_FAILED:/)
+  assert.match(mapGitNetworkError(new Error('! [remote rejected] main -> main (protected branch)')).message, /^GIT_REMOTE_REJECTED:/)
+  assert.match(mapGitNetworkError(new Error('! [rejected] main -> main (non-fast-forward)')).message, /^GIT_PUSH_REJECTED_NON_FF:/)
+})
+
+test('hex-named branches cannot impersonate commit hashes while short OIDs still work', async t => {
+  const { root, git, write, commit } = await fixture(t)
+  await write('a.txt', 'base\n'); await commit()
+  const hash = (await git.raw(['rev-parse', 'HEAD'])).trim()
+  const spoof = hash.startsWith('deadbee') ? 'cafebab' : 'deadbee'
+  await git.raw(['branch', spoof])
+  await assert.rejects(gitCommitDetail(root, spoof), /INVALID_COMMIT_HASH/)
+  await assert.rejects(buildNotesSummary(root, { mode: 'commits', commitHashes: [spoof], includeWorking: false }), /INVALID_BUILD_BASE_COMMIT/)
+  await assert.rejects(gitFileCommitPatch(root, 'a.txt', [spoof]), /INVALID_COMMIT_HASH/)
+  for (const length of [7, 8, 9]) assert.equal((await gitCommitDetail(root, hash.slice(0, length))).hash, hash)
+  assert.equal(await isHeadPushed(root), false)
+  await git.raw(['update-ref', 'refs/remotes/origin/main', hash])
+  assert.equal(await isHeadPushed(root), true)
+})
+
+test('read-only config disables local executable filters and detects untrusted entries and hooks', async t => {
+  const { root, git } = await fixture(t)
+  for (const [key, value] of [['filter.danger.clean', 'echo unsafe'], ['filter.danger.process', 'echo unsafe'], ['filter.danger.required', 'true'], ['diff.danger.textconv', 'echo unsafe'], ['core.sshCommand', 'unsafe'], ['core.hooksPath', 'custom-hooks'], ['credential.helper', 'unsafe']]) await git.addConfig(key, value)
+  await writeFile(path.join(root, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 0\n')
+  await writeFile(path.join(root, '.git', 'included-config'), '[filter "included"]\n\tclean = echo unsafe\n[diff "included"]\n\ttextconv = echo unsafe\n')
+  await git.addConfig('include.path', 'included-config')
+  const config = await safeReadOnlyGitConfig(root)
+  assert.ok(config.includes('filter.included.clean='))
+  assert.ok(config.includes('diff.included.textconv='))
+  for (const value of ['core.fsmonitor=false', 'diff.external=', 'core.pager=cat', 'core.hooksPath=', 'core.sshCommand=', 'credential.helper=', 'filter.danger.clean=', 'filter.danger.smudge=', 'filter.danger.process=', 'filter.danger.required=false', 'diff.danger.textconv=']) assert.ok(config.includes(value), value)
+  const detected = await detectUntrustedGitConfig(root)
+  for (const key of ['filter.danger.clean', 'filter.danger.process', 'diff.danger.textconv', 'core.sshcommand', 'core.hookspath', 'credential.helper', 'hooks/pre-commit']) assert.ok(detected.map(value => value.toLowerCase()).includes(key), key)
+  assert.ok(!detected.some(value => value.endsWith('.sample')))
+})
 
 async function fixture(t: TestContext, objectFormat = 'sha1') {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'ame-git-ops-'))
@@ -798,7 +845,7 @@ test('discard rejects traversal, metadata, alternate streams and symlink escapes
   await write('keep.txt', 'keep\n')
   await writeFile(path.join(temporary, 'outside.txt'), 'outside\n')
   const metadata = await readFile(path.join(root, '.git', 'config'), 'utf8')
-  for (const value of ['', '.', './', '..', '../outside.txt', '..\\outside.txt', 'nested/../keep.txt', 'nested\\..\\keep.txt', '.git/config', '.GIT\\config', 'nested/.Git/config', 'C:relative.txt', 'C:\\Windows\\win.ini', '/etc/passwd', '\\\\host\\share', 'file:stream', 'nul\0.txt']) {
+  for (const value of ['', '.', './', '..', '../outside.txt', '..\\outside.txt', 'nested/../keep.txt', 'nested\\..\\keep.txt', '.git/config', '.GIT\\config', 'nested/.Git/config', 'C:relative.txt', 'C:\\Windows\\win.ini', '/etc/passwd', '\\\\host\\share', ...(process.platform === 'win32' ? ['file:stream'] : []), 'nul\0.txt']) {
     await assert.rejects(discardFile(root, value), /INVALID_PATH/, value)
   }
   await symlink(temporary, path.join(root, 'escape'), process.platform === 'win32' ? 'junction' : 'dir')
@@ -1044,6 +1091,41 @@ test('stash round trips tracked and untracked content, apply retains entries, po
   }
 })
 
+test('release gates packaging on signing secrets, smoke tests Windows, and publishes checksummed artifacts', async () => {
+  const release = await workflow('release.yml')
+  const job = release.jobs.package
+  const packageIndex = job.steps.findIndex((step: any) => step.name === 'Package platform artifacts without publishing')
+  const guardIndex = job.steps.findIndex((step: any) => step.name === 'Require signing secrets for tag releases')
+  assert.ok(guardIndex >= 0 && guardIndex < packageIndex)
+  const guard = job.steps[guardIndex]
+  assert.equal(guard.if, "github.event_name == 'push' && inputs.dry_run != true")
+  assert.ok(guard.run.includes("'${{ matrix.platform }}' = win"))
+  for (const secret of ['CSC_LINK', 'APPLE_ID', 'APPLE_APP_SPECIFIC_PASSWORD', 'APPLE_TEAM_ID']) {
+    assert.equal(guard.env[secret], '${{ secrets.' + secret + ' }}')
+    assert.ok(guard.run.includes('${' + secret + ':?'))
+  }
+  const smokeIndex = job.steps.findIndex((step: any) => step.run === 'node scripts/smoke-packaged.mjs')
+  assert.ok(smokeIndex > packageIndex)
+  assert.equal(job.steps[smokeIndex].if, "matrix.platform == 'win'")
+  const checksumIndex = job.steps.findIndex((step: any) => step.name === 'Generate packaged artifact checksums')
+  assert.ok(checksumIndex > smokeIndex)
+  const checksum = job.steps[checksumIndex].run
+  assert.ok(checksum.includes('files=(*.exe *.dmg *.zip)'))
+  assert.ok(checksum.includes('sha256sum "$file"') && checksum.includes('shasum -a 256 "$file"'))
+  assert.ok(checksum.includes('SHA256SUMS-${{ matrix.platform }}-${{ matrix.arch }}.txt'))
+  const uploadIndex = job.steps.findIndex((step: any) => step.uses === 'actions/upload-artifact@v4')
+  assert.ok(uploadIndex > checksumIndex)
+  for (const artifact of ['*.exe', '*.dmg', '*.zip', '*.blockmap', 'latest*.yml', 'SHA256SUMS-${{ matrix.platform }}-${{ matrix.arch }}.txt']) {
+    assert.ok(job.steps[uploadIndex].with.path.split('\n').includes(`release/${artifact}`))
+  }
+  const publish = release.jobs.publish
+  assert.equal(publish.needs, 'package')
+  assert.equal(publish.if, "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')")
+  assert.equal(publish.permissions.contents, 'write')
+  assert.ok(publish.steps.some((step: any) => step.uses === 'actions/download-artifact@v4'))
+  assert.ok(steps(publish).some(run => run.includes('gh release create "$GITHUB_REF_NAME" --verify-tag "${files[@]}"')))
+})
+
 const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 async function workflow(name: string) {
   const source = await readFile(path.join(repoRoot, '.github', 'workflows', name), 'utf8')
@@ -1102,7 +1184,9 @@ test('release YAML covers target native rebuild, pinned runtime, signing and arc
   const packaging = job.steps.find((step: any) => step.run?.includes('npx electron-builder --${{ matrix.platform }}'))
   assert.ok(packaging.run.includes('--publish never'))
   assert.ok(packaging.run.includes('--${{ matrix.arch }}'))
-  assert.ok(packaging.run.includes('--config.win.signAndEditExecutable=true'))
+  assert.ok(packaging.run.includes('node scripts/build-win-release.mjs --targets ' + '${{ matrix.targets }}'))
+  const windowsPackaging = await readFile(path.join(repoRoot, 'scripts', 'build-win-release.mjs'), 'utf8')
+  for (const value of ['CSC_LINK', 'signAndEditExecutable: true', 'icacls', '*S-1-15-2-1:(OI)(CI)(RX)']) assert.ok(windowsPackaging.includes(value), value)
   for (const key of ['CSC_LINK', 'CSC_KEY_PASSWORD', 'APPLE_ID', 'APPLE_APP_SPECIFIC_PASSWORD', 'APPLE_TEAM_ID']) assert.ok(packaging.env[key].includes(`secrets.${key}`), key)
   const artifact = job.steps.find((step: any) => step.uses === 'actions/upload-artifact@v4')
   assert.equal(artifact.with['if-no-files-found'], 'error')

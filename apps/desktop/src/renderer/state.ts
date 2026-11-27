@@ -96,7 +96,7 @@ export function parsePreferences(raw: string | null): Preferences {
   } catch { /* Invalid saved preferences must not prevent startup. */ }
   return result
 }
-export type Buffer = FileDocument & { projectID: string; text: string; conflict: boolean }
+export type Buffer = FileDocument & { projectID: string; text: string; conflict: boolean; diskRevision?: string; diskContent?: string }
 export const dirty = (buffer: Buffer) => buffer.text !== buffer.content
 export const projectDirtyPaths = (buffers: Record<string, Buffer>, projectID?: string): ReadonlySet<string> => new Set(Object.values(buffers).filter(buffer => buffer.projectID === projectID && dirty(buffer)).map(buffer => buffer.path))
 export const tabIsDirty = (tab: Tab, paths: ReadonlySet<string>) => tab.mode === 'file' && paths.has(tab.path)
@@ -108,11 +108,13 @@ export function withoutProject(preferences: Preferences, id: string, remaining: 
   return { ...preferences, projects: withoutKey(preferences.projects, id), project: preferences.project === id ? remaining[0]?.id : preferences.project }
 }
 export function reconcileDocument(current: Buffer, incoming: FileDocument): Buffer {
-  if (current.revision === incoming.revision) return current
-  return dirty(current) ? { ...current, conflict: true } : { ...current, ...incoming, text: incoming.content, conflict: false }
+  if (current.revision === incoming.revision) return current.conflict && !dirty(current) ? { ...current, conflict: false, diskRevision: undefined, diskContent: undefined } : current
+  if (!dirty(current)) return { ...current, ...incoming, text: incoming.content, conflict: false, diskRevision: undefined, diskContent: undefined }
+  if (incoming.content === current.text) return { ...current, ...incoming, text: current.text, conflict: false, diskRevision: undefined, diskContent: undefined }
+  return { ...current, conflict: true, diskRevision: incoming.revision, diskContent: incoming.content }
 }
 export function savedDocument(current: Buffer, saved: FileDocument, submitted: string): Buffer {
-  return { ...current, ...saved, text: current.text === submitted ? saved.content : current.text, conflict: false }
+  return { ...current, ...saved, text: current.text === submitted ? saved.content : current.text, conflict: false, diskRevision: undefined, diskContent: undefined }
 }
 export const languageFor = (path: string) => {
   const name = path.replace(/\\/g, '/').split('/').pop()!.toLowerCase()

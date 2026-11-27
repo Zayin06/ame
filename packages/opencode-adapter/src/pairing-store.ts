@@ -24,6 +24,12 @@ export class PairingDeviceStore {
   private loading: Promise<void>
   private records: DeviceRecord[] = []
   private writes: Promise<void> = Promise.resolve()
+  private mutations: Promise<unknown> = Promise.resolve()
+  private async mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const pending = this.mutations.catch(() => {}).then(operation)
+    this.mutations = pending
+    return pending
+  }
   private timer?: ReturnType<typeof setTimeout>
   private dirty = false
   private lastSavedUse = new Map<string, number>()
@@ -50,12 +56,14 @@ export class PairingDeviceStore {
 
   async create(userAgent?: string) {
     await this.ready()
+    return this.mutate(async () => {
     const token = randomBytes(32).toString('base64url'), now = Date.now()
     const record: DeviceRecord = { id: randomUUID(), label: parseDeviceLabel(userAgent), createdAt: now, lastUsedAt: now, tokenHash: hash(token).toString('hex') }
     this.records.push(record)
     try { await this.persist() } catch (error) { this.records = this.records.filter(item => item !== record); throw error }
     this.lastSavedUse.set(record.id, now)
     return { device: publicDevice(record), token }
+    })
   }
 
   authenticate(token: string): PairedDevice | undefined {
@@ -77,14 +85,26 @@ export class PairingDeviceStore {
 
   async revoke(id: string) {
     await this.ready()
+    return this.mutate(async () => {
     const found = this.records.some(item => item.id === id)
+    const previous = this.records, dirty = this.dirty
     this.records = this.records.filter(item => item.id !== id)
-    await this.persist()
+    try { await this.persist() } catch (error) { this.records = previous; this.dirty = dirty; throw error }
     this.lastSavedUse.delete(id)
     return found
+    })
   }
 
-  async revokeAll() { await this.ready(); const count = this.records.length; this.records = []; this.lastSavedUse.clear(); await this.persist(); return count }
+  async revokeAll() {
+    await this.ready()
+    return this.mutate(async () => {
+    const previous = this.records, dirty = this.dirty
+    this.records = []
+    try { await this.persist() } catch (error) { this.records = previous; this.dirty = dirty; throw error }
+    this.lastSavedUse.clear()
+    return previous.length
+    })
+  }
 
   private persist() {
     this.dirty = false
@@ -92,7 +112,16 @@ export class PairingDeviceStore {
     const write = this.writes.catch(() => {}).then(async () => {
       await mkdir(path.dirname(this.file), { recursive: true })
       const temporary = `${this.file}.${randomBytes(6).toString('hex')}.tmp`
-      try { await writeFile(temporary, contents, { mode: 0o600, flag: 'wx' }); await rename(temporary, this.file) }
+      try {
+        await writeFile(temporary, contents, { mode: 0o600, flag: 'wx' })
+        for (let attempt = 0; ; attempt++) {
+          try { await rename(temporary, this.file); break }
+          catch (error) {
+            if (attempt >= 5 || !['EPERM', 'EBUSY', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
+            await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)))
+          }
+        }
+      }
       finally { await unlink(temporary).catch(() => {}) }
     })
     this.writes = write

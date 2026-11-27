@@ -34,7 +34,7 @@ function QuickOpenDialog({ mode, files, recentPaths, activeFile, activeLineCount
   const title = lineMode ? 'Đi đến dòng' : 'Mở tệp nhanh'
 
   useEffect(() => { inputRef.current?.focus() }, [])
-  useEffect(() => { setSelected(0) }, [files, recentPaths])
+  useEffect(() => { setSelected(value => Math.max(0, Math.min(value, items.length - 1))) }, [items.length])
   useEffect(() => { optionsRef.current?.children[index]?.scrollIntoView?.({ block: 'nearest' }) }, [index, input])
 
   const selectFile = (item: QuickOpenItem) => {

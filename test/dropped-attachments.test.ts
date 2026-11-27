@@ -25,6 +25,19 @@ function assertDataUrl(url: string, mime: string, bytes: Uint8Array) {
   assert.deepEqual(Buffer.from(url.split(',')[1], 'base64'), Buffer.from(bytes))
 }
 
+test('external secrets are rejected while normal temporary files and workspace paths remain supported', async t => {
+  const { root, file } = await fixture(t)
+  for (const name of ['.ssh/id_rsa', '.ssh/public.txt', '.aws/config', '.gnupg/key.txt', '.kube/config', '.config/gcloud/token.txt', '.env', '.env.local', 'id_rsa.backup', 'id_ed25519.pub', '.npmrc', '.netrc', 'service-credentials.json']) {
+    const [result] = await resolveDroppedPaths(root, [await file(name, 'secret', true)])
+    assert.ok(!result.ok, name)
+    assert.equal(result.reason, 'SENSITIVE_PATH_REJECTED', name)
+  }
+  const [normal] = await resolveDroppedPaths(root, [await file('normal.txt', 'safe', true)])
+  assert.ok(normal.ok && normal.kind === 'external-text')
+  const [workspace] = await resolveDroppedPaths(root, [await file('.env', 'workspace')])
+  assert.ok(workspace.ok && workspace.kind === 'workspace-file')
+})
+
 test('normalizes raw/data base64 and rejects malformed or empty payloads', () => {
   for (const raw of ['Y W\tJ\r\nj\n', 'data:image/png;base64,Y W\r\nJj', ' \ndata:image/png;base64, YWJj\n']) {
     assert.equal(normalizeBase64DataUrl('image/webp', raw), 'data:image/webp;base64,YWJj')

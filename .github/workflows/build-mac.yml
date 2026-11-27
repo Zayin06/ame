@@ -7,7 +7,7 @@ on:
       arch:
         description: macOS target architecture
         type: choice
-        default: all
+        default: arm64
         options:
           - all
           - arm64
@@ -38,7 +38,14 @@ jobs:
         shell: bash
         run: |
           selected="${{ inputs.arch }}"
-          if [ -z "$selected" ] || [ "$selected" = "all" ] || [ "$selected" = "${{ matrix.arch }}" ]; then
+          if [ -z "$selected" ]; then
+            case "$GITHUB_REF_NAME" in
+              mac-x64-*) selected="x64" ;;
+              mac-all-*) selected="all" ;;
+              *) selected="arm64" ;;
+            esac
+          fi
+          if [ "$selected" = "all" ] || [ "$selected" = "${{ matrix.arch }}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -69,9 +76,6 @@ jobs:
       - name: Typecheck
         if: steps.filter.outputs.enabled == 'true'
         run: npm run typecheck
-      - name: Rebuild native modules for Electron target architecture
-        if: steps.filter.outputs.enabled == 'true'
-        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
       - name: Download and verify pinned OpenCode 2.3.2 macOS runtime
         if: steps.filter.outputs.enabled == 'true'
         shell: bash
@@ -89,14 +93,26 @@ jobs:
           unzip -q "$archive" -d "$extract_dir"
           chmod 0755 "$extract_dir/opencode"
           echo "AME_OPENCODE_CLI=$extract_dir/opencode" >> "$GITHUB_ENV"
+          echo "AME_OPENCODE_SHA256=$(shasum -a 256 "$extract_dir/opencode" | awk '{print tolower($1)}')" >> "$GITHUB_ENV"
       - name: Stage and verify OpenCode 2.3.2 macOS runtime
         if: steps.filter.outputs.enabled == 'true'
         run: npm run runtime:prepare
+      - name: Build backend plugin before tests
+        if: steps.filter.outputs.enabled == 'true'
+        run: npm run build:server
+      - name: Unit tests
+        if: steps.filter.outputs.enabled == 'true'
+        env:
+          AME_REQUIRE_BACKEND_TESTS: '1'
+        run: npm test
+      - name: Rebuild native modules for Electron target architecture
+        if: steps.filter.outputs.enabled == 'true'
+        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
       - name: Build server plugin and Electron app
         if: steps.filter.outputs.enabled == 'true'
         env:
           NODE_OPTIONS: --max-old-space-size=6144
-        run: npm run build:server && npx electron-vite build
+        run: npx electron-vite build
       - name: Package macOS DMG only
         if: steps.filter.outputs.enabled == 'true'
         env:

@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import * as fs from 'node:fs'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { readOsClipboardFiles } from '../apps/desktop/src/main/os-clipboard-files'
 import { tmpdir } from 'node:os'
 import { runInNewContext } from 'node:vm'
@@ -289,13 +289,14 @@ const nativeExamples: Invocation[] = [
   { method: 'petReport', args: [petSessions] }, { method: 'petTestSpeech', args: [] }, { method: 'petGenerateDialogue', args: ['model'] }
 ]
 
-async function harness(directory = 'workspace') {
+async function harness(directory = 'workspace', userData = directory) {
   const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'main', 'index.ts'), 'utf8')
   const start = source.indexOf('const text ='), end = source.indexOf('async function openWindow()')
   assert.ok(start >= 0 && end > start)
   const calls: Invocation[] = []
   const messages: string[] = []
   let response = 1
+  let untrustedEntries: string[] = [], pushed = false
   let clipboardText = ''
   let onConfirm: (() => Promise<void>) | undefined
   let picked = { canceled: true, filePaths: [] as string[] }
@@ -418,13 +419,17 @@ async function harness(directory = 'workspace') {
   adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
     z, URL, Buffer, process, randomUUID, Error, resolveModelLevel, GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
-    fs, path, readOsClipboardFiles,
+    fs: { ...fs, promises: { ...fs.promises, realpath: async (value: string) => fs.promises.realpath(value).catch(() => path.resolve(value)) } }, path, readOsClipboardFiles,
+    readFile, writeFile, fileURLToPath, setTimeout, clearTimeout,
+    app: { getPath: () => userData },
+    detectUntrustedGitConfig: async () => untrustedEntries,
+    isHeadPushed: async () => pushed,
     clipboard: { availableFormats: () => ['text/uri-list'], read: () => clipboardText },
     window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
     translationLocks, buildAndroidTranslationPrompt, commitAgentLocks, buildCommitAgentPrompt, extractCommitSnapshotID, parseCommitAgentPlan, canonicalWorkspaceScope,
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
     detectAndroidProject: async (...args: unknown[]) => { calls.push({ method: 'detectAndroidProject', args }); return detected },
-    pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
+    pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }).strict(),
     managed: true,
     createTsLanguageService: (directory: string) => serviceFactory('lsp', directory),
     createNodeDebugger: (directory: string, emit: (event: unknown) => void) => serviceFactory('debug', directory, emit),
@@ -452,13 +457,17 @@ async function harness(directory = 'workspace') {
   }
   adapter.detach = (...args: unknown[]) => { calls.push({ method: 'detach', args }) }
   adapter.attach = (...args: unknown[]) => { calls.push({ method: 'attach', args }) }
-  const { call, dispatch, lspServices, debuggers } = runInNewContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\n({ call, dispatch, lspServices, debuggers })', context) as {
+   const { call, dispatch, lspServices, debuggers, loadWorkspaceTrust, notifyTerminal, flushTerminalOutput } = runInNewContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\n({ call, dispatch, lspServices, debuggers, loadWorkspaceTrust, notifyTerminal, flushTerminalOutput })', context) as {
     call: (method: string, args: unknown[]) => Promise<unknown>
     dispatch: (method: string, args: unknown[]) => Promise<unknown>
     lspServices: Map<string, any>; debuggers: Map<string, any>
+    loadWorkspaceTrust: () => Promise<void>; notifyTerminal: (event: unknown) => void; flushTerminalOutput: (id?: string) => void
   }
   return {
     call, dispatch, lspServices, debuggers, services, serviceResult, calls, messages, result, petState, resolved,
+    loadWorkspaceTrust, notifyTerminal, flushTerminalOutput,
+    setUntrustedEntries: (entries: string[]) => { untrustedEntries = entries },
+    setHeadPushed: (value: boolean) => { pushed = value },
     setClipboardPaths: (files: string[]) => { clipboardText = files.map(file => pathToFileURL(file).href).join('\r\n') },
     setClipboardApi: (api: unknown) => { (context as Record<string, unknown>).clipboard = api },
     setReplacement: (replace: (...args: any[]) => Promise<unknown>) => { workspace.replaceInProject = replace },
@@ -480,6 +489,7 @@ async function harness(directory = 'workspace') {
     setPending: (p: unknown[], f: unknown[]) => { permissions = p; forms = f },
     setWorkspaceMethod: (method: string, handler: (...args: any[]) => any) => { workspace[method] = handler },
     setAdapterMethod: (method: string, handler: (...args: any[]) => any) => { adapter[method] = handler },
+    setTerminalMethod: (method: string, handler: (...args: any[]) => any) => { (context.terminals as Record<string, (...args: any[]) => any>)[method] = handler },
     translationLocks,
     useLockStore: (store: ReturnType<typeof createTranslationLockStore>) => { context.translationLocks = store },
     commitAgentLocks,
@@ -526,6 +536,12 @@ function rendererHooks() {
       if (!previous || !same(previous.deps, deps)) slots[index] = { deps, callback }
       return slots[index].callback
     },
+    useMemo(factory: () => any, deps: readonly unknown[]) {
+      if (!rendering) return React.useMemo(factory, deps)
+      const index = cursor++, previous = slots[index]
+      if (!previous || !same(previous.deps, deps)) slots[index] = { deps, value: factory() }
+      return slots[index].value
+    },
     useEffect(effect: () => void | (() => void), deps?: readonly unknown[]) {
       if (!rendering) return React.useEffect(effect, deps)
       const index = cursor++, previous = slots[index]
@@ -551,6 +567,7 @@ async function rendererModule(file: string, hooks: ReturnType<typeof rendererHoo
     react: hooks.react, 'react/jsx-runtime': jsxRuntime, './state': rendererState, './editor-split': editorSplit,
     './workspace-paths': workspacePaths, './terminal-controls': terminalControls, './platform': platform, './project-removal': projectRemoval,
     './pet-sessions': petSessionMapping, '../chat-refresh': chatRefresh, './editor-model-lifecycle': editorModelLifecycle,
+    './buffer-recovery': { syncDirtyBuffers() {}, hasUnsavedBuffers: () => false, takeRecoveredBuffers: () => ({}), clearRecoveredBuffers() {} },
     'monaco-editor': { editor: { getModels: () => [] }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } },
     '../composer-mentions': composerMentions, '../chat-submit': { chatSubmit }, '../model-selection': modelSelection,
     '../chat-timeline': chatTimeline, '../chat-todo': chatTodo, '../chat-rewind': chatRewind, '../agent-map-model': { familySummaryFromSessions }
@@ -779,6 +796,108 @@ test('permission IPC validates enum-only inputs and forwards create/update/read 
   }
   await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's']))
   await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's', 'full', []]))
+})
+
+test('full permission mode requires native consent and permission updates reject protected sessions', async () => {
+  const h = await harness()
+  h.cancel()
+  await assert.rejects(h.dispatch('createSession', ['p', 'full']), /CANCELLED/)
+  await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's', 'full']), /CANCELLED/)
+  assert.equal(h.calls.filter(call => call.method !== 'confirm').length, 0)
+  assert.equal(h.messages.length, 2)
+  assert.match(String(h.calls[0].args[1]), /shell.*ghi tệp/)
+  h.approve()
+  for (const store of [h.translationLocks, h.commitAgentLocks]) {
+    await store.recordSession('p', 'protected')
+    await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 'protected', 'full']), /SESSION_REQUIRED/)
+  }
+  assert.equal(h.messages.length, 2)
+})
+
+test('undo commit confirms natively with distinct pushed and unpushed warnings', async () => {
+  for (const pushed of [false, true]) {
+    const h = await harness()
+    h.setHeadPushed(pushed)
+    h.cancel()
+    await assert.rejects(h.dispatch('gitUndoLastCommit', ['p']), /CANCELLED/)
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm'])
+    assert.match(String(h.calls[0].args[1]), pushed ? /HEAD.*push.*remote/ : /chưa.*push.*remote/)
+    h.approve(); h.calls.length = 0
+    await h.dispatch('gitUndoLastCommit', ['p'])
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'gitUndoLastCommit'])
+  }
+})
+
+test('workspace trust rejects declined active operations, leaves reads open, and persists approvals', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'ame-workspace-trust-'))
+  try {
+    const h = await harness(directory)
+    h.setUntrustedEntries(['core.hooksPath', 'hooks/pre-commit'])
+    h.cancel()
+    for (const [method, args] of [
+      ['commit', ['p', 'message']], ['commitAgentExecutePlan', ['p', 'commit-1', approvedPlan]],
+      ['gitFetch', ['p']], ['gitPull', ['p']], ['gitPush', ['p']], ['terminalCreate', ['p']],
+      ['debugStart', ['p', { entry: 'app.ts' }]],
+    ] as [string, unknown[]][]) await assert.rejects(h.dispatch(method, args), /WORKSPACE_UNTRUSTED/)
+    assert.ok(h.calls.every(call => call.method === 'confirm'))
+    assert.match(String(h.calls[0].args[1]), /\.git\/config.*hooks[\s\S]*core.hooksPath[\s\S]*hooks\/pre-commit/)
+    h.calls.length = 0
+    await h.dispatch('git', ['p']); await h.dispatch('listFiles', ['p']); await h.dispatch('diff', ['p', 'a.txt'])
+    assert.equal(h.calls.some(call => call.method === 'confirm'), false)
+    await assert.rejects(readFile(path.join(directory, 'trusted-workspaces.json'), 'utf8'))
+    h.approve(); h.calls.length = 0
+    await h.dispatch('commit', ['p', 'message'])
+    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'commit'])
+    assert.deepEqual(JSON.parse(await readFile(path.join(directory, 'trusted-workspaces.json'), 'utf8')), [await fs.promises.realpath(directory)])
+    const restored = await harness(directory)
+    restored.setUntrustedEntries(['hooks/pre-commit']); restored.cancel()
+    await restored.loadWorkspaceTrust()
+    await restored.dispatch('commit', ['p', 'message'])
+    assert.deepEqual(restored.calls.map(call => call.method), ['commit'])
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('pairing native dialogs do not hold authority while their mutations remain serialized', async () => {
+  for (const [method, args] of [['pairingConfigure', [{ enabled: true, keepScreenActive: false }]], ['pairingRevokeDevice', ['device']], ['pairingRevokeAll', []]] as [string, unknown[]][]) {
+    const h = await harness()
+    let release!: () => void
+    h.onConfirm(() => new Promise<void>(resolve => { release = resolve }))
+    const pairing = h.dispatch(method, args)
+    await h.dispatch('prompt', ['p', 's', 'hello', selectedModel])
+    assert.equal(h.calls.at(-1)?.method, 'prompt')
+    let releaseAuthority!: () => void
+    h.gateOperation(new Promise<void>(resolve => { releaseAuthority = resolve }))
+    const prompt = h.dispatch('prompt', ['p', 's', 'next', selectedModel])
+    await new Promise(resolve => setImmediate(resolve))
+    release()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(h.calls.some(call => call.method === (method === 'pairingConfigure' ? 'configurePairing' : method)), false)
+    releaseAuthority()
+    await Promise.all([prompt, pairing])
+    assert.equal(h.calls.at(-1)?.method, method === 'pairingConfigure' ? 'configurePairing' : method)
+  }
+})
+
+test('terminal IPC batches data per terminal and flushes on exit and explicit boundaries', async () => {
+  const h = await harness()
+  const event = (terminalID: string, data: string, exitCode?: number) => ({ type: 'terminal', projectID: 'p', terminalID, data, ...(exitCode !== undefined ? { exitCode } : {}) })
+  h.notifyTerminal(event('one', 'a')); h.notifyTerminal(event('one', 'b')); h.notifyTerminal(event('two', 'c'))
+  assert.equal(h.calls.length, 0)
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.deepEqual(plain(h.calls.map(call => call.args[0])), [event('one', 'ab'), event('two', 'c')])
+  h.calls.length = 0
+  h.notifyTerminal(event('one', 'd')); h.notifyTerminal(event('one', '', 0))
+  assert.deepEqual(plain(h.calls.map(call => call.args[0])), [event('one', 'd'), event('one', '', 0)])
+  h.calls.length = 0
+  h.setTerminalMethod('snapshot', () => { assert.equal(h.calls.at(-1)?.method, 'ame:event'); return 'snapshot' })
+  h.setTerminalMethod('close', () => { assert.equal(h.calls.at(-1)?.method, 'ame:event') })
+  h.notifyTerminal(event('one', 'e'))
+  assert.equal(await h.dispatch('terminalSnapshot', ['p', 'one']), 'snapshot')
+  h.notifyTerminal(event('one', 'g'))
+  await h.dispatch('terminalClose', ['p', 'one'])
+  h.notifyTerminal(event('two', 'f')); h.flushTerminalOutput()
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.deepEqual(plain(h.calls.map(call => call.args[0])), [event('one', 'e'), event('one', 'g'), event('two', 'f')])
 })
 
 test('Chat permission picker replaces Agent, persists drafts, updates sessions immediately and guards pending sends', async () => {
@@ -1448,6 +1567,12 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
         whenReady: () => ({ then: (callback: () => Promise<void>) => { boot = callback(); return boot } }),
         isPackaged: false, getAppPath: () => process.cwd(), getPath: () => 'userData', quit: () => { sequence.push('quit') } },
       BrowserWindow: MockWindow, screen: {},
+      session: { defaultSession: { setPermissionRequestHandler: (handler: (...args: any[]) => void) => {
+        for (const permission of ['media', 'geolocation', 'notifications', 'unknown']) {
+          handler({}, permission, (allowed: boolean) => assert.equal(allowed, false))
+        }
+        sequence.push('permissions:denied')
+      }, setPermissionCheckHandler: (handler: () => boolean) => { assert.equal(handler(), false); sequence.push('permission-checks:denied') } } },
       Menu: { buildFromTemplate: (template: any[]) => { assert.deepEqual(plain(template).map((item: any) => item.role), ['appMenu', 'fileMenu', 'editMenu', 'viewMenu', 'windowMenu']); return template }, setApplicationMenu: () => { sequence.push('menu') } },
       Workspaces: class {
         constructor(_file: string, changed: (projectID: string) => void) { onFiles = changed }
@@ -1471,9 +1596,14 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
         async ready() { sequence.push('pairing-devices:ready') }
       },
       createAmeKit: (value: any) => { accountOptions = value; return { generatePetDialogue: (model: string, signal: AbortSignal) => ({ model, signal }), dispose: async () => { sequence.push('account:dispose') } } },
-      setTimeout: (callback: () => void, ms: number) => { assert.equal(ms, 500); bundleTimers.push(callback); return { unref() {} } },
+      setTimeout: (callback: () => void, ms: number) => {
+        if (ms === 8_000) return setTimeout(callback, ms)
+        assert.equal(ms, 500); bundleTimers.push(callback); return { unref() {} }
+      },
+      clearTimeout,
       loadPetSprite: async (value: string) => { spritePath = value; throw new Error('missing sprite') },
       createPetHost: (value: any) => { options = value; sequence.push('pet:create'); return pet },
+      loadWorkspaceTrust: async () => {}, notifyTerminal() {}, flushTerminalOutput() {},
       notify: (event: any) => { sequence.push(`notify:${event.type}:${event.projectID}`); if (event.type === 'amekit-bundle') bundleEvents.push(plain(event)) }, pickImport: () => {}, ipcMain: { handle: () => {} }, schema: {},
       dispatch: async () => { sequence.push('backend:start') },
       readFile: async () => { throw new Error('no saved pairing') }, screenActive: () => {},
@@ -1481,6 +1611,8 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
     }
     runInNewContext(ts.transpileModule(source.slice(source.indexOf('async function openWindow()')), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
     await boot
+    assert.ok(sequence.includes('permissions:denied'))
+    assert.ok(sequence.includes('permission-checks:denied'))
     await new Promise(resolve => setImmediate(resolve))
     assert.equal(accountOptions.globalConfigDir, path.join('userData', 'backend', 'config', 'opencode'))
     assert.equal(accountOptions.autoSync, true)
@@ -1553,6 +1685,29 @@ test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits 
   }
 })
 
+test('desktop shutdown always quits after cleanup rejection or the overall deadline', async () => {
+  const source = await readFile(path.resolve('apps/desktop/src/main/index.ts'), 'utf8')
+  for (const stalled of [false, true]) {
+    let handler!: (event: any) => void, deadline!: () => void, quits = 0, cleared = false
+    const calls: string[] = []
+    runInNewContext(ts.transpileModule(source.slice(source.indexOf('let quitting = false')), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, {
+      app: { on: (_name: string, callback: typeof handler) => { handler = callback }, quit: () => { quits++ } },
+      account: { dispose: async () => {} }, terminals: { dispose() {} },
+      adapter: { abortRequests() {}, dispose() { calls.push('adapter'); throw new Error('dispose failed') } },
+      workspace: { dispose() { calls.push('workspace') } }, runtime: { stop: async () => { calls.push('runtime') } },
+      pairing: { stop: () => stalled ? new Promise(() => {}) : Promise.reject(new Error('pairing failed')) },
+      petHost: undefined, lspServices: new Map(), debuggers: new Map(), authority: Promise.resolve(), shuttingDown: false,
+      flushTerminalOutput() {}, screenActive() {}, setTimeout: (callback: () => void, ms: number) => { assert.equal(ms, 8_000); deadline = callback; return 1 },
+      clearTimeout: () => { cleared = true },
+    })
+    handler({ preventDefault() {} })
+    await new Promise(resolve => setImmediate(resolve))
+    if (stalled) { assert.equal(quits, 0); deadline(); await new Promise(resolve => setImmediate(resolve)) }
+    else assert.deepEqual(calls, ['adapter', 'workspace', 'runtime'])
+    assert.equal(quits, 1); assert.equal(cleared, true)
+  }
+})
+
 test('all new IPC tuples reject malformed requests before dispatch or confirmation', async () => {
   const { dispatch, calls, messages } = await harness()
   for (const { method, args } of examples) {
@@ -1616,7 +1771,7 @@ test('all new IPC tuples reject malformed requests before dispatch or confirmati
 
 test('new IPC dispatch preserves arguments and optional defaults without stage or dry-run dialogs', async () => {
   const { dispatch, calls, messages } = await harness()
-  for (const { method, args } of examples.filter(({ method }) => !['clipboardFiles', 'pasteClipboardFiles', 'deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage', 'sessionUsage', 'gitDeleteBranch', 'gitStashDrop'].includes(method))) {
+  for (const { method, args } of examples.filter(({ method }) => !['clipboardFiles', 'pasteClipboardFiles', 'deletePath', 'discardFile', 'revealPath', 'deleteSession', 'generateCommitMessage', 'sessionUsage', 'gitDeleteBranch', 'gitStashDrop', 'gitUndoLastCommit'].includes(method))) {
     calls.length = 0
     const result = await dispatch(method, args)
     assert.deepEqual(plain(calls), [{ method, args }])
@@ -3176,9 +3331,15 @@ test('dropped paths and native picker resolve against the registered workspace a
 })
 
 test('prompt IPC forwards bounded file parts and rejects malformed parts before invoking the adapter', async () => {
-  const h = await harness()
+  const directory = await mkdtemp(path.join(tmpdir(), 'ame-prompt-files-'))
+  try {
+  await writeFile(path.join(directory, 'notes.txt'), 'notes')
+  const h = await harness(directory)
   const file = { uri: 'data:image/png;base64,YQ==', name: 'shot.png', mime: 'image/png', source: { type: 'inline' } }
-  const files = [file, { uri: 'file:///C:/notes.txt', source: { type: 'uri', uri: 'file:///C:/notes.txt' } }]
+  const uri = pathToFileURL(path.join(directory, 'notes.txt')).href
+  await writeFile(path.join(directory, 'large.bin'), Buffer.alloc(10 * 1024 * 1024 + 1))
+  await symlink(directory, path.join(directory, 'linked'), process.platform === 'win32' ? 'junction' : 'dir')
+  const files = [file, { uri, source: { type: 'uri', uri } }]
   await h.dispatch('prompt', ['p', 's', '', selectedModel, 'agent', files])
   assert.deepEqual(plain(h.calls.at(-1)), { method: 'prompt', args: ['p', 's', '', { ...selectedModel, modelID: 'server-model' }, 'agent', files] })
   await h.dispatch('prompt', ['p', 's', '', selectedModel, undefined, Array(8).fill(file)])
@@ -3190,10 +3351,20 @@ test('prompt IPC forwards bounded file parts and rejects malformed parts before 
     [{ ...file, uri: 'https://example.com/image.png' }], [{ ...file, uri: 'data:image/png;base64,Y Q==' }],
     [{ ...file, extra: true }], [{ ...file, source: { type: 'inline', extra: true } }],
     [{ ...file, source: { type: 'uri', uri: 'bad\0' } }], [{ ...file, source: { type: 'uri', uri: 'x'.repeat(4097) } }],
+    [{ uri: pathToFileURL(path.join(directory, '..', 'outside.txt')).href }],
+    [{ uri: pathToFileURL(path.join(directory, '.git', 'config')).href }],
+    [{ ...file, source: { type: 'uri', uri: pathToFileURL(path.join(directory, '..', 'outside.txt')).href } }],
+    [{ ...file, source: { type: 'uri', uri: pathToFileURL(path.join(directory, '.git', 'config')).href } }],
+    [{ ...file, source: { type: 'uri', uri: 'file://localhost/outside.txt' } }],
+    [{ ...file, source: { type: 'uri', uri: 'file:/outside.txt' } }],
+    [{ uri: 'file:///bad%2Fpath' }], [{ uri: pathToFileURL(directory).href }],
+    [{ uri: pathToFileURL(path.join(directory, 'large.bin')).href }],
+    [{ uri: pathToFileURL(path.join(directory, 'linked', 'notes.txt')).href }],
   ]) await assert.rejects(h.dispatch('prompt', ['p', 's', '', selectedModel, undefined, invalid]))
   assert.equal(h.calls.length, 0)
   await h.translationLocks.recordSession('p', 'translation')
   await assert.rejects(h.dispatch('prompt', ['p', 'translation', '', selectedModel, undefined, [file]]), /TRANSLATION/)
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
 test('preload forwards all new methods, optional arguments, return values and rejections', async () => {

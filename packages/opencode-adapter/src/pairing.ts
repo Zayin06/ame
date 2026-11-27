@@ -1,5 +1,6 @@
 import { createServer, request, type IncomingMessage, type ServerResponse, type Server } from 'node:http'
 import type { Socket } from 'node:net'
+import path from 'node:path'
 import { OpenCode } from '@opencode/client'
 import type { PairingCode, PairingSettings } from '../../protocol/src/index'
 import { randomBytes } from 'node:crypto'
@@ -20,6 +21,20 @@ export function pairingPayload(address: string, code: string) {
 }
 
 const hopHeaders = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']
+function normalizeProxyPathname(rawPathname: string): string | null {
+  let decoded: string
+  try { decoded = decodeURIComponent(rawPathname) } catch (error) { if (error instanceof URIError) return null; throw error }
+  return path.posix.normalize(decoded.replace(/\\+/g, '/'))
+}
+function isAllowedRemoteRoute(method: string | undefined, pathname: string): boolean {
+  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method ?? '')) return false
+  if (/^\/api\/session(?:\/active|\/[^/]+)?$/.test(pathname)) return true
+  if (/^\/api\/session\/[^/]+\/(?:message[^/]*(?:\/.*)?|prompt|interrupt|diff|permission[^/]*(?:\/.*)?|form[^/]*(?:\/.*)?|fork|revert[^/]*(?:\/.*)?|agent|model|command|compact|context|view|generate)$/.test(pathname)) return true
+  if (pathname === '/api/permission/request' || pathname === '/api/form') return true
+  if (method !== 'GET') return false
+  return pathname === '/' || /^\/(?:assets\/.*|favicon[^/]*|manifest[^/]*)$/.test(pathname) ||
+    /^\/api\/(?:info|event|project(?:\/.*)?|location|model(?:\/default)?|agent(?:\/.*)?|command|skill|reference|vcs[^/]*(?:\/.*)?|worktree|fs\/(?:list|find|read\/.*)|experimental\/(?:artifacts[^/]*(?:\/.*)?|media\/.*|blob\/.*))$/.test(pathname)
+}
 function forwardHeaders(input: IncomingMessage['headers']) {
   const headers = { ...input }
   for (const name of [...hopHeaders, ...(input.connection?.split(',').map(value => value.trim().toLowerCase()) ?? [])]) delete headers[name]
@@ -95,15 +110,15 @@ export class PairingHost {
     const port = URL.parse(`http://${req.headers.host}`)?.port
     return `opencode_session${port ? `_${port}` : ''}`
   }
-  private authenticate(req: IncomingMessage, url: URL) {
+  private authenticate(req: IncomingMessage, url: URL, websocket = false) {
     const basic = (value: string | null | undefined) => {
       if (!value?.startsWith('Basic ')) return
       const decoded = Buffer.from(value.slice(6), 'base64').toString()
       return decoded.startsWith('opencode:') ? decoded.slice(9) : undefined
     }
-    const query = url.searchParams.get('auth_token')
+    const query = websocket ? url.searchParams.get('auth_token') : null
     const header = req.headers.authorization
-    for (const token of [basic(query ? `Basic ${query}` : undefined), basic(header)]) {
+    for (const token of [basic(query ? `Basic ${query}` : undefined), header?.startsWith('Bearer ') ? header.slice(7) : basic(header)]) {
       const device = token ? this.store!.authenticate(token) : undefined
       if (device) return device
     }
@@ -147,13 +162,26 @@ export class PairingHost {
     if (!target) { res.writeHead(503).end(); return }
     // Keep the path as a path: never interpret an incoming absolute URL as an outbound destination.
     if (!req.url?.startsWith('/') || req.url.startsWith('//')) { res.writeHead(400).end(); return }
+    const checkedPath = normalizeProxyPathname(new URL(req.url, 'http://127.0.0.1').pathname)
+    if (checkedPath === null) { res.writeHead(400).end(); return }
+    const connectRoute = /^\/auth\/connect\/[A-Za-z0-9_-]+$/.test(checkedPath) && ['GET', 'POST', 'HEAD'].includes(req.method ?? '')
+    if (connectRoute && (req.method === 'HEAD' || /slackbot|whatsapp|telegrambot|discordbot|twitterbot|facebookexternalhit|linkedinbot|bot|crawler|preview/i.test(req.headers['user-agent'] ?? ''))) {
+      res.writeHead(405, { 'cache-control': 'no-store' }).end(); return
+    }
+    if (!connectRoute && !isAllowedRemoteRoute(req.method, checkedPath)) {
+      res.writeHead(403, { 'cache-control': 'no-store', 'content-type': 'application/json' }).end(JSON.stringify({ message: 'Remote admin/pairing route is disabled' })); return
+    }
     let requestPath = req.url, deviceID: string | undefined
     if (this.store) {
       if (this.revoking) { res.writeHead(401, { 'cache-control': 'no-store' }).end(); return }
       const url = new URL(req.url, 'http://127.0.0.1')
-      if (req.method === 'POST' && url.pathname.replace(/\/+$/, '') === '/api/pair') { res.writeHead(403, { 'cache-control': 'no-store', 'content-type': 'application/json' }).end(JSON.stringify({ message: 'Remote pairing code creation is disabled' })); return }
-      if (req.method === 'GET' && /^\/auth\/connect\/[A-Za-z0-9_-]+$/.test(url.pathname)) {
+      const pathname = normalizeProxyPathname(url.pathname)
+      if (pathname === null) { res.writeHead(400).end(); return }
+      if (/^\/auth\/connect\/[A-Za-z0-9_-]+$/.test(url.pathname)) {
         res.setHeader('cache-control', 'no-store')
+        if (!['GET', 'POST'].includes(req.method ?? '') || /slackbot|whatsapp|telegrambot|discordbot|twitterbot|facebookexternalhit|linkedinbot|bot|crawler|preview/i.test(req.headers['user-agent'] ?? '')) {
+          res.writeHead(405).end(); return
+        }
         const code = url.pathname.slice('/auth/connect/'.length), expiry = this.pendingCodes.get(code)
         this.pendingCodes.delete(code)
         if (!expiry || expiry.expiresAt <= Date.now()) {
@@ -165,10 +193,12 @@ export class PairingHost {
         const { token, device } = await this.store.create(req.headers['user-agent'])
         if (generation !== this.generation || !this.server) { await this.store.revoke(device.id); res.writeHead(401).end(); return }
         if (req.headers.accept?.includes('text/html')) {
-          res.writeHead(302, { location: '/', 'set-cookie': `${this.cookieName(req)}=${token}; Path=/; HttpOnly; SameSite=Lax${this.settings.publicURL.startsWith('https://') ? '; Secure' : ''}; Max-Age=315360000` }).end()
+          res.writeHead(302, { location: '/', 'set-cookie': `${this.cookieName(req)}=${token}; Path=/; HttpOnly; SameSite=Lax${this.settings.publicURL.startsWith('https://') ? '; Secure' : ''}; Max-Age=2592000` }).end()
         } else { res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ token })) }
         return
       }
+      if (!isAllowedRemoteRoute(req.method, pathname)) { res.writeHead(403, { 'cache-control': 'no-store', 'content-type': 'application/json' }).end(JSON.stringify({ message: 'Remote admin/pairing route is disabled' })); return }
+      if (url.searchParams.has('auth_token')) { res.writeHead(401, { 'cache-control': 'no-store' }).end(); return }
       const device = this.authenticate(req, url)
       if (!device) { res.writeHead(401, { 'cache-control': 'no-store', 'content-type': 'application/json' }).end(JSON.stringify({ message: 'Authentication required' })); return }
       deviceID = device.id
@@ -189,10 +219,17 @@ export class PairingHost {
   private upgrade(req: IncomingMessage, socket: Socket, head: Buffer) {
     const target = this.current()
     if (!target || !req.url?.startsWith('/') || req.url.startsWith('//')) { socket.destroy(); return }
+    const checkedPath = normalizeProxyPathname(new URL(req.url, 'http://127.0.0.1').pathname)
+    if (checkedPath === null) { socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return }
+    if (!isAllowedRemoteRoute(req.method, checkedPath)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return }
     let requestPath = req.url, deviceID: string | undefined
     if (this.store) {
       if (this.revoking) { socket.destroy(); return }
-      const url = new URL(req.url, 'http://127.0.0.1'), device = this.authenticate(req, url)
+      const url = new URL(req.url, 'http://127.0.0.1')
+      const pathname = normalizeProxyPathname(url.pathname)
+      if (pathname === null) { socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return }
+      if (!isAllowedRemoteRoute(req.method, pathname)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return }
+      const device = this.authenticate(req, url, true)
       if (!device) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return }
       deviceID = device.id; this.track(socket, deviceID)
       url.searchParams.delete('auth_token'); requestPath = url.pathname + url.search
@@ -239,9 +276,11 @@ export class PairingHost {
     await this.store?.flush()
   }
   async revokeDevice(id: string) {
-    await this.store?.revoke(id)
-    for (const socket of this.deviceSockets.get(id) ?? []) socket.destroy()
-    this.deviceSockets.delete(id)
+    try { await this.store?.revoke(id) }
+    finally {
+      for (const socket of this.deviceSockets.get(id) ?? []) socket.destroy()
+      this.deviceSockets.delete(id)
+    }
     return this.status()
   }
   async revokeAll() {
@@ -250,9 +289,11 @@ export class PairingHost {
     try {
       await Promise.all([...this.connecting])
       await this.store?.revokeAll()
+    } finally {
       for (const socket of this.sockets) socket.destroy()
       this.sockets.clear(); this.deviceSockets.clear()
-    } finally { this.revoking = false }
+      this.revoking = false
+    }
     return this.status()
   }
 }

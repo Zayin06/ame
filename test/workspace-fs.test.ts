@@ -3,6 +3,8 @@ import { test, type TestContext } from 'node:test'
 import { mkdtemp, mkdir, open, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { copyEntry, copyExternalEntries, copyExternalPaths, createDirectory, createFile, deletePath, MAX_COPY_BYTES, MAX_COPY_ENTRIES, moveEntry, renameOrMove, uniqueChildName, validateWorkspacePath } from '../packages/ide-core/src/workspace-fs'
 
 async function fixture(t: TestContext) {
@@ -12,6 +14,22 @@ async function fixture(t: TestContext) {
   await mkdir(root)
   return { root, temporary }
 }
+
+test('Git metadata aliases and resolved Windows short names are rejected', async t => {
+  const { root } = await fixture(t)
+  await mkdir(path.join(root, '.git', 'hooks'), { recursive: true })
+  for (const relative of ['.GiT/hooks/pre-commit', '.git. /hooks/pre-commit', 'safe/../.GIT/config']) {
+    await assert.rejects(validateWorkspacePath(root, relative), { code: 'PATH_OUTSIDE_WORKSPACE' })
+  }
+  await t.test('real 8.3 alias', { skip: process.platform !== 'win32' }, async shortTest => {
+    const { stdout } = await promisify(execFile)('cmd.exe', ['/d', '/c', 'for %I in (.git) do @echo %~sI'], { cwd: root })
+    const shortName = path.basename(stdout.trim())
+    if (!shortName || shortName.toLowerCase() === '.git' || !shortName.includes('~')) {
+      shortTest.skip('8.3 short names are disabled on this test volume'); return
+    }
+    await assert.rejects(validateWorkspacePath(root, `${shortName}/hooks/pre-commit`), { code: 'PATH_OUTSIDE_WORKSPACE' })
+  })
+})
 
 test('CRUD creates nested parents, normalizes paths, moves files and recursively deletes folders', async t => {
   const { root } = await fixture(t)

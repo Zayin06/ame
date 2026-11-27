@@ -5,6 +5,27 @@ import path from 'node:path'
 import os from 'node:os'
 import test from 'node:test'
 import { Workspaces } from '../packages/ide-core/src/workspace'
+import { cleanupStaleSaveTemps, renameWithRetry } from '../packages/ide-core/src/file-save'
+
+test('rename retries transient locks and stale cleanup only removes old save artifacts', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ame-save-cleanup-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  await fs.writeFile(path.join(root, 'source'), 'data')
+  const rename = fs.rename
+  let calls = 0
+  const mock = t.mock.method(fs, 'rename', async (...args: Parameters<typeof fs.rename>) => {
+    if (calls++ < 2) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' })
+    return rename(...args)
+  })
+  syncBuiltinESMExports()
+  try { await renameWithRetry(path.join(root, 'source'), path.join(root, 'target')); assert.equal(calls, 3) }
+  finally { mock.mock.restore(); syncBuiltinESMExports() }
+  for (const name of ['.ame-save-old.tmp', '.ame-save-old.bak', '.ame-save-fresh.tmp', '.ame-recovery-kept.bak', 'keep.tmp']) await fs.writeFile(path.join(root, name), 'data')
+  const old = new Date(Date.now() - 11 * 60 * 1000)
+  for (const name of ['.ame-save-old.tmp', '.ame-save-old.bak', '.ame-recovery-kept.bak', 'keep.tmp']) await fs.utimes(path.join(root, name), old, old)
+  await cleanupStaleSaveTemps(root)
+  assert.deepEqual((await fs.readdir(root)).sort(), ['.ame-recovery-kept.bak', '.ame-save-fresh.tmp', 'keep.tmp', 'target'])
+})
 
 for (const failure of ['write', 'rename'] as const) {
   test(`failed ${failure} leaves the original document intact and removes save staging files`, async t => {

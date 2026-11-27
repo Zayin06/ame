@@ -10,6 +10,43 @@ import { createTsLanguageService } from '../packages/ide-core/src/ts-lsp'
 const math = '/** Add two numbers. */\nexport function add(a: number, b: number): number {\n  return a + b\n}\nexport const answer = 42\n'
 const app = "import * as math from './math'\nconst result: number = math.add(6, 7)\nconsole.log(result)\n"
 
+test('transient initialization errors retain the workspace root for retry', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-init-'))
+  const service = createTsLanguageService(root)
+  let calls = 0
+  t.mock.method(Worker.prototype, 'postMessage', function (this: Worker, message: any) {
+    if (!message.id) return
+    assert.equal(message.root, root)
+    const ok = ++calls > 1
+    queueMicrotask(() => this.emit('message', { id: message.id, serviceID: message.serviceID, ok, result: [], message: 'transient init failure' }))
+  })
+  try {
+    await assert.rejects(service.diagnostics(), /transient init failure/)
+    assert.deepEqual(await service.diagnostics(), [])
+    assert.equal(calls, 2)
+  } finally { service.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('timed out requests reject all pending work and restart the worker', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-timeout-'))
+  const service = createTsLanguageService(root, { requestTimeoutMs: 100 })
+  const workers = new Set<Worker>()
+  let respond = false
+  t.mock.method(Worker.prototype, 'postMessage', function (this: Worker, message: any) {
+    workers.add(this)
+    if (respond && message.id) {
+      assert.equal(message.root, root)
+      queueMicrotask(() => this.emit('message', { id: message.id, serviceID: message.serviceID, ok: true, result: [] }))
+    }
+  })
+  try {
+    await Promise.all([assert.rejects(service.diagnostics(), /^Error: LSP_TIMEOUT$/), assert.rejects(service.hover('a.ts', 1, 1), /LSP_TIMEOUT/)])
+    respond = true
+    assert.deepEqual(await service.diagnostics(), [])
+    assert.equal(workers.size, 2)
+  } finally { service.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-lsp-'))
   await mkdir(path.join(root, 'src'))

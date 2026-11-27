@@ -1,5 +1,6 @@
 import path from "node:path"
-import { lstat, open, realpath } from "node:fs/promises"
+import { lstat, open, realpath, rename, unlink } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { constants } from "node:fs"
 import { AmeApi, ClientError, isTransientError } from "./api"
 import { assertModel, assertChatModel, resolveModelLevel, managedProvider, modelPolicy, providerURL } from "./model-policy"
@@ -61,6 +62,8 @@ type ImportSession = {
   originalFiles: Map<string, Uint8Array>
   workingFiles: Map<string, Uint8Array>
   savedToDisk: Set<string>
+  aiFixedPaths: Set<string>
+  reviewedAiFixes: Set<string>
 }
 type ElectronMain = { safeStorage: Encryption; dialog: Pick<typeof import("electron")["dialog"], "showMessageBox"> }
 const MAX_POLICY_LEASE_MS = 24 * 60 * 60_000
@@ -129,6 +132,11 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
   }
   let activeArchiveCache: CachedServerArchive | undefined
   let importSession: ImportSession | undefined
+  const aiFixWarning = () => {
+    if (!importSession?.aiFixedPaths.size) return ""
+    const paths = [...importSession.aiFixedPaths].sort().map(file => `${file} [${importSession!.reviewedAiFixes.has(file) ? "đã duyệt" : "CHƯA DUYỆT"}]${file.startsWith("agents/") ? " [agent: kiểm tra quyền và prompt]" : ""}`)
+    return "\n\nCảnh báo: AI Auto-Fix đã chỉnh sửa các tệp sau (kiểm tra kỹ quyền và prompt trước khi phát hành): " + paths.join(", ")
+  }
   const resetImport = () => { source = undefined; packed = undefined; importSession = undefined; activeArchiveCache = undefined }
   const loadActiveServerArchive = async (needFiles: boolean) => {
     const latest = await api!.latest(signal)
@@ -180,9 +188,11 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       },
     })
     session.workingFiles.set(targetPath, fixed.contentBytes.slice())
+    session.aiFixedPaths.add(targetPath)
+    session.reviewedAiFixes.delete(targetPath)
     session.savedToDisk.delete(targetPath)
     const currentPreview = recomputeImportPreview()
-    return { preview: currentPreview, fix: { path: targetPath, summary: fixed.summary, diff: fixed.diff, model: fixed.model, redactionCount: fixed.redactionCount } }
+    return { preview: currentPreview, fix: { path: targetPath, summary: fixed.summary, diff: fixed.diff, model: fixed.model, redactionCount: fixed.redactionCount, securityChanges: fixed.securityChanges } }
   }
   const rpc = async (input: unknown, cleanup = false) => {
     const endpoint = options.endpoint()
@@ -331,6 +341,14 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       await confirm("Dọn bundle AmeKit cũ khỏi dự án?", `Xóa các tệp agent và skill do AmeKit cài trước đây trong ${path.join(directory, ".opencode")} và ${path.join(directory, ".amekit")}. Các tệp cá nhân và tệp của dự án được giữ nguyên.`)
       return installer.cleanLegacyProject(directory, signal)
     }
+    if (operation === "recover") {
+      const directory = payload.project ? await project(payload.project) : undefined
+      await confirm("Khôi phục trạng thái AmeKit?", "Khôi phục bản sao lưu giao dịch bị gián đoạn và dọn dữ liệu giao dịch cũ.")
+      await trackLocalWrite(() => installer.recoverManagedState(directory ? path.join(directory, ".opencode") : globalConfigDir, directory ? path.join(directory, ".amekit") : globalManagedDir))
+      await snapshotInstalledBundle()
+      await reloadAndRestorePolicy()
+      return { recovered: true }
+    }
     if (["installed", "offline", "uninstall"].includes(operation)) {
       if (operation === "installed") { const state = await installer.installedGlobal(globalConfigDir, globalManagedDir); return state ? installView(state) : null }
       if (operation === "offline") { const state = await installer.offlineGlobal(globalConfigDir, globalManagedDir, discover, signal); return { ...installView(state), changed: false } }
@@ -388,7 +406,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       case "update-features": {
         await api.guard(true, signal); await synchronize()
         if (payload.activate !== undefined && !["true", "false"].includes(payload.activate)) throw new Error("INVALID_PAYLOAD")
-        const activateNow = payload.activate !== "false"
+        const activateNow = payload.activate === "true"
         const active = await loadActiveServerArchive(true)
         const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel", "buildNotesSkill", "buildNotesModel"]
           .filter(key => typeof payload[key] === "string" && payload[key].trim())
@@ -444,7 +462,7 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
           root, folderName: path.basename(path.resolve(root)) || root, options: importOptions, adaptClaudeAgents,
           originalInheritedIssues: nextScanned.inheritedIssues.map(issue => ({ ...issue })), inheritedIssues: nextScanned.inheritedIssues.map(issue => ({ ...issue })),
           originalFiles: new Map(nextScanned.files.map(file => [file.path, file.data.slice()])),
-          workingFiles: new Map(nextScanned.files.map(file => [file.path, file.data.slice()])), savedToDisk: new Set(),
+          workingFiles: new Map(nextScanned.files.map(file => [file.path, file.data.slice()])), savedToDisk: new Set(), aiFixedPaths: new Set(), reviewedAiFixes: new Set(),
         }
         signal.throwIfAborted()
         resetImport(); source = nextScanned.preview; importSession = nextSession
@@ -454,10 +472,16 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       case "fix-import-all":
       case "exclude-import-file":
       case "revert-import-fix":
+      case "accept-import-fix":
       case "save-import-fix": {
         await api.guard(true, signal)
         if (!importSession || !source) throw new Error("IMPORT_REQUIRED")
         const session = importSession, targetPath = payload.path
+        if (operation === "accept-import-fix") {
+          if (!session.aiFixedPaths.has(targetPath)) throw new Error("IMPORT_FILE_NOT_FOUND")
+          session.reviewedAiFixes.add(targetPath)
+          return { accepted: targetPath }
+        }
         if (operation === "fix-import") return fixImportFile(targetPath)
         if (operation === "fix-import-all") {
           const targets = importView().fixablePaths.slice(0, 10)
@@ -476,6 +500,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         if (operation === "exclude-import-file") {
           if (!session.workingFiles.has(targetPath) && !session.inheritedIssues.some(issue => issue.path === targetPath)) throw new Error("IMPORT_FILE_NOT_FOUND")
           session.workingFiles.delete(targetPath)
+          session.aiFixedPaths.delete(targetPath)
+          session.reviewedAiFixes.delete(targetPath)
           session.inheritedIssues = session.inheritedIssues.filter(issue => issue.path !== targetPath)
           session.savedToDisk.delete(targetPath)
           return { preview: recomputeImportPreview(), excluded: targetPath }
@@ -484,6 +510,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
           if (!session.originalFiles.has(targetPath) && !session.originalInheritedIssues.some(issue => issue.path === targetPath)) throw new Error("IMPORT_FILE_NOT_FOUND")
           const original = session.originalFiles.get(targetPath)
           if (original) session.workingFiles.set(targetPath, original.slice())
+          session.aiFixedPaths.delete(targetPath)
+          session.reviewedAiFixes.delete(targetPath)
           session.inheritedIssues = [...session.inheritedIssues.filter(issue => issue.path !== targetPath), ...session.originalInheritedIssues.filter(issue => issue.path === targetPath).map(issue => ({ ...issue }))]
           session.savedToDisk.delete(targetPath)
           return { preview: recomputeImportPreview(), reverted: targetPath }
@@ -491,9 +519,8 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         if (!session.workingFiles.has(targetPath) || !session.originalFiles.has(targetPath)) throw new Error("IMPORT_FILE_NOT_FOUND")
         await confirm("Lưu tệp đã sửa về thư mục gốc?", `Ghi đè ${targetPath} trong ${session.root}. Hành động này sẽ cập nhật tệp nguồn trên đĩa.`)
         try {
-          await installer.safeDirectory(session.root)
           safePath(targetPath)
-          const root = path.resolve(session.root), segments = targetPath.split("/")
+          const root = await installer.safeDirectory(session.root), segments = targetPath.split("/")
           let current = root
           const check = async () => {
             current = root
@@ -505,17 +532,28 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
             return lstat(current)
           }
           const before = await check()
-          const handle = await open(current, constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0))
+          const target = current, temporary = path.join(path.dirname(target), `.amekit-fix-${randomUUID()}.tmp`)
+          const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, before.mode)
+          let saveFailure: unknown
           try {
-            const opened = await handle.stat()
-            const checked = await check()
-            if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.dev !== checked.dev || opened.ino !== checked.ino) throw new Error("SAVE_PATH_UNSAFE")
             signal.throwIfAborted()
-            await handle.truncate(0)
             await handle.writeFile(session.workingFiles.get(targetPath)!)
             await handle.sync()
-          } finally { await handle.close() }
-        } catch { throw new Error("SAVE_PATH_UNSAFE") }
+            await handle.close()
+            for (let attempt = 0; ; attempt++) {
+              const checked = await check()
+              if (checked.nlink !== 1 || checked.dev !== before.dev || checked.ino !== before.ino) throw new Error("SAVE_PATH_UNSAFE")
+              try { await rename(temporary, target); break } catch (error) {
+                if (attempt >= 4 || !["EPERM", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
+                await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)))
+              }
+            }
+          } catch (error) { saveFailure = error; throw error }
+          finally { await handle.close().catch(() => {}); await unlink(temporary).catch(error => { if (error.code !== "ENOENT" && !saveFailure) throw error }) }
+        } catch (error) {
+          if ((error as Error).message === "REPARSE_DIRECTORY_REJECTED") throw new Error("SAVE_PATH_UNSAFE")
+          throw error
+        }
         session.savedToDisk.add(targetPath)
         return { saved: targetPath }
       }
@@ -533,22 +571,22 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       case "publish": {
         await api.guard(true, signal); await synchronize()
         if (!packed) throw new Error("PACKAGE_REQUIRED")
-        await confirm("Publish AmeKit bundle?", `Upload version ${packed.summary.version}, ${packed.bytes.length} bytes, SHA-256 ${packed.sha256}. Publishing does not activate the release.`)
+        await confirm("Publish AmeKit bundle?", `Upload version ${packed.summary.version}, ${packed.bytes.length} bytes, SHA-256 ${packed.sha256}. Publishing does not activate the release.` + aiFixWarning())
         return api.publish(packed.bytes, packed.summary.version, packed.sha256, () => {}, signal)
       }
       case "release": {
         await api.guard(true, signal); await synchronize()
         if (!source) throw new Error("IMPORT_REQUIRED")
         if (payload.activate !== undefined && !["true", "false"].includes(payload.activate)) throw new Error("INVALID_PAYLOAD")
-        const activateNow = payload.activate !== "false"
+        const activateNow = payload.activate === "true"
         const features = Object.fromEntries(["commitEnhanceSkill", "commitEnhanceModel", "androidTranslationSkill", "androidTranslationModel", "buildNotesSkill", "buildNotesModel"]
           .filter(key => typeof payload[key] === "string" && payload[key].trim())
           .map(key => [key, payload[key]]))
         const nextPacked = await pack(source, payload.version, signal, features)
         if (activateNow) {
-          await confirm("Phát hành & kích hoạt AmeKit?", `Đóng gói v${nextPacked.summary.version} (${nextPacked.bytes.length} bytes, ${nextPacked.summary.fileCount} tệp, SHA-256 ${nextPacked.sha256.slice(0, 12)}…), xuất bản lên máy chủ và kích hoạt ngay cho toàn bộ team.`)
+          await confirm("Phát hành & kích hoạt AmeKit?", `Đóng gói v${nextPacked.summary.version} (${nextPacked.bytes.length} bytes, ${nextPacked.summary.fileCount} tệp, SHA-256 ${nextPacked.sha256.slice(0, 12)}…), xuất bản lên máy chủ và kích hoạt ngay cho toàn bộ team.` + aiFixWarning())
         } else {
-          await confirm("Xuất bản bản nháp AmeKit?", `Đóng gói v${nextPacked.summary.version} (${nextPacked.bytes.length} bytes, ${nextPacked.summary.fileCount} tệp, SHA-256 ${nextPacked.sha256.slice(0, 12)}…) và xuất bản lên máy chủ (chưa kích hoạt cho team).`)
+          await confirm("Xuất bản bản nháp AmeKit?", `Đóng gói v${nextPacked.summary.version} (${nextPacked.bytes.length} bytes, ${nextPacked.summary.fileCount} tệp, SHA-256 ${nextPacked.sha256.slice(0, 12)}…) và xuất bản lên máy chủ (chưa kích hoạt cho team).` + aiFixWarning())
         }
         const release = await api.publish(nextPacked.bytes, nextPacked.summary.version, nextPacked.sha256, () => {}, signal)
         packed = undefined
@@ -663,11 +701,11 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       try {
         if (backgroundInFlight) await backgroundInFlight.catch(() => {})
         await ready
-        if (["refresh", "installed", "offline", "sync", "install", "uninstall"].includes(operation) && autoSyncInFlight) await autoSyncInFlight.catch(() => {})
+        if (["refresh", "installed", "offline", "sync", "install", "uninstall", "recover"].includes(operation) && autoSyncInFlight) await autoSyncInFlight.catch(() => {})
         result = await execute(operation, payload)
       }
       catch (error) { failure = error }
-      if (!["status", "usage-prices", "installed", "offline", "uninstall", "logout", "legacy-installed", "clean-legacy"].includes(operation)) {
+      if (!["status", "usage-prices", "installed", "offline", "uninstall", "recover", "logout", "legacy-installed", "clean-legacy"].includes(operation)) {
         if (failure && (["login", "refresh", "assert-ready", "assert-model"].includes(operation) || !api?.account)) {
           api?.suspend(); resetImport(); blocker = code(failure); await revoke()
         } else if (!["login", "refresh", "assert-ready", "assert-model"].includes(operation)) {
@@ -675,7 +713,10 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         }
         try { await persist() } catch (error) { failure ??= error }
       }
-      if (failure) throw new Error(`${code(failure)}${failure instanceof AiFixError && failure.detail ? `: ${failure.detail}` : ""}`)
+      if (failure) {
+        if (operation === "save-import-fix" && failure instanceof Error && (failure as NodeJS.ErrnoException).code) throw failure
+        throw new Error(`${code(failure)}${failure instanceof AiFixError && failure.detail ? `: ${failure.detail}` : ""}`)
+      }
       return result
     })().finally(() => { busy = false; if (inFlight === task) inFlight = undefined })
     inFlight = task

@@ -73,8 +73,11 @@ const CODE_FENCE_LANGS = new Set([
 ])
 export function secretFindings(text: string) {
   const findings: { rule: "private-key" | "provider-key" | "assignment"; classification: "blocked" | "template" | "code-expression" }[] = []
-  if (/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i.test(text)) findings.push({ rule: "private-key", classification: "blocked" })
-  for (const _ of text.matchAll(/\b(?:sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b/gi)) findings.push({ rule: "provider-key", classification: "blocked" })
+  if (/-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED|PGP) )?PRIVATE KEY(?: BLOCK)?-----/i.test(text)) findings.push({ rule: "private-key", classification: "blocked" })
+  for (const _ of text.matchAll(/\b(?:sk-[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[A-Z0-9]{16}|(?:gh[pousr]_|github_pat_|glpat-)[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{35}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/gi)) findings.push({ rule: "provider-key", classification: "blocked" })
+  for (const match of text.matchAll(/\bBearer\s+(?!\[REDACTED_)([A-Za-z0-9._~+\/-]+=*)/gi)) {
+    findings.push({ rule: "provider-key", classification: /^(?:YOUR_[A-Z0-9_]+|INSERT_[A-Z0-9_]+_HERE)$/.test(match[1]) ? "template" : "blocked" })
+  }
   for (const match of text.matchAll(/(?:api[_-]?key|password|secret|token)\s*[:=]\s*(["']?)([A-Za-z0-9_+\/=-]{16,})/gi)) {
     const value = match[2], rest = text.slice(match.index! + match[0].length)
     const boundary = match[1] ? rest.startsWith(match[1]) : /^(?:\s|$|[,;}\]"'])/.test(rest)

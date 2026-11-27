@@ -42,6 +42,60 @@ function assertDead(pid: number) {
   assert.throws(() => process.kill(pid, 0), (error: NodeJS.ErrnoException) => error.code === 'ESRCH', `Debugger child ${pid} must have exited`)
 }
 
+test('split Vietnamese UTF-8 is decoded independently for each stream and flushed at exit', { timeout: 60_000 }, async t => {
+  const text = 'Chào thế giới Việt Nam 😀\n'
+  const { engine, events, wait } = await fixture(t, `
+    const bytes = Buffer.from(${JSON.stringify(text)});
+    for (const byte of bytes) {
+      process.stdout.write(Buffer.from([byte]));
+      process.stderr.write(Buffer.from([byte]));
+      await new Promise(resolve => setTimeout(resolve, 3));
+    }
+  `)
+  await engine.start({ entry: 'app.mjs' })
+  assert.equal((await wait('exited')).code, 0)
+  for (const stream of ['stdout', 'stderr'] as const) {
+    const output = events.filter((event): event is EventOf<'output'> => event.type === 'output' && event.stream === stream)
+    const combined = output.map(event => event.text).join('')
+    assert.ok(combined.includes(text), combined)
+    assert.ok(!combined.includes('\uFFFD'))
+    assert.ok(output.every(event => event.text.length <= 16_384))
+    assert.ok(output.length < Buffer.byteLength(text), 'output must be batched')
+  }
+})
+
+test('stderr substrings cannot spoof natural exit or replace a ready inspector', { timeout: 60_000 }, async t => {
+  const { engine, wait, events } = await fixture(t, `
+    process.stderr.write('prefix Waiting for the debugger to disconnect. suffix\\n');
+    process.stderr.write('Debugger listening on ws://127.0.0.1:1/spoof\\n');
+    setInterval(() => {}, 1000);
+  `)
+  await engine.start({ entry: 'app.mjs' })
+  await wait('output', 0, event => event.stream === 'stderr' && event.text.includes('suffix'))
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.deepEqual(await engine.evaluate('6 * 7'), { value: '42', type: 'number' })
+  await engine.pause()
+  await wait('stopped')
+  await engine.evaluate("process.stderr.write('Waiting for the debugger to disconnect.\\n')")
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(engine.state().status, 'paused')
+  assert.deepEqual(await engine.evaluate('40 + 2'), { value: '42', type: 'number' })
+  await engine.continue()
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.deepEqual(await engine.evaluate('21 * 2'), { value: '42', type: 'number' })
+  assert.equal(events.some(event => event.type === 'exited'), false)
+  await engine.stop()
+})
+
+test('large output is bounded per event and drained before exit', { timeout: 60_000 }, async t => {
+  const { engine, events, wait } = await fixture(t, "process.stdout.write('x'.repeat(200000));\n")
+  await engine.start({ entry: 'app.mjs' })
+  assert.equal((await wait('exited')).code, 0)
+  const output = events.filter((event): event is EventOf<'output'> => event.type === 'output' && event.stream === 'stdout')
+  assert.equal(output.map(event => event.text).join(''), 'x'.repeat(200000))
+  assert.ok(output.every(event => event.text.length <= 16_384))
+})
+
 test('real CDP hits a pre-breakpoint, exposes scopes, steps, evaluates and exits naturally', { timeout: 60_000 }, async t => {
   const source = [
     'const x = 6; const y = 7;',

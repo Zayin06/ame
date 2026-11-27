@@ -20,6 +20,25 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, changed?: (p
   t.after(async () => { workspaces.dispose(); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) })
   return { root, directory, workspaces, project }
 }
+test('replace-all and save share file locks across atomic inode replacement', async t => {
+  const { directory, workspaces, project } = await fixture(t)
+  workspaces.dispose()
+  await writeFile(path.join(directory, 'a.txt'), 'cat')
+  const doc = await workspaces.read(project.id, 'a.txt')
+  const options = { query: 'cat', replacement: 'dog' }
+  const preview = await workspaces.replaceInProject(project.id, { ...options, dryRun: true })
+  const results = await Promise.allSettled([
+    workspaces.save(project.id, 'a.txt', 'saved', doc.revision),
+    workspaces.replaceInProject(project.id, options, preview.previews),
+    workspaces.replaceInProject(project.id, options, preview.previews),
+  ])
+  const disk = await readFile(path.join(directory, 'a.txt'), 'utf8')
+  assert.ok(disk === 'saved' || disk === 'dog')
+  const saves = results[0].status === 'fulfilled' ? 1 : 0
+  const replacements = results.slice(1).reduce((sum, result) => sum + (result.status === 'fulfilled' ? (result.value as { filesChanged: number }).filesChanged : 0), 0)
+  assert.equal(saves + replacements, 1)
+})
+
 test('build notes workspace delegate is read-only and emits no change notifications', async t => {
   const notifications: string[] = []
   const { directory, workspaces, project } = await fixture(t, id => notifications.push(id))
@@ -143,6 +162,38 @@ test('removal creates missing persistence directories even without a watcher', a
   workspaces.dispose()
   await workspaces.remove(project.id)
   assert.deepEqual(JSON.parse(await readFile(storage, 'utf8')), [])
+})
+
+test('workspace status never executes repository-local core.fsmonitor', async t => {
+  const { root, directory, workspaces, project } = await fixture(t)
+  const git = simpleGit(directory)
+  await git.init()
+  const marker = path.join(root, 'fsmonitor-ran')
+  const script = path.join(directory, '.git', 'fsmonitor-test')
+  const quotedMarker = marker.replace(/\\/g, '/').replace(/'/g, "'\\''")
+  await writeFile(script, `#!/bin/sh\nprintf ran > '${quotedMarker}'\nprintf '\\0'\n`, { mode: 0o755 })
+  await git.addConfig('core.fsmonitor', script.replace(/\\/g, '/'))
+  // Positive control: prove the configured script actually executes on this Git/filesystem.
+  await git.status()
+  assert.equal(await readFile(marker, 'utf8'), 'ran')
+  await rm(marker)
+  await workspaces.status(project.id)
+  await workspaces.commitPlanSnapshot(project.id)
+  await assert.rejects(readFile(marker), { code: 'ENOENT' })
+})
+
+test('BOM metadata is bounded and removed with its project', async t => {
+  const { directory, workspaces, project } = await fixture(t)
+  await writeFile(path.join(directory, 'bom'), '\uFEFForiginal')
+  const internals = workspaces as unknown as { setBom(id: string, key: string, hasBom: boolean): void; bom: Map<string, boolean> }
+  for (let i = 0; i < 2100; i++) internals.setBom(project.id, String(i), true)
+  assert.equal(internals.bom.size, 2000)
+  assert.equal(internals.bom.has(project.id + '\0' + '0'), false)
+  const document = await workspaces.read(project.id, 'bom')
+  await workspaces.save(project.id, 'bom', 'saved', document.revision)
+  assert.equal(await readFile(path.join(directory, 'bom'), 'utf8'), '\uFEFFsaved')
+  await workspaces.remove(project.id)
+  assert.equal([...internals.bom.keys()].some(key => key.startsWith(project.id + '\0')), false)
 })
 
 test('concurrent project removals persist the latest list and reload only the survivor', async t => {

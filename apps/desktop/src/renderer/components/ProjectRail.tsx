@@ -48,9 +48,9 @@ function SessionRow({ projectID, session, now, active, connected, onSelect, onRe
   </div>
 }
 
-export function ProjectRail({ projects, projectID, sessions, sessionID, loading, sessionsLoading, error, connected, creating, git, onSelect, onSession, onTool, onCreate, onPick, onRetry, onRemove, sessionCache, onSessions, onSessionRemoved }: {
+export function ProjectRail({ projects, projectID, sessions, sessionID, loading, sessionsLoading, error, connected, git, onSelect, onSession, onTool, onCreate, onPick, onRetry, onRemove, sessionCache, onSessions, onSessionRemoved }: {
   sessionCache: Record<string, Session[]>; onSessions: (id: string, sessions: Session[]) => void; onSessionRemoved?: (projectID: string, sessionID: string) => void;
-  projects: Project[]; projectID?: string; sessions: Session[]; sessionID?: string; loading: boolean; sessionsLoading: boolean; error: string; connected: boolean; creating: boolean; git?: GitState; generation: number;
+  projects: Project[]; projectID?: string; sessions: Session[]; sessionID?: string; loading: boolean; sessionsLoading: boolean; error: string; connected: boolean; git?: GitState; generation: number;
   onRemove: (id: string) => void; onSelect: (id: string) => void; onSession: (project: string, session: string) => void; onTool: (id: string, tab: 'files' | 'search' | 'git') => void; onCreate: (id: string) => void; onPick: () => void; onRetry: () => void
 }) {
   const [query, setQuery] = useState('')
@@ -175,7 +175,7 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
             {dirty && <span className="proj-dirty-indicator" title="Có thay đổi Git chưa commit" aria-hidden="true" />}
             <div className="proj-actions">
               <button type="button" className="proj-act-btn" aria-label={`Tùy chọn dự án: ${project.name}`} aria-haspopup="menu" aria-expanded={projectMenu === project.id} title="Thao tác dự án" onClick={event => { menuButtonRef.current = event.currentTarget; setProjectMenu(value => value === project.id ? null : project.id); setFilterOpen(false) }}><Icon name="more" /></button>
-              <button type="button" className="proj-act-btn" aria-label={`New Chat: ${project.name}`} title="Cuộc trò chuyện mới" disabled={!connected || creating} onClick={() => onCreate(project.id)}><Icon name="plus" /></button>
+              <button type="button" className="proj-act-btn" aria-label={`New Chat: ${project.name}`} title="Cuộc trò chuyện mới" disabled={!connected} onClick={() => onCreate(project.id)}><Icon name="plus" /></button>
             </div>
           </div>
           {projectMenu === project.id && <div className="proj-row-popover" role="menu" aria-label={`Thao tác dự án: ${project.name}`} ref={menuRef} onKeyDown={event => {

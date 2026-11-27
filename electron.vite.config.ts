@@ -21,7 +21,7 @@ export default defineConfig({
   },
   renderer: {
     root: resolve('apps/desktop/src/renderer'),
-    plugins: [monacoHighlightFix(), react()],
+    plugins: [monacoHighlightFix(), react(), { name: 'prod-csp', apply: 'build', transformIndexHtml(html) { return html.replace(/ ws:\/\/localhost:\* ws:\/\/127\.0\.0\.1:\*/g, '') } }],
     optimizeDeps: { exclude: ['monaco-editor'] },
     build: { rollupOptions: { input: resolve('apps/desktop/src/renderer/index.html') } },
     server: { host: '127.0.0.1', fs: { allow: [resolve('.')] } }

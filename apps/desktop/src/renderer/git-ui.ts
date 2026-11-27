@@ -15,6 +15,7 @@ const gitErrors: Record<string, { title: string; detail?: string }> = {
   GIT_AUTH_FAILED: { title: 'Xác thực Git với remote thất bại' },
   GIT_OFFLINE: { title: 'Không thể kết nối tới remote Git' },
   GIT_PUSH_REJECTED_NON_FF: { title: 'Push bị từ chối do remote có commit mới', detail: 'Hãy Pull về trước rồi thử Push lại.' },
+  GIT_REMOTE_REJECTED: { title: 'Remote từ chối nhận commit', detail: 'Kiểm tra quy tắc bảo vệ nhánh, quyền push hoặc hook trên máy chủ.' },
   GIT_CONFLICT: { title: 'Phát sinh xung đột (merge conflict)', detail: 'Giải quyết xung đột trong mã nguồn, stage các tệp đã sửa rồi commit để hoàn tất.' },
   GIT_DIRTY_WORKTREE: { title: 'Có thay đổi cục bộ chưa commit sẽ bị ghi đè', detail: 'Hãy Commit hoặc Stash thay đổi trước khi Pull / chuyển nhánh.' },
   GIT_ROOT_REQUIRED: { title: 'Thư mục dự án không phải gốc Git (.git)' },

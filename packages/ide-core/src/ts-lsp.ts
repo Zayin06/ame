@@ -22,10 +22,10 @@ let nextServiceID = 1, nextRequestID = 1
 let sharedWorker: Worker | undefined
 let workerGeneration = 0
 const activeServices = new Set<number>()
-const pending = new Map<number, { serviceID: number; resolve: (result: unknown) => void; reject: (error: Error) => void }>()
+const pending = new Map<number, { serviceID: number; timer: ReturnType<typeof setTimeout>; resolve: (result: unknown) => void; reject: (error: Error) => void }>()
 
 function rejectPending(error: Error) {
-  for (const request of pending.values()) request.reject(error)
+  for (const request of pending.values()) { clearTimeout(request.timer); request.reject(error) }
   pending.clear()
 }
 
@@ -43,6 +43,7 @@ function spawn() {
     const request = pending.get(message.id)
     if (!request || request.serviceID !== message.serviceID) return
     pending.delete(message.id)
+    clearTimeout(request.timer)
     if (message.ok) request.resolve(message.result)
     else {
       const error = new Error(message.message)
@@ -64,7 +65,9 @@ function spawn() {
 }
 
 /** Workspaces retain isolated engines inside one lazily created shared worker. */
-export function createTsLanguageService(workspaceRoot: string): TsLanguageService {
+export function createTsLanguageService(workspaceRoot: string, options: { requestTimeoutMs?: number } = {}): TsLanguageService {
+  const requestTimeoutMs = options.requestTimeoutMs ?? 15_000
+  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error('INVALID_LSP_TIMEOUT')
   const root = fs.realpathSync(workspaceRoot)
   const serviceID = nextServiceID++
   activeServices.add(serviceID)
@@ -77,13 +80,24 @@ export function createTsLanguageService(workspaceRoot: string): TsLanguageServic
         const current = sharedWorker ?? spawn()
         if (sentGeneration !== workerGeneration) initializedInWorker = false
         const id = nextRequestID++
-        pending.set(id, { serviceID, resolve: result => resolve(result as T), reject })
+        const generation = workerGeneration
+        const timer = setTimeout(() => {
+          if (sharedWorker !== current || !pending.has(id)) return
+          sharedWorker = undefined
+          workerGeneration++
+          rejectPending(new Error('LSP_TIMEOUT'))
+          void current.terminate()
+        }, requestTimeoutMs)
+        pending.set(id, { serviceID, timer, resolve: result => {
+          if (sharedWorker === current && workerGeneration === generation) initializedInWorker = true
+          resolve(result as T)
+        }, reject })
         try {
           current.postMessage({ id, serviceID, root: initializedInWorker ? undefined : root, method, args })
-          initializedInWorker = true
           sentGeneration = workerGeneration
         } catch (error) {
           pending.delete(id)
+          clearTimeout(timer)
           reject(error)
         }
       } catch (error) { reject(error) }
@@ -116,6 +130,7 @@ export function createTsLanguageService(workspaceRoot: string): TsLanguageServic
       for (const [id, request] of pending) {
         if (request.serviceID !== serviceID) continue
         request.reject(error)
+        clearTimeout(request.timer)
         pending.delete(id)
       }
       if (sharedWorker) {

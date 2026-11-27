@@ -10,7 +10,7 @@ function terminatedNames(buffer: Buffer, wide: boolean): string[] {
     if (wide ? buffer.readUInt16LE(end) !== 0 : buffer[end] !== 0) continue
     if (end === start) break
     const name = buffer.subarray(start, end)
-    names.push(name.toString(wide ? 'utf16le' : isUtf8(name) ? 'utf8' : 'latin1'))
+    names.push(wide ? name.toString('utf16le') : isUtf8(name) ? name.toString('utf8') : new TextDecoder('windows-1252').decode(name))
     start = end + step
   }
   return names

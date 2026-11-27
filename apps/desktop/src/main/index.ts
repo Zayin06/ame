@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerSaveBlocker, screen, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerSaveBlocker, screen, session, shell } from 'electron'
 import * as fs from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
@@ -12,6 +12,7 @@ import { rendererSource, isRendererDocument } from './renderer-source'
 import { readOsClipboardFiles } from './os-clipboard-files'
 import { Workspaces } from '../../../../packages/ide-core/src/workspace'
 import { validateWorkspacePath } from '../../../../packages/ide-core/src/workspace-fs'
+import { detectUntrustedGitConfig, isHeadPushed } from '../../../../packages/ide-core/src/git-ops'
 import { resolveDroppedPaths } from '../../../../packages/ide-core/src/dropped-attachments'
 import { Terminals } from '../../../../packages/ide-core/src/terminal'
 import { createTsLanguageService, type TsLanguageService } from '../../../../packages/ide-core/src/ts-lsp'
@@ -45,7 +46,7 @@ let managed = true
 let shuttingDown = false
 let pairing: RemotePairing
 let screenBlocker: number | undefined
-const pairingSchema = z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() })
+const pairingSchema = z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }).strict()
 function screenActive(enabled: boolean) {
   if (enabled && (screenBlocker === undefined || !powerSaveBlocker.isStarted(screenBlocker))) screenBlocker = powerSaveBlocker.start('prevent-display-sleep')
   if (!enabled && screenBlocker !== undefined) { if (powerSaveBlocker.isStarted(screenBlocker)) powerSaveBlocker.stop(screenBlocker); screenBlocker = undefined }
@@ -74,6 +75,61 @@ async function startBackend() {
   }
 }
 const text = z.string().max(200000)
+const trustedWorkspaces = new Set<string>()
+let trustWrites: Promise<unknown> = Promise.resolve()
+function trustFile() { return path.join(app.getPath('userData'), 'trusted-workspaces.json') }
+async function loadWorkspaceTrust() {
+  trustedWorkspaces.clear()
+  try {
+    const directories = z.array(z.string().min(1)).parse(JSON.parse(await readFile(trustFile(), 'utf8')))
+    for (const directory of directories) trustedWorkspaces.add(directory)
+  } catch { /* Missing or invalid trust never grants access. */ }
+}
+async function assertWorkspaceTrusted(projectID: string) {
+  const directory = workspace.get(projectID).directory
+  let canonical: string
+  try { canonical = await fs.promises.realpath(directory) }
+  catch { throw new Error('WORKSPACE_UNTRUSTED') }
+  if (trustedWorkspaces.has(canonical)) return
+  const entries = await detectUntrustedGitConfig(directory).catch(error => {
+    // Terminals and debuggers also support projects without a Git repository.
+    if (error instanceof Error && error.message === 'GIT_ROOT_REQUIRED') return []
+    throw error
+  })
+  if (!entries.length) return
+  try {
+    await confirmation('Tin cậy workspace này?', `${canonical}\n.git/config / hooks có thể thực thi lệnh khi thao tác với workspace:\n${entries.join('\n')}`)
+  } catch { throw new Error('WORKSPACE_UNTRUSTED') }
+  if (shuttingDown) throw new Error('APP_SHUTTING_DOWN')
+  const save = trustWrites.catch(() => {}).then(async () => {
+    if (trustedWorkspaces.has(canonical)) return
+    const file = trustFile(), temporary = `${file}.${randomUUID()}.tmp`
+    try {
+      await fs.promises.mkdir(path.dirname(file), { recursive: true })
+      await writeFile(temporary, JSON.stringify([...trustedWorkspaces, canonical]), { mode: 0o600 })
+      await fs.promises.rename(temporary, file)
+      trustedWorkspaces.add(canonical)
+    } finally { await fs.promises.rm(temporary, { force: true }) }
+  })
+  trustWrites = save
+  await save
+}
+async function validatePromptFiles(projectID: string, files: z.infer<typeof promptFilesSchema> | undefined) {
+  for (const item of files ?? []) {
+    for (const uri of [item.uri, item.source?.type === 'uri' ? item.source.uri : undefined]) {
+      if (!uri || !/^file:/i.test(uri)) continue
+      try {
+        const directory = workspace.get(projectID).directory
+        const url = new URL(uri)
+        if (url.search || url.hash) throw new Error('INVALID_FILE_URI')
+        const absolute = fileURLToPath(url)
+        const { target } = await validateWorkspacePath(directory, path.relative(directory, absolute))
+        const info = await fs.promises.lstat(target)
+        if (info.isSymbolicLink() || !info.isFile() || info.size > 10 * 1024 * 1024) throw new Error('INVALID_ATTACHMENT')
+      } catch { throw new Error('INVALID_ATTACHMENT: file URI must reference a regular workspace file outside .git, without symlinks, at most 10 MiB') }
+    }
+  }
+}
 // Support both Electron's legacy raw-format API and its newer ClipboardItem API.
 async function osClipboardFiles(): Promise<string[]> {
   const legacy = clipboard as unknown as Parameters<typeof readOsClipboardFiles>[0]
@@ -246,7 +302,7 @@ const schema = {
   commitAgentPrompt: z.tuple([boundedID, boundedID.optional(), text.min(1).refine(value => !!value.trim() && !value.includes('\0')), z.enum(['analyze', 'split', 'single', 'custom']).optional()]),
   commitAgentLock: z.tuple([boundedID, boundedID]),
   commitAgentExecutePlan: z.tuple([boundedID, boundedID, planSchema]),
-  prompt: z.tuple([id, id, text, z.object({ id, modelID: id.optional(), name: z.string().max(512), providerID: id }).optional(), id.optional(), promptFilesSchema.optional()]),
+  prompt: z.tuple([id, id, text, modelSchema.optional(), id.optional(), promptFilesSchema.optional()]),
   resolveDroppedPaths: z.tuple([boundedID, z.array(z.string().max(4096)).max(32)]),
   pickAttachmentFiles: z.tuple([boundedID]),
   cancel: z.tuple([id, id]), permissions: z.tuple([id, id]), replyPermission: z.tuple([id, id, z.enum(['once', 'always', 'reject'])]),
@@ -271,6 +327,24 @@ function debuggerFor(projectID: string) {
   return service
 }
 function notify(event: IdeEvent) { if (window && !window.isDestroyed()) window.webContents.send('ame:event', event) }
+type TerminalEvent = Extract<IdeEvent, { type: 'terminal' }>
+const terminalOutput = new Map<string, { event: TerminalEvent; timer: ReturnType<typeof setTimeout> }>()
+function flushTerminalOutput(terminalID?: string) {
+  for (const [id, pending] of terminalOutput) {
+    if (terminalID !== undefined && id !== terminalID) continue
+    clearTimeout(pending.timer)
+    terminalOutput.delete(id)
+    notify(pending.event)
+  }
+}
+function notifyTerminal(event: IdeEvent) {
+  if (event.type !== 'terminal') return notify(event)
+  if (event.exitCode !== undefined) { flushTerminalOutput(event.terminalID); notify(event); return }
+  const pending = terminalOutput.get(event.terminalID)
+  if (pending) { pending.event = { ...event, data: (pending.event.data ?? '') + (event.data ?? '') }; return }
+  const timer = setTimeout(() => flushTerminalOutput(event.terminalID), 16)
+  terminalOutput.set(event.terminalID, { event: { ...event }, timer })
+}
 const projectRemovalConfirmations = new Map<string, { token: string; expires: number }>()
 async function confirmation(message: string, detail?: string) {
   const result = await dialog.showMessageBox(window!, { type: 'question', buttons: ['Hủy', 'Xác nhận'], defaultId: 0, cancelId: 0, message, ...(detail ? { detail } : {}) })
@@ -423,10 +497,11 @@ function translationLockState(projectID: string): SessionLockState {
   }
 }
 async function call(method: keyof typeof schema, args: unknown[]) {
-  schema[method].parse(args)
+  const parsed = schema[method].parse(args) as any[]
   if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
   // Dispatch remains explicit: renderer never chooses arbitrary Node functions or IPC channels.
-  const [a, b, c, d, e, f] = args as any[]
+  const [a, b, c, d, e, f] = parsed
+  if (['commit', 'commitAgentExecutePlan', 'gitFetch', 'gitPull', 'gitPush', 'terminalCreate', 'debugStart'].includes(method)) await assertWorkspaceTrusted(a)
   switch (method) {
     case 'platform': return process.platform
     case 'artifacts': return adapter.artifacts(a, b)
@@ -454,10 +529,10 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'terminalProfiles': return terminals.available()
     case 'terminalList': return terminals.list(a)
     case 'terminalCreate': return terminals.create(a, b, c, d)
-    case 'terminalSnapshot': return terminals.snapshot(a, b)
+    case 'terminalSnapshot': flushTerminalOutput(b); return terminals.snapshot(a, b)
     case 'terminalWrite': return terminals.write(a, b, c)
     case 'terminalResize': return terminals.resize(a, b, c, d)
-    case 'terminalClose': return terminals.close(a, b)
+    case 'terminalClose': flushTerminalOutput(b); return terminals.close(a, b)
     case 'lspUpdateDocument': return lspFor(a).updateDocument(b, c, d)
     case 'lspCloseDocument': return lspFor(a).closeDocument(b)
     case 'lspRefresh': return lspFor(a).refreshFiles()
@@ -576,7 +651,11 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'gitPush': return workspace.gitPush(a, b)
     case 'gitLog': return workspace.gitLog(a, b)
     case 'gitCommitDetail': return workspace.gitCommitDetail(a, b)
-    case 'gitUndoLastCommit': return workspace.gitUndoLastCommit(a)
+    case 'gitUndoLastCommit': {
+      const pushed = await isHeadPushed(workspace.get(a).directory)
+      await confirmation('Hoàn tác commit cuối cùng?', pushed ? 'Cảnh báo: HEAD đã được push lên remote. Hoàn tác sẽ thay đổi lịch sử cục bộ đã chia sẻ.' : 'Commit chưa được push lên remote. Thay đổi sẽ được giữ trong staging area.')
+      return workspace.gitUndoLastCommit(a)
+    }
     case 'gitStashList': return workspace.gitStashList(a)
     case 'gitStashPush': return workspace.gitStashPush(a, b, c)
     case 'gitStashApply': return d === undefined ? workspace.gitStashApply(a, b, c) : workspace.gitStashApply(a, b, c, d)
@@ -598,22 +677,30 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'pairingStatus': return pairing.status()
     case 'pairingConfigure':
       if (a.enabled && !managed) throw new Error('PAIRING_PRIVATE_BACKEND_REQUIRED')
-      if (a.enabled && !pairing.status().enabled) await confirmation('Bật Remote access qua OpenTunnel? Máy chủ sẽ có địa chỉ Internet; lưu lượng được mã hóa đầu cuối tại Ame IDE. Thiết bị có mã QR hoặc link sẽ có toàn quyền OpenCode tích hợp. Không chia sẻ mã ghép nối.')
-      return configurePairing(a)
+      // Consent is request-bound: queued disable/enable transitions can change status while the dialog is open.
+      if (a.enabled) await confirmation('Bật Remote access qua OpenTunnel? Máy chủ sẽ có địa chỉ Internet; lưu lượng được mã hóa đầu cuối tại Ame IDE. Thiết bị có mã QR hoặc link sẽ có toàn quyền OpenCode tích hợp. Không chia sẻ mã ghép nối.')
+      return withAuthority(() => {
+        if (a.enabled && !managed) throw new Error('PAIRING_PRIVATE_BACKEND_REQUIRED')
+        return configurePairing(a)
+      })
     case 'pairingCode': return pairing.issue()
     case 'pairingRevokeDevice':
       await confirmation('Ngắt kết nối thiết bị này? Thiết bị sẽ không thể truy cập Ame IDE cho tới khi ghép nối lại.')
-      return pairing.revokeDevice(a)
+      return withAuthority(() => pairing.revokeDevice(a))
     case 'pairingRevokeAll':
       await confirmation('Ngắt kết nối tất cả thiết bị đã ghép nối? Mọi thiết bị từ xa sẽ mất quyền truy cập ngay lập tức.')
-      return pairing.revokeAll()
+      return withAuthority(() => pairing.revokeAll())
     case 'sessions': return adapter.sessions(a)
     case 'createSession': {
+      if (b === 'full') await confirmation('Bật quyền tự động cho phép?', 'Agent sẽ tự động chấp thuận lệnh shell và ghi tệp mà không hỏi lại. Chỉ tiếp tục khi bạn tin cậy agent và workspace.')
       const orchestrator = await account.readOrchestrator?.()
       return orchestrator ? adapter.createSession(a, b, orchestrator.id) : adapter.createSession(a, b)
     }
     case 'sessionPermissionMode': return adapter.sessionPermissionMode(a, b)
-    case 'updateSessionPermissionMode': return adapter.updateSessionPermissionMode(a, b, c)
+    case 'updateSessionPermissionMode':
+      await assertRegularSession(a, b)
+      if (c === 'full') await confirmation('Bật quyền tự động cho phép?', 'Agent sẽ tự động chấp thuận lệnh shell và ghi tệp mà không hỏi lại. Chỉ tiếp tục khi bạn tin cậy agent và workspace.')
+      return adapter.updateSessionPermissionMode(a, b, c)
     case 'renameSession': return adapter.renameSession(a, b, c)
     case 'archiveSession': return adapter.archiveSession(a, b, c)
     case 'deleteSession':
@@ -924,6 +1011,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     }
     case 'prompt': {
       assertRegularSession(a, b)
+      await validatePromptFiles(a, f)
       const selected = await resolveModel(a, d, true)
       return adapter.prompt(a, b, c, selected, e, f)
     }
@@ -944,8 +1032,16 @@ async function call(method: keyof typeof schema, args: unknown[]) {
   }
 }
 let authority: Promise<unknown> = Promise.resolve()
+function withAuthority<T>(operation: () => Promise<T>) {
+  const task = authority.catch(() => {}).then(() => {
+    if (shuttingDown) throw new Error('APP_SHUTTING_DOWN')
+    return operation()
+  })
+  authority = task
+  return task
+}
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'createSession', 'prompt', 'stageRevert', 'clearRevert', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'commitAgentPrompt', 'commitAgentLock', 'commitAgentExecutePlan', 'btwAsk', 'petGenerateDialogue', 'account', 'pairingConfigure', 'pairingRevokeDevice', 'pairingRevokeAll'].includes(method)) return call(method, args)
+  if (!['startBackend', 'connect', 'discover', 'createSession', 'prompt', 'stageRevert', 'clearRevert', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'commitAgentPrompt', 'commitAgentLock', 'commitAgentExecutePlan', 'btwAsk', 'petGenerateDialogue', 'account'].includes(method)) return call(method, args)
   // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
@@ -963,8 +1059,8 @@ async function openWindow() {
     const response = dialog.showMessageBoxSync(window!, { type: 'warning', buttons: ['Ở lại', 'Bỏ thay đổi và đóng'], defaultId: 0, cancelId: 0, message: 'Có file chưa lưu. Đóng Ame IDE?' })
     if (response === 1) event.preventDefault()
   })
-  window.webContents.on('render-process-gone', () => terminals.dispose())
-  window.on('closed', () => { terminals.dispose(); window = undefined; petHost?.reconcile() })
+  window.webContents.on('render-process-gone', () => { flushTerminalOutput(); terminals.dispose(); flushTerminalOutput() })
+  window.on('closed', () => { flushTerminalOutput(); terminals.dispose(); flushTerminalOutput(); window = undefined; petHost?.reconcile() })
   if (renderer.url) await window.loadURL(renderer.url)
   else await window.loadFile(renderer.file!)
   petHost?.reconcile()
@@ -974,6 +1070,8 @@ if (!primaryInstance) app.quit()
 app.on('second-instance', () => { if (window?.isMinimized()) window.restore(); window?.focus() })
 void app.whenReady().then(async () => {
   if (!primaryInstance) return
+  session?.defaultSession?.setPermissionRequestHandler?.((_webContents, _permission, callback) => callback(false))
+  session?.defaultSession?.setPermissionCheckHandler?.(() => false)
   if (process.platform === 'darwin') Menu.setApplicationMenu(Menu.buildFromTemplate([
     { role: 'appMenu' }, { role: 'fileMenu' }, { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' }
   ]))
@@ -982,11 +1080,12 @@ void app.whenReady().then(async () => {
     notify({ type: 'files', projectID })
   })
   await workspace.load()
+  await loadWorkspaceTrust()
   translationLocks = createTranslationLockStore(path.join(app.getPath('userData'), 'translation-locks.json'))
   await translationLocks.load()
   commitAgentLocks = createCommitAgentLockStore(path.join(app.getPath('userData'), 'commit-agent-locks.json'))
   await commitAgentLocks.load()
-  terminals = new Terminals(projectID => workspace.get(projectID).directory, notify)
+  terminals = new Terminals(projectID => workspace.get(projectID).directory, notifyTerminal)
   adapter = new OpenCodeAdapter(notify)
   for (const project of workspace.list()) adapter.attach(project.id, project.directory)
   const spritePath = app.isPackaged ? path.join(process.resourcesPath, 'ame-chibi.png') : path.join(app.getAppPath(), 'packages/amekit/src/assets/ame-chibi.png')
@@ -1042,19 +1141,25 @@ void app.whenReady().then(async () => {
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
 let quitting = false
 app.on('will-quit', event => {
+  flushTerminalOutput()
   if (quitting || !account) return
   event.preventDefault(); quitting = true; shuttingDown = true
   screenActive(false)
   terminals?.dispose()
+  flushTerminalOutput()
   adapter.abortRequests()
   // Start Account disposal now: its abort signal releases work holding authority.
   const accountDisposal = account.dispose().catch(() => {})
   // Abort in-flight pet generation before waiting for authority; queued calls fail closed.
-  void Promise.resolve().then(() => petHost?.dispose()).finally(async () => {
+  let deadline: ReturnType<typeof setTimeout>
+  const cleanup = Promise.resolve().then(() => petHost?.dispose()).finally(async () => {
     for (const service of lspServices.values()) { try { service.dispose() } catch { /* Continue disposing other projects. */ } }
     lspServices.clear()
     await Promise.allSettled([...debuggers.values()].map(async service => service.dispose()))
     debuggers.clear()
   }).finally(() => authority.catch(() => {}))
-    .finally(() => pairing.stop()).finally(() => accountDisposal).finally(async () => { adapter.dispose(); workspace.dispose(); await runtime.stop(); app.quit() })
+    .finally(() => pairing.stop()).finally(() => accountDisposal)
+    .finally(() => adapter.dispose()).finally(() => workspace.dispose()).finally(() => runtime.stop())
+  void Promise.race([cleanup, new Promise<void>(resolve => { deadline = setTimeout(resolve, 8_000) })])
+    .catch(() => {}).finally(() => { clearTimeout(deadline); app.quit() })
 })

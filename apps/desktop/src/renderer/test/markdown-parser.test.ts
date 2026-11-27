@@ -33,6 +33,16 @@ test('IDE errors humanize IPC and OS codes without changing unknown messages or 
 
 const text = (value: string): InlineNode => ({ type: 'text', text: value })
 
+test('unmatched opening brackets parse in linear time without losing text', () => {
+  for (const source of ['['.repeat(50000), '['.repeat(50000) + '](https://example.com/unclosed', '[x]('.repeat(12500)]) {
+    const start = performance.now()
+    const result = parseInline(source)
+    const elapsed = performance.now() - start
+    assert.ok(elapsed < 250, `bracket parsing took ${elapsed.toFixed(1)}ms`)
+    assert.deepEqual(result, [text(source)])
+  }
+})
+
 test('parses all six heading levels, paragraphs and horizontal rules', () => {
   assert.deepEqual(parseMarkdown('# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six'), ['One', 'Two', 'Three', 'Four', 'Five', 'Six'].map((title, i) => ({ type: 'heading', level: i + 1, children: [text(title)] })))
   assert.deepEqual(parseMarkdown('## Title ##\n\nfirst\nsecond\n\n---\n***\n___'), [

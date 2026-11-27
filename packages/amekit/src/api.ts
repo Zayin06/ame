@@ -68,7 +68,11 @@ export class AmeApi {
   readonly origin: string
   private auth?: AuthPayload
   private token?: string
-  constructor(server = "https://amecode.ameno.tech", private fetcher: typeof fetch = fetch) { this.origin = serverURL(server) }
+  private readonly appVersion: string
+  constructor(server = "https://amecode.ameno.tech", private fetcher: typeof fetch = fetch, options: { appVersion?: string } = {}) {
+    this.origin = serverURL(server)
+    this.appVersion = options.appVersion ?? (process.env.AME_APP_VERSION || process.env.npm_package_version || "0.1.0")
+  }
   get account() { return this.auth?.user }
   get expires() { return this.auth ? Date.parse(this.auth.session.expires_at) : 0 }
   get provider() { return this.auth && { provider: this.auth.provider, catalog: this.auth.catalog, registry: this.auth.registry } }
@@ -111,7 +115,7 @@ export class AmeApi {
   }
   async login(username: string, password: string, signal?: AbortSignal) {
     this.clear()
-    return this.accept(await json(await this.request("/v1/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password, client: { editor: "AmeKit", app_version: "0.1.0" } }), signal }, false)))
+    return this.accept(await json(await this.request("/v1/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password, client: { editor: "AmeKit", app_version: this.appVersion } }), signal }, false)))
   }
   async refresh(signal?: AbortSignal, options?: { preserveOnTransient?: boolean }) {
     try { return this.accept(await json(await this.request("/v1/session", { signal }))) }

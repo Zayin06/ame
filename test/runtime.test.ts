@@ -4,6 +4,8 @@ import { access, cp, mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/pro
 import path from 'node:path'
 import { OpenCode } from '@opencode/client'
 import { PrivateRuntime, privateEnvironment } from '../packages/opencode-adapter/src/runtime'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 
 test('private profile ignores inherited OpenCode overrides and keeps tool environment', () => {
   const env = privateEnvironment('C:\\private', 'private-secret', { OPENCODE_CONFIG: 'global.json', OPENCODE_CONFIG_CONTENT: 'secret', OPENCODE_SERVER_PASSWORD: 'global', XDG_CONFIG_HOME: 'global', NODE_OPTIONS: '--inspect', PATH: 'tools', HOME: 'original' })
@@ -27,6 +29,47 @@ test('missing bundled executable fails closed and stop during preparation cannot
     await assert.rejects(start, /BUNDLED_RUNTIME_INVALID/)
     await assert.rejects(runtime.start(), /RUNTIME_STOPPING/)
   } finally { await runtime.stop(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('stop escalates without awaiting a stalled startup', { timeout: 10_000 }, async t => {
+  const runtime = new PrivateRuntime({ resources: '', profile: '' })
+  const signals: (NodeJS.Signals | undefined)[] = []
+  let close!: () => void
+  const child = { pid: 2147483647, kill: (signal?: NodeJS.Signals) => {
+    signals.push(signal);
+    (runtime as any).child = undefined; close()
+    return true
+  } }
+  Object.assign(runtime, { child, closed: new Promise<void>(resolve => { close = resolve }), pending: new Promise(() => {}), endpoint: { url: 'http://localhost' } })
+  if (process.platform !== 'win32') t.mock.method(process, 'kill', (_pid: number, signal: NodeJS.Signals | number) => { if (signal !== 0) signals.push(signal as NodeJS.Signals); if (signal === 'SIGKILL') close(); return true })
+  const stopping = runtime.stop()
+  assert.deepEqual(signals, process.platform === 'win32' ? [] : ['SIGTERM'])
+  await stopping
+  assert.deepEqual(signals, process.platform === 'win32' ? [undefined] : ['SIGTERM', 'SIGKILL'])
+  assert.equal((runtime as any).endpoint, undefined)
+})
+
+test('stop terminates a real runtime child and its grandchild', { timeout: 15000 }, async () => {
+  const runtime = new PrivateRuntime({ resources: '', profile: '' })
+  const child = spawn(process.execPath, ['-e', `const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); console.log(c.pid); setInterval(()=>{},1000)`], { detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
+  let grandchildPid: number | undefined
+  const closed = new Promise<void>(resolve => child.once('close', resolve))
+  Object.assign(runtime, { child, closed })
+  try {
+    const [data] = await once(child.stdout!, 'data')
+    grandchildPid = Number(data.toString().trim())
+    assert.ok(grandchildPid > 0)
+    process.kill(grandchildPid, 0)
+    await runtime.stop()
+    for (let i = 0; i < 100; i++) {
+      try { process.kill(grandchildPid, 0) } catch (error) { assert.equal((error as NodeJS.ErrnoException).code, 'ESRCH'); return }
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.fail('grandchild still exists after stop')
+  } finally {
+    await runtime.stop()
+    if (grandchildPid) { try { process.kill(grandchildPid, 'SIGKILL') } catch {} }
+  }
 })
 
 const resources = path.resolve('resources')

@@ -3,6 +3,48 @@ import test from 'node:test'
 import { shellProfiles, Terminals } from '../packages/ide-core/src/terminal'
 import type { spawn } from 'node-pty'
 import type { TerminalEvent } from '../packages/protocol/src/index'
+import type { execFileSync } from 'node:child_process'
+
+test('chunk snapshots retain the exact suffix and exited sessions do not consume live slots', () => {
+  const shells: { data(text: string): void; exit(event: { exitCode: number }): void }[] = []
+  const launch = (() => {
+    const shell = { data: (_text: string) => {}, exit: (_event: { exitCode: number }) => {} }
+    shells.push(shell)
+    return { onData: (fn: typeof shell.data) => { shell.data = fn; return { dispose() {} } }, onExit: (fn: typeof shell.exit) => { shell.exit = fn; return { dispose() {} } }, kill() {} }
+  }) as unknown as typeof spawn
+  const service = new Terminals(id => id, () => {}, [{ id: 'sh', name: 'sh', executable: 'sh', args: [] }], launch)
+  try {
+    const first = service.create('p')
+    const chunks = ['a'.repeat(700_000), 'b'.repeat(500_000), 'suffix']
+    for (const chunk of chunks) shells[0].data(chunk)
+    assert.equal(service.snapshot('p', first.id).output, chunks.join('').slice(-1024 * 1024))
+    assert.equal(service.snapshot('p', first.id).sequence, 3)
+    shells[0].exit({ exitCode: 0 })
+    for (let i = 0; i < 20; i++) { service.create('p'); shells.at(-1)!.exit({ exitCode: 0 }) }
+    assert.equal(service.list('p').length, 20)
+    assert.throws(() => service.snapshot('p', first.id), /UNKNOWN_TERMINAL/)
+    for (let i = 0; i < 20; i++) service.create('p')
+    assert.throws(() => service.create('p'), /TERMINAL_LIMIT/)
+    assert.equal(service.list('p').length, 40)
+  } finally { service.dispose() }
+})
+
+test('Windows kills the process tree before the PTY and tolerates taskkill failure', { skip: process.platform !== 'win32' }, () => {
+  for (const pid of [123, 0, -1, undefined]) {
+    const calls: string[] = []
+    const launch = (() => ({ pid, onData: () => ({ dispose() {} }), onExit: () => ({ dispose() {} }), kill: () => calls.push('pty') })) as unknown as typeof spawn
+    const killTree = ((file: string, args: string[], options: unknown) => {
+      calls.push('tree')
+      assert.equal(file, 'taskkill')
+      assert.deepEqual(args, ['/PID', '123', '/T', '/F'])
+      assert.deepEqual(options, { windowsHide: true, timeout: 2000 })
+      throw new Error('already gone')
+    }) as unknown as typeof execFileSync
+    const service = new Terminals(id => id, () => {}, [{ id: 'sh', name: 'sh', executable: 'sh', args: [] }], launch, killTree)
+    service.create('p'); service.dispose()
+    assert.deepEqual(calls, pid === 123 ? ['tree', 'pty'] : ['pty'])
+  }
+})
 
 test('macOS prefers the user login shell and falls back to system zsh/bash without Windows paths', () => {
   const available = new Set(['/opt/homebrew/bin/fish', '/bin/zsh', '/bin/bash'])

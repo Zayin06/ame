@@ -9,6 +9,7 @@ import ts from 'typescript'
 function elements(node: ReactNode): ReactElement<any>[] {
   if (Array.isArray(node)) return node.flatMap(elements)
   if (!isValidElement<any>(node)) return []
+  if (typeof node.type === 'function' && node.type.name === 'ChatTurnView') return [node, ...elements((node.type as any)(node.props))]
   return [node, ...elements((node.props as any).children)]
 }
 
@@ -31,6 +32,8 @@ function harness(overrides: Record<string, any> = {}, app = false) {
     createSession: async () => ({ id: 'created', title: 'Created' }), ...overrides,
   }
   const hooks = {
+    memo: (component: unknown) => component,
+    useMemo: (factory: () => unknown) => factory(),
     useState(initial: any) {
       const index = cursor++
       if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial
@@ -64,6 +67,7 @@ function harness(overrides: Record<string, any> = {}, app = false) {
     setTimeout, clearTimeout, requestAnimationFrame: () => {},
     require: (name: string) => {
       if (name === 'react') return hooks
+      if (app && name === './components/ErrorBoundary') return { ErrorBoundary: ({ children }: { children: any }) => children }
       if (name === 'monaco-editor') return { editor: { getModels: () => [] }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } }
       if (name.startsWith('./') && (!app || name.startsWith('./components/'))) return new Proxy({}, { get: (_target, key) => key === 'errorText' || key === 'humanizeIdeError' ? (e: any) => e.message : String(key) })
       return nativeRequire(name)
@@ -104,6 +108,52 @@ function attach(h: ReturnType<typeof harness>) {
 }
 function attachments(h: ReturnType<typeof harness>) { return h.nodes().find(node => Array.isArray(node.props.attachments) && node.props.onRemove)!.props.attachments }
 function retry(h: ReturnType<typeof harness>, id: string) { elements(h.warning(id)).find(node => node.type === 'button')!.props.onClick(); h.render() }
+
+test('Enter sends unmatched slash and mention text but attachment search and valid choices consume it', async () => {
+  const prompts: string[] = []
+  const h = harness({ prompt: async (_project: string, _session: string, text: string) => { prompts.push(text) } })
+  try {
+    h.render(); await h.settle()
+    for (const value of ['xem /etc/hosts', 'xem @missing', 'xem /', 'xem @']) {
+      type(h, value)
+      h.input().props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() {} })
+      await h.settle()
+      assert.equal(prompts.at(-1), value)
+    }
+    h.nodes().find(node => node.props['aria-label'] === 'Đính kèm ngữ cảnh')!.props.onClick(); h.render()
+    const search = h.nodes().find(node => node.props['aria-label'] === 'Tìm tệp đính kèm')!
+    let prevented = false
+    search.props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() { prevented = true } })
+    assert.equal(prevented, true); assert.equal(prompts.length, 4)
+    h.render({ files: ['src/ok.ts'] }); type(h, 'xem @src')
+    h.input().props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() {} })
+    await h.settle()
+    assert.equal(prompts.length, 4)
+    assert.match(h.input().props.value, /@src\/ok.ts/)
+  } finally { h.dispose() }
+})
+
+test('streaming reuses completed turn objects and rewind callbacks but invalidates changed history', async () => {
+  let items = [{ id: 'u1', role: 'user', text: 'old' }, { id: 'a1', role: 'assistant', text: 'answer' }, { id: 'u2', role: 'user', text: 'new' }, { id: 'a2', role: 'assistant', text: 'stream' }]
+  const listeners = new Set<(event: any) => void>()
+  const h = harness({ messages: async () => items.map(item => ({ ...item })), onEvent: (listener: (event: any) => void) => { listeners.add(listener); return () => listeners.delete(listener) } })
+  const refresh = async () => { listeners.forEach(listener => listener({ type: 'opencode', projectID: 'p', sessionID: 'A' })); await new Promise(resolve => setTimeout(resolve, 120)); await h.settle() }
+  const turns = () => h.nodes().filter(node => typeof node.type === 'function' && node.type.name === 'ChatTurnView')
+  try {
+    h.render({ sessions: [{ id: 'A', status: 'running' }] }); await h.settle()
+    const first = turns()[0].props
+    items = items.map(item => item.id === 'a2' ? { ...item, text: 'stream more' } : item)
+    await refresh()
+    assert.equal(turns()[0].props.turn, first.turn)
+    assert.equal(turns()[0].props.onRewind, first.onRewind)
+    items = items.map(item => item.id === 'a1' ? { ...item, text: 'corrected' } : item)
+    await refresh()
+    assert.notEqual(turns()[0].props.turn, first.turn)
+    const compact = turns()[0].props.turn
+    h.render({ timelineDetail: 'everything' })
+    assert.notEqual(turns()[0].props.turn, compact)
+  } finally { h.dispose() }
+})
 
 test('A → New Chat → A preserves text and attachments across remounts and projects; draft IDs stay separate', async () => {
   const h = harness()

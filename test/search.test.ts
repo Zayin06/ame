@@ -284,6 +284,23 @@ test('replacement expansion exceeding the editor byte limit fails before any fil
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), bom, 'the BOM must count toward the output byte limit')
 })
 
+test('replace executes each approved write inside the supplied file lock', async t => {
+  const { root, put } = await fixture(t)
+  await put('a.txt', 'cat')
+  const options = { query: 'cat', replacement: 'dog' }
+  const preview = await replaceInWorkspace(root, { ...options, dryRun: true })
+  const locked: string[] = []
+  const result = await replaceInWorkspace(root, options, preview.previews, async (file, operation) => {
+    locked.push(file)
+    assert.equal(await readFile(path.join(root, file), 'utf8'), 'cat')
+    await operation()
+    assert.equal(await readFile(path.join(root, file), 'utf8'), 'dog')
+  })
+  assert.deepEqual(locked, ['a.txt'])
+  assert.equal(result.filesChanged, 1)
+  assert.deepEqual(result.conflicts, [])
+})
+
 test('an atomic file replacement with identical bytes during matching is a conflict, not a successful write', async t => {
   const { root, put } = await fixture(t)
   await put('a.txt', 'cat')

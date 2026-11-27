@@ -121,3 +121,26 @@ test('numeric defaults normalize to finite numbers shared by input and submissio
     }
   }
 })
+
+test('custom multiselect Enter ignores IME composition and legacy keyCode 229', () => {
+  const h = harness({ ...form, fields: [{ key: 'tags', title: 'Tags', type: 'multiselect', custom: true, options: [] }] })
+  h.render()
+  const input = () => h.find(node => node.type === 'input' && node.props.placeholder === 'Nhập lựa chọn khác, nhấn Enter')
+  for (const flags of [{ nativeEvent: { isComposing: true } }, { nativeEvent: {}, keyCode: 229 }, { nativeEvent: { keyCode: 229 } }]) {
+    const target = { value: '日本語' }
+    input().props.onKeyDown({ key: 'Enter', ...flags, currentTarget: target, preventDefault() { assert.fail('IME Enter must not be consumed') } })
+    assert.equal(target.value, '日本語')
+    assert.doesNotMatch(h.render(), /日本語 ×/)
+  }
+  input().props.onKeyDown({ key: 'Enter', nativeEvent: {}, currentTarget: { value: '日本語' }, preventDefault() {} })
+  assert.match(h.render(), /日本語 ×/)
+})
+
+test('untrusted patterns reject oversized, nested quantifiers and oversized test values safely', () => {
+  const { exports } = harness()
+  const validate = (pattern: string, value: string) => exports.validateFormAnswer({ ...form, fields: [{ key: 'value', title: 'Value', type: 'string', pattern }] }, { value })
+  for (const pattern of ['a'.repeat(257), '^(a+)+$', '^((a*)+)+$', '(a{1,3}){2,}', '^a*a*a*a*a*a*a*a*b$']) assert.throws(() => validate(pattern, 'a'.repeat(100) + '!'), /Value/)
+  assert.throws(() => validate('^a+$', 'a'.repeat(1025)), /Value/)
+  assert.throws(() => validate('[', 'a'), /Value/)
+  assert.equal(validate('^[a-z]+$', 'hello').value, 'hello')
+})

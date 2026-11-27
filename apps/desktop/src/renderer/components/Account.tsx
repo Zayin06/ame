@@ -57,6 +57,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   const setTab = (value: string) => { setErrorState(null); setBundleNotice(''); updateTab(value) }
   const setAdminTab = (value: 'publish' | 'features' | 'history') => { setErrorState(null); updateAdminTab(value) }
   const [busy, setBusy] = useState(false)
+  const busyRef = useRef(false)
   const [busyOp, setBusyOp] = useState<{ operation: string; path?: string } | null>(null)
   const [loading, setLoading] = useState(true)
   const [bundleLoading, setBundleLoading] = useState(false)
@@ -89,7 +90,6 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   }
   const [releases, setReleases] = useState<Release[]>([])
   const [cursor, setCursor] = useState('')
-  const [, setActivation] = useState('')
   const [noRelease, setNoRelease] = useState(false)
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null)
   const [packaged, setPackaged] = useState<Packaged | null>(null)
@@ -159,7 +159,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
   const request = useCallback((operation: string, payload?: Record<string, string>) => {
     const next = pending.current.then(async () => {
       const value = await window.ame.account(operation, payload)
-      if (['status', 'login', 'refresh', 'logout', 'sync', 'offline', 'uninstall', 'update-features'].includes(operation)) window.dispatchEvent(new Event('ame-account-changed'))
+      if (['login', 'refresh', 'logout', 'sync', 'offline', 'uninstall', 'update-features'].includes(operation)) window.dispatchEvent(new Event('ame-account-changed'))
       return value
     })
     pending.current = next.catch(() => {})
@@ -258,6 +258,8 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
     setBuildNotesSkill(skill => importPreview?.skills.includes(skill) ? skill : '')
   }, [importPreview])
   const execute = async (operation: string, payload?: Record<string, string>) => {
+    if (busyRef.current) return
+    busyRef.current = true
     setBusy(true); setBusyOp({ operation, path: payload?.path }); setErrorState(null)
     const importOperation = ['fix-import', 'fix-import-all', 'exclude-import-file', 'revert-import-fix', 'save-import-fix'].includes(operation)
     if (importOperation) setFixNotice('')
@@ -282,7 +284,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           setServerFeaturesNotice(''); setSrvEditingVersion(false); setSrvCustomVersion(''); setServerFeaturesLoaded(false); setServerFeaturesLoading(false)
           updateAdminTab('publish')
           setImportPreview(null); setPackaged(null); setPublishNotice(''); setLatest(null); setInstalled(null); setLegacyInfo(null); setBundleNotice(''); resetFeatures(); setAppliedFixes({}); setFixNotice('')
-          setReleases([]); setCursor(''); setActiveReleaseId(''); setActivation(''); setRevision(''); setNoRelease(false); setTab('account')
+          setReleases([]); setCursor(''); setActiveReleaseId(''); setRevision(''); setNoRelease(false); setTab('account')
         }
       } else {
         if (operation === 'import' && value) {
@@ -332,7 +334,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
         if (operation === 'latest' || operation === 'activate') {
           const data = object(value), release = object(data.release) as Release
           setLatest(release); setActiveReleaseId(releaseID(release)); setNoRelease(false); setRevision(String(data.revision ?? ''))
-          if (operation === 'activate') { setActivation(releaseID(release)); setPublishNotice(`Đã kích hoạt v${release.version || releaseID(release)} cho team.`) }
+          if (operation === 'activate') { setPublishNotice(`Đã kích hoạt v${release.version || releaseID(release)} cho team.`) }
         }
         if (operation === 'release' || operation === 'publish') {
           const data = operation === 'release' ? value as { packaged?: Packaged; release?: Release; activated?: { release?: Release; revision?: number } | null; activationError?: string } : { release: value as Release }
@@ -341,12 +343,11 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           if (published) {
             const id = releaseID(published)
             setPublishNotice(`Đã xuất bản v${published.version || id}.${data.activated ? ' Đã kích hoạt cho team.' : data.activationError ? ` Chưa kích hoạt: ${formatAmeKitError(data.activationError).title}. Mở lịch sử để thử Kích hoạt lại.` : ' Mở lịch sử để kích hoạt cho team khi sẵn sàng.'}`)
-            setActivation(id)
             setReleases(old => [published, ...old.filter(release => releaseID(release) !== id)])
             if (data.activated) {
               const active = data.activated.release ?? published
               setLatest(active); setActiveReleaseId(releaseID(active)); setNoRelease(false)
-              setRevision(String(data.activated.revision ?? '')); setActivation(releaseID(active))
+              setRevision(String(data.activated.revision ?? ''))
             }
             try {
               applyHistory(await request('history'))
@@ -403,7 +404,7 @@ export function Account({ projectID, close, embedded = false }: { projectID?: st
           try { applyHistory(await request('history')) } catch { /* Keep the original actionable activation error. */ }
         }
       }
-    } finally { setBusy(false); setBusyOp(null) }
+    } finally { busyRef.current = false; setBusy(false); setBusyOp(null) }
   }
   const renderIssues = () => <><div className="amekit-issue-tabs" role="tablist" aria-label="Phân loại vấn đề">{(Object.keys(issueLabels) as IssueSeverity[]).map(severity => <button key={severity} id={`amekit-issue-${severity}`} role="tab" aria-selected={issueTab === severity} aria-controls="amekit-issue-panel" onClick={() => setIssueTab(severity)}>{issueLabels[severity]} ({grouped[severity].length})</button>)}</div>
           <div id="amekit-issue-panel" className="amekit-issues" role="tabpanel" aria-labelledby={`amekit-issue-${issueTab}`} tabIndex={0}>{grouped[issueTab].length ? <ul>{grouped[issueTab].map((issue, index) => <li className="amekit-issue-row" key={index}><code>{issue.path || 'Bundle'}</code><span>{issue.reason}</span>{issueTab === 'error' && issue.path && <div className="amekit-issue-actions">{importPreview?.fixablePaths?.includes(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('fix-import', { path: issue.path })}>{busyOp?.operation === 'fix-import' && busyOp.path === issue.path ? 'Đang sửa…' : 'Sửa bằng AI'}</button>}{canExcludeImportPath(issue.path) && <button type="button" disabled={busy} onClick={() => void execute('exclude-import-file', { path: issue.path })}>Bỏ tệp</button>}</div>}</li>)}</ul> : <p className="muted">Không có mục nào trong nhóm này.</p>}</div></>

@@ -1,9 +1,12 @@
-import { copyFile, lstat, mkdir, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { renameWithRetry } from './file-save'
 import { constants, createReadStream } from 'node:fs'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 
 function fail(code: string): never { throw Object.assign(new Error(code), { code }) }
+function isGitSegment(part: string) { return part.replace(/[. ]+$/, '').toLowerCase() === '.git' }
+function hasGitSegment(parts: readonly string[]) { return parts.some(isGitSegment) }
 function inside(root: string, target: string) {
   const relative = path.relative(root, target)
   if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) fail('PATH_OUTSIDE_WORKSPACE')
@@ -19,7 +22,7 @@ async function existing(target: string) {
 export async function validateWorkspacePath(root: string, relative: string, options?: { allowRoot?: boolean }): Promise<{ rootReal: string; target: string; normalized: string }> {
   if (typeof relative !== 'string' || relative.includes('\0') || relative.includes(':') || path.isAbsolute(relative) || path.win32.isAbsolute(relative) || /^[a-zA-Z]:/.test(relative)) fail('INVALID_PATH')
   const parts = relative.replace(/\\/g, '/').split('/')
-  if (parts.some(part => part.replace(/[. ]+$/, '').toLowerCase() === '.git' || part.toLowerCase() === '.git')) fail('PATH_OUTSIDE_WORKSPACE')
+  if (hasGitSegment(parts)) fail('PATH_OUTSIDE_WORKSPACE')
   const rootReal = await realpath(root)
   if (!(await stat(rootReal)).isDirectory()) fail('NOT_A_DIRECTORY')
   const target = path.resolve(rootReal, ...parts)
@@ -35,7 +38,10 @@ export async function validateWorkspacePath(root: string, relative: string, opti
     const info = await existing(current)
     if (!info) break
     if (info.isSymbolicLink()) fail('SYMLINK_NOT_ALLOWED')
-    inside(rootReal, await realpath(current))
+    const resolved = await realpath(current)
+    inside(rootReal, resolved)
+    const resolvedParts = path.relative(rootReal, resolved).split(path.sep).filter(Boolean)
+    if (hasGitSegment(resolvedParts)) fail('PATH_OUTSIDE_WORKSPACE')
     if (index < segments.length - 1 && !info.isDirectory()) fail('NOT_A_DIRECTORY')
   }
   return { rootReal, target, normalized }
@@ -84,8 +90,8 @@ export async function renameOrMove(root: string, fromRelative: string, toRelativ
   const info = await lstat(from.target)
   if (process.platform === 'win32' && from.target !== to.target && from.target.toLowerCase() === to.target.toLowerCase()) {
     const temporary = path.join(path.dirname(from.target), `.ame-rename-${randomUUID()}`)
-    await rename(from.target, temporary)
-    try { await rename(temporary, to.target) } catch (error) { await rename(temporary, from.target); throw error }
+    await renameWithRetry(from.target, temporary)
+    try { await renameWithRetry(temporary, to.target) } catch (error) { await renameWithRetry(temporary, from.target); throw error }
     return { from: from.normalized, to: to.normalized }
   }
   const relative = path.relative(from.target, to.target)
@@ -95,7 +101,7 @@ export async function renameOrMove(root: string, fromRelative: string, toRelativ
   await validateWorkspacePath(from.rootReal, from.normalized)
   await validateWorkspacePath(from.rootReal, to.normalized)
   if (await existing(to.target)) fail('ALREADY_EXISTS')
-  await rename(from.target, to.target)
+  await renameWithRetry(from.target, to.target)
   return { from: from.normalized, to: to.normalized }
 }
 
@@ -150,7 +156,7 @@ async function directoryTargetCheck(directory: string) {
 async function externalSource(absolute: string) {
   if (typeof absolute !== 'string' || !path.isAbsolute(absolute) || absolute.includes('\0')) fail('INVALID_PATH')
   const parts = absolute.slice(path.parse(absolute).root.length).split(/[\\/]/)
-  if (parts.some(part => part.toLowerCase() === '.git' || part.replace(/[. ]+$/, '').toLowerCase() === '.git')) fail('PATH_OUTSIDE_WORKSPACE')
+  if (hasGitSegment(parts)) fail('PATH_OUTSIDE_WORKSPACE')
   if (parts.some(part => part.includes(':') || part !== '.' && part !== '..' && /[. ]$/.test(part))) fail('INVALID_PATH')
   let current = path.parse(absolute).root
   for (const part of parts) {

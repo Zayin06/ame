@@ -113,6 +113,8 @@ export function createPetHost(options: PetHostOptions) {
   }
   function place() {
     if (!window || window.isDestroyed()) return
+    // Commit a pending user drag before a display change can clamp the live window.
+    flushPosition()
     const target = bounds()
     changingBounds = true
     try { lockSize(window, target.width, target.height); window.setBounds(target); void placeBubble() } finally { changingBounds = false }
@@ -217,7 +219,7 @@ export function createPetHost(options: PetHostOptions) {
       }).catch(() => { if (!disposed && window === current) fail() })
     } catch { fail() }
   }
-  const onDisplay = () => { place(); persistPosition() }
+  const onDisplay = () => { place() }
   async function init(): Promise<PetHostState> {
     ensureActive()
     if (initialized) return state()
@@ -228,6 +230,7 @@ export function createPetHost(options: PetHostOptions) {
       speech = stored.speech; cache = stored.cache; dialogue = lines
     } catch { /* Missing, corrupt or invalid settings leave clean defaults in place. */ }
     initialized = true
+    electron.screen.on("display-added", onDisplay)
     electron.screen.on("display-removed", onDisplay)
     electron.screen.on("display-metrics-changed", onDisplay)
     timer = setInterval(() => {
@@ -279,6 +282,7 @@ export function createPetHost(options: PetHostOptions) {
     if (disposed) return
     disposed = true; lifetime.abort(); if (timer) clearInterval(timer)
     if (initialized) {
+      electron.screen.removeListener("display-added", onDisplay)
       electron.screen.removeListener("display-removed", onDisplay)
       electron.screen.removeListener("display-metrics-changed", onDisplay)
     }

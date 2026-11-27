@@ -56,6 +56,9 @@ function harness(options: { revert?: RevertState; parentID?: string; locked?: 't
   let delay: Promise<unknown> | undefined, failure: unknown, promptFailure: unknown
   const calls: { method: string; args: unknown[] }[] = []
   const hooks = {
+    memo: (component: unknown) => component,
+    useMemo: (factory: () => unknown) => factory(),
+    useCallback: (fn: unknown) => fn,
     useState(initial: unknown) { const index = cursor++; if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial; return [slots[index], (next: unknown) => { const value = typeof next === 'function' ? next(slots[index]) : next; if (!Object.is(value, slots[index])) { slots[index] = value; writes++ } }] },
     useRef(initial: unknown) { const index = cursor++; if (!(index in slots)) slots[index] = { current: initial }; return slots[index] },
     useId() { return `id-${cursor++}` },
@@ -87,7 +90,12 @@ function harness(options: { revert?: RevertState; parentID?: string; locked?: 't
     for (let pass = 0; pass < 15; pass++) { const before = writes; cursor = 0; effectIndex = 0; tree = Component(props); pending.splice(0).forEach(run => run()); if (writes === before) return renderToStaticMarkup(tree) }
     throw new Error('Effects did not settle')
   }
-  function all(node: ReactNode): ReactElement<Record<string, unknown>>[] { if (Array.isArray(node)) return node.flatMap(all); if (!isValidElement<Record<string, unknown>>(node)) return []; return [node, ...all(node.props.children as ReactNode)] }
+  function all(node: ReactNode): ReactElement<Record<string, unknown>>[] {
+    if (Array.isArray(node)) return node.flatMap(all)
+    if (!isValidElement<Record<string, unknown>>(node)) return []
+    if (typeof node.type === 'function' && node.type.name === 'ChatTurnView') return [node, ...all((node.type as any)(node.props))]
+    return [node, ...all(node.props.children as ReactNode)]
+  }
   function find(predicate: (node: ReactElement<Record<string, unknown>>) => boolean) { const node = all(tree).find(predicate); assert.ok(node, 'Expected element'); return node }
   const button = (text: string) => find(node => node.type === 'button' && renderToStaticMarkup(node.props.children as ReactNode).includes(text))
   function click(text: string) { const node = button(text); assert.ok(!node.props.disabled); (node.props.onClick as () => void)() }
@@ -115,8 +123,8 @@ test('chooser stages both chat-only and file rewinds, autofills empty draft and 
     try {
       h.render(); await h.flush(); h.change(draft); h.render()
       // Select the target user turn rather than the first historical turn.
-      const trigger = h.find(node => node.type === 'section' && node.props.className === 'chat-turn' && String(node.key) === 'target')
-      const children = trigger.props.children as ReactElement<Record<string, unknown>>[]
+      const trigger = h.find(node => typeof node.type === 'function' && node.type.name === 'ChatTurnView' && String(node.key) === 'target')
+      const children = (trigger.type as any)(trigger.props).props.children as ReactElement<Record<string, unknown>>[]
       const actions = children.find(node => isValidElement(node) && node.props.className === 'rewind-turn-actions')!
       ;((actions.props.children as ReactElement<Record<string, unknown>>[])[0].props.onClick as () => void)()
       const html = h.render(); assert.match(html, /Chỉ quay lui hội thoại/); assert.match(html, /Quay lui hội thoại &amp; tệp/)

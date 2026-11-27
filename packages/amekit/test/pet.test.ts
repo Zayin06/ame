@@ -209,6 +209,31 @@ test("pet short click reveals, restores and focuses the main window; dragging ne
   setMain(false)
 })
 
+test("display removal preserves saved secondary coordinates and addition restores them", async t => {
+  const { host, userData, screen } = await fixture(t)
+  const second = { x: -1200, y: 0, width: 1200, height: 800 }
+  let displays = [{ workArea: area }, { workArea: second }]
+  screen.getAllDisplays = () => displays
+  const position = { x: -600, y: 300 }
+  const saved = JSON.stringify({ preferences: { ...defaultPetPreferences, position }, speech: { enabled: false, sound: false }, cache: null })
+  await writeFile(join(userData, "desktop-pet.json"), saved)
+  await host.init(); await flush()
+  const pet = MockWindow.windows[0]
+  assert.equal(pet.bounds.x, position.x)
+  pet.emit("moved") // Exercise a pending drag-save timer during monitor removal.
+  displays = [{ workArea: area }]
+  screen.emit("display-removed")
+  assert.ok(pet.bounds.x >= 0)
+  assert.deepEqual(host.state().preferences.position, position)
+  assert.deepEqual(JSON.parse(await readFile(join(userData, "desktop-pet.json"), "utf8")).preferences.position, position)
+  displays = [{ workArea: area }, { workArea: second }]
+  screen.emit("display-added")
+  assert.deepEqual({ x: pet.bounds.x, y: pet.bounds.y }, position)
+  host.dispose()
+  assert.equal(screen.listenerCount("display-added"), 0)
+  assert.deepEqual(JSON.parse(await readFile(join(userData, "desktop-pet.json"), "utf8")).preferences.position, position)
+})
+
 test("pet drag and native DPI drift keep canonical size and locks across moves, scales and displays", async t => {
   const { host, setCursor, screen } = await fixture(t)
   await host.init(); await flush()

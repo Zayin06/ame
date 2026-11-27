@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { spawn, type IPty } from 'node-pty'
@@ -26,34 +27,50 @@ export function shellProfiles(platform = process.platform, env: NodeJS.ProcessEn
 }
 
 export class Terminals {
-  private sessions = new Map<string, { info: TerminalInfo; pty: IPty; output: string; sequence: number; listeners: { dispose(): void }[] }>()
-  constructor(private directory: (projectID: string) => string, private emit: (event: TerminalEvent) => void, private profiles = shellProfiles(), private launch: typeof spawn = spawn) {}
+  private sessions = new Map<string, { info: TerminalInfo; pty: IPty; chunks: string[]; head: number; length: number; sequence: number; listeners: { dispose(): void }[] }>()
+  private exited: string[] = []
+  constructor(private directory: (projectID: string) => string, private emit: (event: TerminalEvent) => void, private profiles = shellProfiles(), private launch: typeof spawn = spawn, private killTree: typeof execFileSync = execFileSync) {}
   available() { return this.profiles.map(({ id, name }) => ({ id, name })) }
   list(projectID: string) { this.directory(projectID); return [...this.sessions.values()].filter(session => session.info.projectID === projectID).map(session => ({ ...session.info })) }
   create(projectID: string, profileID?: string, cols = 80, rows = 24): TerminalInfo {
     this.dimensions(cols, rows)
     const cwd = this.directory(projectID)
-    if (this.sessions.size >= 20) throw new Error('TERMINAL_LIMIT: Đóng bớt terminal trước khi tạo mới.')
+    if ([...this.sessions.values()].filter(session => session.info.exitCode === undefined).length >= 20) throw new Error('TERMINAL_LIMIT: Đóng bớt terminal trước khi tạo mới.')
     const profile = profileID ? this.profiles.find(profile => profile.id === profileID) : this.profiles[0]
     if (!profile) throw new Error('TERMINAL_PROFILE_UNAVAILABLE')
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string' && !/^(ELECTRON_|AME_|NODE_OPTIONS$|NODE_INSPECT|OPENCODE_SERVER_)/i.test(entry[0])))
     const pty = this.launch(profile.executable, profile.args, { name: 'xterm-256color', cwd, cols, rows, env: { ...env, TERM_PROGRAM: 'Ame', COLORTERM: 'truecolor' } })
     const info: TerminalInfo = { id: randomUUID(), projectID, title: profile.name, cols, rows }
-    const session = { info, pty, output: '', sequence: 0, listeners: [] as { dispose(): void }[] }
+    const session = { info, pty, chunks: [] as string[], head: 0, length: 0, sequence: 0, listeners: [] as { dispose(): void }[] }
     this.sessions.set(info.id, session)
     session.listeners.push(pty.onData(data => {
-      session.output = (session.output + data).slice(-1024 * 1024)
+      if (data.length) { session.chunks.push(data); session.length += data.length }
+      while (session.length > 1024 * 1024) {
+        const excess = session.length - 1024 * 1024, first = session.chunks[session.head]
+        if (first.length <= excess) {
+          session.length -= first.length
+          session.chunks[session.head++] = ''
+        } else {
+          session.chunks[session.head] = first.slice(excess)
+          session.length -= excess
+        }
+      }
+      if (session.head > 1024 && session.head * 2 >= session.chunks.length) {
+        session.chunks = session.chunks.slice(session.head); session.head = 0
+      }
       this.emit({ type: 'terminal', projectID, terminalID: info.id, sequence: ++session.sequence, data })
     }), pty.onExit(({ exitCode }) => {
       info.exitCode = exitCode
       this.emit({ type: 'terminal', projectID, terminalID: info.id, sequence: ++session.sequence, exitCode })
       session.listeners.splice(0).forEach(listener => listener.dispose())
+      this.exited.push(info.id)
+      while (this.exited.length > 20) this.sessions.delete(this.exited.shift()!)
     }))
     return { ...info }
   }
   snapshot(projectID: string, id: string): TerminalSnapshot {
     const session = this.get(projectID, id)
-    return { ...session.info, output: session.output, sequence: session.sequence }
+    return { ...session.info, output: session.chunks.slice(session.head).join(''), sequence: session.sequence }
   }
   write(projectID: string, id: string, data: string) {
     if (typeof data !== 'string' || data.length > 65536) throw new Error('INVALID_TERMINAL_INPUT')
@@ -72,7 +89,13 @@ export class Terminals {
     const session = this.get(projectID, id)
     session.listeners.forEach(listener => listener.dispose())
     this.sessions.delete(id)
-    if (session.info.exitCode === undefined) { try { session.pty.kill() } catch { /* The shell may already have exited. */ } }
+    this.exited = this.exited.filter(exitedID => exitedID !== id)
+    if (session.info.exitCode === undefined) {
+      if (process.platform === 'win32' && typeof session.pty.pid === 'number' && session.pty.pid > 0) {
+        try { this.killTree('taskkill', ['/PID', String(session.pty.pid), '/T', '/F'], { windowsHide: true, timeout: 2000 }) } catch { /* Still release the PTY if the tree already exited. */ }
+      }
+      try { session.pty.kill() } catch { /* The shell may already have exited. */ }
+    }
   }
   closeProject(projectID: string) {
     for (const { info } of this.sessions.values()) if (info.projectID === projectID) this.close(projectID, info.id)

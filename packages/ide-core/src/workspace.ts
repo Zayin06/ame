@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, watch, realpath as fsRealpath, type FSWatcher } from 'node:fs'
-import { readFile, readdir, realpath, stat, lstat, writeFile, mkdir, rename, unlink } from 'node:fs/promises'
+import { readFile, readdir, realpath, stat, lstat, writeFile, mkdir, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { simpleGit } from 'simple-git'
 import { execFile } from 'node:child_process'
@@ -10,12 +10,13 @@ import type { BuildNotesRequest, CommitAgentPlan, Project, FileDocument, FileEnt
 import * as workspaceFs from './workspace-fs'
 import { searchWorkspace, replaceInWorkspace } from './search'
 import * as gitOps from './git-ops'
-import { saveFileSafely } from './file-save'
+import { saveFileSafely, renameWithRetry } from './file-save'
 import type { DiffTarget } from '../../protocol/src/index'
 import { isValidGitCommitHash } from '../../protocol/src/index'
 
 const revision = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
 const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf])
+const MAX_BOM_CACHE = 2000
 export class Workspaces {
   private projects = new Map<string, Project>()
   private watchers = new Map<string, FSWatcher>()
@@ -24,7 +25,11 @@ export class Workspaces {
   private searchControllers = new Map<string, AbortController>()
   private watchTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private saves = new Map<string, Promise<unknown>>()
-  private fileBoms = new Map<string, Map<string, boolean>>()
+  private bom = new Map<string, boolean>()
+  private setBom(id: string, key: string, hasBom: boolean) {
+    this.bom.set(id + '\0' + key, hasBom)
+    if (this.bom.size > MAX_BOM_CACHE) this.bom.delete(this.bom.keys().next().value!)
+  }
   private projectQueue: Promise<unknown> = Promise.resolve()
   constructor(private storage: string, private changed: (projectID: string) => void = () => {}) {}
   async load() {
@@ -122,7 +127,7 @@ export class Workspaces {
       this.searchControllers.get(id)?.abort()
       this.searchControllers.delete(id)
       this.projects.delete(id)
-      this.fileBoms.delete(id)
+      for (const key of this.bom.keys()) if (key.startsWith(id + '\0')) this.bom.delete(key)
     })
   }
   private async writeProjectsAtomic(projects: Project[]): Promise<void> {
@@ -131,7 +136,7 @@ export class Workspaces {
     try {
       await writeFile(temporary, JSON.stringify(projects), { encoding: 'utf8', flag: 'wx' })
       // Never unlink the destination: failed replacement must preserve stored projects.
-      await rename(temporary, this.storage)
+      await renameWithRetry(temporary, this.storage)
     } catch (error) {
       await unlink(temporary).catch(() => {})
       throw error
@@ -199,13 +204,21 @@ export class Workspaces {
     if (bytes.includes(0)) throw new Error('BINARY_FILE')
     const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
     const fileRevision = revision(bytes)
-    let metadata = this.fileBoms.get(id)
-    if (!metadata) { metadata = new Map(); this.fileBoms.set(id, metadata) }
-    metadata.set(JSON.stringify([relative, fileRevision]), bytes.subarray(0, 3).equals(utf8Bom))
-    metadata.set(JSON.stringify([await this.fileKey(id, target), fileRevision]), bytes.subarray(0, 3).equals(utf8Bom))
+    this.setBom(id, JSON.stringify([relative, fileRevision]), bytes.subarray(0, 3).equals(utf8Bom))
+    this.setBom(id, JSON.stringify([await this.fileKey(id, target), fileRevision]), bytes.subarray(0, 3).equals(utf8Bom))
     return { path: relative, content, revision: fileRevision }
   }
+  private async withPathSaveLock<T>(id: string, relative: string, operation: () => Promise<T>): Promise<T> {
+    const target = await this.resolve(id, relative)
+    const key = `path:${process.platform === 'win32' ? target.toLowerCase() : target}`
+    const task = (this.saves.get(key) ?? Promise.resolve()).catch(() => {}).then(operation)
+    this.saves.set(key, task)
+    try { return await task } finally { if (this.saves.get(key) === task) this.saves.delete(key) }
+  }
   async save(id: string, relative: string, content: string, expected: string): Promise<FileDocument> {
+    return this.withPathSaveLock(id, relative, () => this.saveUnlocked(id, relative, content, expected))
+  }
+  private async saveUnlocked(id: string, relative: string, content: string, expected: string): Promise<FileDocument> {
     if (Buffer.byteLength(content) > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
     const resolvedTarget = await this.resolve(id, relative)
     const key = await this.fileKey(id, resolvedTarget)
@@ -215,7 +228,7 @@ export class Workspaces {
       if (await this.fileKey(id, target) !== key) throw new Error('FILE_CONFLICT: File was replaced before saving.')
       const current = await readFile(target)
       if (revision(current) !== expected) throw new Error('FILE_CONFLICT: File changed on disk. Reload before saving.')
-      const hasBom = this.fileBoms.get(id)?.get(JSON.stringify([key, expected])) ?? this.fileBoms.get(id)?.get(JSON.stringify([relative, expected])) ?? current.subarray(0, 3).equals(utf8Bom)
+      const hasBom = this.bom.get(id + '\0' + JSON.stringify([key, expected])) ?? this.bom.get(id + '\0' + JSON.stringify([relative, expected])) ?? current.subarray(0, 3).equals(utf8Bom)
       const bytes = Buffer.from(hasBom && !content.startsWith('\uFEFF') ? '\uFEFF' + content : content, 'utf8')
       if (bytes.length > 4 * 1024 * 1024) throw new Error('FILE_TOO_LARGE')
       await saveFileSafely(target, bytes, current, async () => {
@@ -257,7 +270,15 @@ export class Workspaces {
     finally { if (this.searchControllers.get(id) === controller) this.searchControllers.delete(id) }
   }
   async replaceInProject(id: string, options: ReplaceOptions, plan?: ReplaceResult['previews']): Promise<ReplaceResult> {
-    const result = await replaceInWorkspace(this.get(id).directory, options, plan)
+    const result = await replaceInWorkspace(this.get(id).directory, options, plan, async (file, operation) => this.withPathSaveLock(id, file, async () => {
+      const key = await this.fileKey(id, await this.resolve(id, file))
+      const task = (this.saves.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+        if (await this.fileKey(id, await this.resolve(id, file)) !== key) throw Object.assign(new Error('FILE_CONFLICT'), { code: 'FILE_CONFLICT' })
+        await operation()
+      })
+      this.saves.set(key, task)
+      try { await task } finally { if (this.saves.get(key) === task) this.saves.delete(key) }
+    }))
     if (options.dryRun !== true && result.filesChanged > 0) this.changed(id)
     return result
   }
@@ -369,7 +390,12 @@ export class Workspaces {
   private git(id: string) {
     const directory = this.get(id).directory
     if (!existsSync(path.join(directory, '.git'))) throw new Error('GIT_ROOT_REQUIRED: Open the repository root for source control.')
-    return simpleGit(directory, { maxConcurrentProcesses: 1, trimmed: false, timeout: { block: 10000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+    return simpleGit(directory, { maxConcurrentProcesses: 1, trimmed: false, config: ['core.fsmonitor=false'], timeout: { block: 10000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+  }
+  private async readOnlyGit(id: string) {
+    this.git(id) // Retain the repository-root guard.
+    const directory = this.get(id).directory
+    return simpleGit(directory, { maxConcurrentProcesses: 1, trimmed: false, config: await gitOps.safeReadOnlyGitConfig(directory), timeout: { block: 10000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
   }
   private async gitPath(id: string, relative: string) {
     const root = this.get(id).directory
@@ -386,7 +412,7 @@ export class Workspaces {
     return path.relative(root, target).split(path.sep).join('/')
   }
   async status(id: string): Promise<GitState> {
-    const git = this.git(id)
+    const git = await this.readOnlyGit(id)
     const result = await git.status()
     const root = this.get(id).directory
     const gitDir = path.resolve(root, (await git.raw(['rev-parse', '--git-dir'])).trim())
@@ -397,7 +423,7 @@ export class Workspaces {
   }
   async diff(id: string, relative: string, target?: DiffTarget) {
     const file = await this.gitPath(id, relative)
-    const git = this.git(id)
+    const git = typeof this.readOnlyGit === "function" ? await this.readOnlyGit(id) : this.git(id)
     if (target && (!['staged', 'working', 'commit', 'range', 'commits'].includes(target.kind) ||
       (target.kind === 'commit' && !isValidGitCommitHash(target.commit)) ||
       (target.kind === 'range' && !isValidGitCommitHash(target.baseCommit)) ||
@@ -419,7 +445,8 @@ export class Workspaces {
       }
       if (!Number.isSafeInteger(size) || size < 0) throw new Error('GIT_DIFF_READ_FAILED')
       return readDiffSide(size, async () => {
-        const { stdout } = await promisify(execFile)('git', ['cat-file', '-p', spec], {
+        const safeConfig = await gitOps.safeReadOnlyGitConfig(this.get(id).directory)
+        const { stdout } = await promisify(execFile)('git', [...safeConfig.flatMap(value => ['-c', value]), 'cat-file', '-p', spec], {
           cwd: this.get(id).directory, encoding: 'buffer', maxBuffer: diffPreviewLimit + 1, timeout: 10000,
           env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' },
         })
@@ -433,7 +460,7 @@ export class Workspaces {
     if (target?.kind === 'commit' || target?.kind === 'commits') {
       // Resolve once, validating existence and distinguishing root commits from read errors.
       const commit = target.kind === 'commit' ? target.commit : target.commits[0]
-      const hash = (await git.raw(['rev-parse', '--verify', `${commit}^{commit}`])).trim()
+      const hash = await gitOps.resolveCommitHash(git, commit)
       const parents = (await git.raw(['rev-list', '--parents', '-n', '1', hash])).trim().split(/\s+/)
       return diffContent(parents[1] ? await blob(`${hash}^`, from) : empty, await blob(hash))
     }
@@ -445,7 +472,7 @@ export class Workspaces {
     let base: string | undefined
     if (target?.kind === 'range') {
       try {
-        base = (await git.raw(['rev-parse', '--verify', `${target.baseCommit}^{commit}`])).trim()
+        base = await gitOps.resolveCommitHash(git, target.baseCommit)
         await git.raw(['merge-base', '--is-ancestor', base, 'HEAD'])
         if ((await git.raw(['merge-base', base, 'HEAD'])).trim() !== base) throw new Error('INVALID_DIFF_TARGET')
       } catch { throw new Error('INVALID_DIFF_TARGET') }
@@ -470,12 +497,12 @@ export class Workspaces {
     const files = [file]
     if (from !== undefined) {
       const source = await this.gitPath(id, from)
-      if (!staged || existsSync(path.join(this.get(id).directory, source)) || await this.git(id).raw(['ls-files', '--stage', '-z', '--', `:(literal)${source}`])) files.push(source)
+      if (!staged || existsSync(path.join(this.get(id).directory, source)) || await (await this.readOnlyGit(id)).raw(['ls-files', '--stage', '-z', '--', `:(literal)${source}`])) files.push(source)
     }
     const specs = [...new Set(files)].map(value => `:(literal)${value}`)
     if (staged) await this.git(id).raw(['add', '-A', '--', ...specs])
     else {
-      const head = await this.git(id).raw(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false)
+      const head = await (await this.readOnlyGit(id)).raw(['rev-parse', '--verify', 'HEAD']).then(() => true, () => false)
       await this.git(id).raw(head ? ['reset', 'HEAD', '--', ...specs] : ['rm', '--cached', '--', ...specs])
     }
     this.changed(id)
@@ -483,7 +510,7 @@ export class Workspaces {
   async commit(id: string, message: string, options?: GitCommitOptions) {
     if (!message.trim() || message.length > 10000 || message.includes('\0')) throw new Error('INVALID_COMMIT_MESSAGE')
     this.git(id)
-    const commitGit = simpleGit(this.get(id).directory, { maxConcurrentProcesses: 1, trimmed: false, timeout: { block: 60000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+    const commitGit = simpleGit(this.get(id).directory, { maxConcurrentProcesses: 1, trimmed: false, config: ['core.fsmonitor=false'], timeout: { block: 60000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
     await commitGit.raw(['commit', ...(options?.amend ? ['--amend'] : []), ...(options?.noVerify ? ['--no-verify'] : []), '-m', message])
     this.changed(id)
   }
@@ -497,6 +524,6 @@ export class Workspaces {
     this.watchTimers.clear()
     for (const watcher of this.watchers.values()) watcher.close()
     this.watchers.clear()
-    this.fileBoms.clear()
+    this.bom.clear()
   }
 }

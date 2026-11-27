@@ -5,10 +5,12 @@ import { assertModel, managedProvider, parseModelLevel, type modelPolicy } from 
 import { MAX_MODEL_REQUEST_BYTES } from "../../ide-core/src/dropped-attachments"
 
 type Access = { policy: ReturnType<typeof modelPolicy>; provider: { base_url: string; api_key: string } }
-export async function modelGateway(access: () => Access | undefined) {
+export async function modelGateway(access: () => Access | undefined, options: { headerTimeoutMs?: number; idleTimeoutMs?: number } = {}) {
+  const { headerTimeoutMs = 120_000, idleTimeoutMs = 10 * 60_000 } = options
   const route = `/${randomBytes(24).toString("hex")}/v1`
   const server = createServer(async (req, res) => {
     const controller = new AbortController()
+    req.on("aborted", () => controller.abort())
     res.on("close", () => { if (!res.writableEnded) controller.abort() })
     try {
       if (req.method !== "POST" || req.url !== `${route}/chat/completions`) throw new Error("AMECODE_ROUTE_NOT_ALLOWED")
@@ -28,15 +30,43 @@ export async function modelGateway(access: () => Access | undefined) {
       }
       assertModel(current?.policy, { providerID: managedProvider, id: payload.model })
       const provider = current!.provider
+      const headerController = new AbortController()
+      const headerTimer = setTimeout(() => headerController.abort(new Error("AMECODE_HEADER_TIMEOUT")), headerTimeoutMs)
       const response = await fetch(provider.base_url.replace(/\/$/, "") + "/chat/completions", {
         method: "POST", body, headers: { "content-type": "application/json", authorization: `Bearer ${provider.api_key}` },
-        redirect: "error", signal: AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]),
-      })
-      if (!response.ok) throw new Error("AMECODE_PROVIDER_ERROR")
+        redirect: "error", signal: AbortSignal.any([controller.signal, headerController.signal]),
+      }).finally(() => clearTimeout(headerTimer))
+      if (!response.ok) {
+        await response.body?.cancel()
+        if (response.status === 429 || response.status >= 500) {
+          const retryAfter = response.headers.get("retry-after")
+          const headers: Record<string, string> = { "content-type": "application/json" }
+          if (retryAfter && (/^\d+$/.test(retryAfter) || Number.isFinite(Date.parse(retryAfter))) && !/[\r\n]/.test(retryAfter)) headers["retry-after"] = retryAfter
+          res.writeHead(response.status, headers)
+          res.end(JSON.stringify({ error: { code: "AMECODE_PROVIDER_ERROR", message: "AMECODE_PROVIDER_ERROR" } }))
+          return
+        }
+        throw new Error("AMECODE_PROVIDER_ERROR")
+      }
       res.writeHead(200, { "content-type": response.headers.get("content-type") ?? "application/json", "cache-control": "no-store" })
       if (response.body) {
         const stream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream)
-        stream.on("error", () => res.destroy()); stream.pipe(res)
+        let idleTimer: ReturnType<typeof setTimeout>
+        const clearIdle = () => clearTimeout(idleTimer)
+        const resetIdle = () => {
+          clearIdle()
+          idleTimer = setTimeout(() => {
+            if (!stream.destroyed && !stream.readableEnded) {
+              controller.abort(new Error("AMECODE_IDLE_TIMEOUT"))
+              stream.destroy(); res.destroy()
+            }
+          }, idleTimeoutMs)
+        }
+        res.once("close", () => { clearIdle(); stream.destroy() })
+        stream.on("data", resetIdle)
+        stream.once("end", clearIdle); stream.once("close", clearIdle)
+        stream.once("error", () => { clearIdle(); res.destroy() })
+        resetIdle(); stream.pipe(res)
       } else res.end()
     } catch (error) {
       if (res.headersSent) { res.destroy(); return }

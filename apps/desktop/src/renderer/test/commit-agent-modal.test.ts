@@ -24,7 +24,10 @@ function harness(resume = false, overrides: Partial<CommitAgentInfo> = {}) {
   const calls: { method: string; args: unknown[] }[] = [], applied: string[] = []
   const events = new Set<(event: IdeEvent) => void>(), listeners = new Map<string, Set<() => void>>()
   const hooks = {
-    useState(initial: unknown) { const i = cursor++; if (!(i in slots)) slots[i] = initial; return [slots[i], (next: unknown) => { const value = typeof next === 'function' ? next(slots[i]) : next; if (!Object.is(slots[i], value)) { slots[i] = value; writes++ } }] },
+    memo: (component: unknown) => component,
+    useMemo: (factory: () => unknown) => factory(),
+    useCallback: (fn: unknown) => fn,
+    useState(initial: unknown) { const i = cursor++; if (!(i in slots)) slots[i] = typeof initial === 'function' ? initial() : initial; return [slots[i], (next: unknown) => { const value = typeof next === 'function' ? next(slots[i]) : next; if (!Object.is(slots[i], value)) { slots[i] = value; writes++ } }] },
     useRef(initial: unknown) { const i = cursor++; if (!(i in slots)) slots[i] = { current: initial }; return slots[i] },
     useEffect(run: () => (() => void) | undefined, deps: unknown[]) { const i = effectIndex++, old = effects[i]; if (!old || deps.some((dep, j) => !Object.is(dep, old.deps[j]))) pending.push(() => { old?.cleanup?.(); effects[i] = { deps, cleanup: run() } }) },
   }
@@ -65,7 +68,12 @@ function harness(resume = false, overrides: Partial<CommitAgentInfo> = {}) {
   const Component = exports.CommitAgentModal as (props: object) => ReactNode
   const props = { projectID: 'project', projectName: 'App', connected: true, theme: 'dark', onClose() { closed++ }, onActivity() {}, onGitRefresh() { refreshed++ }, onApplyCommitMessage(message: string) { applied.push(message) }, onOpenFile() {} }
   function render(extra: object = {}) { Object.assign(props, extra); for (let pass = 0; pass < 10; pass++) { const before = writes; cursor = 0; effectIndex = 0; tree = Component(props); pending.splice(0).forEach(run => run()); if (before === writes) return renderToStaticMarkup(tree) } throw new Error('Effects did not settle') }
-  function all(node: ReactNode): ReactElement<Record<string, unknown>>[] { if (Array.isArray(node)) return node.flatMap(all); if (!isValidElement<Record<string, unknown>>(node)) return []; return [node, ...all(node.props.children as ReactNode)] }
+  function all(node: ReactNode): ReactElement<Record<string, unknown>>[] {
+    if (Array.isArray(node)) return node.flatMap(all)
+    if (!isValidElement<Record<string, unknown>>(node)) return []
+    if (typeof node.type === 'function' && node.type.name === 'ChatTurnView') return [node, ...all((node.type as any)(node.props))]
+    return [node, ...all(node.props.children as ReactNode)]
+  }
   function find(predicate: (node: ReactElement<Record<string, unknown>>) => boolean) { const node = all(tree).find(predicate); assert.ok(node, 'Expected element'); return node }
   function button(text: string) { return find(node => node.type === 'button' && renderToStaticMarkup(node.props.children as ReactNode).includes(text)) }
   return {
@@ -471,6 +479,9 @@ function chatHarness(apiOverrides: Record<string, unknown> = {}) {
     onEvent: () => () => {}, ...apiOverrides,
   }
   const hooks = {
+    memo: (component: unknown) => component,
+    useMemo: (factory: () => unknown) => factory(),
+    useCallback: (fn: unknown) => fn,
     useState(initial: any) { const i = cursor++; if (!(i in slots)) slots[i] = typeof initial === 'function' ? initial() : initial; return [slots[i], (next: any) => { slots[i] = typeof next === 'function' ? next(slots[i]) : next }] },
     useRef(initial: any) { const i = cursor++; return slots[i] ??= { current: initial } },
     useId: () => 'commit-chat-test',
@@ -500,7 +511,12 @@ function chatHarness(apiOverrides: Record<string, unknown> = {}) {
     onCreated() {}, onCreate() { created++ }, onOpenCommitAgent() { opened++ }, report() {}, onActivity() {}, onOpenPanel() {}, onOpenFile() {}, onSelectSession() {},
   }
   function render(patch: object = {}) { props = { ...props, ...patch }; cursor = 0; tree = exports.Chat(props); const effects = pending; pending = []; effects.forEach(run => run()); return tree }
-  function all(node: ReactNode): ReactElement<Record<string, any>>[] { if (Array.isArray(node)) return node.flatMap(all); if (!isValidElement<Record<string, any>>(node)) return []; return [node, ...all(node.props.children)] }
+  function all(node: ReactNode): ReactElement<Record<string, any>>[] {
+    if (Array.isArray(node)) return node.flatMap(all)
+    if (!isValidElement<Record<string, any>>(node)) return []
+    if (typeof node.type === 'function' && node.type.name === 'ChatTurnView') return [node, ...all((node.type as any)(node.props))]
+    return [node, ...all(node.props.children)]
+  }
   return {
     render, nodes: () => all(tree),
     emit() { listeners.get('ame-commit-agent-changed')?.forEach(fn => fn()) },

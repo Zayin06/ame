@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes, createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -53,11 +53,12 @@ export class PrivateRuntime {
     const password = randomBytes(32).toString('base64url')
     const child = spawn(executable, ['serve', '--hostname', '127.0.0.1', '--port', '0'], {
       cwd: path.join(profile, 'workspace'), env: privateEnvironment(profile, password),
-      windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
     })
     this.child = child
     this.closed = new Promise(resolve => { child.once('close', () => { if (this.child === child) { this.child = undefined; this.endpoint = undefined; if (!this.stopping) this.options.onExit?.() } resolve() }) })
-    child.stderr?.on('data', () => {})
+    let stderr = Buffer.alloc(0)
+    child.stderr?.on('data', (chunk: Buffer) => { stderr = Buffer.concat([stderr, chunk]).subarray(-4096) })
     try {
       const url = await new Promise<string>((resolve, reject) => {
         let buffer = ''
@@ -79,7 +80,13 @@ export class PrivateRuntime {
       if (this.stopping || this.child !== child || child.exitCode !== null || child.signalCode !== null) throw new Error('RUNTIME_STOPPED')
       this.endpoint = { url, username: 'opencode', password }
       return this.endpoint
-    } catch (error) { child.kill(); await this.closed; throw error }
+    } catch (error) {
+      await this.killTree(child, this.closed)
+      if (error instanceof Error && /^RUNTIME_START_(FAILED|TIMEOUT)/.test(error.message) && stderr.length) {
+        throw new Error(`${error.message}: ${stderr.toString('utf8').trim()}`, { cause: error })
+      }
+      throw error
+    }
   }
   private async waitUntilReady(child: ChildProcess, url: string, password: string) {
     const headers = { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` }
@@ -146,12 +153,49 @@ export class PrivateRuntime {
       child.off('error', stopped)
     }
   }
+  private async killTree(child: ChildProcess, closed?: Promise<void>) {
+    const pid = child.pid
+    const wait = async (ms: number) => {
+      const controller = new AbortController()
+      try { await Promise.race([closed ?? Promise.resolve(), delay(ms, undefined, { signal: controller.signal })]) }
+      finally { controller.abort() }
+    }
+    const alive = () => child.exitCode == null && child.signalCode == null
+    if (process.platform === 'win32') {
+      if (pid && pid > 0) await new Promise<void>(resolve => {
+        execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 3000 }, () => resolve())
+      })
+      if (alive()) child.kill()
+      await wait(2000)
+    } else {
+      const signal = (value: NodeJS.Signals) => {
+        if (pid && pid > 0) {
+          try { process.kill(-pid, value); return } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+          }
+        }
+        if (alive()) child.kill(value)
+      }
+      signal('SIGTERM')
+      if (pid && pid > 0) {
+        const deadline = Date.now() + 5000
+        while (Date.now() < deadline) {
+          try { process.kill(-pid, 0) } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ESRCH') break
+            throw error
+          }
+          await delay(Math.min(50, Math.max(1, deadline - Date.now())))
+        }
+      } else await wait(5000)
+      // Descendants may outlive their parent and keep the process group alive.
+      signal('SIGKILL')
+      await wait(2000)
+    }
+  }
   async stop() {
     this.stopping = true
-    this.child?.kill()
-    await this.pending?.catch(() => {})
-    if (this.child) this.child.kill()
-    await this.closed
+    const child = this.child
+    if (child) await this.killTree(child, this.closed)
     this.endpoint = undefined
   }
 }

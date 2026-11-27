@@ -74,8 +74,9 @@ export function createManagedCatalogGuard(deps: Dependencies) {
       if (!info.parentID) return false
       id = info.parentID
     }
-    // Unknown ancestry must not bypass restrictions for a currently managed agent.
-    return catalog().agents.includes(agent)
+    // Unknown ancestry must not bypass any active managed catalog.
+    const active = catalog()
+    return active.agents.length > 0 || active.skills.length > 0
   }
 
   async function visibleAgents(active: ManagedCatalog) {

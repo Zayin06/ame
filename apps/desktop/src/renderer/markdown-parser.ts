@@ -20,6 +20,21 @@ function safeUrl(value: string): boolean {
 export function parseInline(text: string, depth = 0): InlineNode[] {
   if (depth > 64) return [{ type: 'text', text }]
   const nodes: InlineNode[] = []
+  let labelSearchExhausted = false
+  let nextLabelEnd = -1
+  let closingParens: Map<number, number> | undefined
+  const destinationEnd = (opening: number) => {
+    if (!closingParens) {
+      closingParens = new Map()
+      const stack: number[] = []
+      for (let index = 0; index < text.length; index++) {
+        if (text[index] === '\\') { index++; continue }
+        if (text[index] === '(') stack.push(index)
+        else if (text[index] === ')') { const start = stack.pop(); if (start !== undefined) closingParens.set(start, index) }
+      }
+    }
+    return closingParens.get(opening)
+  }
   const plain = (value: string) => {
     const last = nodes.at(-1)
     if (last?.type === 'text') last.text += value
@@ -39,16 +54,13 @@ export function parseInline(text: string, depth = 0): InlineNode[] {
       }
       plain(marker); i += marker.length; continue
     }
-    if (text[i] === '[') {
-      const labelEnd = text.indexOf('](', i + 1)
+    if (text[i] === '[' && !labelSearchExhausted) {
+      if (nextLabelEnd <= i) nextLabelEnd = text.indexOf('](', i + 1)
+      const labelEnd = nextLabelEnd
+      if (labelEnd < 0) labelSearchExhausted = true
       if (labelEnd >= 0) {
-        let end = labelEnd + 2, balance = 1
-        for (; end < text.length; end++) {
-          if (text[end] === '\\') { end++; continue }
-          if (text[end] === '(') balance++
-          if (text[end] === ')' && --balance === 0) break
-        }
-        if (balance === 0) {
+        const end = destinationEnd(labelEnd + 1)
+        if (end !== undefined) {
           const url = text.slice(labelEnd + 2, end)
           if (safeUrl(url)) nodes.push({ type: 'link', url, children: parseInline(text.slice(i + 1, labelEnd), depth + 1) })
           else plain(text.slice(i, end + 1))

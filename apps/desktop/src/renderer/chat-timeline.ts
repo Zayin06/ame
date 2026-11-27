@@ -27,6 +27,7 @@ export type TimelineBlock =
   | { kind: 'live-status'; id: string; label: string }
 
 export type ChatTurn = { id: string; user?: ChatItem; live: boolean; blocks: TimelineBlock[] }
+export type CompletedTurnCache = Map<string, { mode: TimelineDetailMode; user?: ChatItem; items: readonly ChatItem[]; turn: ChatTurn }>
 
 export function extractUserDisplayText(text: string): string {
   const normalized = text.replace(/\r\n/g, '\n')
@@ -204,7 +205,7 @@ function liveStatusLabel(items: readonly ChatItem[], questionActive: boolean): s
   return items[lastIndexWhere(items, item => item.kind !== 'changes')]?.kind === 'reasoning' ? 'Đang suy nghĩ…' : 'Đang xử lý…'
 }
 
-export function projectChatTimeline(items: readonly ChatItem[], options: { running: boolean; mode: TimelineDetailMode; pendingForms?: boolean }): ChatTurn[] {
+export function projectChatTimeline(items: readonly ChatItem[], options: { running: boolean; mode: TimelineDetailMode; pendingForms?: boolean }, completedCache?: CompletedTurnCache): ChatTurn[] {
   const isActive = (item: ChatItem) => activeTool(item, options.running || !!options.pendingForms)
   const turns: { id: string; user?: ChatItem; items: ChatItem[] }[] = []
   for (const item of items) {
@@ -214,10 +215,15 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
       turns[turns.length - 1].items.push(item)
     }
   }
+  const presentIDs = new Set(turns.map(turn => turn.id))
+  for (const id of completedCache?.keys() ?? []) if (!presentIDs.has(id)) completedCache!.delete(id)
   return turns.map((turn, turnIndex) => {
     const assistantItems = turn.items
     const visible = assistantItems.filter(isVisible)
     const live = turnIndex === turns.length - 1 && (options.running || !!options.pendingForms || assistantItems.some(isActive))
+    const cached = completedCache?.get(turn.id)
+    if (!live && cached?.mode === options.mode && cached.user === turn.user && cached.items.length === assistantItems.length && cached.items.every((item, index) => item === assistantItems[index])) return cached.turn
+    completedCache?.delete(turn.id)
     const workedMs = workedDuration(turn.user, assistantItems)
     const lastWorkIndex = lastIndexWhere(visible, item => item.kind === 'tool' || item.kind === 'reasoning')
     const commentary = new Set(visible.filter((item, index) => isText(item) && (item.phase === 'commentary' || item.phase !== 'final_answer' && index < lastWorkIndex)))
@@ -278,6 +284,8 @@ export function projectChatTimeline(items: readonly ChatItem[], options: { runni
       }
     }
     if (live) blocks.push({ kind: 'live-status', id: `${turn.id}:status`, label: options.pendingForms ? 'Đang chờ bạn trả lời câu hỏi…' : liveStatusLabel(visible, options.running || !!options.pendingForms) })
-    return { id: turn.id, ...(turn.user ? { user: turn.user } : {}), live, blocks }
+    const projected = { id: turn.id, ...(turn.user ? { user: turn.user } : {}), live, blocks }
+    if (!live) completedCache?.set(turn.id, { mode: options.mode, user: turn.user, items: assistantItems, turn: projected })
+    return projected
   })
 }

@@ -65,6 +65,17 @@ const textTooLarge = 'Tệp văn bản bên ngoài vượt quá giới hạn 512
 
 function comparable(value: string): string { return process.platform === 'win32' ? value.toLowerCase() : value }
 
+function sensitiveExternalPath(value: string): boolean {
+  const normalized = value.replace(/\\/g, '/').toLowerCase()
+  const parts = normalized.split('/').filter(Boolean).map(part => part.replace(/[. ]+$/, ''))
+  // Dot-prefixed names must retain their leading dot, including .env.
+  if (parts.some(part => ['.ssh', '.aws', '.gnupg', '.kube'].includes(part))) return true
+  if (parts.some((part, index) => part === '.config' && parts[index + 1] === 'gcloud')) return true
+  const name = parts.at(-1) ?? ''
+  if (/^(?:\.env(?:\.|$)|id_rsa|id_ed25519)/.test(name) || ['.npmrc', '.netrc'].includes(name) || name.includes('credentials')) return true
+  return /^\/(?:etc|proc)(?:\/|$)/.test(normalized) || /^(?:[a-z]:)?\/(?:windows|programdata)(?:\/|$)/.test(normalized)
+}
+
 async function checkedPath(value: string) {
   const { lstat, realpath } = await import('node:fs/promises')
   const { default: path } = await import('node:path')
@@ -106,6 +117,7 @@ export async function resolveDroppedPaths(projectDir: string, paths: readonly st
       if (!info.isFile()) { reject('Chỉ hỗ trợ kéo tệp tin.'); continue }
       const relative = path.relative(realProject, real)
       const insideWorkspace = relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+      if (!insideWorkspace && sensitiveExternalPath(real)) { reject('SENSITIVE_PATH_REJECTED'); continue }
       const relativePosix = relative.split(path.sep).join('/')
       if (insideWorkspace && relativePosix.split('/').some(part => part.replace(/[. ]+$/, '').toLowerCase() === '.git')) {
         reject('Không thể đính kèm tệp nội bộ .git.'); continue

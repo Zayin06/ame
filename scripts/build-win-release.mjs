@@ -1,10 +1,19 @@
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 
 const require = createRequire(import.meta.url)
 const builder = require('electron-builder')
 const { NsisTarget } = require('app-builder-lib/out/targets/nsis/NsisTarget')
+
+const args = process.argv.slice(2)
+const targetsIndex = args.indexOf('--targets')
+const targetArgs = targetsIndex < 0 ? ['nsis', 'portable'] : args.slice(targetsIndex + 1)
+const targets = targetArgs.flatMap(value => value.split(',')).map(value => value.trim()).filter(Boolean)
+if (args.some(value => value.startsWith('--') && value !== '--targets') || args.filter(value => value === '--targets').length > 1 || !targets.length || targets.some(value => !['nsis', 'portable'].includes(value))) {
+  throw new Error('Usage: node scripts/build-win-release.mjs [--targets nsis,portable | portable | nsis portable]')
+}
 
 const originalExecuteMakensis = NsisTarget.prototype.executeMakensis
 NsisTarget.prototype.executeMakensis = async function (defines, commands, script) {
@@ -25,13 +34,14 @@ NsisTarget.prototype.executeMakensis = async function (defines, commands, script
 }
 
 await builder.build({
-  targets: builder.Platform.WINDOWS.createTarget(['nsis', 'portable'], builder.Arch.x64),
+  targets: builder.Platform.WINDOWS.createTarget(targets, builder.Arch.x64),
   publish: 'never',
+  ...(process.env.CSC_LINK?.trim() ? { config: { win: { signAndEditExecutable: true } } } : {}),
 })
 
 if (process.platform === 'win32') {
   const unpackedDir = path.resolve('release', 'win-unpacked')
   const sysRoot = process.env.SystemRoot || 'C:\\Windows'
   const icaclsExe = path.join(sysRoot, 'System32', 'icacls.exe')
-  execFileSync(icaclsExe, [unpackedDir, '/grant', '*S-1-15-2-1:(OI)(CI)(RX)'], { stdio: 'inherit' })
+  if (existsSync(unpackedDir)) execFileSync(icaclsExe, [unpackedDir, '/grant', '*S-1-15-2-1:(OI)(CI)(RX)'], { stdio: 'inherit' })
 }

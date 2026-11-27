@@ -38,6 +38,9 @@ export function BuildNotesPanel({ projectID, connected, git, generation, initial
   const [scopeProject, setScopeProject] = useState(projectID)
   const mounted = useRef(false)
   const scope = useRef({ projectID, generation })
+  const projectScope = useRef({ projectID })
+  if (projectScope.current.projectID !== projectID) projectScope.current = { projectID }
+  const aiContext = projectScope.current
   const lock = useRef<object | null>(null)
   if (scope.current.projectID !== projectID || scope.current.generation !== generation) scope.current = { projectID, generation }
   const context = scope.current
@@ -60,7 +63,7 @@ export function BuildNotesPanel({ projectID, connected, git, generation, initial
   useEffect(() => {
     lock.current = null
     setBusy(false)
-  }, [projectID, generation])
+  }, [projectID])
 
   useEffect(() => {
     if (initialBaseCommit) {
@@ -117,12 +120,12 @@ export function BuildNotesPanel({ projectID, connected, git, generation, initial
     if (!current() || lock.current || !connected || !hasChanges) return
     const token = {}
     lock.current = token
-    const valid = () => current() && lock.current === token
+    const valid = () => mounted.current && projectScope.current === aiContext && lock.current === token
     setBusy(true); setError(undefined); setCopied('')
     try {
       const generated = await window.ame.generateBuildNotes(projectID, request)
       if (valid()) { setResult(generated); setNotesText(generated.notes); setViewMode('preview') }
-    } catch (reason) { if (valid()) report(reason) }
+    } catch (reason) { if (valid() && !cancelled(reason)) setError(reason) }
     finally { if (valid()) { lock.current = null; setBusy(false) } }
   }
 

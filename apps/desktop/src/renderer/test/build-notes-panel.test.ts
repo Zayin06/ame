@@ -225,13 +225,19 @@ for (const boundary of ['project', 'generation', 'unmount'] as const) {
     })
     h.render(); h.render(); h.invoke(h.byID('build-notes-generate-btn')); h.render()
     if (boundary === 'unmount') h.unmount()
-    else { h.render(boundary === 'project' ? { projectID: 'other' } : { generation: 1 }); await h.flush() }
+    else {
+      h.render(boundary === 'project' ? { projectID: 'other' } : { generation: 1 }); await h.flush()
+      if (boundary === 'generation') assert.equal(h.byID('build-notes-generate-btn').props.disabled, true)
+    }
     const writes = h.writes
     oldPreview.resolve({ ...preview, skill: 'stale' }); oldResult.resolve({ ...result, notes: 'STALE NOTES' }); oldLog.resolve([first]); await tick()
-    assert.equal(h.writes, writes)
+    if (boundary === 'generation') assert.ok(h.writes > writes)
+    else assert.equal(h.writes, writes)
     if (boundary !== 'unmount') {
       const html = h.render()
-      assert.doesNotMatch(html, /STALE NOTES|Skill: \/stale|feat: checkout/)
+      assert.doesNotMatch(html, /Skill: \/stale|feat: checkout/)
+      if (boundary === 'generation') assert.match(html, /STALE NOTES/)
+      else assert.doesNotMatch(html, /STALE NOTES/)
       assert.equal(h.byID('build-notes-generate-btn').props.disabled, false)
       h.unmount()
     }

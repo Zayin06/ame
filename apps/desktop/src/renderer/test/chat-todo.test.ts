@@ -430,9 +430,12 @@ test('ring renders proportional progress and handles an empty snapshot without N
 test('Chat renders one inline per-turn Todo above blocks for live and historical turns, never in the composer dock', () => {
   const source = readFileSync(new URL('../components/Chat.tsx', import.meta.url), 'utf8')
   const turnBody = source.slice(source.indexOf('<div className="msg-turn-body">'), source.indexOf('{turn.blocks.map'))
-  assert.match(turnBody, /\{todoView\.byTurnID\[turn\.id\] && <TodoProgressCard/)
-  assert.match(turnBody, /snapshot=\{todoView\.byTurnID\[turn\.id\]\}/)
+  assert.match(turnBody, /^<div className="msg-turn-body">\{todo && <TodoProgressCard\b[^>]*snapshot=\{todo\}\s*\/>\}$/)
   assert.doesNotMatch(turnBody, /!turn\.live|variant=/)
+  const turnView = source.match(/<ChatTurnView\b[^>]*\/>/)?.[0]
+  assert.ok(turnView, 'Chat renders the extracted turn component')
+  assert.match(turnView, /\btodo=\{todoView\.byTurnID\[turn\.id\]\}/)
+  assert.doesNotMatch(turnView, /!turn\.live/)
   const dock = source.slice(source.indexOf('<div className="composer-dock">'))
   assert.doesNotMatch(dock, /TodoProgressCard|todoView\.composer/)
   assert.equal((source.match(/<TodoProgressCard\b/g) ?? []).length, 1)

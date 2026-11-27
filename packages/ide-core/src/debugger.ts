@@ -3,6 +3,7 @@ import { existsSync, realpathSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { createRequire, SourceMap, type SourceMapPayload, type SourceMapping } from 'node:module'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { validateWorkspacePath } from './workspace-fs'
 
@@ -56,6 +57,10 @@ type Session = {
   resolved: Set<string>
   sequence: number
   stderr: string
+  executionBegun?: boolean
+  output?: { stream: 'stdout' | 'stderr' | 'console'; text: string }[]
+  outputLength?: number
+  outputTimer?: ReturnType<typeof setTimeout>
   waitingForDisconnect?: boolean
   detachTimer?: ReturnType<typeof setTimeout>
 }
@@ -94,6 +99,27 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
     try { onEvent(event) } catch { /* The host owns callback error reporting. */ }
   }
   function emitState() { emit({ type: 'state', snapshot: state() }) }
+  function flushOutput(s: Session) {
+    clearTimeout(s.outputTimer); s.outputTimer = undefined
+    const output = s.output ?? []
+    s.output = []; s.outputLength = 0
+    for (const event of output) emit({ type: 'output', ...event })
+  }
+  function output(s: Session, stream: 'stdout' | 'stderr' | 'console', text: string) {
+    // Bound both retained output and individual events, without splitting surrogate pairs.
+    while (text.length) {
+      let size = Math.min(text.length, 16_384)
+      if (size < text.length && /[\uD800-\uDBFF]/.test(text[size - 1])) size--
+      const part = text.slice(0, size); text = text.slice(size)
+      s.output ??= []
+      const last = s.output[s.output.length - 1]
+      if (last?.stream === stream && last.text.length + part.length <= 16_384) last.text += part
+      else s.output.push({ stream, text: part })
+      s.outputLength = (s.outputLength ?? 0) + part.length
+      if (s.outputLength >= 65_536 || s.output.length >= 256) flushOutput(s)
+    }
+    if (s.output?.length && !s.outputTimer) s.outputTimer = setTimeout(() => flushOutput(s), 32)
+  }
   function check(s: Session) { if (!s.active || s.stopping || session !== s) throw failure('DEBUG_SESSION_STOPPED') }
   async function validated(relative: string, allowRoot = false) {
     if (typeof relative !== 'string' || relative.replace(/\\/g, '/').split('/').includes('..')) throw failure('PATH_OUTSIDE_WORKSPACE')
@@ -109,7 +135,7 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
     // Let responses already queued on the CDP socket settle before detaching at natural exit.
     s.detachTimer = setTimeout(() => {
       s.detachTimer = undefined
-      if (!s.pending.size && s.active && !s.stopping) disconnect(s)
+      if (!s.pending.size && s.active && !s.stopping && snapshot.status !== 'paused') disconnect(s)
     }, 25)
   }
   function disconnect(s: Session) {
@@ -125,6 +151,7 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
   }
   function finish(s: Session, code: number | null, signal?: NodeJS.Signals | null) {
     if (!s.active) return
+    flushOutput(s)
     s.active = false
     s.abort.abort()
     disconnect(s)
@@ -252,6 +279,7 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
     emitState()
   }
   async function paused(s: Session, params: Pause) {
+    flushOutput(s)
     const version = ++s.pauseVersion
     await breakpointQueue
     check(s)
@@ -311,6 +339,9 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
       for (const file of files.values()) for (const point of file.points) if (point.id === breakpointId) point.verified = true
       emitState()
     } else if (method === 'Debugger.paused') {
+      flushOutput(s)
+      snapshot = { ...snapshot, status: 'paused' }
+      s.waitingForDisconnect = false
       void paused(s, params as Pause).catch(error => {
         if (s.active && !s.stopping) {
           emit({ type: 'output', stream: 'stderr', text: `Debugger error: ${String(error)}\n` })
@@ -323,7 +354,7 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
       emitState()
     } else if (method === 'Runtime.consoleAPICalled') {
       const event = params as { args: RemoteObject[] }
-      emit({ type: 'output', stream: 'console', text: event.args.map(value => preview(value).value).join(' ') + '\n' })
+      output(s, 'console', event.args.map(value => preview(value).value).join(' ') + '\n')
     }
   }
   async function connect(s: Session, address: string) {
@@ -398,19 +429,36 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
         s.abort.signal.addEventListener('abort', abort, { once: true })
         child.once('error', error => done(error))
         child.once('exit', () => { done(failure('DEBUG_EXITED_BEFORE_CONNECT')); disconnect(s) })
-        child.stdout.on('data', (chunk: Buffer) => emit({ type: 'output', stream: 'stdout', text: chunk.toString() }))
-        child.stderr.on('data', (chunk: Buffer) => {
-          const text = chunk.toString()
-          emit({ type: 'output', stream: 'stderr', text })
-          s.stderr = (s.stderr + text).slice(-8192)
-          const match = s.stderr.match(/Debugger listening on (ws:\/\/[^\s]+)/)
-          if (match) done(undefined, match[1])
-          // Node deliberately stays alive at natural exit until its inspector client detaches.
-          if (s.stderr.includes('Waiting for the debugger to disconnect')) {
-            s.waitingForDisconnect = true
-            detachWhenFinished(s)
+        for (const stream of ['stdout', 'stderr'] as const) {
+          const decoder = new StringDecoder('utf8')
+          let ended = false, discardLine = false
+          const consume = (text: string) => {
+            output(s, stream, text)
+            if (stream !== 'stderr') return
+            // Parse complete lines; discard oversized lines rather than matching a truncated suffix.
+            for (const part of text.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+              s.stderr += part
+              if (s.stderr.length > 8192) { s.stderr = ''; discardLine = true }
+              if (!part.endsWith('\n')) continue
+              const line = s.stderr.replace(/\r?\n$/, '')
+              s.stderr = ''
+              if (!discardLine) {
+                const match = !s.ready && line.match(/^Debugger listening on (ws:\/\/127\.0\.0\.1:\d+\/\S+)$/)
+                if (match) done(undefined, match[1])
+                // Node versions also use an ellipsis for this exact runtime control line.
+                if ((line === 'Waiting for the debugger to disconnect.' || line === 'Waiting for the debugger to disconnect...') && s.executionBegun && snapshot.status !== 'paused') {
+                  s.waitingForDisconnect = true
+                  detachWhenFinished(s)
+                }
+              }
+              discardLine = false
+            }
           }
-        })
+          child[stream].on('data', (chunk: Buffer) => consume(decoder.write(chunk)))
+          const end = () => { if (!ended) { ended = true; consume(decoder.end()) } }
+          child[stream].once('end', end)
+          child[stream].once('close', end)
+        }
       })
       emitState()
       await connect(s, await address)
@@ -421,6 +469,7 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
         s.ready = true
         for (const file of files.values()) await applyBreakpoints(s, file)
       })
+      s.executionBegun = true
       await command(s, 'Runtime.runIfWaitingForDebugger')
     } catch (error) {
       await shutdown(s)
@@ -430,7 +479,15 @@ export function createNodeDebugger(workspaceRoot: string, onEvent: (event: Debug
   async function control(method: string, status: 'running' | 'paused') {
     const s = session
     if (!s || snapshot.status !== status) throw failure(status === 'paused' ? 'DEBUG_NOT_PAUSED' : 'DEBUG_NOT_RUNNING')
-    await command(s, method)
+    const previous = snapshot, version = s.pauseVersion
+    // stderr can arrive before the CDP resumed notification on its separate pipe.
+    // Once resume/step has been sent, execution may already be finishing.
+    const result = command(s, method)
+    if (status === 'paused') snapshot = { ...snapshot, status: 'running', frames: [], variables: [] }
+    try { await result } catch (error) {
+      if (session === s && s.pauseVersion === version) snapshot = previous
+      throw error
+    }
   }
 
   return {

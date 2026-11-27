@@ -29,7 +29,24 @@ export function validateFormAnswer(form: SessionForm, answer: SessionFormAnswer)
       if (typeof value !== 'string') fail()
       const text = value as string
       if (text.length < (field.minLength ?? 0) || text.length > (field.maxLength ?? 20000)) fail()
-      if (field.pattern) { try { if (!new RegExp(field.pattern).test(text)) fail() } catch { fail() } }
+      if (field.pattern) {
+        // Treat server-supplied patterns as untrusted: reject quantified groups,
+        // backreferences/lookarounds and cap input before running the JS engine.
+        if (field.pattern.length > 256 || text.length > 1024) fail()
+        // A deliberately small regex subset: no groups/alternation/backreferences,
+        // and only one repetition site (including bounded repetitions).
+        const tokens = field.pattern.match(/\\.|\[(?:\\.|[^\]\\])*\]|[^]/g) ?? []
+        let repetitions = 0
+        for (let index = 0; index < tokens.length; index++) {
+          const token = tokens[index]
+          if (token.startsWith('[')) continue
+          if (token.startsWith('\\')) { if (/^\\[1-9k]$/.test(token)) fail(); continue }
+          if ('()|'.includes(token)) fail()
+          if ('*+?{'.includes(token) && ++repetitions > 1) fail()
+        }
+        if (/\{/.test(field.pattern)) fail()
+        try { if (!new RegExp(field.pattern).test(text)) fail() } catch { fail() }
+      }
       if (field.options?.length && field.required && !field.custom && !field.allowCustom && !field.options.some(option => option.value === value)) fail()
     } else if (field.type === 'multiselect') {
       if (!Array.isArray(value) || value.length < (field.minItems ?? 0) || value.length > (field.maxItems ?? 100)) fail()
@@ -75,7 +92,7 @@ export function SessionFormCard({ projectID, form, disabled = false, onResolved 
             <span>{option.label}{option.description && <small>{option.description}</small>}</span>
           </label>)}</div>}
           {field.type === 'string' && (!options?.length || !field.required || field.custom || field.allowCustom) && <input id={`${form.id}-${field.key}`} aria-label={options?.length ? `${label} — câu trả lời khác` : label} type={field.format === 'email' ? 'email' : field.format === 'uri' ? 'url' : field.format === 'date' ? 'date' : 'text'} placeholder={field.placeholder || (options?.length ? 'Hoặc nhập câu trả lời khác…' : '')} value={typeof value === 'string' ? value : ''} onChange={event => set(field.key, event.target.value)} />}
-          {field.type === 'multiselect' && field.custom && <input id={`${form.id}-${field.key}`} aria-label={`${label} — thêm lựa chọn`} placeholder="Nhập lựa chọn khác, nhấn Enter" onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); const text = event.currentTarget.value.trim(); if (text) set(field.key, [...new Set([...(Array.isArray(value) ? value : []), text])]); event.currentTarget.value = '' } }} />}
+          {field.type === 'multiselect' && field.custom && <input id={`${form.id}-${field.key}`} aria-label={`${label} — thêm lựa chọn`} placeholder="Nhập lựa chọn khác, nhấn Enter" onKeyDown={event => { if (event.nativeEvent?.isComposing || event.keyCode === 229 || event.nativeEvent?.keyCode === 229) return; if (event.key === 'Enter') { event.preventDefault(); const text = event.currentTarget.value.trim(); if (text) set(field.key, [...new Set([...(Array.isArray(value) ? value : []), text])]); event.currentTarget.value = '' } }} />}
           {field.type === 'multiselect' && Array.isArray(value) && value.filter(entry => !field.options.some(option => option.value === entry)).map(entry => <button type="button" key={entry} onClick={() => set(field.key, value.filter(item => item !== entry))}>{entry} ×</button>)}
           {field.type === 'boolean' && <input id={`${form.id}-${field.key}`} aria-label={label} type="checkbox" checked={value === true} onChange={event => set(field.key, event.target.checked)} />}
           {(field.type === 'number' || field.type === 'integer') && <input id={`${form.id}-${field.key}`} aria-label={label} type="number" step={field.type === 'integer' ? 1 : 'any'} min={typeof field.minimum === 'number' ? field.minimum : undefined} max={typeof field.maximum === 'number' ? field.maximum : undefined} value={typeof value === 'number' ? value : ''} onChange={event => set(field.key, event.target.value === '' ? undefined : event.target.valueAsNumber)} />}

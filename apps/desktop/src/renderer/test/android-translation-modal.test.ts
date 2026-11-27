@@ -29,6 +29,9 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
   let forms: SessionForm[] = []
   let skills: SkillSummary[] = [], skillsLoads = 0
   const hooks = {
+    memo: (component: unknown) => component,
+    useMemo: (factory: () => unknown) => factory(),
+    useCallback: (fn: unknown) => fn,
     useState(initial: unknown) {
       const index = cursor++
       if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial
@@ -131,6 +134,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
   function all(node: ReactNode): ReactElement<Record<string, unknown>>[] {
     if (Array.isArray(node)) return node.flatMap(all)
     if (!isValidElement<Record<string, unknown>>(node)) return []
+    if (typeof node.type === 'function' && node.type.name === 'ChatTurnView') return [node, ...all((node.type as any)(node.props))]
     return [node, ...all(node.props.children as ReactNode)]
   }
   function find(predicate: (node: ReactElement<Record<string, unknown>>) => boolean) { const result = all(tree).find(predicate); assert.ok(result, 'Expected element'); return result }
@@ -161,6 +165,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     delayPrompt(value: Promise<unknown>) { nextPrompt = value },
     get closed() { return closed }, get activity() { return activity }, get focused() { return focused },
     unmount() { effects.forEach(effect => effect.cleanup?.()) },
+    remount(extra: object = {}) { effects.forEach(effect => effect.cleanup?.()); effects.length = 0; slots.length = 0; pending.length = 0; return render(extra) },
   }
 }
 
@@ -196,7 +201,9 @@ test('failed translation surfaces compaction errors and a new-session action ins
       const alert = h.find(node => node.props.role === 'alert' && renderToStaticMarkup(node.props.children as ReactNode).includes('Compaction summary'))
       assert.equal(alert.props.className, 'inline-error')
       assert.match(renderToStaticMarkup(alert), /Compaction summary reached the output token limit/)
-      assert.match(renderToStaticMarkup(alert), /Ngữ cảnh phiên đã quá dài khiến bước tóm tắt bị vượt giới hạn token\. Hãy bấm Phiên dịch mới \(hoặc tạo cuộc trò chuyện mới\) để tiếp tục\./)
+      assert.match(renderToStaticMarkup(alert), component === 'AndroidTranslationModal'
+        ? /Ngữ cảnh phiên đã quá dài khiến bước tóm tắt bị vượt giới hạn token\. Hãy bấm Phiên dịch mới \(hoặc tạo cuộc trò chuyện mới\) để tiếp tục\./
+        : /Ngữ cảnh phiên đã quá dài khiến bước tóm tắt bị vượt giới hạn token\. Hãy tạo cuộc trò chuyện mới để tiếp tục\./)
       assert.doesNotMatch(html, /Đã dịch xong\?/)
       if (component === 'AndroidTranslationModal') {
         const banner = h.find(node => node.props.role === 'alert' && renderToStaticMarkup(node.props.children as ReactNode).includes('Lượt dịch gần nhất gặp lỗi'))
@@ -468,6 +475,39 @@ test('resumed sessions display their pinned model rather than a changed feature 
   assert.match(html, /Model: previous-pinned-model/)
   assert.doesNotMatch(html, /Model: New default/)
   h.unmount()
+})
+
+test('feature modal unsent drafts survive close/remount, stay project-scoped and clear on new session', async () => {
+  for (const component of ['AndroidTranslationModal', 'CommitAgentModal'] as const) {
+    const h = harness({ component })
+    try {
+      h.render(); await h.flush(); h.change('unsent draft'); h.render()
+      h.key({ key: 'Escape', preventDefault() {}, stopPropagation() {} })
+      h.remount(); await h.flush()
+      assert.equal(h.find(node => node.type === 'textarea').props.value, 'unsent draft')
+      h.remount({ projectID: 'other' }); await h.flush()
+      assert.equal(h.find(node => node.type === 'textarea').props.value, '')
+      h.remount({ projectID: 'project' }); await h.flush()
+      assert.equal(h.find(node => node.type === 'textarea').props.value, 'unsent draft')
+      h.click(component === 'AndroidTranslationModal' ? 'Phiên dịch mới' : 'Phiên mới'); h.render()
+      h.remount(); await h.flush()
+      assert.equal(h.find(node => node.type === 'textarea').props.value, '')
+    } finally { h.unmount() }
+  }
+})
+
+test('Full mode resets when cleared or explicitly toggled but survives nonempty edits', async () => {
+  const h = harness()
+  try {
+    h.render(); await h.flush(); h.click('Thêm ngôn ngữ mới'); h.render()
+    h.change('Dịch ja'); assert.match(h.render(), /Full ×/)
+    h.change('   '); assert.doesNotMatch(h.render(), /Full ×/)
+    h.change('Dịch bổ sung'); h.render(); h.submit(); await h.flush()
+    assert.equal(h.calls[0].args[3], 'custom')
+    h.click('Phiên dịch mới'); h.render(); h.click('Thêm ngôn ngữ mới'); h.render()
+    h.click('Chuyển về dịch bổ sung'); assert.doesNotMatch(h.render(), /Full ×/)
+    h.submit(); await h.flush(); assert.equal(h.calls[1].args[3], 'custom')
+  } finally { h.unmount() }
 })
 
 test('feature modals refresh info and active session pins on account and bundle updates without blocking continuation', async () => {

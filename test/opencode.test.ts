@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import path from 'node:path'
-import { OpenCodeAdapter, localURL, normalizeMessages, parseCompletedTodos } from '../packages/opencode-adapter/src/index'
+import { OpenCodeAdapter, localURL, normalizeMessages, parseCompletedTodos, sameDirectory } from '../packages/opencode-adapter/src/index'
 import { SessionActivity } from '../packages/opencode-adapter/src/session-activity'
 import type { IdeEvent } from '../packages/protocol/src/index'
 import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
@@ -11,6 +11,35 @@ import type { UsagePrices } from '../packages/amekit/src/usage-pricing'
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 const waitFor = async (check: () => boolean) => { for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)) }; throw new Error('TIMED_OUT') }
+
+test('directory identity resolves paths and folds casing only on Windows', () => {
+  assert.equal(sameDirectory('project/../project', path.resolve('project')), true)
+  assert.equal(sameDirectory('project', 'other-project'), false)
+  assert.equal(sameDirectory(path.resolve('Project'), path.resolve('project')), process.platform === 'win32')
+  if (process.platform === 'win32') assert.equal(sameDirectory('C:\\Foo\\Project', 'c:\\foo\\project'), true)
+})
+
+test('idle SSE watchdog probes and reconnects a half-open connection without disturbing healthy idle streams', async () => {
+  const adapter = new OpenCodeAdapter(() => {})
+  const controller = new AbortController()
+  let subscriptions = 0, probes = 0, aborted = 0
+  let healthy = true
+  const client = {
+    server: { info: async () => { probes++; if (!healthy) throw new Error('unreachable'); return { version: '2.3.2' } } },
+    event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
+      subscriptions++
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => { aborted++; resolve() }, { once: true }))
+    } },
+  }
+  const running = (adapter as any).events(client, controller.signal, 20)
+  try {
+    await waitFor(() => probes >= 2)
+    assert.equal(subscriptions, 1, 'healthy idle streams must stay open')
+    healthy = false
+    await waitFor(() => aborted === 1)
+    await waitFor(() => subscriptions >= 2)
+  } finally { controller.abort(); await running; adapter.dispose() }
+})
 
 test('disposing the adapter aborts an acknowledged connection with a stalled prompt request', async () => {
   const directory = path.resolve('shutdown-project')
@@ -1444,6 +1473,44 @@ test('btwAsk validates owned trimmed questions, switches selected model and gene
     failModel = false; failGenerate = true
     await assert.rejects(adapter.btwAsk('p', 's1', 'Question', model))
   } finally { adapter.dispose() }
+})
+
+test('session mutex restores BTW model before queued prompts and permission updates, including failures', async () => {
+  const adapter = new OpenCodeAdapter(() => {})
+  const previous = { id: 'previous', providerID: 'amecode' }
+  const selected = { id: 'selected', modelID: 'selected', providerID: 'amecode', name: 'Selected' }
+  let current = previous, fail = false
+  const calls: string[] = []
+  let entered!: () => void, release!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const gate = new Promise<void>(resolve => { release = resolve })
+  Object.assign(adapter, { state: { connected: true }, client: { session: {
+    get: async ({ sessionID }: { sessionID: string }) => { calls.push(`get:${sessionID}`); return { model: current, location: { directory: process.cwd() } } },
+    switchModel: async ({ model }: { model: typeof previous }) => { current = model; calls.push(`model:${model.id}`) },
+    switchAgent: async () => { calls.push('agent') },
+    generate: async () => { calls.push('generate'); entered(); await gate; if (fail) throw new Error('generation failed'); return { text: 'answer' } },
+    prompt: async () => { calls.push(`prompt:${current.id}`) },
+    update: async () => { calls.push('permissions') },
+  } } })
+  adapter.attach('p', process.cwd())
+  try {
+    const btw = adapter.btwAsk('p', 's1', 'question', selected)
+    await started
+    const prompt = adapter.prompt('p', 's1', 'prompt', selected, 'agent')
+    const permission = adapter.updateSessionPermissionMode('p', 's1', 'default')
+    await Promise.resolve()
+    assert.deepEqual(calls, ['get:s1', 'model:selected', 'generate'])
+    release()
+    await Promise.all([btw, prompt, permission])
+    assert.deepEqual(calls, ['get:s1', 'model:selected', 'generate', 'model:previous', 'get:s1', 'model:selected', 'agent', 'prompt:selected', 'get:s1', 'permissions', 'get:s1'])
+    current = previous; fail = true; calls.length = 0
+    await assert.rejects(adapter.btwAsk('p', 's1', 'question', selected), /generation failed/)
+    assert.deepEqual(current, previous)
+    assert.equal(calls.at(-1), 'model:previous')
+    fail = false
+    await adapter.prompt('p', 's1', 'after failure', selected)
+    assert.equal((adapter as any).sessionLocks.size, 0)
+  } finally { release(); adapter.dispose() }
 })
 
 test('btwAsk retries empty answers once with a plain-text no-tool prompt and a fresh timeout', async t => {

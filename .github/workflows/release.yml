@@ -100,6 +100,7 @@ jobs:
           fi
           if [ "${{ matrix.platform }}" != "win" ]; then chmod 0755 "$bin_path"; fi
           echo "AME_OPENCODE_CLI=$bin_path" >> "$GITHUB_ENV"
+          echo "AME_OPENCODE_SHA256=$( (sha256sum "$bin_path" 2>/dev/null || shasum -a 256 "$bin_path") | awk '{print tolower($1)}' )" >> "$GITHUB_ENV"
       - name: Acquire pinned runtime if no trusted local path is configured
         shell: bash
         run: |
@@ -135,6 +136,23 @@ jobs:
       - run: npm run build
         env:
           NODE_OPTIONS: --max-old-space-size=6144
+      - name: Require signing secrets for tag releases
+        if: github.event_name == 'push' && inputs.dry_run != true
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ '${{ matrix.platform }}' = win ]; then
+            : "${CSC_LINK:?CSC_LINK is required for Windows tag releases}"
+          else
+            : "${APPLE_ID:?APPLE_ID is required for macOS tag releases}"
+            : "${APPLE_APP_SPECIFIC_PASSWORD:?APPLE_APP_SPECIFIC_PASSWORD is required for macOS tag releases}"
+            : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required for macOS tag releases}"
+          fi
       - name: Package platform artifacts without publishing
         shell: bash
         env:
@@ -145,11 +163,28 @@ jobs:
           APPLE_TEAM_ID: ${{ inputs.dry_run != true && secrets.APPLE_TEAM_ID || '' }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: |
-          signing=()
-          if [ '${{ matrix.platform }}' = win ] && [ -n "$CSC_LINK" ]; then
-            signing+=(--config.win.signAndEditExecutable=true)
+          if [ '${{ matrix.platform }}' = win ]; then
+            node scripts/build-win-release.mjs --targets ${{ matrix.targets }}
+          else
+            npx electron-builder --${{ matrix.platform }} ${{ matrix.targets }} --${{ matrix.arch }} --publish never
           fi
-          npx electron-builder --${{ matrix.platform }} ${{ matrix.targets }} --${{ matrix.arch }} --publish never "${signing[@]}"
+      - name: Smoke test packaged Windows app
+        if: matrix.platform == 'win'
+        run: node scripts/smoke-packaged.mjs
+      - name: Generate packaged artifact checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          shopt -s nullglob
+          files=(*.exe *.dmg *.zip)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo 'No packaged artifacts found for checksums' >&2
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            sha256sum "$file" 2>/dev/null || shasum -a 256 "$file"
+          done > "SHA256SUMS-${{ matrix.platform }}-${{ matrix.arch }}.txt"
       - uses: actions/upload-artifact@v4
         with:
           name: ame-ide-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.run_id }}
@@ -160,3 +195,28 @@ jobs:
             release/*.zip
             release/*.blockmap
             release/latest*.yml
+            release/SHA256SUMS-${{ matrix.platform }}-${{ matrix.arch }}.txt
+  publish:
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ame-ide-*
+          path: artifacts
+      - name: Publish verified tag release with artifacts and checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find artifacts -type f -print0)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo 'No release artifacts downloaded' >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag "${files[@]}"

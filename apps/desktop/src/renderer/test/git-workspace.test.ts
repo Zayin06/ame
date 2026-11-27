@@ -352,7 +352,9 @@ test('undo restores message and refreshes; amend prefill and commit shortcut res
     async stageAll(...args: unknown[]) { calls.push(['stageAll', ...args]) },
   })
   h.render(); await h.flush(); h.invoke(h.byID('git-workspace-undo-commit-btn')); await h.flush()
-  assert.equal(h.props.message, 'restored commit'); assert.equal(refreshes, 1)
+  assert.equal(h.props.message, 'feat: draft'); assert.equal(refreshes, 1)
+  h.render({ message: '   ' }); h.invoke(h.byID('git-workspace-undo-commit-btn')); await h.flush()
+  assert.equal(h.props.message, 'restored commit'); assert.equal(refreshes, 2)
   h.invoke(h.find(node => node.type === 'button' && text(node).startsWith('staged.ts'))); assert.deepEqual(diffs, ['staged.ts'])
   h.click('Bỏ stage'); await h.flush(); h.click('Stage tất cả (1 tệp)'); await h.flush()
   assert.ok(calls.some(call => call[0] === 'stage' && call[1] === 'project' && call[2] === 'staged.ts' && call[3] === false && call[4] === undefined))

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { PetHostState } from "../../../../../packages/amekit/src/pet-host"
 import { petLabels, petRows, petSpriteCss, petStates, type PetState } from "../../../../../packages/amekit/src/pet"
 
@@ -20,6 +20,16 @@ export function PetSettings(props: PetSettingsProps) {
   const [failure, setFailure] = useState("")
   const [pending, setPending] = useState(false)
   const state = props.petState
+  const [draftScale, setDraftScale] = useState(state?.preferences.scale ?? 0.25)
+  const scaleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const pendingScale = useRef<number | undefined>(undefined)
+  useEffect(() => { if (pendingScale.current === undefined) setDraftScale(state?.preferences.scale ?? 0.25) }, [state?.preferences.scale])
+  const configureRef = useRef(props.onConfigure); configureRef.current = props.onConfigure
+  useEffect(() => () => {
+    clearTimeout(scaleTimer.current)
+    const scale = pendingScale.current
+    if (scale !== undefined) { pendingScale.current = undefined; void Promise.resolve().then(() => configureRef.current({ scale })).catch(() => {}) }
+  }, [])
   const selected = preview === "live" ? state?.activity ?? "idle" : preview
   const disabled = !state || !!props.loading || pending
   const model = props.selectedModel?.trim() ?? ""
@@ -29,6 +39,13 @@ export function PetSettings(props: PetSettingsProps) {
   }
   const configure = (input: Parameters<PetSettingsProps["onConfigure"]>[0]) => {
     void run(() => props.onConfigure(input), "Không thể lưu cài đặt pet. Hãy thử lại.")
+  }
+  const flushScale = () => {
+    clearTimeout(scaleTimer.current)
+    const scale = pendingScale.current
+    if (scale === undefined) return
+    pendingScale.current = undefined
+    configure({ scale })
   }
   const speech = (input: Parameters<PetSettingsProps["onSpeech"]>[0]) => {
     void run(() => props.onSpeech(input), "Không thể lưu cài đặt lời thoại.")
@@ -50,8 +67,8 @@ export function PetSettings(props: PetSettingsProps) {
         <button type="button" role="switch" aria-labelledby="pet-visible-label" aria-checked={state?.preferences.enabled ?? false} disabled={disabled} onClick={() => configure({ enabled: !state?.preferences.enabled })}>{state?.preferences.enabled ? "Bật" : "Tắt"}</button>
       </div>
       <div className="pet-settings-row">
-        <div><p className="pet-settings-label">Kích thước</p><p>{Math.round((state?.preferences.scale ?? 0.25) * 100)}% · 25%–200%</p></div>
-        <input type="range" aria-label="Kích thước pet" aria-valuetext={`${Math.round((state?.preferences.scale ?? 0.25) * 100)}%`} min="25" max="200" step="5" value={(state?.preferences.scale ?? 0.25) * 100} disabled={disabled} onChange={event => configure({ scale: Number(event.currentTarget.value) / 100 })} />
+        <div><p className="pet-settings-label">Kích thước</p><p>{Math.round(draftScale * 100)}% · 25%–200%</p></div>
+        <input type="range" aria-label="Kích thước pet" aria-valuetext={`${Math.round(draftScale * 100)}%`} min="25" max="200" step="5" value={draftScale * 100} disabled={!state} onChange={event => { const scale = Number(event.currentTarget.value) / 100; setDraftScale(scale); pendingScale.current = scale; clearTimeout(scaleTimer.current); scaleTimer.current = setTimeout(flushScale, 120) }} onPointerUp={flushScale} onKeyUp={flushScale} />
       </div>
       <div className="pet-settings-row"><p>Đưa pet về góc dưới bên phải màn hình chính.</p><button type="button" disabled={disabled} onClick={() => configure({ resetPosition: true })}>Đặt lại vị trí</button></div>
       <div className="pet-settings-row">

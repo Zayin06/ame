@@ -15,7 +15,7 @@ function nodes(node: ReactNode): Node[] {
   if (!isValidElement<Record<string, any>>(node)) return []
   return [node, ...nodes(node.props.children)]
 }
-function environment(api: Record<string, any> = {}) {
+function environment(api: Record<string, any> = {}, confirm = (_message: string) => true) {
   let active: any
   const hooks = {
     useState(initial: any) {
@@ -43,7 +43,7 @@ function environment(api: Record<string, any> = {}) {
     revealPath: async (...args: any[]) => { calls.push(['reveal', ...args]) },
     ...api,
   }
-  runInNewContext(code, { exports, window: { ame, addEventListener() {}, removeEventListener() {}, innerWidth: 800, innerHeight: 600 }, require: (name: string) => modules[name] ?? nativeRequire(name) })
+  runInNewContext(code, { exports, window: { ame, confirm, addEventListener() {}, removeEventListener() {}, innerWidth: 800, innerHeight: 600 }, require: (name: string) => modules[name] ?? nativeRequire(name) })
   function mount(component = exports.testing.Explorer, extra: Record<string, any> = {}) {
     const h = { slots: [] as any[], effects: [] as any[], pending: [] as any[], cursor: 0, effectIndex: 0 }
     let tree: ReactNode
@@ -120,6 +120,20 @@ test('same-project delete reports the owning project', async () => {
   assert.deepEqual(e.calls, [['delete', file.path, 'a']])
   assert.equal(h.directoryProps().selected, null)
   h.unmount()
+})
+
+test('delete warns for dirty files and descendants, cancellation preserves them', async () => {
+  for (const entry of [file, dir]) for (const accepted of [false, true]) {
+    const messages: string[] = [], deleted: string[] = []
+    const e = environment({ deletePath: async (_project: string, path: string) => { deleted.push(path); return { path } } }, message => { messages.push(message); return accepted })
+    const h = e.mount(undefined, { dirtyPaths: new Set([file.path, 'src-other/safe.ts']) })
+    h.open(entry); h.click(`Delete ${entry.path}`); await h.flush()
+    assert.equal(messages.length, 1)
+    assert.match(messages[0], /src\/a.ts/)
+    assert.doesNotMatch(messages[0], /src-other/)
+    assert.deepEqual(deleted, accepted ? [entry.path] : [])
+    h.unmount()
+  }
 })
 
 test('scoped Ctrl/Cmd shortcuts use selected files, ignore inputs, and Escape clears cut', async () => {

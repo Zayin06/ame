@@ -9,6 +9,7 @@ import { formatGitError, syncBadgeSummary } from '../git-ui'
 import { FileTypeIcon } from '../components/FileTypeIcon'
 import { WORKSPACE_DRAG_MIME } from '../composer-mentions'
 import { ProjectSearch } from './ProjectSearch'
+import { loadInstalledAccount } from '../buffer-recovery'
 
 type Mutate = <T>(action: () => Promise<T>, success?: (result: T) => void, refreshAfter?: boolean, onError?: (error: unknown) => void) => Promise<void>
 type Naming = { kind: 'file' | 'directory' | 'rename'; parent: string; entry?: FileEntry }
@@ -23,6 +24,7 @@ const pasteDirectory = (entry: FileEntry | null) => entry ? entry.directory ? en
 type ExplorerMenu = { kind: 'file' | 'directory'; entry: FileEntry; x: number; y: number } | { kind: 'root'; x: number; y: number }
 const emptyOSClipboard = { hasFiles: false, count: 0, names: [] as string[] }
 type InspectorProps = {
+  dirtyPaths?: ReadonlySet<string>
   projectID?: string; name?: string; connected?: boolean; tab: 'files' | 'search' | 'git'; setTab: (tab: 'files' | 'search' | 'git') => void; generation: number;
   git?: GitState; gitError: string; refresh: () => void; onOpen: (path: string, line?: number, column?: number) => void;
   onRename: (from: string, to: string) => void; onDelete: (path: string, targetProjectID?: string) => void;
@@ -93,7 +95,8 @@ function Directory(props: DirectoryProps) {
   })}</ul>
 }
 
-function Explorer({ projectID, name, generation, onOpen, onRename, onDelete, busy, mutate }: {
+function Explorer({ projectID, name, generation, onOpen, onRename, onDelete, busy, mutate, dirtyPaths }: {
+  dirtyPaths?: ReadonlySet<string>;
   projectID: string; name?: string; generation: number; onOpen: InspectorProps['onOpen']; onRename: InspectorProps['onRename']; onDelete: InspectorProps['onDelete']; busy: boolean; mutate: Mutate
 }) {
   const [naming, setNaming] = useState<Naming | null>(null)
@@ -216,7 +219,7 @@ function Explorer({ projectID, name, generation, onOpen, onRename, onDelete, bus
     {entry && <><button role="menuitem" aria-label={`Duplicate ${entry.path}`} onClick={() => { closeMenu(); void mutate(() => window.ame.copyPath(projectID, projectID, entry.path, parentPath(entry.path))) }}><Icon name="copy" /><span>Nhân bản</span></button><button role="menuitem" aria-label={`Rename ${entry.path}`} onClick={() => edit({ kind: 'rename', parent: parentPath(entry.path), entry })}><Icon name="pencil" /><span>Đổi tên</span></button></>}
     {entry && <button role="menuitem" aria-label={`Copy Path ${entry.path}`} onClick={() => { closeMenu(); void mutate(async () => { if (!navigator.clipboard) throw new Error('Clipboard không khả dụng.'); await navigator.clipboard.writeText(entry.path) }, undefined, false) }}><Icon name="copy" /><span>Sao chép đường dẫn</span></button>}
     <button role="menuitem" aria-label={`Reveal in OS ${entry?.path || ''}`} onClick={() => { closeMenu(); void mutate(() => window.ame.revealPath(projectID, entry?.path || ''), undefined, false) }}><Icon name="externalLink" /><span>Mở trong thư mục</span></button>
-    {entry && <><div className="insp-tree-popover__sep" role="separator" /><button role="menuitem" className="insp-tree-popover__danger" aria-label={`Delete ${entry.path}`} onClick={() => { closeMenu(); void mutate(() => window.ame.deletePath(projectID, entry.path), result => { setNaming(null); deleted(result.path) }) }}><Icon name="trash" /><span>Xóa</span></button></>}
+    {entry && <><div className="insp-tree-popover__sep" role="separator" /><button role="menuitem" className="insp-tree-popover__danger" aria-label={`Delete ${entry.path}`} onClick={() => { closeMenu(); const unsaved = [...(dirtyPaths ?? [])].filter(path => withinPath(path, entry.path)); if (unsaved.length && !window.confirm(`Các tệp có thay đổi chưa lưu: ${unsaved.join(', ')}. Vẫn xóa?`)) return; void mutate(() => window.ame.deletePath(projectID, entry.path), result => { setNaming(null); deleted(result.path) }) }}><Icon name="trash" /><span>Xóa</span></button></>}
   </div>
   return <div ref={root} data-testid="explorer" tabIndex={0} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openMenu(null, event.clientX, event.clientY) }} onKeyDown={event => {
     if ((event.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"]') || busy) return
@@ -240,7 +243,7 @@ export function Inspector(props: InspectorProps) {
   return <ProjectInspector key={props.projectID || ''} {...props} />
 }
 
-function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report, commitMessage, onCommitMessageChange, gitWorkspaceOpen, onOpenGitWorkspace, onOpenCommitAgent, onCommitEnhanceSkillChange }: InspectorProps) {
+function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report, commitMessage, onCommitMessageChange, gitWorkspaceOpen, onOpenGitWorkspace, onOpenCommitAgent, onCommitEnhanceSkillChange, dirtyPaths }: InspectorProps) {
   const [localMessage, setLocalMessage] = useState('')
   const message = commitMessage ?? localMessage
   const setMessage = (next: string) => {
@@ -272,15 +275,15 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
       setCommitEnhanceSkill(skill)
       skillChange.current?.(skill)
     }
-    const load = async () => {
+    const load = async (event: Event | boolean = true) => {
       const request = ++revision
       updateSkill('')
       try {
-        const value = await window.ame?.account?.('installed', {})
+        const value = await loadInstalledAccount(() => window.ame?.account?.('installed', {}), !!event)
         if (current && request === revision) updateSkill((value as { features?: { commitEnhanceSkill?: string } } | null)?.features?.commitEnhanceSkill || '')
       } catch { if (current && request === revision) updateSkill('') }
     }
-    void load()
+    void load(false)
     window.addEventListener('ame-account-changed', load)
     window.addEventListener('ame-bundle-updated', load)
     return () => { current = false; window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-bundle-updated', load) }
@@ -345,7 +348,7 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
   return <aside data-testid="inspector" className="inspector-pane" data-region="Project Inspector">
     <header className="inspector-pane__header"><span className="inspector-pane__title" title={name}><Icon name="folder" /><span className="truncate">{name || 'Project Inspector'}</span>{git?.branch && <span className="branch-tag">{git.branch}</span>}</span><IconButton label="Đóng Inspector (ẩn cố định)" onClick={onHide}><Icon name="left" /></IconButton></header>
     <nav className="inspector-mode-bar" aria-label="Inspector">{(['files', 'search', 'git'] as const).map(mode => <button key={mode} className={`inspector-mode-btn ${tab === mode ? 'is-active' : ''}`} title={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-label={mode === 'git' ? 'Git Diff' : mode === 'files' ? 'Explorer' : 'Search'} aria-pressed={tab === mode} onClick={() => setTab(mode)}><Icon name={mode === 'files' ? 'folder' : mode === 'search' ? 'search' : 'git'} />{mode === 'git' && changes.length > 0 && <span className="diff-dot" />}</button>)}</nav>
-    <div className="inspector-pane__body">{!projectID ? <Empty>Mở một thư mục để bắt đầu.</Empty> : tab === 'files' ? <Explorer projectID={projectID} name={name} generation={generation} onOpen={onOpen} onRename={onRename} onDelete={onDelete} busy={busy} mutate={mutate} /> : tab === 'search' ? <ProjectSearch key={projectID} projectID={projectID} generation={generation} refresh={refresh} onOpen={onOpen} /> : <>
+    <div className="inspector-pane__body">{!projectID ? <Empty>Mở một thư mục để bắt đầu.</Empty> : tab === 'files' ? <Explorer dirtyPaths={dirtyPaths} projectID={projectID} name={name} generation={generation} onOpen={onOpen} onRename={onRename} onDelete={onDelete} busy={busy} mutate={mutate} /> : tab === 'search' ? <ProjectSearch key={projectID} projectID={projectID} generation={generation} refresh={refresh} onOpen={onOpen} /> : <>
       <div className="scm-branch-controls"><label htmlFor="inspector-branch">Branch</label><select id="inspector-branch" aria-label="Git branch" title={branch || 'Chọn nhánh'} value={branch} disabled={busy || branchLoading || !branches} onChange={event => { const next = event.target.value; if (next !== branch) void mutate(() => window.ame.checkoutBranch(projectID, next)) }}>
         {!branches?.branches.some(item => item.name === branch) && <option value={branch}>{branch || (branchLoading ? 'Đang đọc…' : 'Chưa có nhánh')}</option>}
         <optgroup label="Nhánh cục bộ">{branches?.branches.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}</optgroup>

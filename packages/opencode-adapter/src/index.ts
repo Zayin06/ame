@@ -46,6 +46,10 @@ function extractToolDiffs(message: SessionMessageInfo, projectRoot: string): Ses
 function sessionErrorMessage(error?: SessionStructuredError): string {
   return error?.message || error?.type || 'Phiên thực thi gặp lỗi.'
 }
+export function sameDirectory(a: string, b: string): boolean {
+  const ra = path.resolve(a), rb = path.resolve(b)
+  return process.platform === 'win32' ? ra.toLowerCase() === rb.toLowerCase() : ra === rb
+}
 export function parseCompletedTodos(part: unknown): TodoItem[] | undefined {
   const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
   if (!object(part) || part.type !== 'tool' || typeof part.name !== 'string' || part.name.trim().toLowerCase() !== 'todowrite' || !object(part.state) || part.state.status !== 'completed') return undefined
@@ -202,6 +206,14 @@ export class OpenCodeAdapter {
   private projects = new Map<string, string>()
   private live = new Map<string, Map<string, ChatItem>>()
   private activity = new SessionActivity()
+  private sessionLocks = new Map<string, Promise<unknown>>()
+  private async withSessionLock<T>(sessionID: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.sessionLocks.get(sessionID) ?? Promise.resolve()
+    const current = previous.catch(() => {}).then(operation)
+    this.sessionLocks.set(sessionID, current)
+    try { return await current }
+    finally { if (this.sessionLocks.get(sessionID) === current) this.sessionLocks.delete(sessionID) }
+  }
   constructor(private notify: (event: IdeEvent) => void, private fetcher: typeof fetch = fetch) {}
   connection() { return { ...this.state } }
   disconnected(error: string) {
@@ -266,7 +278,7 @@ export class OpenCodeAdapter {
   private directory(projectID: string) { const value = this.projects.get(projectID); if (!value) throw new Error('UNKNOWN_PROJECT'); return value }
   private async owned(projectID: string, sessionID: string) {
     const session = await this.api().session.get({ sessionID })
-    if (path.resolve(session.location.directory) !== path.resolve(this.directory(projectID))) throw new Error('SESSION_PROJECT_MISMATCH')
+    if (!sameDirectory(session.location.directory, this.directory(projectID))) throw new Error('SESSION_PROJECT_MISMATCH')
     return session
   }
   async sessions(projectID: string): Promise<Session[]> {
@@ -351,26 +363,36 @@ export class OpenCodeAdapter {
     return permissionModeFromSession(await this.owned(projectID, sessionID))
   }
   async updateSessionPermissionMode(projectID: string, sessionID: string, mode: PermissionMode): Promise<PermissionMode> {
+    return this.withSessionLock(sessionID, async () => {
     const parsed = permissionModeSchema.parse(mode)
     await this.owned(projectID, sessionID)
     await this.api().session.update({ sessionID, permissions: permissionRules(parsed) })
     const result = await this.sessionPermissionMode(projectID, sessionID)
     this.notify({ type: 'opencode', projectID, sessionID })
     return result
+    })
   }
   async forkSession(projectID: string, sessionID: string): Promise<Session> {
     await this.owned(projectID, sessionID)
     return mapSession(await this.api().session.fork({ sessionID }), this.directory(projectID))
   }
   async btwAsk(projectID: string, sessionID: string, question: string, model?: Model): Promise<{ answer: string }> {
-    await this.owned(projectID, sessionID)
+    return this.withSessionLock(sessionID, async () => {
+    const { model: previousModel } = await this.owned(projectID, sessionID)
     const trimmed = question.trim()
     if (!trimmed || trimmed.length > 20000) throw new Error('INVALID_PROMPT')
     if (model) await this.api().session.switchModel({ sessionID, model: { id: model.id, providerID: model.providerID } })
+    try {
     const result = await this.api().session.generate({ sessionID, prompt: trimmed }, { signal: AbortSignal.timeout(45_000) })
     if (result.text.trim()) return { answer: result.text.trim() }
     const retry = await this.api().session.generate({ sessionID, prompt: `Answer directly in plain text using only the existing conversation context. Do not call any tools; if the information is not present in the conversation, briefly say so.\n\n${trimmed}` }, { signal: AbortSignal.timeout(45_000) })
     return { answer: retry.text.trim() }
+    } finally {
+      if (model && previousModel && (previousModel.id !== model.id || previousModel.providerID !== model.providerID)) {
+        await this.api().session.switchModel({ sessionID, model: previousModel })
+      }
+    }
+    })
   }
   async artifacts(projectID: string, sessionID?: string): Promise<ArtifactSummary[]> {
     const directory = this.directory(projectID)
@@ -614,6 +636,7 @@ export class OpenCodeAdapter {
     return list.data.filter(a => !a.hidden && a.mode !== 'subagent').map(a => ({ id: a.id, name: a.name }))
   }
   async prompt(projectID: string, sessionID: string, text: string, model?: Model, agent?: string, files?: PromptFileAttachment[], skills?: { id: string }[]) {
+    return this.withSessionLock(sessionID, async () => {
     await this.owned(projectID, sessionID)
     if (!(text.trim().length > 0 || (Array.isArray(files) && files.length > 0)) || text.length > 200000) throw new Error('INVALID_PROMPT')
     if (!model) throw new Error('SELECT_MODEL_REQUIRED')
@@ -621,6 +644,7 @@ export class OpenCodeAdapter {
     await this.api().session.switchModel({ sessionID, model: { id: model.id, providerID: model.providerID } })
     if (agent) await this.api().session.switchAgent({ sessionID, agent })
     await this.api().session.prompt({ sessionID, text: text.trim() ? text : '(Đính kèm tệp)', ...(mappedFiles.length ? { files: mappedFiles } : {}), ...(skills?.length ? { skills } : {}) })
+    })
   }
   async cancel(projectID: string, sessionID: string) {
     const session = await this.owned(projectID, sessionID)
@@ -665,12 +689,46 @@ export class OpenCodeAdapter {
     }
     throw new Error('PERMISSION_NOT_FOUND')
   }
-  private async events(client: OpenCodeClient, signal: AbortSignal) {
+  private async events(client: OpenCodeClient, signal: AbortSignal, watchdogMs = 90_000) {
     let attempt = 0
     while (!signal.aborted) {
+      const connection = new AbortController()
+      const connectionSignal = AbortSignal.any([signal, connection.signal])
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let lastEvent = Date.now(), probing = false
+      const reset = () => {
+        clearTimeout(timer)
+        if (!connectionSignal.aborted) timer = setTimeout(() => { void probe() }, watchdogMs)
+      }
+      const probe = async () => {
+        if (connectionSignal.aborted || probing) return
+        if (Date.now() - lastEvent < watchdogMs) { reset(); return }
+        probing = true
+        const idleSince = lastEvent
+        const controller = new AbortController()
+        const probeSignal = AbortSignal.any([connectionSignal, controller.signal])
+        let timeout: ReturnType<typeof setTimeout> | undefined
+        try {
+          // Bound even a client implementation that fails to honor its abort signal.
+          await Promise.race([
+            client.server.info({ signal: probeSignal }),
+            new Promise<never>((_, reject) => {
+              timeout = setTimeout(() => { controller.abort(); reject(new Error('SSE_HEALTH_TIMEOUT')) }, 5_000)
+            }),
+          ])
+        } catch {
+          if (lastEvent === idleSince && !connectionSignal.aborted) connection.abort()
+        } finally {
+          clearTimeout(timeout); controller.abort(); probing = false; reset()
+        }
+      }
+      const clear = () => clearTimeout(timer)
+      connectionSignal.addEventListener('abort', clear, { once: true })
+      reset()
       try {
-        for await (const event of client.event.subscribe({ signal })) {
-          if (signal.aborted) break
+        for await (const event of client.event.subscribe({ signal: connectionSignal })) {
+          if (connectionSignal.aborted) break
+          lastEvent = Date.now(); reset()
           if (event.type === 'server.connected') {
             // SSE has no replay. Drop deltas and force history reads on every reconnect.
             attempt = 0; this.live.clear(); this.activity.clear()
@@ -682,6 +740,7 @@ export class OpenCodeAdapter {
           this.accept(event)
         }
       } catch { /* A new live-only subscription below must resync API history. */ }
+      finally { clear(); connection.abort(); connectionSignal.removeEventListener('abort', clear) }
       if (signal.aborted) break
       this.state = { ...this.state, connected: false, error: 'Mất kết nối stream; đang kết nối lại…' }
       this.notify({ type: 'connection', connection: this.connection() })
@@ -712,9 +771,8 @@ export class OpenCodeAdapter {
       const target = 'location' in event ? event.location?.directory : undefined
       let matched = false
       if (target) {
-        const resolvedTarget = path.resolve(target).toLowerCase()
         for (const [projectID, root] of this.projects) {
-          if (path.resolve(root).toLowerCase() === resolvedTarget) {
+          if (sameDirectory(root, target)) {
             matched = true
             this.notify({ type: 'catalog', projectID })
           }
@@ -726,7 +784,7 @@ export class OpenCodeAdapter {
     const sessionID = event.type === 'form.created' ? event.data.form.sessionID : 'data' in event && event.data && typeof event.data === 'object' && 'sessionID' in event.data ? String(event.data.sessionID) : undefined
     const directory = 'location' in event ? event.location?.directory : undefined
     for (const [projectID, root] of this.projects) {
-      if (!directory || path.resolve(directory) === path.resolve(root)) {
+      if (!directory || sameDirectory(directory, root)) {
         this.notify(sessionID === undefined ? { type: 'opencode', projectID } : { type: 'opencode', projectID, sessionID })
         if (event.type === 'session.revert.cleared' || (event.type === 'session.revert.staged' && Array.isArray(event.data.revert?.files) && event.data.revert.files.length > 0)) this.notify({ type: 'files', projectID })
       }

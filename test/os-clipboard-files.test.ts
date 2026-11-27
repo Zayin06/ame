@@ -28,6 +28,10 @@ test('CF_HDROP supports Latin-1 ANSI and valid UTF-8 names', () => {
   assert.deepEqual(parseWinCfHdrop(hdrop(['C:\\日本語.txt'], false, 20, 'utf8')), ['C:\\日本語.txt'])
 })
 
+test('CF_HDROP decodes ANSI Windows-1252 Euro bytes', () => {
+  assert.deepEqual(parseWinCfHdrop(hdrop(['C:\\price\x80.txt'], false)), ['C:\\price€.txt'])
+})
+
 test('CF_HDROP rejects truncated headers and invalid offsets without throwing', () => {
   for (let size = 0; size < 20; size++) assert.deepEqual(parseWinCfHdrop(Buffer.alloc(size)), [])
   for (const offset of [0, 1, 19, 24, 0xffffffff]) {

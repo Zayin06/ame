@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { extractCommitSnapshotID, inspectCommitAgentPlan } from '../../../../../packages/amekit/src/commit-plan'
 import type { ChatItem, CommitAgentInfo, CommitAgentMode, CommitAgentStoredPlan, Model, Permission, Session, SessionForm } from '../../../../../packages/protocol/src/index'
 import { extractCommitMessagesFromText, extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
@@ -17,6 +17,9 @@ const presets = [
   { mode: 'single', title: 'Viết 1 thông điệp commit chuẩn', text: 'Đọc đầy đủ diff mọi tệp đã stage, không cắt 64KB, và tạo 1 commit message Conventional Commits trong fenced code block commit để điền vào ô Commit. Không tự tạo commit.' },
 ] satisfies { mode: CommitAgentMode; title: string; text: string }[]
 const notify = () => window.dispatchEvent(new Event('ame-commit-agent-changed'))
+const drafts = new Map<string, string>()
+const draftRevisions = new Map<string, number>()
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
 type Props = {
   projectID: string; projectName?: string; projectDirectory?: string; connected: boolean; theme: 'dark' | 'light'
@@ -35,7 +38,8 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
   const [forms, setForms] = useState<SessionForm[]>([])
-  const [text, setText] = useState('')
+  const [text, updateText] = useState(() => drafts.get(projectID) ?? '')
+  const setText = (value: string) => { draftRevisions.set(projectID, (draftRevisions.get(projectID) ?? 0) + 1); if (value) drafts.set(projectID, value); else drafts.delete(projectID); updateText(value) }
   const [busy, setBusy] = useState(false)
   const [replying, setReplying] = useState(false)
   const [loaded, setLoaded] = useState(false)
@@ -61,7 +65,7 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
     }
     return next
   })
-  const turns = projectChatTimeline(messages, { running, mode: timelineDetail, pendingForms: forms.length > 0 })
+  const turns = useMemo(() => projectChatTimeline(messages, { running, mode: timelineDetail, pendingForms: forms.length > 0 }), [messages, running, timelineDetail, forms.length])
   const planCards = turns.flatMap(turn => turn.blocks.flatMap(block => {
     const inspection = block.kind === 'text' ? inspectCommitAgentPlan(block.item.text) : null
     return inspection ? [{ turn, block, inspection, key: `${sessionID}:${turn.id}:${block.id}` }] : []
@@ -122,15 +126,15 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
       try {
         const [items, pending, sessions, pendingForms] = await Promise.allSettled([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID), window.ame.sessions(projectID), window.ame.forms(projectID, sessionID)])
         if (!alive) return
-        if (items.status === 'fulfilled') setMessages(items.value)
-        if (pending.status === 'fulfilled') setPermissions(pending.value)
-        if (pendingForms.status === 'fulfilled') setForms(pendingForms.value)
+        if (items.status === 'fulfilled') setMessages(current => same(current, items.value) ? current : items.value)
+        if (pending.status === 'fulfilled') setPermissions(current => same(current, pending.value) ? current : pending.value)
+        if (pendingForms.status === 'fulfilled') setForms(current => same(current, pendingForms.value) ? current : pendingForms.value)
         setLoaded(true)
         const failed = [items, pending, sessions, pendingForms].find(result => result.status === 'rejected')
         if (failed?.status === 'rejected') setError(`Không tải được một phần dữ liệu phiên commit: ${errorText(failed.reason)}`)
         const latest = sessions.status === 'fulfilled' ? sessions.value.find(item => item.id === sessionID) : undefined
         setSessionStateReady(sessions.status === 'fulfilled' && pending.status === 'fulfilled' && pendingForms.status === 'fulfilled' && latest?.status === 'idle')
-        if (latest) setSession(latest)
+        if (latest) setSession(current => same(current, latest) ? current : latest)
       } finally { loading = false; if (alive && queued) { queued = false; void load() } }
     }
     const unsubscribe = window.ame.onEvent(event => { if (event.type === 'opencode' && event.projectID === projectID && (!event.sessionID || event.sessionID === sessionID)) void load() })
@@ -170,8 +174,10 @@ export function CommitAgentModal({ projectID, projectName, projectDirectory, con
     if (!available || !value.trim() || operation.current) return
     operation.current = true; setBusy(true); setSessionStateReady(false); setError(''); setApplied('')
     const request = epoch.current
+    const draftRevision = draftRevisions.get(projectID)
     try {
       const result = await window.ame.commitAgentPrompt(projectID, sessionID, value.trim(), mode)
+      if (draftRevisions.get(projectID) === draftRevision) drafts.delete(projectID)
       notify(); callbacks.current.onActivity()
       if (!mounted.current || request !== epoch.current) return
       setSession(result.session); currentSession.current = result.session.id; setModel(result.model); setDisabledSessionModel(false)

@@ -28,7 +28,7 @@ test('loopback tunnel gateway forwards client auth without injecting master cred
   const seen: { url?: string; authorization?: string }[] = []
   const upstream = createServer((req, res) => {
     seen.push({ url: req.url, authorization: req.headers.authorization })
-    if (req.url === '/stream') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('data: ready\n\n'); return }
+    if (req.url === '/api/event') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('data: ready\n\n'); return }
     if (req.url === '/api/pair' && req.headers.authorization === 'Basic master') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ code: 'native_code', expires_in: 300 })); return }
     res.writeHead(req.headers.authorization === 'Basic client' ? 200 : 401)
     req.pipe(res)
@@ -52,20 +52,20 @@ test('loopback tunnel gateway forwards client auth without injecting master cred
     await host.configure(settings)
     assert.equal((await fetch(`${url}/api/info`)).status, 401)
     assert.equal(seen.at(-1)?.authorization, undefined)
-    const response = await fetch(`${url}/echo?key=value`, { method: 'POST', headers: { authorization: 'Basic client' }, body: 'body' })
+    const response = await fetch(`${url}/api/session/s1/prompt?key=value`, { method: 'POST', headers: { authorization: 'Basic client' }, body: 'body' })
     assert.equal(response.status, 200); assert.equal(await response.text(), 'body')
-    assert.deepEqual(seen.at(-1), { url: '/echo?key=value', authorization: 'Basic client' })
+    assert.deepEqual(seen.at(-1), { url: '/api/session/s1/prompt?key=value', authorization: 'Basic client' })
     const code = await host.issue()
     assert.equal(JSON.parse(code.qr).code, 'native_code')
     assert.ok(code.expiresAt > Date.now() + 290000)
     assert.equal(seen.at(-1)?.authorization, 'Basic master', 'only code creation uses the private endpoint directly')
     const controller = new AbortController()
-    const stream = await fetch(`${url}/stream`, { signal: controller.signal })
+    const stream = await fetch(`${url}/api/event`, { signal: controller.signal })
     const reader = stream.body!.getReader()
     assert.equal(new TextDecoder().decode((await reader.read()).value), 'data: ready\n\n')
     controller.abort(); await reader.cancel().catch(() => {})
     await new Promise<void>((resolve, reject) => {
-      const req = request(`${url}/socket`, { headers: { connection: 'Upgrade', upgrade: 'test' } })
+      const req = request(`${url}/api/event`, { headers: { connection: 'Upgrade', upgrade: 'test' } })
       req.on('upgrade', (_, socket) => { socket.on('error', reject); socket.once('data', data => { assert.equal(data.toString(), 'ping'); socket.destroy(); resolve() }); socket.write('ping') })
       req.on('error', reject); req.end()
     })
@@ -131,6 +131,34 @@ test('permanent store hashes credentials, sanitizes public metadata, serializes 
     await restored.revokeAll()
     const empty = new PairingDeviceStore(file); await empty.ready()
     assert.deepEqual(empty.list(), [])
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('failed revocation and concurrent creation remain consistent in memory and on disk', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'ame-pairing-'))
+  const file = path.join(directory, 'devices.json')
+  const store = new PairingDeviceStore(file)
+  try {
+    const first = await store.create('First')
+    const original = (store as any).persist.bind(store)
+    let entered!: () => void, release!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let fail = true
+    const mock = t.mock.method(store as any, 'persist', async () => {
+      if (fail) { fail = false; entered(); await gate; throw new Error('disk failed') }
+      return original()
+    })
+    const revoked = assert.rejects(store.revoke(first.device.id), /disk failed/)
+    await started
+    const creating = store.create('Second')
+    release(); await revoked
+    const second = await creating
+    mock.mock.restore()
+    assert.ok(store.authenticate(first.token)); assert.ok(store.authenticate(second.token))
+    await store.flush()
+    const restored = new PairingDeviceStore(file); await restored.ready()
+    assert.ok(restored.authenticate(first.token)); assert.ok(restored.authenticate(second.token))
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -231,11 +259,11 @@ test('permanent gateway persists credentials across complete restart and master 
     assert.equal(seen.length, 0)
     const blocked = await fetch(`${base}/api/pair`, { method: 'POST' })
     assert.equal(blocked.status, 403)
-    assert.deepEqual(await blocked.json(), { message: 'Remote pairing code creation is disabled' })
+    assert.deepEqual(await blocked.json(), { message: 'Remote admin/pairing route is disabled' })
     const code = await host.issue()
     assert.match(JSON.parse(code.qr).code, /^[A-Za-z0-9_-]{32}$/)
     const connectPath = new URL(code.url).pathname
-    const response = await fetch(base + connectPath, { headers: { 'user-agent': 'OpenCode Android' } })
+    const response = await fetch(base + connectPath, { method: 'POST', headers: { 'user-agent': 'OpenCode Android' } })
     assert.equal(response.status, 200)
     assert.equal(response.headers.get('cache-control'), 'no-store')
     const { token } = await response.json() as { token: string }
@@ -249,44 +277,69 @@ test('permanent gateway persists credentials across complete restart and master 
     assert.equal(await htmlReplay.text(), 'Liên kết ghép nối đã hết hạn hoặc đã được sử dụng.')
     assert.equal(host.status().devices?.[0].label, 'OpenCode Android')
     const auth = `Basic ${Buffer.from(`opencode:${token}`).toString('base64')}`
-    let result = await fetch(`${base}/echo?auth_token=${encodeURIComponent(auth.slice(6))}&keep=1`, { headers: { authorization: 'Basic bad', cookie: 'opencode_session=old; opencode_session_8443=bad; app=keep' } })
+    for (const route of ['/api/config', '/api/credential', '/api/pty', '/api/session/s1/shell', '/api/session/s1/environment', '/api/rpc', '/api/rpc/', '/api/rpc/amekit-models/update', '/api/rpc/amekit-models/status', '/api//rpc/amekit-models/update', '/api/%72pc/amekit-models/update', '/api%5crpc/amekit-models/update', '/api/pair/']) {
+      for (const method of route.includes('pair') ? ['POST'] : ['GET', 'POST', 'PUT', 'DELETE']) {
+        const denied = await fetch(base + route, { method, headers: { authorization: auth } })
+        assert.equal(denied.status, 403, `${method} ${route}`)
+        assert.equal(denied.headers.get('cache-control'), 'no-store')
+        assert.deepEqual(await denied.json(), { message: 'Remote admin/pairing route is disabled' })
+      }
+    }
+    assert.equal((await fetch(`${base}/api/%zz`, { headers: { authorization: auth } })).status, 400)
+    for (const [route, status] of [['/api/config', 403], ['/api/credential', 403], ['/api/pty', 403], ['/api/rpc/amekit-models', 403], ['/api/%72pc/amekit-models', 403], ['/api/%zz', 400]] as const) {
+      await new Promise<void>((resolve, reject) => {
+        const req = request(base + route, { headers: { authorization: auth, connection: 'Upgrade', upgrade: 'websocket' } }, res => {
+          assert.equal(res.statusCode, status)
+          assert.equal(res.statusMessage, status === 403 ? 'Forbidden' : 'Bad Request')
+          res.resume(); resolve()
+        })
+        req.on('error', reject); req.end()
+      })
+    }
+    assert.equal(seen.length, 0, 'blocked routes must not reach the private upstream')
+    assert.equal((await fetch(`${base}/api/info?auth_token=${encodeURIComponent(auth.slice(6))}`, { headers: { authorization: auth } })).status, 401)
+    let result = await fetch(`${base}/api/info?keep=1`, { headers: { authorization: `Bearer ${token}`, cookie: 'opencode_session=old; opencode_session_8443=bad; app=keep' } })
     assert.equal(result.status, 200)
-    assert.equal(seen.at(-1)?.url, '/echo?keep=1')
+    assert.equal(seen.at(-1)?.url, '/api/info?keep=1')
     assert.equal(seen.at(-1)?.headers.authorization, 'Basic master-first')
     assert.equal(seen.at(-1)?.headers.cookie, 'app=keep')
     assert.equal(result.headers.get('set-cookie'), 'app=safe')
     const browserCode = await host.issue()
+    for (const headers of [{ 'user-agent': 'Mozilla Safari', }, ...['Slackbot', 'WhatsApp', 'TelegramBot', 'Discordbot', 'Twitterbot', 'facebookexternalhit', 'LinkedInBot', 'bot', 'crawler', 'preview'].map(ua => ({ 'user-agent': ua }))]) {
+      const probe = await fetch(base + new URL(browserCode.url).pathname, { method: headers['user-agent'] === 'Mozilla Safari' ? 'HEAD' : 'GET', headers })
+      assert.equal(probe.status, 405)
+    }
     result = await fetch(base + new URL(browserCode.url).pathname, { headers: { accept: 'text/html' }, redirect: 'manual' })
     assert.equal(result.status, 302)
     assert.equal(result.headers.get('location'), '/')
     const cookie = result.headers.get('set-cookie')!
     assert.ok(cookie.startsWith(`opencode_session_${host.status().port}=`))
-    for (const flag of ['HttpOnly', 'SameSite=Lax', 'Secure', 'Max-Age=']) assert.ok(cookie.includes(flag))
+    for (const flag of ['HttpOnly', 'SameSite=Lax', 'Secure', 'Max-Age=2592000']) assert.ok(cookie.includes(flag))
     const cookieHeader = cookie.split(';')[0]
-    assert.equal((await fetch(`${base}/cookie`, { headers: { cookie: cookieHeader } })).status, 200)
-    assert.equal((await fetch(`${base}/cookie`, { headers: { cookie: cookieHeader, origin: base } })).status, 200)
-    assert.equal((await fetch(`${base}/cookie`, { headers: { cookie: cookieHeader, origin: settings.publicURL } })).status, 401)
-    assert.equal((await fetch(`${base}/cookie`, { headers: { cookie: cookieHeader, origin: '' } })).status, 401)
-    assert.equal((await fetch(`${base}/cookie`, { headers: { cookie: cookieHeader, origin: 'https://evil.example.com' } })).status, 401)
-    assert.equal((await fetch(`${base}/cookie`, { headers: { cookie: cookieHeader, origin: 'null' } })).status, 401)
-    assert.equal((await fetch(`${base}/header`, { headers: { authorization: auth } })).status, 200)
-    assert.equal((await fetch(`${base}/fallback?auth_token=invalid`, { headers: { authorization: auth } })).status, 200)
-    assert.equal((await fetch(`${base}/fallback`, { headers: { authorization: 'Basic invalid', cookie: cookieHeader } })).status, 200)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { cookie: cookieHeader } })).status, 200)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { cookie: cookieHeader, origin: base } })).status, 200)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { cookie: cookieHeader, origin: settings.publicURL } })).status, 401)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { cookie: cookieHeader, origin: '' } })).status, 401)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { cookie: cookieHeader, origin: 'https://evil.example.com' } })).status, 401)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { cookie: cookieHeader, origin: 'null' } })).status, 401)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { authorization: auth } })).status, 200)
+    assert.equal((await fetch(`${base}/api/info?auth_token=invalid`, { headers: { authorization: auth } })).status, 401)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { authorization: 'Basic invalid', cookie: cookieHeader } })).status, 200)
     await host.stop()
     endpoint = { ...endpoint, headers: { authorization: 'Basic master-rotated' } }
     host = new PairingHost(() => endpoint, new PairingDeviceStore(file))
     await host.configure(settings)
     base = `http://127.0.0.1:${host.status().port}`
     assert.equal(host.status().devices?.length, 2)
-    assert.equal((await fetch(`${base}/restart`, { headers: { authorization: auth, connection: 'close' } })).status, 200)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { authorization: auth, connection: 'close' } })).status, 200)
     assert.equal(seen.at(-1)?.headers.authorization, 'Basic master-rotated')
     await host.revokeDevice(host.status().devices!.find(device => device.label.includes('OpenCode'))!.id)
     await new Promise(resolve => setTimeout(resolve, 20))
-    assert.equal((await fetch(`${base}/restart`, { headers: { authorization: auth, connection: 'close' } })).status, 401)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { authorization: auth, connection: 'close' } })).status, 401)
     await host.revokeAll()
     assert.deepEqual(host.status().devices, [])
     await new Promise(resolve => setTimeout(resolve, 20))
-    assert.equal((await fetch(`${base}/cookie`, { headers: { cookie: cookieHeader } })).status, 401)
+    assert.equal((await fetch(`${base}/api/info`, { headers: { cookie: cookieHeader } })).status, 401)
   } finally { await host.stop(); await new Promise<void>(resolve => upstream.close(() => resolve())); await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -315,14 +368,14 @@ test('gateway codes are bounded, expire, and are invalidated by revokeAll and st
   } finally { Date.now = realNow; await host.stop(); await rm(directory, { recursive: true, force: true }) }
 })
 
-test('device and global revocation close HTTP streams and both sides of authenticated websocket upgrades', { timeout: 15000 }, async () => {
+test('device and global revocation close HTTP streams and both sides of authenticated websocket upgrades', { timeout: 15000 }, async t => {
   const directory = await mkdtemp(path.join(tmpdir(), 'ame-pairing-'))
   const file = path.join(directory, 'devices.json')
   const remoteSockets = new Set<import('node:net').Socket>()
   const upstream = createServer((req, res) => { res.writeHead(200); res.write('stream') })
   upstream.on('connection', socket => { remoteSockets.add(socket); socket.on('error', () => {}); socket.on('close', () => remoteSockets.delete(socket)) })
   upstream.on('upgrade', (req, socket) => {
-    assert.equal(req.url, '/socket')
+    assert.equal(req.url, '/api/event')
     assert.equal(req.headers.authorization, 'Basic master')
     assert.equal(req.headers.cookie, 'app=keep')
     socket.on('error', () => {}); socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\nSet-Cookie: opencode_session=secret\r\n\r\n'); socket.pipe(socket)
@@ -335,26 +388,31 @@ test('device and global revocation close HTTP streams and both sides of authenti
     const base = `http://127.0.0.1:${host.status().port}`
     const first = await store.create('First'), second = await store.create('Second')
     assert.equal(await new Promise<number>((resolve, reject) => {
-      const req = request(`${base}/socket`, { headers: { connection: 'Upgrade', upgrade: 'test' } })
+      const req = request(`${base}/api/event`, { headers: { connection: 'Upgrade', upgrade: 'test' } })
       req.on('response', res => { resolve(res.statusCode!); res.resume() }); req.on('error', reject); req.end()
     }), 401)
     const auth = (token: string) => `Basic ${Buffer.from(`opencode:${token}`).toString('base64')}`
     const open = (token: string) => new Promise<import('node:net').Socket>((resolve, reject) => {
-      const req = request(`${base}/socket?auth_token=${encodeURIComponent(auth(token).slice(6))}`, { headers: { connection: 'Upgrade', upgrade: 'test', authorization: 'Basic client-secret', cookie: 'opencode_session=private; opencode_session_123=private; app=keep' } })
+      const req = request(`${base}/api/event?auth_token=${encodeURIComponent(auth(token).slice(6))}`, { headers: { connection: 'Upgrade', upgrade: 'test', authorization: 'Basic client-secret', cookie: 'opencode_session=private; opencode_session_123=private; app=keep' } })
       req.on('error', reject)
       req.on('upgrade', (res, socket) => { assert.equal(res.headers['set-cookie'], undefined); socket.on('error', () => {}); resolve(socket) })
       req.end()
     })
     const firstSocket = await open(first.token), secondSocket = await open(second.token)
-    const stream = await fetch(`${base}/stream`, { headers: { authorization: auth(first.token) } })
+    const stream = await fetch(`${base}/api/event`, { headers: { authorization: auth(first.token) } })
     const reader = stream.body!.getReader(); await reader.read()
     const firstClosed = once(firstSocket, 'close')
-    await host.revokeDevice(first.device.id)
+    const persist = t.mock.method(store as any, 'persist', async () => { throw new Error('disk failed') })
+    await assert.rejects(host.revokeDevice(first.device.id), /disk failed/)
     await firstClosed
     await assert.rejects(reader.read())
+    assert.ok(store.authenticate(first.token), 'failed durable revoke rolls back credentials')
     assert.equal(secondSocket.destroyed, false)
     const secondClosed = once(secondSocket, 'close')
-    await host.revokeAll(); await secondClosed
+    await assert.rejects(host.revokeAll(), /disk failed/); await secondClosed
+    assert.equal(store.list().length, 2, 'failed global revoke rolls back all credentials')
+    persist.mock.restore()
+    await host.revokeAll()
     assert.deepEqual(store.list(), [])
     await new Promise(resolve => setTimeout(resolve, 30))
     assert.equal(remoteSockets.size, 0)

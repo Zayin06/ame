@@ -172,16 +172,18 @@ test('AME children and grandchildren are guarded regardless of current agent', a
   assert.equal(await standalone.isAmeWorkSession('third-agent', 'child'), false)
 })
 
-test('missing/failed ancestry fails closed for current members without caching catalog decisions', async () => {
+test('missing/failed ancestry fails closed for any active catalog without caching decisions', async () => {
   for (const fails of [false, true]) {
     let catalog = { agents: ['third-agent'], skills: [] as string[] }
     const guard = createManagedCatalogGuard({ getCatalog: () => catalog, getSession: async () => { if (fails) throw Error('lookup'); return undefined }, listAgents: async () => available })
-    const identity = { agent: 'third-agent', sessionID: 'unknown' }
+    const identity = { agent: 'unlisted-agent', sessionID: 'unknown' }
     await assert.rejects(guard.assertBeforeExecute(execute('skill', { id: 'unmanaged' }, identity)), forbiddenSkill('unmanaged'))
     catalog = { agents: [], skills: [] }
     await guard.assertBeforeExecute(execute('skill', { id: 'unmanaged' }, identity))
     catalog = { agents: ['third-agent'], skills: [] }
     await assert.rejects(guard.assertBeforeExecute(execute('skill', { id: 'unmanaged' }, identity)), forbiddenSkill('unmanaged'))
+    catalog = { agents: [], skills: ['first-skill'] }
+    await assert.rejects(guard.assertBeforeExecute(execute('subagent', { agent: 'explore' }, identity)), forbiddenAgent('explore'))
   }
 })
 
@@ -205,6 +207,9 @@ test('session facts cache is bounded to 500 and ancestry to six ancestors, with 
   const deep = createManagedCatalogGuard({ getCatalog: () => active, getSession: async id => { count++; return { agent: 'build', parentID: String(Number(id) + 1) } }, listAgents: async () => available })
   assert.equal(await deep.isAmeWorkSession('third-agent', '0'), true)
   assert.equal(count, 7)
+  assert.equal(await deep.isAmeWorkSession('unlisted-agent', '0'), true)
+  const emptyDeep = createManagedCatalogGuard({ getCatalog: () => EMPTY_MANAGED_CATALOG, getSession: async id => ({ parentID: id + 'x' }), listAgents: async () => available })
+  assert.equal(await emptyDeep.isAmeWorkSession('unlisted-agent', '0'), false)
   const sixth = createManagedCatalogGuard({ getCatalog: () => active, getSession: async id => ({ agent: id === '6' ? root.agent : 'build', parentID: String(Number(id) + 1) }), listAgents: async () => available })
   assert.equal(await sixth.isAmeWorkSession('build', '0'), true)
   const cycle = createManagedCatalogGuard({ getCatalog: () => active, getSession: async id => ({ parentID: id }), listAgents: async () => available })

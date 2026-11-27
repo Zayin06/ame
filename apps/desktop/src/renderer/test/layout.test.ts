@@ -82,6 +82,8 @@ test('file invalidation reloads clean buffers but preserves dirty edits with con
   assert.equal(conflict.content, 'before')
   assert.equal(conflict.revision, 'r1')
   assert.equal(conflict.conflict, true)
+  assert.equal(conflict.diskRevision, 'r2')
+  assert.equal(conflict.diskContent, 'external')
   assert.equal(reconcileDocument(edited, { ...incoming, revision: 'r1' }), edited)
 })
 test('save completion preserves keystrokes typed while save was in flight', () => {
@@ -125,6 +127,24 @@ test('dirty markers cover active and inactive file tabs but never diff or other 
   for (const path of ['a.ts', 'b.ts']) assert.equal(tabIsDirty({ path, mode: 'diff' }, paths), false)
   for (const path of ['clean.ts', 'other.ts']) assert.equal(tabIsDirty({ path, mode: 'file' }, paths), false)
   assert.equal(projectDirtyPaths(buffers).size, 0)
+})
+test('matching disk edits clear conflicts and retain the incoming revision', () => {
+  const edited = { ...clean, text: 'my edits', conflict: true, diskRevision: 'r2', diskContent: 'external' }
+  const matched = reconcileDocument(edited, { path: clean.path, content: 'my edits', revision: 'r3' })
+  assert.equal(matched.conflict, false)
+  assert.equal(matched.revision, 'r3')
+  assert.equal(dirty(matched), false)
+  assert.equal(matched.diskRevision, undefined)
+  assert.equal(matched.diskContent, undefined)
+  const conflict = reconcileDocument(edited, { path: clean.path, content: 'new external', revision: 'r4' })
+  assert.equal(conflict.revision, clean.revision)
+  assert.equal(conflict.content, clean.content)
+  assert.equal(conflict.text, edited.text)
+  assert.equal(conflict.diskRevision, 'r4')
+  assert.equal(conflict.diskContent, 'new external')
+  const cleanConflict = reconcileDocument({ ...clean, conflict: true, diskRevision: 'r2' }, clean)
+  assert.equal(cleanConflict.conflict, false)
+  assert.equal(cleanConflict.diskRevision, undefined)
 })
 test('project removal clears only its preferences, sessions, buffers and diffs and chooses fallback', () => {
   const preferences = { ...defaults(), project: 'one', projects: { one: { tabs: [] }, two: { tabs: [] } } }

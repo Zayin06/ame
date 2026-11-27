@@ -8,12 +8,14 @@ import { promisify } from 'node:util'
 import { validateWorkspacePath } from './workspace-fs'
 import { isMainThread } from 'node:worker_threads'
 import { SearchWorker } from './search-worker-client'
+import { saveFileSafely } from './file-save'
 
 export type { SearchQuery, SearchMatch, SearchResponse } from '../../protocol/src/index'
 type SearchOptions = { signal?: AbortSignal; forceEngine?: 'ripgrep' | 'node'; rgPath?: string; timeoutMs?: number }
 type IgnoreRule = { base: string; pattern: RegExp; directory: boolean; negate: boolean }
 const skipped = new Set(['.git', 'node_modules', 'dist', 'out', '.next'])
 const maxBytes = 2 * 1024 * 1024
+const decoder = new TextDecoder('utf-8', { fatal: true })
 const execute = promisify(execFile)
 
 export function findRipgrep(env: NodeJS.ProcessEnv = process.env, exists: (p: string) => boolean = existsSync): string | null {
@@ -124,8 +126,9 @@ async function* textFiles(root: string, query: SearchQuery, signal?: AbortSignal
       const file = await validateWorkspacePath(root, relative)
       const handle = await open(file.target, 'r')
       try {
-        if (!(await handle.stat()).isFile() || (await handle.stat()).size > maxBytes) continue
-        const bytes = Buffer.alloc(maxBytes + 1)
+        const info = await handle.stat()
+        if (!info.isFile() || info.size > maxBytes) continue
+        const bytes = Buffer.allocUnsafe(Math.min(info.size + 1, maxBytes + 1))
         let size = 0
         while (size < bytes.length) {
           abort(signal)
@@ -135,7 +138,7 @@ async function* textFiles(root: string, query: SearchQuery, signal?: AbortSignal
         }
         if (size > maxBytes || bytes.subarray(0, size).includes(0)) continue
         let content: string
-        try { content = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size)) } catch { continue }
+        try { content = decoder.decode(bytes.subarray(0, size)) } catch { continue }
         abort(signal)
         yield { path: relative, content, revision: revision(bytes.subarray(0, size)), bom: size >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf }
       } finally { await handle.close() }
@@ -200,7 +203,7 @@ export async function searchWorkspace(root: string, query: SearchQuery, options:
 
 const revision = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
 
-export async function replaceInWorkspace(root: string, options: ReplaceOptions, plan?: ReplacePreview[]): Promise<ReplaceResult> {
+export async function replaceInWorkspace(root: string, options: ReplaceOptions, plan?: ReplacePreview[], withFileLock?: (file: string, operation: () => Promise<void>) => Promise<void>): Promise<ReplaceResult> {
   const { rootReal } = await validateWorkspacePath(root, '', { allowRoot: true })
   let allowlist: Set<string> | undefined
   if (options.files && !plan) {
@@ -220,33 +223,37 @@ export async function replaceInWorkspace(root: string, options: ReplaceOptions, 
       // No discovery here: only the exact files and per-file replacement counts approved in preview.
       for (const [entryIndex, entry] of plan.entries()) {
         try {
-          const checked = await validateWorkspacePath(rootReal, entry.path)
-          const handle = await open(checked.target, 'r+')
-          try {
-            const before = await handle.readFile()
-            if (revision(before) !== entry.revision) { result.conflicts.push(entry.path); continue }
+          const write = async () => {
+            const checked = await validateWorkspacePath(rootReal, entry.path)
+            const handle = await open(checked.target, 'r+')
+            let before: Buffer
+            let openedFile: { dev: bigint; ino: bigint }
+            try {
+              before = await handle.readFile()
+              openedFile = await handle.stat({ bigint: true })
+            } finally { await handle.close() }
+            if (revision(before) !== entry.revision) { result.conflicts.push(entry.path); return }
             const changed = isMainThread && options.regex
               ? await (worker ??= new SearchWorker()).run<{ after: string; count: number }>({ kind: 'replacement', content: before.toString('utf8'), options, maximum: entry.count })
               : replacementText(before.toString('utf8'), options, entry.count)
-            const current = await readFile(checked.target)
-            const openedFile = await handle.stat({ bigint: true }), currentFile = await stat(checked.target, { bigint: true })
-            // An atomic save can replace a file with identical bytes while this handle still
-            // points at the old inode. Never report a successful write to that detached file.
-            if (revision(current) !== entry.revision || openedFile.dev !== currentFile.dev || openedFile.ino !== currentFile.ino) { result.conflicts.push(entry.path); continue }
-            const bytes = Buffer.from(changed.after, 'utf8')
-            let offset = 0
-            while (offset < bytes.length) {
-              const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, offset)
-              if (!bytesWritten) throw new Error('WRITE_FAILED')
-              offset += bytesWritten
+            const verify = async () => {
+              const validated = await validateWorkspacePath(rootReal, entry.path)
+              const current = await readFile(validated.target)
+              const currentFile = await stat(checked.target, { bigint: true })
+              // Identical bytes on a new inode still invalidate the approved handle.
+              if (validated.target !== checked.target || revision(current) !== entry.revision || openedFile.dev !== currentFile.dev || openedFile.ino !== currentFile.ino) throw Object.assign(new Error('FILE_CONFLICT'), { code: 'FILE_CONFLICT' })
             }
-            await handle.truncate(bytes.length)
+            const bytes = Buffer.from(changed.after, 'utf8')
+            await saveFileSafely(checked.target, bytes, before, verify)
             result.filesChanged++
             result.replacements += changed.count
             result.writtenFiles.push(entry.path)
             result.previews.push(entry)
-          } finally { await handle.close() }
+          }
+          if (withFileLock) await withFileLock(entry.path, write)
+          else await write()
         } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'FILE_CONFLICT') { result.conflicts.push(entry.path); continue }
           result.errors.push({ path: entry.path, code: (error as NodeJS.ErrnoException).code ?? 'WRITE_FAILED' })
           if (error instanceof Error && /SEARCH_(?:TIMEOUT|WORKER)/.test(error.message)) {
             for (const pending of plan.slice(entryIndex + 1)) result.errors.push({ path: pending.path, code: 'REPLACE_ABORTED' })
@@ -259,7 +266,7 @@ export async function replaceInWorkspace(root: string, options: ReplaceOptions, 
   }
   if (!options.dryRun) {
     const preview = await replaceInWorkspace(rootReal, { ...options, dryRun: true })
-    return replaceInWorkspace(rootReal, options, preview.previews)
+    return replaceInWorkspace(rootReal, options, preview.previews, withFileLock)
   }
   if (!options.query) return result
   matcher(options) // Validate before scanning, including an empty workspace.

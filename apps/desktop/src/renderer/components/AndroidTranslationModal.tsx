@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AndroidTranslationInfo, ChatItem, Model, Permission, Session } from '../../../../../packages/protocol/src/index'
 import { extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
 import type { SessionForm } from '../../../../../packages/protocol/src/index'
@@ -16,6 +16,10 @@ const updatePrompt = 'Chạy chế độ Update: quét key mới/thay đổi tro
 const fullPrompt = 'Dịch toàn bộ strings.xml sang ngôn ngữ mới: [nhập mã locale, ví dụ: ja, ko, fr]\nGhi chú giọng văn / ngữ cảnh (nếu có): '
 const scanPrompt = 'Chạy strings_tool.py scan và pending để báo cáo tình trạng các locale trong dự án (chỉ báo cáo, chưa sửa file).'
 const notifyTranslation = () => window.dispatchEvent(new Event('ame-translation-changed'))
+const drafts = new Map<string, string>()
+const draftRevisions = new Map<string, number>()
+const draftModes = new Map<string, 'update' | 'full' | 'scan' | 'custom'>()
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
 type Props = {
   projectID: string
@@ -37,8 +41,10 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
   const [messages, setMessages] = useState<ChatItem[]>([])
   const [permissions, setPermissions] = useState<Permission[]>([])
   const [forms, setForms] = useState<SessionForm[]>([])
-  const [text, setText] = useState('')
-  const [mode, setMode] = useState<'update' | 'full' | 'scan' | 'custom'>('custom')
+  const [text, updateText] = useState(() => drafts.get(projectID) ?? '')
+  const setText = (value: string) => { draftRevisions.set(projectID, (draftRevisions.get(projectID) ?? 0) + 1); if (value) drafts.set(projectID, value); else { drafts.delete(projectID); draftModes.delete(projectID) } if (!value.trim()) setMode('incremental'); updateText(value) }
+  const [mode, updateMode] = useState<'incremental' | 'update' | 'full' | 'scan' | 'custom'>(() => draftModes.get(projectID) ?? 'custom')
+  const setMode = (value: typeof mode) => { if (value === 'incremental') draftModes.delete(projectID); else draftModes.set(projectID, value); updateMode(value) }
   const [busy, setBusy] = useState(false)
   const [replying, setReplying] = useState(false)
   const [loaded, setLoaded] = useState(false)
@@ -58,6 +64,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
   const locked = !!sessionID && !!info?.lockedSessionIDs.includes(sessionID)
   const running = session?.status === 'running' || forms.length > 0
   const available = connected && !!info?.configured && !locked && !busy && !running && !forms.length && (!sessionID || loaded)
+  const turns = useMemo(() => projectChatTimeline(messages, { running, mode: timelineDetail, pendingForms: forms.length > 0 }), [messages, running, timelineDetail, forms.length])
 
   useEffect(() => {
     mounted.current = true
@@ -113,14 +120,14 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
       try {
         const [items, pending, sessions, pendingForms] = await Promise.allSettled([window.ame.messages(projectID, sessionID), window.ame.permissions(projectID, sessionID), window.ame.sessions(projectID), window.ame.forms(projectID, sessionID)])
         if (alive) {
-          if (items.status === 'fulfilled') setMessages(items.value)
-          if (pending.status === 'fulfilled') setPermissions(pending.value)
-          if (pendingForms.status === 'fulfilled') setForms(pendingForms.value)
+          if (items.status === 'fulfilled') setMessages(current => same(current, items.value) ? current : items.value)
+          if (pending.status === 'fulfilled') setPermissions(current => same(current, pending.value) ? current : pending.value)
+          if (pendingForms.status === 'fulfilled') setForms(current => same(current, pendingForms.value) ? current : pendingForms.value)
           setLoaded(true)
           const failed = [items, pending, sessions, pendingForms].find(result => result.status === 'rejected')
           if (failed?.status === 'rejected') setError(`Không tải được một phần dữ liệu phiên dịch: ${errorText(failed.reason)}`)
           const latest = sessions.status === 'fulfilled' ? sessions.value.find(item => item.id === sessionID) : undefined
-          if (latest) setSession(latest)
+          if (latest) setSession(current => same(current, latest) ? current : latest)
         }
       } catch (e) { if (alive) { setError(errorText(e)); setLoaded(true) } }
       finally { loading = false; if (alive && queued) { queued = false; void load() } }
@@ -159,8 +166,10 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
     if (!available || !value.trim() || operation.current) return
     operation.current = true; setBusy(true); setError('')
     const request = epoch.current
+    const draftRevision = draftRevisions.get(projectID)
     try {
-      const result = await window.ame.androidTranslationPrompt(projectID, sessionID, value.trim(), preset)
+      const result = await window.ame.androidTranslationPrompt(projectID, sessionID, value.trim(), preset === 'incremental' ? 'custom' : preset)
+      if (draftRevisions.get(projectID) === draftRevision) { drafts.delete(projectID); draftModes.delete(projectID) }
       notifyTranslation(); callbacks.current.onActivity()
       if (!mounted.current || request !== epoch.current) return
       setSession(result.session); currentSession.current = result.session.id; setPinnedModel(result.model); setDisabledSessionModel(false)
@@ -217,7 +226,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
       {disabledSessionModel && <div className="warning" role="status">Model trước đó của phiên đã bị vô hiệu hóa từ API. Lượt tiếp theo sẽ tự động dùng model đang hoạt động: {info?.effectiveModelName || info?.effectiveModelID}.</div>}
       {error && <div className="inline-error" role="alert">{formatAmeKitError(error).title}{formatAmeKitError(error).detail && <p>{formatAmeKitError(error).detail}</p>}</div>}
       <div ref={stream} className="chat-stream translation-modal__timeline" onScroll={event => { const el = event.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
-        {!info ? <p role="status">Đang tải cấu hình dịch…</p> : sessionID && !loaded ? <p role="status">Đang tải phiên dịch…</p> : !messages.length && !locked ? <div className="translation-presets"><h3>Chỉ dịch Android Strings</h3><p>Chỉ bản địa hóa res/values*/strings.xml và i18n/translation-context.md. Dùng Chat chính cho yêu cầu lập trình khác.</p><div className="translation-presets__grid"><button type="button" disabled={!available} onClick={() => void send(updatePrompt, 'update')}><strong>Cập nhật string mới (Update)</strong><span>Đồng bộ key mới và thay đổi với các locale hiện có.</span></button><button type="button" disabled={!available} onClick={() => { setText(fullPrompt); setMode('full'); input.current?.focus() }}><strong>Thêm ngôn ngữ mới (Full)</strong><span>Chọn mã locale và ngữ cảnh trước khi gửi.</span></button><button type="button" disabled={!available} onClick={() => void send(scanPrompt, 'scan')}><strong>Quét key thiếu / lỗi (Scan)</strong><span>Chỉ báo cáo, chưa sửa tệp.</span></button></div></div> : projectChatTimeline(messages, { running, mode: timelineDetail, pendingForms: forms.length > 0 }).map(turn => <section key={turn.id} className="chat-turn">
+        {!info ? <p role="status">Đang tải cấu hình dịch…</p> : sessionID && !loaded ? <p role="status">Đang tải phiên dịch…</p> : !messages.length && !locked ? <div className="translation-presets"><h3>Chỉ dịch Android Strings</h3><p>Chỉ bản địa hóa res/values*/strings.xml và i18n/translation-context.md. Dùng Chat chính cho yêu cầu lập trình khác.</p><div className="translation-presets__grid"><button type="button" disabled={!available} onClick={() => void send(updatePrompt, 'update')}><strong>Cập nhật string mới (Update)</strong><span>Đồng bộ key mới và thay đổi với các locale hiện có.</span></button><button type="button" disabled={!available} onClick={() => { setText(fullPrompt); setMode('full'); input.current?.focus() }}><strong>Thêm ngôn ngữ mới (Full)</strong><span>Chọn mã locale và ngữ cảnh trước khi gửi.</span></button><button type="button" disabled={!available} onClick={() => void send(scanPrompt, 'scan')}><strong>Quét key thiếu / lỗi (Scan)</strong><span>Chỉ báo cáo, chưa sửa tệp.</span></button></div></div> : turns.map(turn => <section key={turn.id} className="chat-turn">
           {turn.user && <article className="msg-user"><MessageContent text={extractUserDisplayText(turn.user.text) || '…'} onOpenFile={onOpenFile} /></article>}
           <div className="msg-turn-body">{turn.blocks.map(block => {
             if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
@@ -234,6 +243,7 @@ export function AndroidTranslationModal({ projectID, projectName, projectDirecto
         {!locked && permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying || !connected} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying || !connected} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying || !connected} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
       {locked ? <div className="translation-locked-banner" role="status"><Icon name="lock" /><p>Phiên dịch đã hoàn tất và được khóa vĩnh viễn. Nội dung chỉ đọc.</p><button type="button" disabled={busy || operation.current} onClick={newSession}>Phiên dịch mới</button></div> : <div className="composer-dock translation-composer"><div className="composer-dock__inner">
+        {mode === 'full' && <button type="button" className="amekit-pill" onClick={() => setMode('incremental')}>Full × · Chuyển về dịch bổ sung</button>}
         {!running && messages.length > 0 && (session?.outcome === 'failed' ? <div className="inline-error" role="alert"><p>Lượt dịch gần nhất gặp lỗi và chưa hoàn tất. Hãy xem chi tiết lỗi ở trên hoặc bấm Phiên dịch mới để chạy lại.</p><button type="button" disabled={busy || operation.current} onClick={newSession}>Phiên dịch mới</button></div> : <div className="translation-finish-banner"><p>Đã dịch xong? Hoàn tất để khóa phiên và tránh dùng nhầm model cho việc code.</p><button type="button" className="translation-primary" disabled={finishDisabled} onClick={() => void finish()}>✓ Hoàn tất &amp; đóng</button></div>)}
         <form className="composer-card translation-composer__form" onSubmit={event => { event.preventDefault(); void send() }}><textarea ref={input} className="composer-input translation-composer__input" aria-label="Yêu cầu dịch Android" placeholder="Nhập yêu cầu dịch strings.xml…" rows={3} value={text} disabled={!available} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); void send() } }} /><div className="translation-composer__toolbar"><span>Chỉ Android Strings · Shift+Enter xuống dòng</span><div className="button-row">{running && sessionID && <button type="button" disabled={!connected || busy} onClick={() => { void window.ame.cancel(projectID, sessionID).catch(e => { if (mounted.current && currentSession.current === sessionID) setError(errorText(e)) }).finally(() => { if (mounted.current && currentSession.current === sessionID) setRevision(value => value + 1) }) }}>Dừng phản hồi</button>}<button type="submit" className="translation-primary" disabled={!available || !text.trim()}>Gửi yêu cầu dịch</button></div></div></form>
       </div></div>}

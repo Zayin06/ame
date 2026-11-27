@@ -88,15 +88,8 @@ async function treeRss(pid) {
   try {
     let rows
     if (process.platform === 'win32') {
-      try {
-        const output = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize | ConvertTo-Json -Compress'])
-        rows = [].concat(JSON.parse(output)).map(row => [Number(row.ProcessId), Number(row.ParentProcessId), Number(row.WorkingSetSize)])
-      } catch {
-        const output = await exec('wmic.exe', ['process', 'get', 'ProcessId,ParentProcessId,WorkingSetSize', '/format:csv'])
-        const lines = output.trim().split(/\r?\n/).map(line => line.trim()).filter(Boolean)
-        const header = lines.shift().split(',')
-        rows = lines.map(line => { const values = line.split(','); return ['ProcessId', 'ParentProcessId', 'WorkingSetSize'].map(key => Number(values[header.indexOf(key)])) })
-      }
+      const output = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize | ConvertTo-Json -Compress'])
+      rows = [].concat(JSON.parse(output)).map(row => [Number(row.ProcessId), Number(row.ParentProcessId), Number(row.WorkingSetSize)])
     } else {
       const output = await exec('ps', ['-axo', 'pid=,ppid=,rss='])
       rows = output.trim().split('\n').map(line => { const [id, parent, kib] = line.trim().split(/\s+/).map(Number); return [id, parent, kib * 1024] })

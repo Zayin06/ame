@@ -172,7 +172,7 @@ export function GitWorkspace(props: GitWorkspaceProps) {
   function undo() {
     void run('Hoàn tác commit cuối', async valid => {
       const result = await window.ame.gitUndoLastCommit(projectID)
-      if (valid() && result.message.trim()) onMessageChange(result.message)
+      if (valid() && !message.trim()) onMessageChange(result.message)
     })
   }
 

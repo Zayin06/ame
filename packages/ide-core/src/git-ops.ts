@@ -1,5 +1,6 @@
 import { createReadStream, existsSync } from 'node:fs'
-import { copyFile, lstat, mkdir, mkdtemp, open, readFile, readlink, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { cleanupStaleSaveTemps } from './file-save'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import os from 'node:os'
@@ -8,12 +9,12 @@ import { simpleGit, type SimpleGit } from 'simple-git'
 import { isValidGitCommitHash } from '../../protocol/src/index'
 import type { BuildNotesFileStat, BuildNotesRequest, CommitAgentSnapshot, CommitAgentPlan, CommitAgentExecuteResult, GitBranches, GitCommitDetail, GitCommitFile, GitCommitSummary, GitPushOptions, GitStashEntry, GitSyncResult } from '../../protocol/src/index'
 
-type GitRunOptions = { env?: NodeJS.ProcessEnv; input?: Buffer | string; timeoutMs?: number }
+type GitRunOptions = { env?: NodeJS.ProcessEnv; input?: Buffer | string | ReturnType<typeof createReadStream>; timeoutMs?: number }
 
 // Stream consumers share exit/timeout handling, including quiet hook failures.
 function streamGit(cwd: string, args: string[], options: GitRunOptions, consume: (chunk: Buffer) => boolean | void) {
   return new Promise<{ stderr: string }>((resolve, reject) => {
-    const child = spawn('git', args, { cwd, env: { ...(options.env ?? process.env), GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' }, windowsHide: true })
+    const child = spawn('git', ['-c', 'core.fsmonitor=false', ...args], { cwd, env: { ...(options.env ?? process.env), GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' }, windowsHide: true })
     let stderr = '', stopped = false, timedOut = false
     const timer = setTimeout(() => { timedOut = true; child.kill() }, options.timeoutMs ?? 60_000)
     child.stdout.on('data', (chunk: Buffer) => {
@@ -27,7 +28,12 @@ function streamGit(cwd: string, args: string[], options: GitRunOptions, consume:
       if (timedOut || (!stopped && code !== 0)) reject(new Error(`GIT_COMMAND_FAILED: git ${args[0]} exit ${code}${timedOut ? ' (timeout)' : ''}${stderr ? `: ${stderr.trim()}` : ''}`))
       else resolve({ stderr })
     })
-    child.stdin.end(options.input)
+    if (options.input && typeof options.input !== 'string' && !Buffer.isBuffer(options.input)) {
+      const input = options.input
+      input.on('error', error => { child.kill(); reject(error) })
+      child.on('close', () => input.destroy())
+      input.pipe(child.stdin)
+    } else child.stdin.end(options.input)
   })
 }
 
@@ -40,7 +46,7 @@ async function runGit(cwd: string, args: string[], options: GitRunOptions = {}) 
 async function runGitBounded(cwd: string, args: string[], maxBytes: number, env?: NodeJS.ProcessEnv) {
   const chunks: Buffer[] = []
   let size = 0, truncated = false
-  await streamGit(cwd, args, { env }, chunk => {
+  await streamGit(cwd, [...(await safeReadOnlyGitConfig(cwd)).flatMap(value => ['-c', value]), ...args], { env }, chunk => {
     const part = chunk.subarray(0, maxBytes + 1 - size)
     // Copy only the retained bytes, never keep a reference to a large source chunk.
     chunks.push(Buffer.from(part)); size += part.length
@@ -54,7 +60,7 @@ async function runGitBounded(cwd: string, args: string[], maxBytes: number, env?
 
 async function hashGitStdout(cwd: string, args: string[], env?: NodeJS.ProcessEnv) {
   const hash = createHash('sha256')
-  await streamGit(cwd, args, { env }, chunk => { hash.update(chunk) })
+  await streamGit(cwd, [...(await safeReadOnlyGitConfig(cwd)).flatMap(value => ['-c', value]), ...args], { env }, chunk => { hash.update(chunk) })
   return hash.digest('hex')
 }
 
@@ -74,20 +80,65 @@ async function assertNoActiveGitOperation(rootReal: string, git: SimpleGit) {
   if ((await runGit(rootReal, ['ls-files', '--unmerged', '-z'])).stdout.length) throw new Error('COMMIT_PLAN_REPO_CONFLICT')
 }
 
-async function repository(root: string) {
+export async function safeReadOnlyGitConfig(rootReal: string): Promise<string[]> {
+  const config = ['core.fsmonitor=false', 'diff.external=', 'core.pager=cat', 'core.hooksPath=', 'core.sshCommand=', 'credential.helper=']
+  const pattern = '^(filter\\..*\\.(clean|smudge|process|required)|diff\\..*\\.textconv)$'
+  const query = async (scope: string[]) => (await runGit(rootReal, ['config', ...scope, '--name-only', '--get-regexp', pattern]).catch(error => {
+    if (/exit 1(?::|$)/.test(String(error))) return { stdout: Buffer.alloc(0) }
+    throw error
+  })).stdout
+  // Keep the explicit local audit, and also cover included/global/worktree definitions
+  // that Git's normal effective configuration will otherwise still execute.
+  const stdout = Buffer.concat([await query(['--local']), Buffer.from('\n'), await query(['--includes'])])
+  const filters = new Set<string>()
+  for (const key of stdout.toString('utf8').split(/\r?\n/).filter(Boolean)) {
+    if (/^filter\..*\.(clean|smudge|process|required)$/i.test(key)) filters.add(key.slice(0, key.lastIndexOf('.')))
+    else config.push(`${key}=`)
+  }
+  for (const filter of filters) config.push(`${filter}.clean=`, `${filter}.smudge=`, `${filter}.process=`, `${filter}.required=false`)
+  return config
+}
+
+export async function detectUntrustedGitConfig(root: string): Promise<string[]> {
+  const { rootReal, git } = await repository(root, true)
+  const { stdout } = await runGit(rootReal, ['config', '--local', '--includes', '--name-only', '--get-regexp', '^(core\\.(fsmonitor|hookspath|sshcommand)|credential\\.helper|diff\\.external|diff\\..*\\.textconv|filter\\..*\\.(clean|smudge|process))$']).catch(error => {
+    if (/exit 1(?::|$)/.test(String(error))) return { stdout: Buffer.alloc(0) }
+    throw error
+  })
+  const gitDir = path.resolve(rootReal, (await git.raw(['rev-parse', '--git-common-dir'])).trim())
+  const hooks = await readdir(path.join(gitDir, 'hooks'), { withFileTypes: true }).catch(() => [])
+  return [...new Set([...stdout.toString('utf8').split(/\r?\n/).filter(Boolean), ...hooks.filter(entry => !entry.isDirectory() && !entry.name.endsWith('.sample')).map(entry => `hooks/${entry.name}`)])]
+}
+
+export async function resolveCommitHash(git: SimpleGit, hash: string): Promise<string> {
+  if (!isValidGitCommitHash(hash)) throw new Error('INVALID_COMMIT_HASH')
+  const resolved = (await git.raw(['rev-parse', '--verify', '--end-of-options', `${hash}^{commit}`])).trim()
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(resolved) || !resolved.toLowerCase().startsWith(hash.toLowerCase())) throw new Error('INVALID_COMMIT_HASH')
+  return resolved
+}
+
+async function selectedCommitOrder(git: SimpleGit, selected: Set<string>): Promise<string[]> {
+  const recent = (await git.raw(['rev-list', '--topo-order', '--max-count=2000', 'HEAD', '--'])).trim().split(/\r?\n/)
+  const ordered = recent.filter(hash => selected.has(hash))
+  const remaining = [...selected].filter(hash => !ordered.includes(hash))
+  if (remaining.length) ordered.push(...(await git.raw(['rev-list', '--no-walk=sorted', ...remaining, '--'])).trim().split(/\r?\n/).filter(Boolean))
+  return ordered
+}
+
+async function repository(root: string, readOnly = false) {
   const rootReal = await realpath(root)
   if (!existsSync(path.join(rootReal, '.git'))) throw new Error('GIT_ROOT_REQUIRED')
-  const git = simpleGit(rootReal, { maxConcurrentProcesses: 1, trimmed: false, timeout: { block: 10000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+  const git = simpleGit(rootReal, { maxConcurrentProcesses: 1, trimmed: false, config: readOnly ? await safeReadOnlyGitConfig(rootReal) : ['core.fsmonitor=false'], timeout: { block: 10000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
   return { rootReal, git }
 }
 
 async function remoteRepository(root: string) {
   const { rootReal } = await repository(root)
-  return simpleGit(rootReal, { maxConcurrentProcesses: 1, trimmed: false, timeout: { block: 60000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+  return simpleGit(rootReal, { maxConcurrentProcesses: 1, trimmed: false, config: ['core.fsmonitor=false'], timeout: { block: 60000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
 }
 
 export async function hasRemote(rootOrGit: string | SimpleGit): Promise<boolean> {
-  const git = typeof rootOrGit === 'string' ? (await repository(rootOrGit)).git : rootOrGit
+  const git = typeof rootOrGit === 'string' ? (await repository(rootOrGit, true)).git : rootOrGit
   return (await git.raw(['remote'])).trim().length > 0
 }
 
@@ -101,8 +152,9 @@ export function mapGitNetworkError(error: unknown): Error {
   const details = error && typeof error === 'object' ? error as { stderr?: unknown; message?: unknown } : undefined
   const message = String(details?.stderr || details?.message || error).trim()
   const codes: [RegExp, string][] = [
-    [/authentication failed|could not read username|permission denied|publickey|repository not found/i, 'GIT_AUTH_FAILED'],
+    [/authentication failed|could not read username|permission denied \((?:publickey|keyboard-interactive)\)|publickey|repository not found/i, 'GIT_AUTH_FAILED'],
     [/could not resolve host|connection refused|timed out|failed to connect|network is unreachable/i, 'GIT_OFFLINE'],
+    [/\[remote rejected\]/i, 'GIT_REMOTE_REJECTED'],
     [/non-fast-forward|fetch first|rejected/i, 'GIT_PUSH_REJECTED_NON_FF'],
     [/would be overwritten by merge|local changes|overwritten by checkout/i, 'GIT_DIRTY_WORKTREE'],
     [/conflict/i, 'GIT_CONFLICT']
@@ -117,7 +169,7 @@ function inside(root: string, target: string) {
 }
 
 async function filePath(root: string, relative: string) {
-  if (typeof relative !== 'string' || !relative || relative.includes('\0') || relative.includes(':') || path.posix.isAbsolute(relative) || path.win32.isAbsolute(relative)) throw new Error('INVALID_PATH')
+  if (typeof relative !== 'string' || !relative || relative.includes('\0') || (process.platform === 'win32' && relative.includes(':')) || /^[a-zA-Z]:/.test(relative) || path.posix.isAbsolute(relative) || path.win32.isAbsolute(relative)) throw new Error('INVALID_PATH')
   const parts = relative.split(/[\\/]/)
   if (parts.some(part => part === '..' || part.toLowerCase() === '.git')) throw new Error('INVALID_PATH')
   const target = path.resolve(root, ...parts)
@@ -148,8 +200,9 @@ async function hasHead(git: Awaited<ReturnType<typeof repository>>['git']) {
 }
 
 export async function stageAll(root: string): Promise<void> {
+  await cleanupStaleSaveTemps(root).catch(() => {})
   const { git } = await repository(root)
-  await git.raw(['add', '-A', '--', '.'])
+  await git.raw(['add', '-A', '--', '.', ':(exclude,glob)**/.ame-save-*.tmp', ':(exclude,glob)**/.ame-save-*.bak'])
 }
 
 export async function unstageAll(root: string): Promise<void> {
@@ -179,7 +232,7 @@ export function validateBranchName(name: string): string {
 }
 
 export async function listBranches(root: string): Promise<GitBranches> {
-  const { git } = await repository(root)
+  const { git } = await repository(root, true)
   const current = (await git.raw(['symbolic-ref', '--quiet', '--short', 'HEAD']).catch(() => '')).trim() || '(detached)'
   const refs = await git.raw(['for-each-ref', '--format=%(refname:short)%00%(objectname)%00%(upstream:short)', '--', 'refs/heads/'])
   const branches = refs.trimEnd().split('\n').filter(Boolean).map(line => {
@@ -277,7 +330,7 @@ function parseCommit(record: string): GitCommitSummary {
 }
 
 export async function gitLog(root: string, limit = 40): Promise<GitCommitSummary[]> {
-  const { git } = await repository(root)
+  const { git } = await repository(root, true)
   if (!await hasHead(git)) return []
   const capped = Number.isFinite(limit) ? Math.max(1, Math.min(200, Math.trunc(limit))) : 40
   const output = await git.raw(['log', `-${capped}`, '--date=iso-strict', `--format=${commitFormat}%x1e`])
@@ -297,7 +350,8 @@ async function commitFirstParentDiff(git: SimpleGit, hash: string) {
 
 export async function gitCommitDetail(root: string, hash: string): Promise<GitCommitDetail> {
   if (!isValidGitCommitHash(hash)) throw new Error('INVALID_COMMIT_HASH')
-  const { git } = await repository(root)
+  const { git } = await repository(root, true)
+  hash = await resolveCommitHash(git, hash)
   const summary = parseCommit(await git.raw(['show', '--quiet', '--date=iso-strict', `--format=${commitFormat}`, hash]))
   const { isMerge, treeArgs, revisions, patchArgs } = await commitFirstParentDiff(git, hash)
   const args = [...treeArgs, '-z']
@@ -352,7 +406,7 @@ function stagedPaths(output: string) {
 
 export async function gitCommitPlanSnapshot(root: string, maxDiffBytes = 48_000, options?: { focusFiles?: readonly string[]; includeDiff?: boolean }): Promise<CommitAgentSnapshot & { stat: string; diffPreview: string; truncated: boolean }> {
   if (!Number.isSafeInteger(maxDiffBytes) || maxDiffBytes < 0) throw new Error('INVALID_MAX_BYTES')
-  const { rootReal, git } = await repository(root)
+  const { rootReal, git } = await repository(root, true)
   const hash = (text: string) => createHash('sha256').update(text).digest('hex')
   const head = (await git.raw(['rev-parse', '--verify', '--quiet', 'HEAD']).catch(() => '')).trim() || '(unborn)'
   const branchRef = (await git.raw(['symbolic-ref', '--quiet', 'HEAD']).catch(() => '')).trim() || '(detached)'
@@ -511,9 +565,9 @@ export async function executeCommitPlan(root: string, plan: CommitAgentPlan): Pr
           if (info?.isDirectory() && !approvedIndexMap.has(file)) throw new Error('INVALID_PATH')
           if (info && !info.isDirectory()) {
             if (!info.isFile() && !info.isSymbolicLink()) throw new Error('INVALID_PATH')
-            const bytes = info.isSymbolicLink() ? await readlink(target, { encoding: 'buffer' }) : await readFile(target)
-            if (createHash('sha256').update(bytes).digest('hex') !== approvedDisk.get(file)) throw new Error('COMMIT_PLAN_STALE')
-            const oid = (await runGit(rootReal, info.isSymbolicLink() ? ['hash-object', '-w', '--no-filters', '--stdin'] : ['hash-object', '-w', '--stdin', '--path', file], { input: bytes })).stdout.toString('utf8').trim()
+            if (await hashFileContent(target) !== approvedDisk.get(file)) throw new Error('COMMIT_PLAN_STALE')
+            const input = info.isSymbolicLink() ? await readlink(target, { encoding: 'buffer' }) : createReadStream(target)
+            const oid = (await runGit(rootReal, info.isSymbolicLink() ? ['hash-object', '-w', '--no-filters', '--stdin'] : ['hash-object', '-w', '--stdin', '--path', file], { input })).stdout.toString('utf8').trim()
             entry = { mode: info.isSymbolicLink() ? '120000' : process.platform === 'win32' ? approvedIndexMap.get(file)?.mode ?? '100644' : (info.mode & 0o111) ? '100755' : '100644', oid }
           }
         }
@@ -639,7 +693,7 @@ export async function buildNotesSummary(root: string, request: BuildNotesRequest
   const validHash = isValidGitCommitHash
   if ((request.baseCommit !== undefined && !validHash(request.baseCommit)) || (request.commitHashes?.length ?? 0) > 50 || request.commitHashes?.some(hash => !validHash(hash))) throw invalid()
   if (!Number.isSafeInteger(maxDiffBytes) || maxDiffBytes < 0) throw new Error('INVALID_MAX_BYTES')
-  const { rootReal, git } = await repository(root)
+  const { rootReal, git } = await repository(root, true)
   const headExists = await hasHead(git)
   const branch = (await git.raw(['symbolic-ref', '--quiet', '--short', 'HEAD']).catch(() => '')).trim() || (headExists ? '(detached)' : '(unborn)')
   const commits: GitCommitSummary[] = []
@@ -667,7 +721,7 @@ export async function buildNotesSummary(root: string, request: BuildNotesRequest
   }
   const ancestor = async (hash: string) => {
     try {
-      const resolved = (await git.raw(['rev-parse', '--verify', `${hash}^{commit}`])).trim()
+      const resolved = await resolveCommitHash(git, hash)
       if (!resolved) throw invalid()
       await git.raw(['merge-base', '--is-ancestor', resolved, 'HEAD'])
       // Quiet nonzero exits can resolve successfully in simple-git; verify the common ancestor too.
@@ -688,8 +742,7 @@ export async function buildNotesSummary(root: string, request: BuildNotesRequest
     const selected = new Set<string>()
     for (const hash of new Set(request.commitHashes ?? [])) selected.add(await ancestor(hash))
     if (selected.size) {
-      const order = (await git.raw(['rev-list', '--topo-order', 'HEAD', '--'])).trim().split(/\r?\n/)
-      for (const hash of order.filter(hash => selected.has(hash))) {
+      for (const hash of await selectedCommitOrder(git, selected)) {
         commits.push(parseCommit(await git.raw(['show', '--quiet', '--date=iso-strict', `--format=${commitFormat}`, hash])))
         const { treeArgs, revisions, patchArgs } = await commitFirstParentDiff(git, hash)
         await collect(treeArgs, revisions, patchArgs, 'committed')
@@ -743,13 +796,13 @@ export async function buildNotesSummary(root: string, request: BuildNotesRequest
 }
 
 export async function gitFileCommitPatch(root: string, relative: string, commitHashes: readonly string[], includeWorking = false, maxCommits = 50): Promise<string> {
-  const { rootReal, git } = await repository(root)
+  const { rootReal, git } = await repository(root, true)
   const { target, file, spec } = await filePath(rootReal, relative)
   if (!Array.isArray(commitHashes) || commitHashes.length < 1 || commitHashes.length > maxCommits || commitHashes.some(hash => !isValidGitCommitHash(hash))) throw new Error('INVALID_COMMIT_HASH')
   const selected = new Set<string>()
   for (const hash of commitHashes) {
     try {
-      const resolved = (await runGit(rootReal, ['rev-parse', '--verify', `${hash}^{commit}`])).stdout.toString('utf8').trim()
+      const resolved = await resolveCommitHash(git, hash)
       await runGit(rootReal, ['merge-base', '--is-ancestor', resolved, 'HEAD'])
       selected.add(resolved)
     } catch { throw new Error('INVALID_COMMIT_HASH') }
@@ -761,8 +814,7 @@ export async function gitFileCommitPatch(root: string, relative: string, commitH
     if (Buffer.byteLength(part) < Buffer.byteLength(text)) truncated = true
     result += part; used += Buffer.byteLength(part)
   }
-  const order = (await git.raw(['rev-list', '--topo-order', 'HEAD', '--'])).trim().split(/\r?\n/)
-  for (const hash of order.filter(hash => selected.has(hash))) {
+  for (const hash of await selectedCommitOrder(git, selected)) {
     if (used >= maxBytes) break
     const summary = parseCommit(await git.raw(['show', '--quiet', `--format=${commitFormat}`, hash]))
     const { patchArgs } = await commitFirstParentDiff(git, hash)
@@ -802,6 +854,11 @@ export async function gitFileCommitPatch(root: string, relative: string, commitH
   return truncated || used >= maxBytes ? utf8Prefix(result, maxBytes - Buffer.byteLength('\n[Diff truncated at 4 MiB]\n')) + '\n[Diff truncated at 4 MiB]\n' : result
 }
 
+export async function isHeadPushed(root: string): Promise<boolean> {
+  const { git } = await repository(root, true)
+  return await hasHead(git) && !!(await git.raw(['branch', '-r', '--contains', 'HEAD'])).trim()
+}
+
 export async function gitUndoLastCommit(root: string): Promise<{ message: string }> {
   const { git } = await repository(root)
   if (!await hasHead(git)) throw new Error('NO_COMMIT_TO_UNDO')
@@ -822,7 +879,7 @@ export async function gitUndoLastCommit(root: string): Promise<{ message: string
 }
 
 export async function gitStashList(root: string): Promise<GitStashEntry[]> {
-  const { git } = await repository(root)
+  const { git } = await repository(root, true)
   // Keep %gd as stash@{index}; --date would otherwise turn the selector into a date.
   const output = await git.raw(['stash', 'list', '--format=%gd%x1f%gs%x1f%aI%x1f%H%x1e'])
   return output.split('\x1e').filter(record => record.trim()).flatMap(record => {
@@ -862,7 +919,7 @@ export async function gitStashDrop(root: string, index: number, expectedOid?: st
 
 export async function stagedDiffSummary(root: string, maxBytes = 65536): Promise<{ diff: string; files: string[]; truncated: boolean; stat?: string }> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('INVALID_MAX_BYTES')
-  const { rootReal, git } = await repository(root)
+  const { rootReal, git } = await repository(root, true)
   const files = (await git.raw(['diff', '--cached', '--name-only', '-z', '--'])).split('\0').filter(Boolean)
   const { text: diff, truncated } = await runGitBounded(rootReal, ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--'], maxBytes)
   if (truncated) {

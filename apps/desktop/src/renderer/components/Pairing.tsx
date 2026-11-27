@@ -13,11 +13,18 @@ export function Pairing() {
   const [now, setNow] = useState(Date.now())
   const generation = useRef(0)
   const mounted = useRef(true)
+  const pollingRef = useRef(false)
   const closeButton = useRef<HTMLButtonElement>(null)
   const pairButton = useRef<HTMLButtonElement>(null)
   useEffect(() => {
     mounted.current = true
-    const poll = () => void window.ame.pairingStatus().then(value => { if (mounted.current) setSettings(value) }, e => { if (mounted.current) setError(errorText(e)) })
+    const poll = async () => {
+      if (pollingRef.current) return
+      pollingRef.current = true
+      try { const value = await window.ame.pairingStatus(); if (mounted.current) { setSettings(value); setError('') } }
+      catch (e) { if (mounted.current) setError(errorText(e)) }
+      finally { pollingRef.current = false }
+    }
     poll()
     const timer = setInterval(() => { setNow(Date.now()); poll() }, 1000)
     return () => { mounted.current = false; generation.current++; clearInterval(timer) }
