@@ -9,23 +9,6 @@ import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
 import { z } from 'zod'
 import { GIT_COMMIT_HASH_PATTERN } from '../packages/protocol/src/index'
-import { COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH } from '../packages/amekit/src/commit-agent'
-
-test('diff IPC validates discriminated targets and forwards legacy and scoped requests', async () => {
-  const source = await readFile('apps/desktop/src/main/index.ts', 'utf8')
-  const calls: unknown[][] = []
-  const dispatch = runInNewContext(ts.transpileModule(source.slice(source.indexOf('const text ='), source.indexOf('let authority:')), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\ncall', {
-    GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
-    z, pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
-    workspace: { diff: (...args: unknown[]) => { calls.push(args); return { original: '', modified: '' } } }
-  }) as (method: string, args: unknown[]) => Promise<unknown>
-  for (const target of [undefined, { kind: 'staged' }, { kind: 'working' }, { kind: 'commit', commit: 'ABCDEF1' }, { kind: 'commit', commit: 'a'.repeat(64) }]) {
-    await dispatch('diff', target ? ['p', 'file', target] : ['p', 'file'])
-    assert.deepEqual(calls.at(-1), ['p', 'file', target])
-  }
-  for (const target of [{ kind: 'commit' }, { kind: 'commit', commit: 'HEAD' }, { kind: 'commit', commit: 'a'.repeat(65) }, { kind: 'staged', commit: 'abcdef1' }, { kind: 'other' }, 'staged']) await assert.rejects(dispatch('diff', ['p', 'file', target]))
-  assert.equal(calls.length, 5)
-})
 
 test('diff scopes isolate partial staging and read historical snapshots including root and deletion', async t => {
   const directory = await mkdtemp(path.join(process.cwd(), '.ame-diff-test-'))

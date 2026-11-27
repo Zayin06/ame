@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent } from 'react'
-import type { AndroidTranslationInfo, CommitAgentSessionState, ChatItem, Model, Permission, PermissionMode, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
+import type { AndroidTranslationInfo, ChatItem, Model, Permission, PermissionMode, ResolvedDroppedFile, Session, SkillSummary, SlashCommand } from '../../../../../packages/protocol/src/index'
 import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
 import { type Preferences, type Tab, type TimelineDetailMode } from '../state'
@@ -218,7 +218,7 @@ function sameChatItems(a: ChatItem[], b: ChatItem[]): boolean {
   })
 }
 
-export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, onOpenCommitAgent, ready, files = [], activeFile, onRequestFiles }: { draftID?: number; focusNonce?: number; timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; onOpenCommitAgent?: (sessionID?: string) => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
+export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', projectID, projectDirectory, sessionID, title, connected, connectionUrl = '', accountRole, defaultModelID, modelLevels, onCreate, report, onActivity, onOpenPanel, onOpenFile, sessions, tabs, changes, changesStatus, theme, projectName, branch, onSelectSession, onCreated, onModelChange, onOpenAndroidTranslation, onPermissionModeChange, ready, files = [], activeFile, onRequestFiles }: { draftID?: number; focusNonce?: number; timelineDetail?: TimelineDetailMode; accountRole?: string; defaultModelID?: string; modelLevels?: Partial<ModelLevels>; connectionUrl?: string; files?: readonly string[]; activeFile?: string; onRequestFiles?: () => void; onOpenAndroidTranslation?: () => void; onPermissionModeChange?: (mode?: PermissionMode) => void; ready: boolean; onCreated: (session: Session) => void; onModelChange?: (model?: Model) => void; projectID?: string; projectDirectory?: string; sessionID?: string; title?: string; connected: boolean; onCreate: () => void; report: (e: unknown) => void; onActivity: () => void; onOpenPanel: (panel: Preferences['panel']) => void; onOpenFile: (path: string, line?: number) => void; sessions: Session[]; tabs: Tab[]; changes: number; changesStatus: 'loading' | 'ready' | 'error'; theme: 'dark' | 'light'; projectName?: string; branch?: string; onSelectSession: (id: string) => void }) {
   const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
   const initialCatalog = cached?.key === connectionUrl ? cached : undefined
   const [messages, setMessages] = useState<ChatItem[]>([])
@@ -239,27 +239,23 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const translationSessionIDs = androidInfo?.translationSessionIDs ?? []
   const lockedTranslation = !!sessionID && lockedTranslationIDs.includes(sessionID)
   const translationSession = !!sessionID && translationSessionIDs.includes(sessionID)
-  const [commitAgentState, setCommitAgentState] = useState<{ projectID: string; info: CommitAgentSessionState }>()
-  const commitAgentInfo = commitAgentState?.projectID === projectID ? commitAgentState?.info : undefined
-  const commitSession = !!sessionID && !!commitAgentInfo?.commitSessionIDs.includes(sessionID)
-  const lockedCommit = !!sessionID && !!commitAgentInfo?.lockedSessionIDs.includes(sessionID)
+  const [pinRevision, setPinRevision] = useState(0)
   useEffect(() => {
-    let alive = true, generation = 0
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const load = async () => {
-      if (!projectID || !connected) return
-      const request = ++generation
-      const info = await (window.ame.commitAgentSessionState ? window.ame.commitAgentSessionState(projectID) : window.ame.commitAgentInfo?.(projectID))?.catch(() => null)
-      if (alive && request === generation && info) setCommitAgentState({ projectID, info })
-    }
-    void load()
-    window.addEventListener('ame-account-changed', load)
-    window.addEventListener('ame-commit-agent-changed', load)
-    const unsubscribe = window.ame.onEvent(event => {
-      if (event.type === 'opencode' && event.projectID === projectID && (!event.sessionID || event.sessionID === sessionID)) { clearTimeout(timer); timer = setTimeout(() => void load(), 300) }
+    const reload = () => setPinRevision(revision => revision + 1)
+    window.addEventListener('ame-account-changed', reload)
+    return () => window.removeEventListener('ame-account-changed', reload)
+  }, [])
+  const pinScope = JSON.stringify([connectionUrl, projectID, sessionID, pinRevision])
+  const [pins, setPins] = useState<{ scope: string; status: 'ready' | 'error'; models: Record<string, string> }>()
+  const pinsLoading = !!sessionID && !!window.ame.pinnedSessionModels && pins?.scope !== pinScope
+  const pinnedModelID = pins?.scope === pinScope && sessionID ? pins?.models[sessionID] : undefined
+  useEffect(() => {
+    let alive = true
+    if (projectID && connected) window.ame.pinnedSessionModels?.(projectID, sessionID).then(models => { if (alive) setPins({ scope: pinScope, status: 'ready', models }) }).catch(error => {
+      if (alive) { setPins({ scope: pinScope, status: 'error', models: {} }); report(error) }
     })
-    return () => { alive = false; clearTimeout(timer); unsubscribe(); window.removeEventListener('ame-account-changed', load); window.removeEventListener('ame-commit-agent-changed', load) }
-  }, [projectID, connected, sessionID])
+    return () => { alive = false }
+  }, [projectID, sessionID, connected, report, pinScope])
   useEffect(() => {
     let alive = true, generation = 0
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -292,6 +288,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const permissionStatus = modeState.scope === permissionScope ? modeState.status : sessionID ? 'loading' : 'ready'
   const permissionLoading = permissionStatus !== 'ready'
   const [updatingPermission, setUpdatingPermission] = useState(false)
+  useEffect(() => { onPermissionModeChange?.(permissionLoading || updatingPermission ? undefined : permissionMode) }, [permissionMode, permissionLoading, updatingPermission, onPermissionModeChange])
   const permissionRequest = useRef(0)
   const permissionPending = useRef(false)
   const currentPermissionScope = useRef(permissionScope); currentPermissionScope.current = permissionScope
@@ -340,7 +337,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const [skills, setSkills] = useState<SkillSummary[]>(() => initialCatalog?.skills ?? [])
   const dragDepth = useRef(0)
   const [dragActive, setDragActive] = useState(false)
-  const canAttach = !lockedTranslation && !translationSession && !commitSession && !lockedCommit && !!projectID && connected
+  const canAttach = !lockedTranslation && !translationSession && !!projectID && connected
   useEffect(() => { dragDepth.current = 0; setDragActive(false) }, [projectID, sessionID, canAttach])
   const [trigger, setTrigger] = useState<ComposerTrigger | null>(null)
   const [attachmentPicker, setAttachmentPicker] = useState(false)
@@ -423,7 +420,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const activeSession = sessions.find(session => session.id === sessionID)
   const activeRevert = (activeSession as (Session & { revert?: RevertState }) | undefined)?.revert
   const { active: activeMessages, revertedTurnCount } = useMemo(() => partitionRevertedMessages(messages, activeRevert), [messages, activeRevert])
-  const canRewindSession = Boolean(projectID && sessionID && !activeSession?.parentID && !translationSession && !lockedTranslation && !commitSession && !lockedCommit)
+  const canRewindSession = Boolean(projectID && sessionID && !activeSession?.parentID && !translationSession && !lockedTranslation)
   const rewindSummary = activeRevert ? describeRevertSummary(activeRevert, rewindRequestedFiles[`${sessionID}:${activeRevert.messageID}`]) : undefined
   useEffect(() => { setRewindPickerTurnID(null) }, [running, activeRevert?.messageID])
   const completedTurns = useRef<CompletedTurnCache>(new Map())
@@ -505,6 +502,9 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   useEffect(() => {
     let alive = true, generation = 0
     let catalogTimer: ReturnType<typeof setTimeout> | undefined
+    // Pin loading restores feature-only model access after an app restart.
+    // Do not race that recovery with a catalog request or reuse its stale cache.
+    if (pinsLoading) return
     const hydrate = (catalog?: ProjectCatalog) => {
       const allowed = chatModelsForPolicy(catalog?.models ?? [], modelPolicy.current.role, modelPolicy.current.defaultModelID)
       setModels(catalog?.models ?? [])
@@ -538,7 +538,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     const cached = projectID && connected ? projectCatalogCache.get(projectID) : undefined
     const catalog = cached?.key === connectionUrl ? cached : undefined
     hydrate(catalog)
-    if (!catalog || Date.now() - catalog.fetchedAt >= 30_000) void load()
+    if (pinnedModelID || !catalog || Date.now() - catalog.fetchedAt >= 30_000) void load()
     const accountChanged = () => { clearProjectCatalogs(); void load() }
     window.addEventListener('ame-account-changed', accountChanged)
     const unsubscribeCatalog = window.ame?.onEvent?.(event => {
@@ -549,12 +549,12 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
       catalogTimer = setTimeout(() => { if (alive) void load() }, 80)
     })
     return () => { alive = false; clearTimeout(catalogTimer); unsubscribeCatalog?.(); window.removeEventListener('ame-account-changed', accountChanged) }
-  }, [projectID, connected, connectionUrl, report])
+  }, [projectID, connected, connectionUrl, report, pinsLoading, pinnedModelID])
   useEffect(() => {
     if (!role || !models.length) userPickedModel.current = false
     setModel(currentValue => resolvePreferredModel({ models, currentValue, defaultModelID: effectiveDefaultModel, role, userPicked: userPickedModel.current }))
   }, [role, catalogModels, effectiveDefaultModel])
-  const activeModel = projectID && connected && modelProject === projectID ? models.find(item => modelKey(item) === model) : undefined
+  const activeModel = projectID && connected && modelProject === projectID ? pinnedModelID ? catalogModels.find(item => item.providerID === 'amecode' && (item.modelID ?? item.id) === pinnedModelID) : models.find(item => modelKey(item) === model) : undefined
   useEffect(() => { onModelChange?.(ready ? activeModel : undefined) }, [activeModel, onModelChange, connected, ready, projectID])
   useEffect(() => {
     if (!projectID || !sessionID || !connected) return
@@ -769,7 +769,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const send = async () => {
     const selectedModel = activeModel
     const { text: prompt, files } = splitComposerAttachments(text, attachments)
-    if (!projectID || (!prompt.trim() && !files.length) || busy || rewindingRef.current || permissionPending.current || permissionLoading || !connected || !ready || !selectedModel || translationSession || lockedTranslation || commitSession || lockedCommit || composing.current) return
+    if (!projectID || (!prompt.trim() && !files.length) || busy || rewindingRef.current || permissionPending.current || permissionLoading || pinsLoading || !connected || !ready || !selectedModel || translationSession || lockedTranslation || composing.current) return
     const submitted = text, submittedSession = sessionID, submittedProject = projectID, submittedAttachments = attachments
     const submittedIDs = new Set(submittedAttachments.map(item => item.id))
     submittingDraft.current = draft
@@ -847,10 +847,9 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
       <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><div className="chat-drawer__head-actions">{drawer === 'agents' && projectID && sessionID && <button type="button" className="chat-drawer__action" onClick={() => { setDrawer(null); setAgentMapOpen(true) }}>Agent map</button>}<IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? lockedTranslation || translationSession ? <Empty>Dùng Chat chính mới cho /btw; phiên dịch Android chỉ dành cho bản địa hóa.</Empty> : projectID && sessionID ? <BtwPanel key={JSON.stringify([projectID, sessionID])} projectID={projectID} sessionID={sessionID} connected={connected} ready={ready} model={activeModel} onCreated={onCreated} onSelectSession={onSelectSession} onActivity={onActivity} /> : <Empty>Chọn một phiên để mở luồng phụ /btw.</Empty> : <>{drawer === 'artifacts' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={sessionID} /> : <Empty>Mở dự án để xem artifacts.</Empty>)}<button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Mở bảng Artifacts</button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
       <div ref={timeline} className="chat-stream" onScroll={e => { const el = e.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
         {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty> : turns.map(turn => <ChatTurnView key={turn.id} turn={turn} todo={todoView.byTurnID[turn.id]} projectID={projectID} sessionID={sessionID} projectDirectory={projectDirectory} theme={theme} canRewindSession={canRewindSession} rewindDisabled={!connected || running || busy || rewinding} pickerOpen={!!turn.user && rewindPickerTurnID === turn.user.id} waitingForForm={!!forms.length} userExpanded={!!turn.user && expandedUserTurnID === turn.user.id} userOverflow={turn.user ? userBubbleOverflow[turn.user.id] : undefined} userCopied={!!turn.user && copiedUserTurnID === turn.user.id} onOpenFile={onOpenFile} onOpenAgentMap={openAgentMap} onTogglePicker={toggleRewindPicker} onRewind={startRewind} onExpandUserTurn={expandUserTurn} onCopyUserTurn={copyUserTurn} />)}
-        {forms.map(form => <SessionFormCard key={`${projectID}:${sessionID}:${form.id}`} projectID={projectID!} form={form} disabled={!connected || lockedTranslation || commitSession || lockedCommit} onResolved={id => { setForms(current => current.filter(form => form.id !== id)); refresh.current() }} />)}
+        {forms.map(form => <SessionFormCard key={`${projectID}:${sessionID}:${form.id}`} projectID={projectID!} form={form} disabled={!connected || lockedTranslation} onResolved={id => { setForms(current => current.filter(form => form.id !== id)); refresh.current() }} />)}
         {permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
-      {commitSession || lockedCommit ? <div className="translation-locked-banner" role="status" data-testid="commit-agent-locked-banner"><Icon name="lock" /><p>{lockedCommit ? 'Phiên Trợ lý Commit AI này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Trợ lý Commit AI riêng. Mở Trợ lý Commit AI để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p><button type="button" onClick={() => onOpenCommitAgent?.(sessionID)}>Trợ lý Commit AI</button><button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <>
       {lockedTranslation || translationSession ? <div className="translation-locked-banner" role="status" data-testid="translation-locked-banner"><Icon name="lock" /><p>{lockedTranslation ? 'Phiên dịch Android này đã hoàn tất và được khóa để tránh dùng nhầm model cho việc code.' : 'Đây là phiên Dịch Android riêng. Mở Dịch Android để tiếp tục, hoặc tạo cuộc trò chuyện mới để lập trình.'}</p>{!lockedTranslation && <button type="button" onClick={() => onOpenAndroidTranslation?.()}>Dịch Android</button>}<button type="button" onClick={onCreate}>Cuộc trò chuyện mới</button></div> : <div className="composer-dock"><div className="composer-dock__inner">{(projectName || sessionID) && <div className="composer-context-strip">{sessionID ? <button className="ctx-strip-chip" onClick={() => onOpenPanel('changes')} title="Thay đổi của toàn bộ session, từ OpenCode snapshots"><Icon name="diff" /><span>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files changed`}</span>{changesStatus === 'ready' && projectName && <span className="ctx-strip-chip__meta">· {projectName}</span>}</button> : <span>Project: <strong>{projectName}</strong>{branch ? ` (${branch})` : ''}</span>}{sessionID && <button type="button" className="agent-map-trigger" data-testid="agent-map-trigger" title="Mở Agent map (sơ đồ subagents, skill, prompt và output)" onClick={() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }}><span className={`agent-map-dot ${agentFamily.runningCount > 0 ? 'agent-map-dot--running' : agentFamily.subagentCount > 0 ? 'agent-map-dot--succeeded' : 'agent-map-dot--idle'}`} aria-hidden="true" /><span>{agentFamily.subagentCount > 0 ? `${agentFamily.subagentCount} subagent` : 'Agent map'}</span></button>}</div>}
               {rewindError && <div className="inline-error" role="alert" data-testid="rewind-error">{rewindError}</div>}
               {activeRevert && rewindSummary && <div className="rewind-banner" data-testid="rewind-banner" role="status">
@@ -876,17 +875,16 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
                 if (!event.clipboardData.getData('text/plain')) event.preventDefault()
                 void receiveAttachments(() => Promise.all(images.map(readBrowserFileAttachment)))
               }} aria-label="Yêu cầu cho agent" aria-autocomplete="list" aria-expanded={!!trigger} aria-controls={trigger ? popoverID : undefined} aria-activedescendant={trigger && choices.length ? `${popoverID}-${selectedCompletion}` : undefined} placeholder="Hỏi bất cứ điều gì — gõ yêu cầu cho agent…" value={text} disabled={!projectID || !connected} onChange={e => { setText(e.target.value); updateTrigger(e.target.value, e.target.selectionStart) }} onClick={e => updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart)} onKeyUp={e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onCompositionStart={() => { composing.current = true; setTrigger(null) }} onCompositionEnd={e => { composing.current = false; updateTrigger(e.currentTarget.value, e.currentTarget.selectionStart) }} onKeyDown={e => { if (composing.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || handlePopoverKey(e)) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} rows={1} />
-        <div className="composer-toolbar"><div className="composer-toolbar__left"><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Đính kèm ngữ cảnh" aria-label="Đính kèm ngữ cảnh" aria-expanded={attachmentPicker} aria-controls={attachmentPicker ? popoverID : undefined} onClick={() => { const open = !attachmentPicker; setAttachmentPicker(open); setAttachmentQuery(''); setCompletionIndex(0); setTrigger(null); if (open) onRequestFiles?.() }}><Icon name="plus" /></button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Slash commands & skills" aria-label="Slash commands & skills" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('/')}>/</button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="File mentions" aria-label="File mentions" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('@')}>@</button>{role === 'user' ? <span className="composer-picker composer-picker--model composer-picker--locked" role="status" aria-label="Mô hình cố định theo chính sách máy chủ" title={`Tài khoản user dùng model cố định từ máy chủ: ${activeModel?.name || model}`}>
-          <span className="composer-picker__face"><Icon name="lock" /><span className="composer-picker__label">{activeModel?.name || model}</span></span>
+        <div className="composer-toolbar"><div className="composer-toolbar__left"><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Đính kèm ngữ cảnh" aria-label="Đính kèm ngữ cảnh" aria-expanded={attachmentPicker} aria-controls={attachmentPicker ? popoverID : undefined} onClick={() => { const open = !attachmentPicker; setAttachmentPicker(open); setAttachmentQuery(''); setCompletionIndex(0); setTrigger(null); if (open) onRequestFiles?.() }}><Icon name="plus" /></button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="Slash commands & skills" aria-label="Slash commands & skills" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('/')}>/</button><button className="icon-btn" type="button" disabled={!projectID || !connected} title="File mentions" aria-label="File mentions" onMouseDown={e => e.preventDefault()} onClick={() => insertTrigger('@')}>@</button>{pinsLoading || pinnedModelID || role === 'user' ? <span className="composer-picker composer-picker--model composer-picker--locked" role="status" aria-label={pinnedModelID ? "Mô hình cố định theo Commit Enhance" : "Mô hình cố định theo chính sách máy chủ"} title={pinsLoading ? 'Đang tải khóa model của phiên…' : pinnedModelID ? `Phiên Phân tích Commit khóa theo model Commit Enhance: ${pinnedModelID}` : `Tài khoản user dùng model cố định từ máy chủ: ${activeModel?.name || model}`}>
+          <span className="composer-picker__face"><Icon name="lock" /><span className="composer-picker__label">{activeModel?.name || pinnedModelID || model}</span></span>
         </span> : <label className="composer-picker composer-picker--model" title={activeModel ? `Model: ${formatModelOptionLabel(activeModel, effectiveModelLevels)}` : 'Chọn model'}>
           <span className="composer-picker__face" aria-hidden="true"><Icon name="sparkles" /><span className="composer-picker__label">{activeModel?.name || 'Chọn model'}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Mô hình" value={model} onChange={e => { userPickedModel.current = true; setModel(e.target.value) }} disabled={!connected || busy}><option value="">Chọn model</option>{models.map(m => <option key={modelKey(m)} value={modelKey(m)}>{formatModelOptionLabel(m, effectiveModelLevels)}</option>)}</select>
         </label>}</div><div className="composer-toolbar__right"><label className={`composer-picker composer-picker--permission${permissionMode === 'full' ? ' is-full' : ''}`} title={(() => { const opt = permissionModeOptions.find(option => option.value === permissionMode); return opt ? `${opt.label} — ${opt.description}` : undefined })()}>
           <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{permissionStatus === 'error' ? 'Lỗi tải quyền' : permissionLoading || updatingPermission ? 'Đang tải quyền…' : permissionModeOptions.find(option => option.value === permissionMode)?.label}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Quyền thực thi" value={permissionMode} onChange={e => void changePermissionMode(e.target.value as PermissionMode)} disabled={!projectID || !connected || busy || permissionLoading || updatingPermission}>{permissionModeOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-        </label>{running && <button className="icon-btn" type="button" disabled={!sessionID || !connected} title="Dừng phản hồi" onClick={() => { if (projectID && sessionID) void window.ame.cancel(projectID, sessionID).then(() => refresh.current()).catch(report) }}><Icon name="stop" /></button>}<button className="send-btn" aria-label="Gửi yêu cầu" disabled={!projectID || !connected || !ready || busy || permissionLoading || updatingPermission || (!text.trim() && !attachments.length) || !activeModel}><Icon name="send" /></button></div></div>
+        </label>{running && <button className="icon-btn" type="button" disabled={!sessionID || !connected} title="Dừng phản hồi" onClick={() => { if (projectID && sessionID) void window.ame.cancel(projectID, sessionID).then(() => refresh.current()).catch(report) }}><Icon name="stop" /></button>}<button className="send-btn" aria-label="Gửi yêu cầu" disabled={!projectID || !connected || !ready || busy || permissionLoading || pinsLoading || updatingPermission || (!text.trim() && !attachments.length) || !activeModel}><Icon name="send" /></button></div></div>
       </form></div></div>}
-      </>}
     </div>
     </div>
     {agentMapOpen && projectID && sessionID && <AgentMap projectID={projectID} sessionID={sessionID} connected={connected} onSelectSession={id => { onSelectSession(id); setAgentMapOpen(false) }} onOpenFile={(path, line) => { onOpenFile(path, line); setAgentMapOpen(false) }} onClose={() => setAgentMapOpen(false)} />}

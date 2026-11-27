@@ -11,12 +11,12 @@ test('four permission presets round trip and enforce V2 actions, including plugi
     full: [{ action: '*', resource: '*', effect: 'allow' }],
     ask: [
       { action: '*', resource: '*', effect: 'ask' },
-      ...['read', 'glob', 'grep', 'webfetch', 'websearch', 'todowrite'].map(action => ({ action, resource: '*', effect: 'allow' })),
+      ...['read', 'glob', 'grep', 'webfetch', 'websearch', 'todowrite', 'question'].map(action => ({ action, resource: '*', effect: 'allow' })),
       ...['edit', 'shell', 'external_directory'].map(action => ({ action, resource: '*', effect: 'ask' })),
     ],
     readonly: [
       { action: '*', resource: '*', effect: 'deny' },
-      ...['read', 'glob', 'grep', 'webfetch', 'websearch', 'todowrite'].map(action => ({ action, resource: '*', effect: 'allow' })),
+      ...['read', 'glob', 'grep', 'webfetch', 'websearch', 'todowrite', 'question'].map(action => ({ action, resource: '*', effect: 'allow' })),
     ],
   }
   for (const mode of permissionModeSchema.options) {
@@ -25,10 +25,12 @@ test('four permission presets round trip and enforce V2 actions, including plugi
   }
   const effect = (rules: PermissionRule[], action: string) => rules.filter(rule => rule.action === '*' || rule.action === action).at(-1)?.effect
   for (const mode of ['ask', 'readonly', 'full'] as const) assert.equal(effect(permissionRules(mode), 'todowrite'), 'allow')
-  for (const mode of ['ask', 'readonly'] as const) {
-    const legacy = permissionRules(mode).filter(rule => rule.action !== 'todowrite')
+  for (const mode of ['ask', 'readonly', 'full'] as const) assert.equal(effect(permissionRules(mode), 'question'), 'allow')
+  for (const mode of ['ask', 'readonly'] as const) for (const omitted of [['todowrite'], ['question'], ['todowrite', 'question']]) {
+    const legacy = permissionRules(mode).filter(rule => !omitted.includes(rule.action))
     assert.equal(permissionModeFromSession({ permissions: legacy }), mode)
   }
+  assert.equal(permissionModeFromSession({ permissions: permissionRules('readonly').filter(rule => rule.action !== 'read') }), 'default')
   for (const action of ['edit', 'shell', 'external_directory', 'custom_mutation', 'subagent', 'execute']) {
     assert.equal(effect(permissionRules('readonly'), action), 'deny')
     assert.equal(effect(permissionRules('ask'), action), 'ask')

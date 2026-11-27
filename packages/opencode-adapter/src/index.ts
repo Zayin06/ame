@@ -783,9 +783,10 @@ export class OpenCodeAdapter {
     }
     const sessionID = event.type === 'form.created' ? event.data.form.sessionID : 'data' in event && event.data && typeof event.data === 'object' && 'sessionID' in event.data ? String(event.data.sessionID) : undefined
     const directory = 'location' in event ? event.location?.directory : undefined
+    const stream = event.type.endsWith('.delta') || event.type === 'session.text.ended' || event.type === 'session.reasoning.ended' || event.type === 'session.tool.input.ended' || event.type === 'session.tool.progress'
     for (const [projectID, root] of this.projects) {
       if (!directory || sameDirectory(directory, root)) {
-        this.notify(sessionID === undefined ? { type: 'opencode', projectID } : { type: 'opencode', projectID, sessionID })
+        this.notify({ type: 'opencode', projectID, ...(sessionID === undefined ? {} : { sessionID }), ...(stream ? { kind: 'stream' as const } : {}) })
         if (event.type === 'session.revert.cleared' || (event.type === 'session.revert.staged' && Array.isArray(event.data.revert?.files) && event.data.revert.files.length > 0)) this.notify({ type: 'files', projectID })
       }
     }

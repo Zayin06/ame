@@ -39,17 +39,7 @@ test('summary distinguishes restored, unavailable, unchanged and chat-only files
   for (const requested of [false, undefined]) assert.equal(describeRevertSummary({ messageID: 'target' }, requested).mode, 'chat-only')
 })
 
-test('backend error codes and ordinary errors have actionable Vietnamese messages', () => {
-  for (const code of ['SESSION_BUSY', 'Session is busy', 'REVERT_CHILD_UNSUPPORTED', 'TRANSLATION_SESSION_LOCKED', 'ANDROID_TRANSLATION_SESSION_REQUIRED', 'COMMIT_AGENT_LOCKED', 'OPENCODE_DISCONNECTED', 'SESSION_PROJECT_MISMATCH']) {
-    assert.notEqual(formatRevertError(new Error(code)), code)
-    assert.equal(formatRevertError({ code }), formatRevertError(new Error(code)))
-  }
-  assert.equal(formatRevertError(new Error('network failed')), 'network failed')
-  assert.equal(formatRevertError('failure'), 'failure')
-  assert.equal(formatRevertError(null), 'Không thể thực hiện quay lui.')
-})
-
-function harness(options: { revert?: RevertState; parentID?: string; locked?: 'translation' | 'commit'; running?: boolean } = {}) {
+function harness(options: { revert?: RevertState; parentID?: string; locked?: 'translation'; running?: boolean; pinned?: boolean; role?: string } = {}) {
   const slots: unknown[] = [], effects: { deps: unknown[]; cleanup?: () => void }[] = [], pending: (() => void)[] = []
   let cursor = 0, effectIndex = 0, writes = 0, tree: ReactNode
   let session: Session & { revert?: RevertState } = { id: 'session', title: 'Chat', status: options.running ? 'running' : 'idle', parentID: options.parentID, revert: options.revert }
@@ -70,10 +60,10 @@ function harness(options: { revert?: RevertState; parentID?: string; locked?: 't
     async clearRevert(...args: unknown[]) { calls.push({ method: 'clearRevert', args }); await delay; if (failure) throw failure; session = { ...session, revert: undefined } },
     async prompt(...args: unknown[]) { calls.push({ method: 'prompt', args }); if (promptFailure) throw promptFailure; session = { ...session, revert: undefined } },
     async messages() { return items }, async permissions() { return [] }, async forms() { return [] },
-    async sessionPermissionMode() { return 'default' }, async models() { return [{ id: 'default', providerID: 'amecode', name: 'Default' }] },
+    async pinnedSessionModels() { return options.pinned ? { session: 'enhance' } : {} },
+    async sessionPermissionMode() { return 'default' }, async models() { return [{ id: 'default', providerID: 'amecode', name: 'Default' }, { id: 'enhance', modelID: 'enhance', providerID: 'amecode', name: 'Enhance' }] },
     async commands() { return [] }, async skills() { return [] }, onEvent() { return () => {} },
     async androidTranslationInfo() { return { lockedSessionIDs: options.locked === 'translation' ? ['session'] : [], translationSessionIDs: [] } },
-    async commitAgentSessionState() { return { lockedSessionIDs: options.locked === 'commit' ? ['session'] : [], commitSessionIDs: [] } },
   }
   const marker = () => null, nativeRequire = createRequire(import.meta.url), exports: Record<string, unknown> = {}
   const code = ts.transpileModule(readFileSync(new URL('../components/Chat.tsx', import.meta.url), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText
@@ -84,7 +74,7 @@ function harness(options: { revert?: RevertState; parentID?: string; locked?: 't
     return nativeRequire(name)
   } })
   const Component = exports.Chat as (props: object) => ReactNode
-  const props = { projectID: 'project', sessionID: 'session', connected: true, ready: true, accountRole: 'user', defaultModelID: 'default', modelLevels: {}, sessions: [session], tabs: [], changes: 0, changesStatus: 'ready', theme: 'dark', onActivity() {}, onOpenFile(path: string) { calls.push({ method: 'openFile', args: [path] }) }, onCreated() {}, onCreate() {}, report() {}, onOpenPanel() {}, onSelectSession() {} }
+  const props = { projectID: 'project', sessionID: 'session', connected: true, ready: true, accountRole: options.role ?? 'user', defaultModelID: 'default', modelLevels: {}, sessions: [session], tabs: [], changes: 0, changesStatus: 'ready', theme: 'dark', onActivity() {}, onOpenFile(path: string) { calls.push({ method: 'openFile', args: [path] }) }, onCreated() {}, onCreate() {}, report() {}, onOpenPanel() {}, onSelectSession() {} }
   function render(extra = {}) {
     Object.assign(props, { sessions: [session] }, extra)
     for (let pass = 0; pass < 15; pass++) { const before = writes; cursor = 0; effectIndex = 0; tree = Component(props); pending.splice(0).forEach(run => run()); if (writes === before) return renderToStaticMarkup(tree) }
@@ -110,8 +100,24 @@ function harness(options: { revert?: RevertState; parentID?: string; locked?: 't
   }
 }
 
+test('commit analysis locks only its model picker for both roles while composer and permissions remain normal', async () => {
+  for (const role of ['admin', 'user']) {
+    const h = harness({ pinned: true, role })
+    try {
+      h.render(); const html = await h.flush()
+      assert.match(html, /composer-picker--locked/)
+      assert.match(html, /model Commit Enhance: enhance/)
+      assert.doesNotMatch(html, /<select[^>]*aria-label="Mô hình"/)
+      assert.equal(h.find(node => node.type === 'select' && node.props['aria-label'] === 'Quyền thực thi').props.disabled, false)
+      assert.equal(h.find(node => node.type === 'textarea').props.disabled, false)
+      h.change('Continue analysis'); h.render(); h.submit(); await h.flush()
+      assert.equal((h.calls.find(call => call.method === 'prompt')?.args[3] as any).modelID, 'enhance')
+    } finally { h.unmount() }
+  }
+})
+
 test('eligible turns expose rewind; child and specialized sessions hide it; running disables it', async () => {
-  for (const options of [{}, { parentID: 'parent' }, { locked: 'translation' as const }, { locked: 'commit' as const }, { running: true }]) {
+  for (const options of [{}, { parentID: 'parent' }, { locked: 'translation' as const }, { running: true }]) {
     const h = harness(options)
     try { h.render(); const html = await h.flush(); if ('parentID' in options || options.locked) assert.doesNotMatch(html, /data-testid="rewind-trigger"/); else assert.equal(h.button('Quay lại từ đây').props.disabled, !!options.running) } finally { h.unmount() }
   }

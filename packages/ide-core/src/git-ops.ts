@@ -1,13 +1,11 @@
 import { createReadStream, existsSync } from 'node:fs'
-import { copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { lstat, readFile, readdir, readlink, realpath, stat, unlink } from 'node:fs/promises'
 import { cleanupStaleSaveTemps } from './file-save'
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import os from 'node:os'
 import path from 'node:path'
 import { simpleGit, type SimpleGit } from 'simple-git'
 import { isValidGitCommitHash } from '../../protocol/src/index'
-import type { BuildNotesFileStat, BuildNotesRequest, CommitAgentSnapshot, CommitAgentPlan, CommitAgentExecuteResult, GitBranches, GitCommitDetail, GitCommitFile, GitCommitSummary, GitPushOptions, GitStashEntry, GitSyncResult } from '../../protocol/src/index'
+import type { BuildNotesFileStat, BuildNotesRequest, GitBranches, GitCommitDetail, GitCommitFile, GitCommitSummary, GitPushOptions, GitStashEntry, GitSyncResult } from '../../protocol/src/index'
 
 type GitRunOptions = { env?: NodeJS.ProcessEnv; input?: Buffer | string | ReturnType<typeof createReadStream>; timeoutMs?: number }
 
@@ -43,10 +41,10 @@ async function runGit(cwd: string, args: string[], options: GitRunOptions = {}) 
   return { stdout: Buffer.concat(chunks), stderr }
 }
 
-async function runGitBounded(cwd: string, args: string[], maxBytes: number, env?: NodeJS.ProcessEnv) {
+async function runGitBounded(cwd: string, args: string[], maxBytes: number, env?: NodeJS.ProcessEnv, readonlyConfig?: string[]) {
   const chunks: Buffer[] = []
   let size = 0, truncated = false
-  await streamGit(cwd, [...(await safeReadOnlyGitConfig(cwd)).flatMap(value => ['-c', value]), ...args], { env }, chunk => {
+  await streamGit(cwd, [...(readonlyConfig ?? await safeReadOnlyGitConfig(cwd)).flatMap(value => ['-c', value]), ...args], { env }, chunk => {
     const part = chunk.subarray(0, maxBytes + 1 - size)
     // Copy only the retained bytes, never keep a reference to a large source chunk.
     chunks.push(Buffer.from(part)); size += part.length
@@ -56,28 +54,6 @@ async function runGitBounded(cwd: string, args: string[], maxBytes: number, env?
   let end = Math.min(bytes.length, maxBytes)
   while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--
   return { text: bytes.subarray(0, end).toString('utf8'), truncated }
-}
-
-async function hashGitStdout(cwd: string, args: string[], env?: NodeJS.ProcessEnv) {
-  const hash = createHash('sha256')
-  await streamGit(cwd, [...(await safeReadOnlyGitConfig(cwd)).flatMap(value => ['-c', value]), ...args], { env }, chunk => { hash.update(chunk) })
-  return hash.digest('hex')
-}
-
-async function hashFileContent(fullPath: string) {
-  const hash = createHash('sha256'), info = await lstat(fullPath)
-  if (info.isSymbolicLink()) hash.update(await readlink(fullPath, { encoding: 'buffer' }))
-  else {
-    if (!info.isFile()) throw new Error('INVALID_PATH')
-    for await (const chunk of createReadStream(fullPath)) hash.update(chunk)
-  }
-  return hash.digest('hex')
-}
-
-async function assertNoActiveGitOperation(rootReal: string, git: SimpleGit) {
-  const gitDir = path.resolve(rootReal, (await git.raw(['rev-parse', '--git-dir'])).trim())
-  if (['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-merge', 'rebase-apply'].some(name => existsSync(path.join(gitDir, name)))) throw new Error('COMMIT_PLAN_REPO_BUSY')
-  if ((await runGit(rootReal, ['ls-files', '--unmerged', '-z'])).stdout.length) throw new Error('COMMIT_PLAN_REPO_CONFLICT')
 }
 
 export async function safeReadOnlyGitConfig(rootReal: string): Promise<string[]> {
@@ -388,304 +364,6 @@ function utf8Prefix(text: string, limit: number): string {
   let end = Math.min(bytes.length, limit)
   while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--
   return bytes.subarray(0, end).toString('utf8')
-}
-
-function stagedPaths(output: string) {
-  const tokens = output.split('\0'), files = new Set<string>(), renamedFrom = new Map<string, string>()
-  for (let i = 0; i + 1 < tokens.length && tokens[i];) {
-    const status = tokens[i++], first = tokens[i++]
-    files.add(first)
-    if (/^[RC]/.test(status)) {
-      const destination = tokens[i++]
-      files.add(destination)
-      if (status.startsWith('R')) renamedFrom.set(destination, first)
-    }
-  }
-  return { files: [...files], renamedFrom }
-}
-
-export async function gitCommitPlanSnapshot(root: string, maxDiffBytes = 48_000, options?: { focusFiles?: readonly string[]; includeDiff?: boolean }): Promise<CommitAgentSnapshot & { stat: string; diffPreview: string; truncated: boolean }> {
-  if (!Number.isSafeInteger(maxDiffBytes) || maxDiffBytes < 0) throw new Error('INVALID_MAX_BYTES')
-  const { rootReal, git } = await repository(root, true)
-  const hash = (text: string) => createHash('sha256').update(text).digest('hex')
-  const head = (await git.raw(['rev-parse', '--verify', '--quiet', 'HEAD']).catch(() => '')).trim() || '(unborn)'
-  const branchRef = (await git.raw(['symbolic-ref', '--quiet', 'HEAD']).catch(() => '')).trim() || '(detached)'
-  const branch = branchRef.startsWith('refs/heads/') ? branchRef.slice('refs/heads/'.length) : branchRef
-  const indexHash = await hashGitStdout(rootReal, ['ls-files', '--stage', '-z'])
-  const workingStatus = await git.raw(['status', '--porcelain=v1', '-z'])
-  const workingDiffHash = await hashGitStdout(rootReal, ['diff', '--no-ext-diff', '--no-textconv', '--'])
-  const stagedFiles = stagedPaths(await git.raw(['diff', '--cached', '--name-status', '-z', '--'])).files
-  const scope = stagedFiles.length > 0 ? 'staged' : 'working'
-  const untrackedRaw = (await runGit(rootReal, ['ls-files', '--others', '--exclude-standard', '-z'])).stdout.toString('utf8').split('\0').filter(Boolean).sort()
-  const untracked: string[] = []
-  const untrackedHashes: Record<string, string> | undefined = scope === 'working' ? Object.create(null) : undefined
-  for (const rawEntry of untrackedRaw) {
-    const { target } = await filePath(rootReal, rawEntry)
-    const info = await lstat(target)
-    if (info.isDirectory()) continue
-    untracked.push(rawEntry)
-    if (untrackedHashes) untrackedHashes[rawEntry] = await hashFileContent(target)
-  }
-  const workingHash = hash((untrackedHashes ? [workingStatus, workingDiffHash, JSON.stringify(Object.entries(untrackedHashes))] : [workingStatus, workingDiffHash]).join('\0'))
-  const workingFiles = [...new Set([
-    ...(await git.raw(['diff', '--no-renames', '--name-only', '-z', '--'])).split('\0'),
-    ...untracked,
-  ].filter(Boolean))]
-  const flags = scope === 'staged' ? ['--cached'] : []
-  let stat = '', diffPreview = '', truncated = false
-  if (options?.includeDiff !== false) {
-    stat = (await git.raw(['diff', ...flags, '--stat', '--'])).trimEnd()
-    const allowed = new Set(scope === 'staged' ? stagedFiles : workingFiles)
-    const focus: string[] = []
-    for (const name of options?.focusFiles ?? []) {
-      const { file } = await filePath(rootReal, name)
-      if (!allowed.has(file)) throw new Error('COMMIT_PLAN_OUT_OF_SCOPE')
-      if (!focus.includes(file)) focus.push(file)
-    }
-    const args = ['diff', ...flags, '--no-ext-diff', '--no-textconv']
-    const first = await runGitBounded(rootReal, [...args, '--', ...focus.map(file => `:(literal)${file}`)], maxDiffBytes)
-    diffPreview = first.text; truncated = first.truncated
-    if (focus.length && !truncated) {
-      const rest = await runGitBounded(rootReal, [...args, '--', '.', ...focus.map(file => `:(exclude,literal)${file}`)], maxDiffBytes - Buffer.byteLength(diffPreview))
-      diffPreview += rest.text; truncated = rest.truncated
-    }
-  }
-  return { head, branchRef, branch, indexHash, workingHash, untrackedHashes, scope, fingerprint: hash([head, branchRef, indexHash, workingHash, scope].join('\0')), stagedFiles, workingFiles, stat, diffPreview, truncated }
-}
-
-export async function executeCommitPlan(root: string, plan: CommitAgentPlan): Promise<CommitAgentExecuteResult> {
-  const { rootReal, git } = await repository(root)
-  await assertNoActiveGitOperation(rootReal, git)
-  const current = await gitCommitPlanSnapshot(root, 0, { includeDiff: false })
-  if (current.head !== plan.snapshot.head || current.indexHash !== plan.snapshot.indexHash ||
-      (plan.snapshot.branchRef !== undefined && current.branchRef !== plan.snapshot.branchRef) ||
-      ((plan.scope === 'working' || plan.snapshot.workingHash !== undefined) && current.workingHash !== plan.snapshot.workingHash)) throw new Error('COMMIT_PLAN_STALE')
-  for (const [file, hash] of Object.entries(plan.snapshot.untrackedHashes ?? {})) if (current.untrackedHashes?.[file] !== hash) throw new Error('COMMIT_PLAN_STALE')
-  if (!['staged', 'working'].includes(plan.scope) || !Array.isArray(plan.commits) || plan.commits.length < 1 || plan.commits.length > 30) throw new Error('INVALID_COMMIT_PLAN')
-  // Never let a working-tree plan accidentally commit an unrelated existing index.
-  if (plan.scope === 'working' && current.stagedFiles.length) throw new Error('COMMIT_PLAN_OUT_OF_SCOPE')
-  const allowed = new Set(plan.scope === 'staged' ? current.stagedFiles : current.workingFiles)
-  const { renamedFrom } = stagedPaths(await git.raw(['diff', '--cached', '--name-status', '-z', '--']))
-  const used = new Set<string>()
-  const groups: { message: string; files: string[] }[] = []
-  for (const group of plan.commits) {
-    if (typeof group.message !== 'string' || !group.message.trim() || group.message.includes('\0') || group.message.length > 10000 || !Array.isArray(group.files) || !group.files.length) throw new Error('INVALID_COMMIT_PLAN')
-    const files = new Set<string>()
-    for (const name of group.files) {
-      const { file } = await filePath(rootReal, name)
-      if (!allowed.has(file)) throw new Error('COMMIT_PLAN_OUT_OF_SCOPE')
-      files.add(file)
-    }
-    // A rename is one indivisible change; include its source even if the agent only named the destination.
-    for (const [destination, source] of renamedFrom) {
-      if (files.has(destination) || files.has(source)) { files.add(source); files.add(destination) }
-    }
-    for (const file of files) {
-      await filePath(rootReal, file)
-      if (!allowed.has(file)) throw new Error('COMMIT_PLAN_OUT_OF_SCOPE')
-      if (used.has(file)) throw new Error('INVALID_COMMIT_PLAN')
-      used.add(file)
-    }
-    groups.push({ message: group.message.trim(), files: [...files] })
-  }
-  const raw = async (args: string[], env?: NodeJS.ProcessEnv) => (await runGit(rootReal, args, { env })).stdout.toString('utf8')
-  const objectFormat = (await raw(['rev-parse', '--show-object-format'])).trim() || 'sha1'
-  const zeroOid = '0'.repeat(objectFormat === 'sha256' ? 64 : 40)
-  const realGitDir = path.resolve(rootReal, (await raw(['rev-parse', '--git-dir'])).trim())
-  const realCommonDir = path.resolve(rootReal, (await raw(['rev-parse', '--git-common-dir'])).trim())
-  const hooksPath = (await raw(['config', '--get', 'core.hooksPath']).catch(() => '')).trim()
-  const realHooksDir = hooksPath ? path.resolve(rootReal, hooksPath) : path.join(realCommonDir, 'hooks')
-  const indexRaw = () => raw(['ls-files', '--stage', '-z'])
-  const initialIndexRaw = await indexRaw()
-  if (createHash('sha256').update(initialIndexRaw).digest('hex') !== current.indexHash) throw new Error('COMMIT_PLAN_STALE')
-  const approvedIndexMap = new Map<string, { mode: string; oid: string }>()
-  for (const record of initialIndexRaw.split('\0').filter(Boolean)) {
-    const match = /^(\d+) ([a-f0-9]+) 0\t([\s\S]+)$/.exec(record)
-    if (!match) throw new Error('COMMIT_PLAN_REPO_CONFLICT')
-    approvedIndexMap.set(match[3], { mode: match[1], oid: match[2] })
-  }
-  const diskHash = async (file: string) => {
-    try {
-      const { target } = await filePath(rootReal, file)
-      if ((await lstat(target)).isDirectory() && approvedIndexMap.get(file)?.mode === '160000') {
-        return (await runGit(target, ['rev-parse', '--verify', 'HEAD'])).stdout.toString('utf8').trim()
-      }
-      if ((await lstat(target)).isDirectory() && approvedIndexMap.has(file)) return '(deleted)'
-      return await hashFileContent(target)
-    } catch (error) {
-      if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return '(deleted)'
-      throw error
-    }
-  }
-  const deletionFirst = (lines: string[]) => lines.sort((a, b) => Number(b.startsWith('0 ')) - Number(a.startsWith('0 '))).join('')
-  const approvedDisk = new Map<string, string>()
-  if (plan.scope === 'working') {
-    for (const file of used) {
-      const hash = await diskHash(file)
-      approvedDisk.set(file, hash)
-      if (current.untrackedHashes?.[file] !== undefined && current.untrackedHashes[file] !== hash) throw new Error('COMMIT_PLAN_STALE')
-    }
-    const workingStatus = await git.raw(['status', '--porcelain=v1', '-z'])
-    const workingDiffHash = await hashGitStdout(rootReal, ['diff', '--no-ext-diff', '--no-textconv', '--'])
-    if (createHash('sha256').update([workingStatus, workingDiffHash, JSON.stringify(Object.entries(current.untrackedHashes ?? {}))].join('\0')).digest('hex') !== current.workingHash) throw new Error('COMMIT_PLAN_STALE')
-  }
-  let expectedHead = current.head, expectedRealIndexRaw = initialIndexRaw
-  const expectedBranchRef = current.branchRef
-  const commits: CommitAgentExecuteResult['commits'] = []
-  const assertExpected = async (remainingFiles: string[]) => {
-    await assertNoActiveGitOperation(rootReal, git)
-    const head = (await git.raw(['rev-parse', '--verify', '--quiet', 'HEAD']).catch(() => '')).trim() || '(unborn)'
-    const branch = (await git.raw(['symbolic-ref', '--quiet', 'HEAD']).catch(() => '')).trim() || '(detached)'
-    if (head !== expectedHead || branch !== expectedBranchRef || await indexRaw() !== expectedRealIndexRaw) throw new Error('COMMIT_PLAN_ABORTED: HEAD, branch or real index changed')
-    for (const file of remainingFiles) if (approvedDisk.has(file) && await diskHash(file) !== approvedDisk.get(file)) throw new Error('COMMIT_PLAN_STALE: working content changed')
-  }
-  for (const [idx, group] of groups.entries()) {
-    let temporary: string | undefined
-    let realIndexLock: string | undefined
-    let nextIndex: string | undefined
-    try {
-      const remainingFiles = groups.slice(idx).flatMap(group => group.files)
-      await assertExpected(remainingFiles)
-      temporary = await mkdtemp(path.join(os.tmpdir(), 'ame-commit-plan-'))
-      const tmpEnv = { ...process.env, GIT_INDEX_FILE: path.join(temporary, 'index') }
-      if (expectedHead !== '(unborn)') await runGit(rootReal, ['read-tree', expectedHead], { env: tmpEnv })
-      else await runGit(rootReal, ['read-tree', '--empty'], { env: tmpEnv })
-      const lines: string[] = []
-      for (const file of group.files) {
-        let entry = approvedIndexMap.get(file)
-        if (plan.scope === 'working') {
-          const { target } = await filePath(rootReal, file)
-          const info = await lstat(target).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; return undefined })
-          entry = undefined
-          if (info?.isDirectory() && approvedIndexMap.get(file)?.mode === '160000') {
-            const oid = (await runGit(target, ['rev-parse', '--verify', 'HEAD'])).stdout.toString('utf8').trim()
-            if (oid !== approvedDisk.get(file)) throw new Error('COMMIT_PLAN_STALE')
-            entry = { mode: '160000', oid }
-          }
-          if (info?.isDirectory() && !approvedIndexMap.has(file)) throw new Error('INVALID_PATH')
-          if (info && !info.isDirectory()) {
-            if (!info.isFile() && !info.isSymbolicLink()) throw new Error('INVALID_PATH')
-            if (await hashFileContent(target) !== approvedDisk.get(file)) throw new Error('COMMIT_PLAN_STALE')
-            const input = info.isSymbolicLink() ? await readlink(target, { encoding: 'buffer' }) : createReadStream(target)
-            const oid = (await runGit(rootReal, info.isSymbolicLink() ? ['hash-object', '-w', '--no-filters', '--stdin'] : ['hash-object', '-w', '--stdin', '--path', file], { input })).stdout.toString('utf8').trim()
-            entry = { mode: info.isSymbolicLink() ? '120000' : process.platform === 'win32' ? approvedIndexMap.get(file)?.mode ?? '100644' : (info.mode & 0o111) ? '100755' : '100644', oid }
-          }
-        }
-        lines.push(`${entry ? `${entry.mode} ${entry.oid}` : `0 ${zeroOid}`}\t${file}\0`)
-      }
-      const input = deletionFirst(lines)
-      await runGit(rootReal, ['update-index', '-z', '--index-info'], { env: tmpEnv, input })
-      const changed = (await raw(['diff', '--cached', '--no-renames', '--name-only', '-z', '--'], tmpEnv)).split('\0').filter(Boolean)
-      if (!changed.length) throw new Error('COMMIT_PLAN_EMPTY_COMMIT')
-      if (changed.some(file => !group.files.includes(file))) throw new Error('COMMIT_PLAN_INDEX_MISMATCH')
-      const messageFile = path.join(temporary, 'message.txt')
-      await writeFile(messageFile, group.message, 'utf8')
-      const expectedTree = (await raw(['write-tree'], tmpEnv)).trim()
-      const tmpGitDir = path.join(temporary, 'gitdir'), tmpHooksDir = path.join(temporary, 'hooks')
-      await runGit(rootReal, ['init', '--bare', `--object-format=${objectFormat}`, tmpGitDir])
-      await writeFile(path.join(tmpGitDir, 'objects', 'info', 'alternates'), path.join(realCommonDir, 'objects').replace(/\\/g, '/') + '\n')
-      const copyIfPresent = async (source: string, destination: string) => {
-        try { await copyFile(source, destination) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-      }
-      await copyIfPresent(path.join(realCommonDir, 'config'), path.join(tmpGitDir, 'config'))
-      if (realGitDir !== realCommonDir) await copyIfPresent(path.join(realGitDir, 'config.worktree'), path.join(tmpGitDir, 'config.worktree'))
-      await copyIfPresent(path.join(realCommonDir, 'info', 'attributes'), path.join(tmpGitDir, 'info', 'attributes'))
-      await mkdir(tmpHooksDir)
-      for (const name of ['pre-commit', 'prepare-commit-msg', 'commit-msg']) {
-        const source = path.join(realHooksDir, name)
-        const st = await stat(source).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; return undefined })
-        if (!st?.isFile() || (process.platform !== 'win32' && !(st.mode & 0o111))) continue
-        const quoted = source.replace(/\\/g, '/').replace(/'/g, "'\\''")
-        await writeFile(path.join(tmpHooksDir, name), `#!/bin/sh\nexec '${quoted}' "$@"\n`, { mode: 0o755 })
-      }
-      await raw([`--git-dir=${tmpGitDir}`, 'config', 'core.bare', 'false'])
-      await raw([`--git-dir=${tmpGitDir}`, 'config', '--unset', 'core.worktree']).catch(() => {})
-      await raw([`--git-dir=${tmpGitDir}`, 'config', 'core.hooksPath', tmpHooksDir])
-      for (const key of ['commit.gpgSign', 'user.signingKey', 'gpg.format', 'gpg.program', 'i18n.commitEncoding', 'core.commentChar']) {
-        const value = await raw(['config', '--get', key]).catch(() => undefined)
-        if (value !== undefined) await raw([`--git-dir=${tmpGitDir}`, 'config', key, value.replace(/\r?\n$/, '')])
-      }
-      const refs = (await raw(['for-each-ref', '--format=%(refname) %(objectname)'])).trim().split(/\r?\n/).filter(Boolean)
-      const updates = refs.flatMap(line => {
-        const [ref, oid] = line.split(' ')
-        return ref === 'HEAD' || ref === expectedBranchRef ? [] : [`update ${ref} ${oid}\n`]
-      }).join('')
-      if (updates) await runGit(rootReal, [`--git-dir=${tmpGitDir}`, 'update-ref', '--stdin'], { input: updates })
-      if (expectedBranchRef !== '(detached)') {
-        await writeFile(path.join(tmpGitDir, 'HEAD'), `ref: ${expectedBranchRef}\n`)
-        if (expectedHead !== '(unborn)') await raw([`--git-dir=${tmpGitDir}`, 'update-ref', expectedBranchRef!, expectedHead])
-      } else await writeFile(path.join(tmpGitDir, 'HEAD'), `${expectedHead}\n`)
-      const isolatedEnv: NodeJS.ProcessEnv = { ...process.env, GIT_DIR: tmpGitDir, GIT_WORK_TREE: rootReal, GIT_INDEX_FILE: tmpEnv.GIT_INDEX_FILE }
-      delete isolatedEnv.GIT_COMMON_DIR
-      delete isolatedEnv.GIT_OBJECT_DIRECTORY
-      delete isolatedEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES
-      for (const role of ['AUTHOR', 'COMMITTER']) {
-        const ident = /^(.*) <([^>]*)> (\d+ [+-]\d{4})$/.exec((await raw(['var', `GIT_${role}_IDENT`])).trim())
-        if (!ident) throw new Error('COMMIT_PLAN_ABORTED: invalid Git identity')
-        isolatedEnv[`GIT_${role}_NAME`] = ident[1]
-        isolatedEnv[`GIT_${role}_EMAIL`] = ident[2]
-        if (process.env[`GIT_${role}_DATE`] === undefined) isolatedEnv[`GIT_${role}_DATE`] = ident[3]
-      }
-      await assertExpected(remainingFiles)
-      await runGit(rootReal, ['commit', '-F', messageFile], { env: isolatedEnv })
-      const candHash = (await raw(['rev-parse', '--verify', 'HEAD'], isolatedEnv)).trim()
-      const parents = (await raw(['rev-list', '--parents', '-n', '1', candHash], isolatedEnv)).trim().split(/\s+/).slice(1)
-      if (JSON.stringify(parents) !== JSON.stringify(expectedHead === '(unborn)' ? [] : [expectedHead])) throw new Error('COMMIT_PLAN_ABORTED: unexpected commit parents')
-      const candTree = (await raw(['rev-parse', '--verify', `${candHash}^{tree}`], isolatedEnv)).trim()
-      if (candTree !== expectedTree) {
-        const changedFiles = (await raw(['diff-tree', '-r', '--no-renames', '--name-only', '-z', expectedTree, candTree], isolatedEnv)).split('\0').filter(Boolean)
-        throw new Error(`COMMIT_PLAN_HOOK_MODIFIED_TREE: ${changedFiles.join(', ')}`)
-      }
-      await assertExpected(remainingFiles)
-      const candidate = (await runGit(rootReal, ['cat-file', 'commit', candHash], { env: isolatedEnv })).stdout
-      const newHead = (await runGit(rootReal, ['hash-object', '-t', 'commit', '-w', '--stdin'], { input: candidate })).stdout.toString('utf8').trim()
-      if (newHead !== candHash) throw new Error('COMMIT_PLAN_ABORTED: promoted commit hash mismatch')
-      const actualSubject = (await raw(['log', '-1', '--format=%s', newHead])).trimEnd()
-      const realIndexPath = path.resolve(rootReal, (await raw(['rev-parse', '--git-path', 'index'])).trim())
-      const lockPath = `${realIndexPath}.lock`
-      const lock = await open(lockPath, 'wx')
-      realIndexLock = lockPath
-      await lock.close()
-      await assertExpected(remainingFiles)
-      await raw(['update-ref', '-m', `commit: ${actualSubject}`, ...(expectedBranchRef === '(detached)' ? ['--no-deref', 'HEAD'] : [expectedBranchRef!]), newHead, expectedHead === '(unborn)' ? zeroOid : expectedHead])
-      const created = { hash: newHead, subject: actualSubject, files: [...group.files] }
-      commits.push(created)
-      created.hash = (await raw(['rev-parse', '--short', newHead])).trim()
-      const actualFiles = (await raw(['diff-tree', '--root', '--no-commit-id', '-r', '--no-renames', '--name-only', '-z', newHead])).split('\0').filter(Boolean)
-      if (!actualFiles.length || actualFiles.some(file => !group.files.includes(file))) throw new Error('COMMIT_PLAN_INDEX_MISMATCH')
-      if (plan.scope === 'working') {
-        // Never adopt hook changes to the real index as our next approved baseline.
-        await assertNoActiveGitOperation(rootReal, git)
-        const currentHead = (await raw(['rev-parse', '--verify', 'HEAD'])).trim()
-        const currentBranch = (await raw(['symbolic-ref', '--quiet', 'HEAD']).catch(() => '')).trim() || '(detached)'
-        if (currentHead !== newHead || currentBranch !== expectedBranchRef || await indexRaw() !== expectedRealIndexRaw) throw new Error('COMMIT_PLAN_ABORTED: HEAD, branch or real index changed')
-        const committedIndex = await raw(['ls-tree', '-r', '-z', newHead])
-        const entries = new Map(committedIndex.split('\0').filter(Boolean).map(record => {
-          const match = /^(\d+) \w+ ([a-f0-9]+)\t([\s\S]+)$/.exec(record)!
-          return [match[3], `${match[1]} ${match[2]}`]
-        }))
-        nextIndex = `${realIndexPath}.${path.basename(temporary)}`
-        await copyIfPresent(realIndexPath, nextIndex)
-        await runGit(rootReal, ['update-index', '-z', '--index-info'], { env: { ...process.env, GIT_INDEX_FILE: nextIndex }, input: deletionFirst(group.files.map(file => `${entries.get(file) ?? `0 ${zeroOid}`}\t${file}\0`)) })
-        await rename(nextIndex, realIndexPath)
-        nextIndex = undefined
-        expectedRealIndexRaw = await indexRaw()
-      }
-      expectedHead = newHead
-      created.files = actualFiles
-      await unlink(realIndexLock)
-      realIndexLock = undefined
-      await runGit(rootReal, ['hook', 'run', '--ignore-missing', 'post-commit']).catch(() => {})
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error)
-      throw Object.assign(new Error(`${detail}. Đã tạo ${commits.length} commit (${commits.map(commit => commit.hash).join(', ')}) trước khi dừng ở nhóm #${idx + 1}: ${group.message.split(/\r?\n/, 1)[0]}`), { code: detail.split(':', 1)[0].trim(), failedGroupIndex: idx, failedSubject: group.message.split(/\r?\n/, 1)[0], commits: [...commits], cause: error })
-    } finally {
-      if (nextIndex) await unlink(nextIndex).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error })
-      if (realIndexLock) await unlink(realIndexLock)
-      if (temporary) await rm(temporary, { recursive: true, force: true, maxRetries: 5 })
-    }
-  }
-  return { commits }
 }
 
 export async function buildNotesSummary(root: string, request: BuildNotesRequest, maxDiffBytes = 56_000): Promise<BuildNotesSummary> {

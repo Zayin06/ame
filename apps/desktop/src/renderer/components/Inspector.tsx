@@ -33,7 +33,8 @@ type InspectorProps = {
   onCommitMessageChange?: (value: string) => void
   gitWorkspaceOpen?: boolean
   onOpenGitWorkspace?: (tab?: 'commit' | 'history' | 'stash' | 'build-notes') => void
-  onOpenCommitAgent?: () => void
+  analysisStarting?: boolean
+  onStartCommitAnalysis?: () => void
   onCommitEnhanceSkillChange?: (skill: string) => void
 }
 
@@ -243,7 +244,7 @@ export function Inspector(props: InspectorProps) {
   return <ProjectInspector key={props.projectID || ''} {...props} />
 }
 
-function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report, commitMessage, onCommitMessageChange, gitWorkspaceOpen, onOpenGitWorkspace, onOpenCommitAgent, onCommitEnhanceSkillChange, dirtyPaths }: InspectorProps) {
+function ProjectInspector({ projectID, name, connected = false, tab, setTab, generation, git, gitError, refresh, onOpen, onRename, onDelete, onDiff, onHide, report, commitMessage, onCommitMessageChange, gitWorkspaceOpen, onOpenGitWorkspace, onStartCommitAnalysis, analysisStarting, onCommitEnhanceSkillChange, dirtyPaths }: InspectorProps) {
   const [localMessage, setLocalMessage] = useState('')
   const message = commitMessage ?? localMessage
   const setMessage = (next: string) => {
@@ -359,7 +360,6 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
         <button type="button" data-testid="scm-pull-btn" disabled={!sync.canSync || busy} onClick={() => syncRemote('pull')}>{sync.pullLabel}</button>
         <button type="button" data-testid="scm-push-btn" disabled={!sync.canSync || busy} onClick={() => syncRemote('push')}>{sync.pushLabel}</button>
         <IconButton label="Lịch sử commit" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('history')}><Icon name="history" /></IconButton>
-        <span data-testid="scm-commit-agent-btn"><IconButton label="Trợ lý Commit AI (phân tích & tách commit)" disabled={!projectID || !onOpenCommitAgent} onClick={() => onOpenCommitAgent?.()}><Icon name="wand" /></IconButton></span>
         <IconButton label="Quản lý Stash" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('stash')}><Icon name="stash" /></IconButton>
         <IconButton label="Mô tả bản build (QC)" disabled={!projectID} onClick={() => onOpenGitWorkspace?.('build-notes')}><Icon name="notes" /></IconButton>
       </div>
@@ -405,7 +405,7 @@ function ProjectInspector({ projectID, name, connected = false, tab, setTab, gen
         </section> : null
       })}
     </>}</div>
-    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => { setMessage(e.target.value); setCommitError('') }} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><button type="button" className={`scm-enhance-icon-btn${enhancing ? ' is-loading' : ''}`} aria-busy={enhancing || undefined} disabled={!connected || busy || !stagedChanges.length} title={enhancing ? 'Đang tạo thông điệp commit…' : enhanceTitle} aria-label={enhancing ? 'Đang tạo thông điệp commit…' : enhanceTitle} data-testid="scm-enhance-btn" onClick={enhanceCommit}>{enhancing ? <span className="amekit-spinner" aria-hidden="true" /> : <Icon name="wand" />}</button><button type="button" className="scm-expand-icon-btn" data-testid="scm-expand-commit-btn" aria-pressed={gitWorkspaceOpen || undefined} title={gitWorkspaceOpen ? 'Thu gọn về thanh bên' : 'Mở rộng khu soạn commit ra vùng giữa'} aria-label={gitWorkspaceOpen ? 'Thu gọn khu soạn commit' : 'Mở rộng khu soạn commit'} onClick={() => onOpenGitWorkspace?.('commit')}><Icon name="expand" /></button></div></div>{commitError && <div className="inline-error scm-commit-error" data-testid="scm-commit-error" role="alert">{commitError}</div>}<button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : <><Icon name="check" /> Commit</>}</button></form>}
+    {tab === 'git' && projectID && <form className="scm-commit-dock is-visible" onSubmit={e => { e.preventDefault(); submitCommit() }}><div className="scm-commit-input-wrap"><textarea aria-label="Thông điệp commit" className="scm-commit-textarea" rows={3} value={message} onChange={e => { setMessage(e.target.value); setCommitError('') }} onKeyDown={e => commitShortcut(e, commitState, submitCommit)} placeholder="Message (Ctrl/Cmd+Enter to commit)" /><div className="scm-commit-input-bar"><button type="button" className={`scm-enhance-icon-btn${enhancing ? ' is-loading' : ''}`} aria-busy={enhancing || undefined} disabled={!connected || busy || !stagedChanges.length} title={enhancing ? 'Đang tạo thông điệp commit…' : enhanceTitle} aria-label={enhancing ? 'Đang tạo thông điệp commit…' : enhanceTitle} data-testid="scm-enhance-btn" onClick={enhanceCommit}>{enhancing ? <span className="amekit-spinner" aria-hidden="true" /> : <Icon name="wand" />}</button><button type="button" className="scm-enhance-icon-btn" data-testid="scm-analysis-btn" disabled={!connected || busy || analysisStarting || !onStartCommitAnalysis} aria-label="Phân tích" title="Phân tích Git trong Chat mới (model Commit Enhance cố định)" onClick={() => onStartCommitAnalysis?.()}><Icon name="sparkles" /></button><button type="button" className="scm-expand-icon-btn" data-testid="scm-expand-commit-btn" aria-pressed={gitWorkspaceOpen || undefined} title={gitWorkspaceOpen ? 'Thu gọn về thanh bên' : 'Mở rộng khu soạn commit ra vùng giữa'} aria-label={gitWorkspaceOpen ? 'Thu gọn khu soạn commit' : 'Mở rộng khu soạn commit'} onClick={() => onOpenGitWorkspace?.('commit')}><Icon name="expand" /></button></div></div>{commitError && <div className="inline-error scm-commit-error" data-testid="scm-commit-error" role="alert">{commitError}</div>}<button className="scm-commit-btn" disabled={!canCommit(commitState)}>{busy ? 'Đang xử lý…' : <><Icon name="check" /> Commit</>}</button></form>}
     <footer className="inspector-pane__footer"><span>{tab === 'git' ? `${changes.length} changes` : tab === 'search' ? 'Project Search' : 'Explorer'}</span><IconButton label="Làm mới dự án" onClick={refresh}><Icon name="refresh" /></IconButton></footer>
   </aside>
 }

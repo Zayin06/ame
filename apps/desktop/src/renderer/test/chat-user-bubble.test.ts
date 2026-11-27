@@ -62,7 +62,6 @@ function harness(items: ChatItem[], options: { clipboard?: boolean } = {}) {
     async skills() { return [] },
     onEvent() { return () => {} },
     async androidTranslationInfo() { return { lockedSessionIDs: [], translationSessionIDs: [] } },
-    async commitAgentSessionState() { return { lockedSessionIDs: [], commitSessionIDs: [] } },
   }
   const marker = () => null, nativeRequire = createRequire(import.meta.url), exports: Record<string, unknown> = {}
   const code = ts.transpileModule(readFileSync(new URL('../components/Chat.tsx', import.meta.url), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText

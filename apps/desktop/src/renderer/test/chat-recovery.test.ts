@@ -59,9 +59,13 @@ function harness(overrides: Record<string, any> = {}, app = false) {
     },
   }
   const exports: any = {}
+  const windowListeners = new Map<string, Set<() => void>>()
   const code = ts.transpileModule(readFileSync(filename, 'utf8').replaceAll('import.meta.env.DEV', 'false'), { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText
   runInNewContext(code, {
-    exports, window: { ame: api, confirm: () => true, addEventListener() {}, removeEventListener() {} },
+    exports, window: { ame: api, confirm: () => true,
+      addEventListener(name: string, listener: () => void) { if (!windowListeners.has(name)) windowListeners.set(name, new Set()); windowListeners.get(name)!.add(listener) },
+      removeEventListener(name: string, listener: () => void) { windowListeners.get(name)?.delete(listener) },
+    },
     localStorage: { getItem: () => JSON.stringify({ ...nativeRequire(app ? './state' : '../state').defaults(), project: 'p', stage: true, panel: 'files', projects: { p: { tabs: [{ mode: 'file', path: 'a.txt' }] } } }), setItem() {} },
     document: { documentElement: { dataset: {}, style: { setProperty() {} } } },
     setTimeout, clearTimeout, requestAnimationFrame: () => {},
@@ -88,6 +92,7 @@ function harness(overrides: Record<string, any> = {}, app = false) {
   }
   return {
     api, render, lifecycle: exports,
+    emit(name: string) { windowListeners.get(name)?.forEach(listener => listener()) },
     remount(patch: any) { cleanups.forEach(cleanup => cleanup?.()); cleanups.length = 0; slots = []; return render(patch) },
     nodes: () => elements(tree),
     input: () => elements(tree).find(node => node.type === 'textarea')!,
@@ -185,6 +190,80 @@ test('permission load error blocks button and Enter, retains draft, and retry un
   } finally { h.dispose() }
 })
 
+test('failed model pin loading releases the send button and reports the error', async () => {
+  const errors: Error[] = []
+  let reject!: (error: Error) => void, prompts = 0
+  const h = harness({ pinnedSessionModels: () => new Promise((_resolve, fail) => { reject = fail }), prompt: async () => { prompts++ } })
+  try {
+    h.render({ report: (error: Error) => errors.push(error) }); await h.settle(); type(h, 'send after load failure')
+    assert.equal(h.send().props.disabled, true)
+    reject(new Error('pins offline')); await h.settle()
+    assert.equal(h.send().props.disabled, false)
+    assert.equal(errors[0].message, 'pins offline')
+    h.input().props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() {} })
+    await h.settle(); assert.equal(prompts, 1)
+  } finally { h.dispose() }
+})
+
+test('reopening a user analysis chat waits for pin recovery and reloads a fresh feature model catalog before sending', async () => {
+  const calls: string[] = [], prompts: any[][] = []
+  let recover!: () => void
+  const enhanced = { id: 'enhance-runtime', modelID: 'enhance', providerID: 'amecode', name: 'Enhance' }
+  let authorized = false
+  const h = harness({
+    pinnedSessionModels: async (project: string, session: string) => {
+      if (!session) return {}
+      assert.equal(project, 'p'); assert.equal(session, 'A'); calls.push('recover')
+      await new Promise<void>(resolve => { recover = resolve })
+      authorized = true
+      return { A: 'enhance' }
+    },
+    models: async () => { calls.push('models'); return [{ id: 'm', providerID: 'amecode', modelID: 'm', name: 'Model' }, ...(authorized ? [enhanced] : [])] },
+    prompt: async (...args: any[]) => { prompts.push(args) },
+  })
+  try {
+    // Populate a still-fresh project cache with only the ordinary user model.
+    h.render({ sessionID: undefined, accountRole: 'user' }); await h.settle()
+    h.render({ sessionID: 'A' }); type(h, 'continue analysis'); await h.settle()
+    assert.equal(h.send().props.disabled, true)
+    assert.deepEqual(calls, ['models', 'recover'])
+    recover(); await h.settle(); await h.settle()
+    assert.equal(calls.at(-1), 'models')
+    assert.equal(h.send().props.disabled, false)
+    h.input().props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() {} })
+    await h.settle()
+    assert.equal(prompts.length, 1)
+    assert.equal(prompts[0][3].modelID, 'enhance')
+  } finally { h.dispose() }
+})
+
+test('account changes restore the selected analysis pin again before sending', async () => {
+  let authorized = false, recoveries = 0
+  const h = harness({
+    pinnedSessionModels: async () => { authorized = true; recoveries++; return { A: 'enhance' } },
+    models: async () => [{ id: 'm', providerID: 'amecode', modelID: 'm', name: 'Model' }, ...(authorized ? [{ id: 'enhance', providerID: 'amecode', modelID: 'enhance', name: 'Enhance' }] : [])],
+  })
+  try {
+    h.render({ accountRole: 'user' }); await h.settle(); await h.settle()
+    type(h, 'continue'); assert.equal(h.send().props.disabled, false)
+    authorized = false; h.emit('ame-account-changed'); h.render()
+    assert.equal(h.send().props.disabled, true)
+    await h.settle(); await h.settle()
+    assert.equal(recoveries, 2)
+    assert.equal(h.send().props.disabled, false)
+  } finally { h.dispose() }
+})
+
+test('locked model label falls back to the pinned ID when the catalog has no match', async () => {
+  const h = harness({ pinnedSessionModels: async () => ({ A: 'uncatalogued-enhance' }) })
+  try {
+    h.render(); await h.settle()
+    const locked = h.nodes().find(node => node.props.className?.includes('composer-picker--locked'))!
+    const label = elements(locked).find(node => node.props.className === 'composer-picker__label')!
+    assert.equal(label.props.children, 'uncatalogued-enhance')
+  } finally { h.dispose() }
+})
+
 test('late session creation from an old draft cannot overwrite a newer New Chat draft', async () => {
   let resolve!: (session: any) => void
   const created: string[] = []
@@ -225,47 +304,36 @@ test('messages render while forms fail, with independent retry and retained prev
   } finally { h.dispose() }
 })
 
-test('Commit AI banner opens the currently selected session, including locked sessions', async () => {
-  const opened: string[] = []
-  const h = harness({ commitAgentInfo: async () => ({ commitSessionIDs: ['A', 'B'], lockedSessionIDs: ['B'] }) })
-  try {
-    h.render({ onOpenCommitAgent: (id: string) => opened.push(id) }); await h.settle()
-    elements(h.warning('commit-agent-locked-banner')).find(node => node.props.children === 'Trợ lý Commit AI')!.props.onClick()
-    h.render({ sessionID: 'B' }); await h.settle()
-    elements(h.warning('commit-agent-locked-banner')).find(node => node.props.children === 'Trợ lý Commit AI')!.props.onClick()
-    assert.deepEqual(opened, ['A', 'B'])
-  } finally { h.dispose() }
-})
-
-test('Chat prefers lightweight commit session state on mount and OpenCode SSE without loading Git info', async () => {
-  const calls: string[] = [], events = new Set<(event: any) => void>()
-  let infoCalls = 0
-  const h = harness({
-    commitAgentSessionState: async (projectID: string) => { calls.push(projectID); return { commitSessionIDs: ['A'], lockedSessionIDs: [] } },
-    commitAgentInfo: async () => { infoCalls++; return { commitSessionIDs: [], lockedSessionIDs: [] } },
-    onEvent: (listener: (event: any) => void) => { events.add(listener); return () => events.delete(listener) },
-  })
+test('analysis opens a new main Chat from GitWorkspace with the current Chat permissions', async () => {
+  const calls: unknown[][] = []
+  const h = harness({ sessions: async () => calls.length ? [{ id: 'analysis', title: 'Analysis' }] : [], startCommitAnalysis: async (...args: unknown[]) => { calls.push(args); return { session: { id: 'analysis', title: 'Analysis' }, model: { id: 'enhance', providerID: 'amecode', name: 'Enhance' } } } }, true)
   try {
     h.render(); await h.settle()
-    assert.deepEqual(calls, ['p']); assert.ok(h.warning('commit-agent-locked-banner'))
-    events.forEach(listener => listener({ type: 'opencode', projectID: 'p', sessionID: 'A' }))
-    await new Promise(resolve => setTimeout(resolve, 350)); await h.settle()
-    assert.deepEqual(calls, ['p', 'p'])
-    h.render({ sessionID: 'normal' }); await h.settle()
-    assert.equal(h.warning('commit-agent-locked-banner'), undefined)
-    assert.deepEqual(calls, ['p', 'p', 'p'])
-    assert.equal(infoCalls, 0, 'Chat must not read Git snapshots or diffs')
+    h.nodes().find(node => typeof node.props.label === 'string' && node.props.label.startsWith('Project Inspector'))!.props.onClick(); h.render()
+    h.nodes().find(node => node.type === 'Chat')!.props.onPermissionModeChange('ask'); h.render()
+    h.nodes().find(node => node.type === 'Inspector')!.props.onOpenGitWorkspace('commit'); h.render()
+    assert.ok(h.nodes().find(node => node.type === 'GitWorkspace'))
+    h.nodes().find(node => node.type === 'GitWorkspace')!.props.onStartCommitAnalysis(); await h.settle()
+    assert.deepEqual(calls, [['p', 'ask']])
+    assert.equal(h.nodes().find(node => node.type === 'GitWorkspace'), undefined)
+    assert.equal(h.nodes().find(node => node.type === 'Chat')!.props.sessionID, 'analysis')
   } finally { h.dispose() }
-  assert.equal(events.size, 0)
 })
 
-test('Chat does not fall back to expensive Git info when the lightweight API rejects', async () => {
-  let infoCalls = 0
-  const h = harness({
-    commitAgentSessionState: async () => { throw new Error('offline') },
-    commitAgentInfo: async () => { infoCalls++; return { commitSessionIDs: [], lockedSessionIDs: [] } },
-  })
-  try { h.render(); await h.settle(); assert.ok(h.input()); assert.equal(infoCalls, 0) } finally { h.dispose() }
+test('analysis remains available before Chat reports its permission mode', async () => {
+  const calls: unknown[][] = []
+  const h = harness({ startCommitAnalysis: async (...args: unknown[]) => { calls.push(args); return { session: { id: 'analysis' }, model: { id: 'enhance' } } } }, true)
+  try {
+    h.render(); await h.settle()
+    h.nodes().find(node => typeof node.props.label === 'string' && node.props.label.startsWith('Project Inspector'))!.props.onClick(); h.render()
+    const inspector = h.nodes().find(node => node.type === 'Inspector')!
+    assert.equal(inspector.props.analysisStarting, false)
+    inspector.props.onOpenGitWorkspace('commit'); h.render()
+    const workspace = h.nodes().find(node => node.type === 'GitWorkspace')!
+    assert.equal(workspace.props.analysisStarting, false)
+    workspace.props.onStartCommitAnalysis(); await h.settle()
+    assert.deepEqual(calls, [['p', undefined]])
+  } finally { h.dispose() }
 })
 
 for (const scope of ['project', 'session', 'new'] as const) {
@@ -336,24 +404,6 @@ test('project removal while createSession is pending cannot recreate a session d
     finish(); await h.settle()
     assert.ok(!h.lifecycle.__chatDraftKeysForTest().drafts.some((key: string) => JSON.parse(key)[0] === 'p'))
     assert.equal(h.lifecycle.__chatDraftKeysForTest().deferred.length, 0)
-  } finally { h.dispose() }
-})
-
-test('App passes the Chat session to CommitAgentModal and clears it for generic entry points and project changes', async () => {
-  const h = harness({}, true)
-  try {
-    h.render(); await h.settle()
-    h.nodes().find(node => node.type === 'Chat')!.props.onOpenCommitAgent('commit-A'); h.render()
-    let modal = h.nodes().find(node => node.type === 'CommitAgentModal')!
-    assert.equal(modal.props.initialSessionID, 'commit-A'); assert.equal(modal.key, 'p:commit-A')
-    modal.props.onClose(); h.render()
-    // Open the inspector through its titlebar control, then use its generic trigger.
-    h.nodes().find(node => typeof node.props.label === 'string' && node.props.label.startsWith('Project Inspector'))!.props.onClick(); h.render()
-    h.nodes().find(node => node.type === 'Inspector')!.props.onOpenCommitAgent(); h.render()
-    modal = h.nodes().find(node => node.type === 'CommitAgentModal')!
-    assert.equal(modal.props.initialSessionID, undefined); assert.equal(modal.key, 'p:')
-    h.nodes().find(node => node.type === 'ProjectRail')!.props.onSelect('other'); h.render(); h.render()
-    assert.equal(h.nodes().find(node => node.type === 'CommitAgentModal'), undefined)
   } finally { h.dispose() }
 })
 

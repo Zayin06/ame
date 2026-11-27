@@ -111,7 +111,7 @@ export function AgentMap({ projectID, sessionID, connected, initialView, initial
     }
     const request = () => { if (!isCurrent()) return; clearTimeout(debounce); debounce = setTimeout(() => void load(), 250) }
     refresh.current = () => { void load() }
-    const unsubscribe = window.ame.onEvent(event => { if (event.type === 'opencode' && event.projectID === projectID) request() })
+    const unsubscribe = window.ame.onEvent(event => { if (event.type === 'opencode' && event.kind !== 'stream' && event.projectID === projectID) request() })
     void load()
     return () => { alive = false; scope.current++; clearTimeout(debounce); clearTimeout(poll); unsubscribe(); refresh.current = () => {} }
   }, [projectID, sessionID, connected, initialView, initialSelectedID])

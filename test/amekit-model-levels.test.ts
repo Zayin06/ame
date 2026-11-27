@@ -373,12 +373,129 @@ test('plugin reloads agents and skills after providers/models and adds one polic
     assert.match(emptyContext.tools.subagent.description, /No managed subagents are currently active/)
     assert.equal(emptyContext.system[0].text, 'No managed skills are currently active.')
     await assert.rejects(hooks.get('experimental.model.resolve')!(input), /AMECODE_LOGIN_REQUIRED/)
-  } finally { await cleanup?.() }
-  assert.deepEqual(disposedAgents, [1, 2, 3, 4])
+  } finally {
+    try { await update?.(null) }
+    finally { await cleanup?.() }
+  }
+  assert.deepEqual(disposedAgents, [1, 2, 3, 4, 5])
   assert.equal(agentTransform, undefined)
   assert.deepEqual([...agentTransforms.keys()], ['markdown'])
   assert.deepEqual(disposedTools, ['execute.after', 'execute.before', 'transform'])
 })
+
+async function modelLocation() {
+  type Context = Parameters<typeof plugin.setup>[0]
+  type ProviderTransform = Parameters<Context['provider']['transform']>[0]
+  type AgentTransform = Parameters<Context['agent']['transform']>[0]
+  type Agent = NonNullable<ReturnType<Parameters<AgentTransform>[0]['get']>>
+  let providerTransform!: ProviderTransform
+  let agentTransform!: AgentTransform
+  let rpc!: { update(value: unknown): Promise<boolean>; status(): Promise<{ authenticated: boolean; models: string[] }> }
+  const hooks = new Map<string, (input: any) => Promise<void>>()
+  const registration = { dispose: async () => {} }
+  const cleanup = await plugin.setup({
+    provider: { transform: async (fn: ProviderTransform) => { providerTransform = fn; return registration }, reload: async () => {} },
+    model: { transform: async () => registration, reload: async () => {} },
+    agent: { transform: async (fn: AgentTransform) => { agentTransform = fn; return registration }, reload: async () => {} },
+    skill: { reload: async () => {} },
+    tool: { transform: async () => registration, hook: async () => registration },
+    session: { hook: async (name: string, fn: (input: any) => Promise<void>) => { hooks.set(name, fn); return registration } },
+    rpc: { register: async (_schema: unknown, handlers: typeof rpc) => { rpc = handlers; return registration } },
+  } as unknown as Context)
+  return {
+    rpc, hooks, cleanup,
+    providers() {
+      const records: Parameters<Parameters<ProviderTransform>[0]['add']>[0][] = []
+      providerTransform({ list: () => [], remove() {}, add: (record: typeof records[number]) => { records.push(record) } } as unknown as Parameters<ProviderTransform>[0])
+      return records
+    },
+    agents() {
+      const agents = new Map<string, Agent>()
+      agentTransform({ list: () => [...agents.values()], update(id: string, transform: (agent: Agent) => void) {
+        const agent = agents.get(id) ?? { id } as Agent
+        agents.set(id, agent); transform(agent)
+      } } as unknown as Parameters<AgentTransform>[0])
+      return agents
+    },
+  }
+}
+
+const locationPolicy = () => ({
+  role: 'admin', catalog,
+  orchestrator: { id: ORCHESTRATOR_AGENT_ID, version: '1.0.0', description: 'Coordinator', prompt: 'Preserved orchestration', subagentDepth: 3 },
+  managedCatalog: { agents: ['custom-lead'], skills: ['custom-skill'] },
+  provider: { base_url: 'https://api.example.com/v1', api_key: 'test-key' }, expires: Date.now() + 60_000,
+})
+
+test('idle location eviction preserves authenticated models, provider credentials, orchestrator and managed catalog', async () => {
+  const upstream = createServer((req, res) => {
+    assert.equal(req.url, '/v1/chat/completions')
+    assert.equal(req.headers.authorization, 'Bearer test-key')
+    req.resume()
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}')
+  })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  let location = await modelLocation()
+  try {
+    assert.deepEqual(await location.rpc.status(), { authenticated: false, models: [] })
+    const policy = locationPolicy()
+    policy.provider.base_url = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`
+    await location.rpc.update(policy)
+    await location.cleanup?.()
+    location = await modelLocation()
+    assert.deepEqual(await location.rpc.status(), { authenticated: true, models: catalog.models.map(model => model.id) })
+    const [provider] = location.providers()
+    assert.equal(provider.info.id, 'amecode')
+    assert.deepEqual(provider.models?.map(model => model.id), [levels.default, levels.opus, levels.haiku, levels.sonnet])
+    const agent = location.agents().get(ORCHESTRATOR_AGENT_ID)!
+    assert.equal(agent.system, '[ame-orchestrator version=1.0.0]\nPreserved orchestration')
+    for (const [action, resource] of [['subagent', 'custom-lead'], ['skill', 'custom-skill']]) {
+      assert.ok(agent.permissions.some(rule => rule.action === action && rule.resource === resource && rule.effect === 'allow'))
+    }
+    const response = await fetch(`${provider.info.settings?.baseURL}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: levels.default, messages: [] }),
+    })
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { ok: true })
+  } finally {
+    try { await location.rpc.update(null) }
+    finally {
+      await location.cleanup?.()
+      upstream.closeAllConnections()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+    }
+  }
+})
+
+for (const reason of ['logout', 'idle revocation', 'idle expiry', 'expired update'] as const) {
+  test(`location setup stays fail-closed after ${reason}`, async t => {
+    let now = Date.now()
+    t.mock.method(Date, 'now', () => now)
+    let location = await modelLocation()
+    try {
+      const policy = locationPolicy()
+      await location.rpc.update(policy)
+      if (reason === 'logout') await location.rpc.update(null)
+      await location.cleanup?.()
+      if (reason === 'idle revocation') await location.rpc.update(null)
+      if (reason === 'idle expiry') now = policy.expires
+      location = await modelLocation()
+      if (reason === 'expired update') {
+        await assert.rejects(location.rpc.update({ ...policy, expires: now }), /AMECODE_LOGIN_REQUIRED/)
+        await location.cleanup?.()
+        location = await modelLocation()
+      }
+      assert.deepEqual(await location.rpc.status(), { authenticated: false, models: [] })
+      assert.deepEqual(location.providers(), [])
+      assert.equal(location.agents().size, 0)
+      await assert.rejects(location.hooks.get('model.request')!({ model: ref(levels.default) }), /AMECODE_LOGIN_REQUIRED/)
+    } finally {
+      try { await location.rpc.update(null) }
+      finally { await location.cleanup?.() }
+    }
+  })
+}
 
 test('gateway rewrites managed tier request bodies and rejects disallowed or unauthenticated requests before proxying', async () => {
   const forwarded: { model: string; messages: unknown; stream: boolean }[] = []

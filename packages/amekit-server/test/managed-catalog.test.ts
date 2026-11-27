@@ -154,7 +154,7 @@ test('runtime exemptions return before reading the catalog', async () => {
 
 test('proven standalone special entrypoints and catalog agents remain untouched', async () => {
   const guard = makeGuard()
-  for (const agent of ['build', 'AndroidTranslation', 'CommitAgent', 'BuildNotes', 'third-agent']) {
+  for (const agent of ['build', 'AndroidTranslation', 'BuildNotes', 'third-agent']) {
     const identity = { agent, sessionID: agent }, input = context(identity), original = structuredClone(input)
     await guard.filterContext(input)
     assert.deepEqual(input, original)
@@ -164,7 +164,7 @@ test('proven standalone special entrypoints and catalog agents remain untouched'
 
 test('AME children and grandchildren are guarded regardless of current agent', async () => {
   const guard = createManagedCatalogGuard({ getCatalog: () => active, getSession: async id => id === 'root' ? { agent: root.agent } : { agent: 'build', parentID: id === 'grandchild' ? 'child' : 'root' }, listAgents: async () => available })
-  for (const sessionID of ['child', 'grandchild']) for (const agent of ['build', 'AndroidTranslation', 'CommitAgent', 'BuildNotes', 'third-agent']) {
+  for (const sessionID of ['child', 'grandchild']) for (const agent of ['build', 'AndroidTranslation', 'BuildNotes', 'third-agent']) {
     await assert.rejects(guard.assertBeforeExecute(execute('subagent', { agent: 'explore' }, { agent, sessionID })), forbiddenAgent('explore'))
     await assert.rejects(guard.assertBeforeExecute(execute('skill', { id: 'unmanaged' }, { agent, sessionID })), forbiddenSkill('unmanaged'))
   }

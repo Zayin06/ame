@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { simpleGit } from 'simple-git'
 import { Workspaces } from '../packages/ide-core/src/workspace'
 import { searchWorkspace, replaceInWorkspace } from '../packages/ide-core/src/search'
-import { executeCommitPlan, gitCommitPlanSnapshot, gitUndoLastCommit, gitStashList, gitStashDrop, gitStashApply, checkoutBranch, gitFileCommitPatch } from '../packages/ide-core/src/git-ops'
+import { gitUndoLastCommit, gitStashList, gitStashDrop, gitStashApply, checkoutBranch, gitFileCommitPatch } from '../packages/ide-core/src/git-ops'
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-review-regression-'))
@@ -22,48 +22,8 @@ async function fixture(t: TestContext) {
   const commit = async () => { await git.add('.'); await git.raw(['commit', '-m', 'fixture']) }
   await put('file', 'before\n'); await commit()
   await ws.add(repo, 'p', false)
-  const plan = async (files: string[]) => {
-    const snapshot = await gitCommitPlanSnapshot(repo)
-    return executeCommitPlan(repo, { planID: 'regression', scope: snapshot.scope, snapshot, commits: [{ message: 'planned', files }] })
-  }
-  return { root, repo, git, put, commit, ws, plan }
+  return { root, repo, git, put, commit, ws }
 }
-
-test('index lock prevents publishing a working commit', async t => {
-  const { repo, git, put, plan } = await fixture(t)
-  const head = await git.revparse(['HEAD'])
-  await put('file', 'after\n')
-  await put('.git/index.lock', '')
-  await assert.rejects(plan(['file']), /EEXIST/)
-  assert.equal(await git.revparse(['HEAD']), head)
-  assert.equal(await git.raw(['show', ':file']), 'before\n')
-  assert.equal(await readFile(path.join(repo, '.git/index.lock'), 'utf8'), '')
-})
-
-test('working submodule update preserves gitlink and does not delete it', async t => {
-  const { repo, root, git, commit, plan } = await fixture(t)
-  const lib = path.join(root, 'lib'); await mkdir(lib)
-  const child = simpleGit(lib)
-  await child.init(); await child.addConfig('user.name', 'Review'); await child.addConfig('user.email', 'review@example.invalid'); await child.addConfig('commit.gpgSign', 'false')
-  await writeFile(path.join(lib, 'part'), 'one'); await child.add('.'); await child.commit('one')
-  await git.raw(['-c', 'protocol.file.allow=always', 'submodule', 'add', lib, 'lib']); await commit()
-  const sub = simpleGit(path.join(repo, 'lib'))
-  await writeFile(path.join(repo, 'lib/part'), 'two'); await sub.add('.'); await sub.raw(['-c', 'user.name=Review', '-c', 'user.email=review@example.invalid', '-c', 'commit.gpgSign=false', 'commit', '-m', 'two'])
-  await plan(['lib'])
-  assert.match(await git.raw(['ls-tree', 'HEAD', 'lib']), new RegExp(`160000 commit ${(await sub.revparse(['HEAD'])).trim()}`))
-  assert.equal((await git.status()).isClean(), true)
-})
-
-test('ordinary post-commit switch uses real index', async t => {
-  const { repo, git, put, plan } = await fixture(t)
-  await git.branch(['other']); await put('file', 'planned\n')
-  const hooks = path.join(repo, '.git/hooks'); await mkdir(hooks, { recursive: true })
-  await writeFile(path.join(hooks, 'post-commit'), '#!/bin/sh\ngit switch -q other\n', { mode: 0o755 })
-  await git.addConfig('core.hooksPath', hooks)
-  await plan(['file'])
-  assert.equal((await git.branch()).current, 'other')
-  assert.equal((await git.status()).isClean(), true)
-})
 
 test('shallow undo preserves branch until missing parent is fetched', async t => {
   const { root, repo, git, put, commit } = await fixture(t)

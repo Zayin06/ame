@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { formatRelativeTime, projectsByChatActivity, visibleProjectSessions } from '../project-order'
+import { formatRelativeTime, projectsByChatActivity, resolveRootSessionID, runningRootSessionIDs, visibleProjectSessions } from '../project-order'
 import type { Session } from '../../../../../packages/protocol/src/index'
 
 const now = 2_000_000_000_000
@@ -64,6 +64,42 @@ test('custom limits are clamped to at least one while retaining the active sessi
 })
 
 const projects = ['empty', 'older', 'newer', 'also-empty'].map(id => ({ id, name: id, directory: id }))
+const descendants: Session[] = [1, 2, 3, 4].map(depth => ({ id: `child-${depth}`, parentID: depth === 1 ? '1' : `child-${depth - 1}`, title: `Agent ${depth}`, updatedAt: 100 + depth }))
+test('subagents never occupy sidebar slots or contribute to totals, including expanded and search results', () => {
+  const items = [...sessionItems, ...descendants]
+  for (const options of [{}, { expanded: true }, { query: 'Agent' }]) {
+    assert.deepEqual(visibleProjectSessions(items, options), visibleProjectSessions(sessionItems, options))
+  }
+  assert.deepEqual(visibleProjectSessions(descendants), { items: [], total: 0, hiddenCount: 0 })
+})
+for (let depth = 1; depth <= 4; depth++) {
+  test(`active descendant at depth ${depth} pins only its root`, () => {
+    const items = [...sessionItems, ...descendants]
+    assert.equal(resolveRootSessionID(items, `child-${depth}`), '1')
+    assert.deepEqual(visibleProjectSessions(items, { activeSessionID: `child-${depth}` }), {
+      items: [sessionItems[1], sessionItems[4], sessionItems[0]], total: 5, hiddenCount: 2,
+    })
+  })
+  test(`running descendant at depth ${depth} lights its idle root`, () => {
+    const items: Session[] = [...sessionItems.map(session => ({ ...session, status: 'idle' as const })), ...descendants.map(session => ({ ...session, status: session.id === `child-${depth}` ? 'running' as const : 'idle' as const }))]
+    assert.deepEqual(runningRootSessionIDs(items), new Set(['1']))
+  })
+}
+test('root resolution and running roots handle missing ancestors and cycles safely', () => {
+  const items: Session[] = [
+    { id: 'root', title: 'Root', status: 'running' },
+    { id: 'idle', title: 'Idle', status: 'idle' },
+    { id: 'a', title: 'A', parentID: 'b', status: 'running' },
+    { id: 'b', title: 'B', parentID: 'a' },
+    { id: 'self', title: 'Self', parentID: 'self', status: 'running' },
+    { id: 'orphan', title: 'Orphan', parentID: 'missing', status: 'running' },
+  ]
+  assert.equal(resolveRootSessionID(items, 'root'), 'root')
+  for (const id of [undefined, '', 'missing', 'a', 'b', 'self', 'orphan']) assert.equal(resolveRootSessionID(items, id), undefined)
+  assert.deepEqual(runningRootSessionIDs(items), new Set(['root']))
+  assert.deepEqual(runningRootSessionIDs([]), new Set())
+  assert.deepEqual(visibleProjectSessions(items, { activeSessionID: 'a' }).items.map(session => session.id), ['root', 'idle'])
+})
 test('projects follow latest chat activity, not selection or session array order', () => {
   const cache = {
     older: [{ id: 'old', title: 'Old', updatedAt: 10 }],

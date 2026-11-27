@@ -116,7 +116,12 @@ export function createTsLanguageService(workspaceRoot: string, options: { reques
     updateDocument: (...args) => rpc('updateDocument', args),
     closeDocument: (...args) => rpc('closeDocument', args),
     refreshFiles,
-    diagnostics: (...args) => rpc('diagnostics', args),
+    diagnostics: async (...args) => {
+      // A filesystem event can queue another pass behind the active refresh.
+      // Wait for both passes before enqueueing diagnostics on the worker.
+      await activeRefresh
+      return rpc('diagnostics', args)
+    },
     completions: (...args) => rpc('completions', args),
     hover: (...args) => rpc('hover', args),
     definition: (...args) => rpc('definition', args),

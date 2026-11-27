@@ -6,7 +6,7 @@ import { simpleGit } from 'simple-git'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { diffContent, diffPreviewLimit, readDiffSide, type DiffSide } from './diff-content'
-import type { BuildNotesRequest, CommitAgentPlan, Project, FileDocument, FileEntry, GitState, GitBranches, GitCommitOptions, GitPushOptions, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
+import type { BuildNotesRequest, Project, FileDocument, FileEntry, GitState, GitBranches, GitCommitOptions, GitPushOptions, SearchQuery, SearchResponse, ReplaceOptions, ReplaceResult } from '../../protocol/src/index'
 import * as workspaceFs from './workspace-fs'
 import { searchWorkspace, replaceInWorkspace } from './search'
 import * as gitOps from './git-ops'
@@ -25,13 +25,18 @@ export class Workspaces {
   private searchControllers = new Map<string, AbortController>()
   private watchTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private saves = new Map<string, Promise<unknown>>()
+  private statusReads = new Map<string, Promise<GitState>>()
   private bom = new Map<string, boolean>()
   private setBom(id: string, key: string, hasBom: boolean) {
     this.bom.set(id + '\0' + key, hasBom)
     if (this.bom.size > MAX_BOM_CACHE) this.bom.delete(this.bom.keys().next().value!)
   }
   private projectQueue: Promise<unknown> = Promise.resolve()
-  constructor(private storage: string, private changed: (projectID: string) => void = () => {}) {}
+  constructor(private storage: string, private onChanged: (projectID: string) => void = () => {}) {}
+  private changed(id: string) {
+    this.statusReads.delete(id)
+    this.onChanged(id)
+  }
   async load() {
     let stored: unknown
     try { stored = JSON.parse(await readFile(this.storage, 'utf8')) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
@@ -107,6 +112,9 @@ export class Workspaces {
     this.gitWatchers.set(id, watchers)
   }
   private scheduleWatchChange(id: string) {
+    // A request arriving after a filesystem change needs a fresh snapshot, even
+    // when an older read is still running or the notification is debounced.
+    this.statusReads.delete(id)
     clearTimeout(this.watchTimers.get(id))
     this.watchTimers.set(id, setTimeout(() => {
       this.watchTimers.delete(id)
@@ -126,6 +134,7 @@ export class Workspaces {
       this.gitWatchers.delete(id)
       this.searchControllers.get(id)?.abort()
       this.searchControllers.delete(id)
+      this.statusReads.delete(id)
       this.projects.delete(id)
       for (const key of this.bom.keys()) if (key.startsWith(id + '\0')) this.bom.delete(key)
     })
@@ -285,18 +294,6 @@ export class Workspaces {
   async stagedDiffSummary(id: string, maxBytes?: number) {
     return gitOps.stagedDiffSummary(this.get(id).directory, maxBytes)
   }
-  async commitPlanSnapshot(id: string, maxDiffBytes?: number, options?: { focusFiles?: readonly string[]; includeDiff?: boolean }) {
-    return gitOps.gitCommitPlanSnapshot(this.get(id).directory, maxDiffBytes, options)
-  }
-  async executeCommitPlan(id: string, plan: CommitAgentPlan) {
-    let result
-    try { result = await gitOps.executeCommitPlan(this.get(id).directory, plan) } catch (error) {
-      if (Array.isArray((error as { commits?: unknown[] })?.commits) && (error as { commits: unknown[] }).commits.length > 0) this.changed(id)
-      throw error
-    }
-    this.changed(id)
-    return result
-  }
   async copyPath(targetID: string, sourceID: string, sourceRelative: string, targetDir: string) {
     const result = await workspaceFs.copyEntry(this.get(sourceID).directory, sourceRelative, this.get(targetID).directory, targetDir)
     this.changed(targetID)
@@ -395,7 +392,7 @@ export class Workspaces {
   private async readOnlyGit(id: string) {
     this.git(id) // Retain the repository-root guard.
     const directory = this.get(id).directory
-    return simpleGit(directory, { maxConcurrentProcesses: 1, trimmed: false, config: await gitOps.safeReadOnlyGitConfig(directory), timeout: { block: 10000 } }).env({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
+    return simpleGit(directory, { maxConcurrentProcesses: 1, trimmed: false, config: await gitOps.safeReadOnlyGitConfig(directory), timeout: { block: 10000 } }).env({ ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' })
   }
   private async gitPath(id: string, relative: string) {
     const root = this.get(id).directory
@@ -412,11 +409,21 @@ export class Workspaces {
     return path.relative(root, target).split(path.sep).join('/')
   }
   async status(id: string): Promise<GitState> {
+    this.get(id)
+    const pending = this.statusReads.get(id)
+    if (pending) return pending
+    const request = this.readStatus(id).finally(() => {
+      if (this.statusReads.get(id) === request) this.statusReads.delete(id)
+    })
+    this.statusReads.set(id, request)
+    return request
+  }
+  private async readStatus(id: string): Promise<GitState> {
     const git = await this.readOnlyGit(id)
     const result = await git.status()
     const root = this.get(id).directory
     const gitDir = path.resolve(root, (await git.raw(['rev-parse', '--git-dir'])).trim())
-    const hasRemote = await gitOps.hasRemote(root)
+    const hasRemote = await gitOps.hasRemote(git)
     const merging = result.conflicted.length > 0 || existsSync(path.join(gitDir, 'MERGE_HEAD')) || existsSync(path.join(gitDir, 'REBASE_HEAD'))
     const renamed = new Map(result.renamed.map(file => [file.to, file.from]))
     return { branch: result.current ?? '(unborn)', changes: result.files.map(f => ({ path: f.path, index: f.index, working: f.working_dir, ...(renamed.has(f.path) ? { from: renamed.get(f.path)! } : {}) })), tracking: result.tracking ?? null, ahead: result.ahead ?? 0, behind: result.behind ?? 0, hasRemote, merging }
@@ -515,6 +522,7 @@ export class Workspaces {
     this.changed(id)
   }
   dispose() {
+    this.statusReads.clear()
     for (const controller of this.searchControllers.values()) controller.abort()
     this.searchControllers.clear()
     this.gitWatchVersions.clear()

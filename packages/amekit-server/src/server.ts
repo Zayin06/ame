@@ -94,11 +94,16 @@ type State = { policy?: ReturnType<typeof modelPolicy>; provider?: { base_url: s
 const shared = globalThis as typeof globalThis & { [key]?: State }
 const state = shared[key] ??= { expires: 0, listeners: new Set() }
 function active() { return state.expires > Date.now() ? state.policy : undefined }
+function clearPolicy() {
+  state.policy = undefined; state.provider = undefined; state.orchestrator = undefined; state.managedCatalog = undefined; state.expires = 0
+}
 function check(model: { providerID: string; id: string }) { assertModel(active(), model) }
 
 export default Plugin.define({
   id: "amekit-models",
   async setup(ctx: Context) {
+    // No expiry timer runs while all locations are idle.
+    if (!state.listeners.size && !active()) clearPolicy()
     const todoGuard = createRootTodoGuard(sessionID => ctx.session.get({ sessionID: sessionID as Session.ID }))
     const catalogGuard = createManagedCatalogGuard({
       getCatalog: () => state.managedCatalog ?? EMPTY_MANAGED_CATALOG,
@@ -141,7 +146,8 @@ export default Plugin.define({
       clearInterval(timer); state.listeners.delete(reload)
       await reloading.catch(() => {})
       const activeReg = agentTransformReg; agentTransformReg = undefined
-      if (!state.listeners.size) { state.policy = undefined; state.provider = undefined; state.orchestrator = undefined; state.managedCatalog = undefined; state.expires = 0 }
+      // OpenCode evicts idle locations without ending the authenticated server session.
+      // Keep shared policy until explicit revocation or expiry.
       await Promise.all([gateway.close(), ...(activeReg ? [activeReg.dispose()] : []), ...registrations.reverse().map(registration => registration.dispose())])
     }
     try {
@@ -208,7 +214,7 @@ export default Plugin.define({
       status: { input: z.null(), output: z.object({ authenticated: z.boolean(), models: z.array(z.string()) }) },
     }, events: {} }, {
       update: async value => {
-        state.policy = undefined; state.provider = undefined; state.orchestrator = undefined; state.managedCatalog = undefined; state.expires = 0
+        clearPolicy()
         try {
           if (value) {
             const policy = modelPolicy(value.role, value.catalog, { featureModels: value.featureModels }), base_url = providerURL(value.provider.base_url)
@@ -225,7 +231,7 @@ export default Plugin.define({
     }))
     timer = setInterval(() => {
       if (state.policy && !active()) {
-        state.policy = undefined; state.provider = undefined; state.orchestrator = undefined; state.managedCatalog = undefined; state.expires = 0
+        clearPolicy()
         void Promise.all([...state.listeners].map(listener => listener())).catch(() => {})
       }
     }, 1000)

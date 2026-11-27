@@ -162,7 +162,7 @@ function liveHarness() {
     for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.fn() }
     return flush()
   }
-  return { render, flush, advance, requests, timers, listeners, event: (projectID: string) => subscription?.({ type: 'opencode', projectID } as IdeEvent), get unsubscriptions() { return unsubscriptions }, unmount: () => effects.forEach(effect => effect.cleanup?.()), get writes() { return writes } }
+  return { render, flush, advance, requests, timers, listeners, event: (projectID: string, kind?: 'stream' | 'session') => subscription?.({ type: 'opencode', projectID, ...(kind ? { kind } : {}) } as IdeEvent), get unsubscriptions() { return unsubscriptions }, unmount: () => effects.forEach(effect => effect.cleanup?.()), get writes() { return writes } }
 }
 
 test('live effects debounce project events, poll only running nodes, retain view on failed refresh, and clean up', async () => {
@@ -173,6 +173,8 @@ test('live effects debounce project events, poll only running nodes, retain view
   assert.ok((await h.flush()).includes('Android layout'))
   h.event('other'); await h.advance(250)
   assert.equal(h.requests.length, 1)
+  h.event('project', 'stream'); await h.advance(300)
+  assert.equal(h.requests.length, 1, 'stream events must not trigger agent-map fetches')
   h.event('project'); await h.advance(100); h.event('project'); await h.advance(249)
   assert.equal(h.requests.length, 1)
   await h.advance(1)

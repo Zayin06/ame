@@ -21,13 +21,13 @@ import { OpenCodeAdapter } from '../../../../packages/opencode-adapter/src/index
 import { PrivateRuntime } from '../../../../packages/opencode-adapter/src/runtime'
 import { createAmeKit } from '../../../../packages/amekit/src/index'
 import { resolveModelLevel, type ModelLevels } from '../../../../packages/amekit/src/model-policy'
-import { buildCommitAgentPrompt, createCommitAgentLockStore, extractCommitSnapshotID, parseCommitAgentPlan, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH } from '../../../../packages/amekit/src/commit-agent'
+import { createPinnedSessionModelStore, buildCommitAnalysisPrompt } from '../../../../packages/amekit/src/commit-analysis'
 import { canonicalWorkspaceScope, detectAndroidProject, buildAndroidTranslationPrompt, createTranslationLockStore } from '../../../../packages/amekit/src/android-translation'
 import { createPetHost } from '../../../../packages/amekit/src/pet-host'
 import { revealPetMainWindow } from '../../../../packages/amekit/src/pet-interaction'
 import { loadPetSprite } from '../../../../packages/amekit/src/pet'
 import type { UsagePrices } from '../../../../packages/amekit/src/usage-pricing'
-import { GIT_COMMIT_HASH_PATTERN, type AndroidTranslationInfo, type AndroidTranslationPromptResult, type BuildNotesPreview, type BuildNotesResult, type CommitAgentExecuteResult, type CommitAgentInfo, type CommitAgentPromptResult, type CommitAgentSnapshot, type CommitAgentPlanStatus, type IdeEvent, type Model, type SessionLockState } from '../../../../packages/protocol/src/index'
+import { GIT_COMMIT_HASH_PATTERN, type AndroidTranslationInfo, type AndroidTranslationPromptResult, type BuildNotesPreview, type BuildNotesResult, type IdeEvent, type Model, type SessionLockState } from '../../../../packages/protocol/src/index'
 
 if (!app.isPackaged && process.env.AME_IDE_TEST_DATA) app.setPath('userData', path.resolve(process.env.AME_IDE_TEST_DATA))
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -38,7 +38,7 @@ let terminals: Terminals
 let adapter: OpenCodeAdapter
 let account: ReturnType<typeof createAmeKit>
 let translationLocks: ReturnType<typeof createTranslationLockStore> | undefined
-let commitAgentLocks: ReturnType<typeof createCommitAgentLockStore> | undefined
+let pinnedModels: ReturnType<typeof createPinnedSessionModelStore> | undefined
 let petHost: ReturnType<typeof createPetHost> | undefined
 let sprite = ''
 let runtime: PrivateRuntime
@@ -175,15 +175,6 @@ const promptFileSchema = z.object({
 }).strict()
 const promptFilesSchema = z.array(promptFileSchema).max(8)
 const boundedID = id.refine(value => !!value.trim() && !value.includes('\0'))
-const planSchema = z.object({
-  planID: boundedID,
-  scope: z.enum(['staged', 'working']),
-  snapshot: z.object({ head: boundedID, branchRef: boundedID.optional(), indexHash: boundedID, workingHash: boundedID.optional(), untrackedHashes: z.record(workspacePath, boundedID).optional() }).strict(),
-  commits: z.array(z.object({
-    message: text.min(1).max(COMMIT_PLAN_MAX_MESSAGE_LENGTH).refine(value => !!value.trim() && !value.includes('\0')),
-    files: z.array(workspacePath).min(1).max(COMMIT_PLAN_MAX_FILES_PER_GROUP)
-  }).strict()).min(1).max(COMMIT_PLAN_MAX_GROUPS)
-}).strict()
 const formAnswerKey = z.string().min(1).max(200).refine(value => !!value.trim() && !value.includes('\0') && !['__proto__', 'prototype', 'constructor'].includes(value))
 const formAnswerString = z.string().max(20000).refine(value => !value.includes('\0'))
 const formAnswer = z.custom<Record<string, unknown>>(input => !!input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input).every(key => formAnswerKey.safeParse(key).success))
@@ -299,11 +290,8 @@ const schema = {
   androidTranslationInfo: z.tuple([boundedID]),
   androidTranslationPrompt: z.tuple([boundedID, boundedID.optional(), text.min(1).refine(value => !!value.trim() && !value.includes('\0')), z.enum(['update', 'full', 'scan', 'custom']).optional()]),
   androidTranslationLock: z.tuple([boundedID, boundedID]),
-  commitAgentInfo: z.tuple([boundedID]),
-  commitAgentSessionState: z.tuple([boundedID]),
-  commitAgentPrompt: z.tuple([boundedID, boundedID.optional(), text.min(1).refine(value => !!value.trim() && !value.includes('\0')), z.enum(['analyze', 'split', 'single', 'custom']).optional()]),
-  commitAgentLock: z.tuple([boundedID, boundedID]),
-  commitAgentExecutePlan: z.tuple([boundedID, boundedID, planSchema]),
+  startCommitAnalysis: z.tuple([boundedID, z.enum(['default', 'ask', 'readonly', 'full']).optional()]),
+  pinnedSessionModels: z.tuple([boundedID, boundedID.optional()]),
   prompt: z.tuple([id, id, text, modelSchema.optional(), id.optional(), promptFilesSchema.optional()]),
   resolveDroppedPaths: z.tuple([boundedID, z.array(z.string().max(4096)).max(32)]),
   pickAttachmentFiles: z.tuple([boundedID]),
@@ -356,6 +344,8 @@ async function pickImport() {
   const selected = await dialog.showOpenDialog(window!, { title: 'Import AmeKit agents / skills', properties: ['openDirectory'] })
   return selected.canceled ? null : selected.filePaths[0] ?? null
 }
+let modelPolicyRecovery: Promise<unknown> | undefined
+let modelPolicyRecoveryAfter = 0
 async function resolveModel(projectID: string, requested?: Model | string, requireRequested = false): Promise<Model> {
   let models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')
   let status = await account.call('status', {}) as { account?: { role?: string }; reconnecting?: boolean; models?: { default_model?: string; models?: { id: string }[] } } | null
@@ -399,6 +389,15 @@ async function resolveFeatureModel(projectID: string, selected: Model, configure
   if (shuttingDown) throw new Error('APP_SHUTTING_DOWN')
   return models.find(model => model.providerID === 'amecode' && (model.modelID === authorized || model.id === authorized)) ?? selected
 }
+async function resolvePinnedModel(projectID: string, pinned: string): Promise<Model> {
+  const selected = await resolveModel(projectID)
+  if ((selected.modelID ?? selected.id) === pinned) return selected
+  const authorized = await account.authorizeFeatureModel?.(pinned)
+  if (authorized !== pinned) throw new Error('COMMIT_ANALYSIS_MODEL_UNAVAILABLE')
+  const model = (await adapter.models(projectID)).find(model => model.providerID === 'amecode' && (model.modelID ?? model.id) === pinned)
+  if (!model) throw new Error('COMMIT_ANALYSIS_MODEL_UNAVAILABLE')
+  return model
+}
 const translationModels = new Map<string, string>()
 function translationKey(projectID: string, sessionID: string) { return JSON.stringify([projectID, sessionID]) }
 async function resolveTranslationModel(projectID: string, sessionID: string, selected: Model, configuredFeatureModel?: string): Promise<Model> {
@@ -435,55 +434,15 @@ async function recoverFeatureSessionModel(projectID: string, selected: Model, pi
 }
 function assertRegularSession(projectID: string, sessionID: string) {
   const { scope, legacy } = lockScopes(projectID)
-  if (commitAgentLocks?.isLocked(scope, sessionID, legacy)) throw new Error('COMMIT_AGENT_SESSION_LOCKED')
-  if (commitAgentLocks?.isSession(scope, sessionID, legacy)) throw new Error('COMMIT_AGENT_SESSION_REQUIRED')
   if (translationLocks?.isLocked(scope, sessionID, legacy)) throw new Error('TRANSLATION_SESSION_LOCKED')
   if (translationLocks?.isTranslationSession(scope, sessionID, legacy)) throw new Error('ANDROID_TRANSLATION_SESSION_REQUIRED')
 }
-const commitAgentModels = new Map<string, string>()
-const commitAgentPlans = new Map<string, { projectID: string; sessionID: string; planID: string; snapshot: CommitAgentSnapshot; status: CommitAgentPlanStatus; userMessageID?: string }>()
-const commitAgentLastFingerprint = new Map<string, string>()
-async function ensureCommitAgentReadonly(projectID: string, session: { id: string }) {
-  try {
-    if (typeof adapter.sessionPermissionMode === 'function' && await adapter.sessionPermissionMode(projectID, session.id) === 'readonly') return
-    const updated = await adapter.updateSessionPermissionMode(projectID, session.id, 'readonly')
-    const actual = typeof adapter.sessionPermissionMode === 'function' ? await adapter.sessionPermissionMode(projectID, session.id) : updated
-    if (actual === 'readonly') return
-  } catch { /* Fail closed: never send a planning prompt with unconfirmed permissions. */ }
-  throw new Error('COMMIT_AGENT_READONLY_REQUIRED')
-}
-async function resolveCommitAgentModel(projectID: string, sessionID: string, selected: Model, configuredFeatureModel?: string): Promise<Model> {
-  const key = translationKey(projectID, sessionID)
-  let pinned = commitAgentModels.get(key)
-  if (!pinned) {
-    const map = await adapter.agentMap(projectID, sessionID).catch(() => null)
-    const session = map?.nodes?.find(node => node.id === sessionID)
-    const models = await adapter.models(projectID).catch(() => [])
-    const model = models.find(model => model.providerID === 'amecode' && (model.id === session?.model || model.modelID === session?.model))
-    pinned = session?.providerID === 'amecode' ? model?.modelID ?? session.model : undefined
-  }
-  const model = await recoverFeatureSessionModel(projectID, selected, pinned, configuredFeatureModel, 'COMMIT_AGENT_MODEL_UNAVAILABLE')
-  commitAgentModels.set(key, model.modelID ?? model.id)
-  return model
-}
-function commitAgentLockState(projectID: string) {
-  const { scope, legacy } = lockScopes(projectID)
-  return { commitSessionIDs: commitAgentLocks?.sessionIDs(scope, legacy) ?? [], lockedSessionIDs: commitAgentLocks?.lockedSessionIDs(scope, legacy) ?? [] }
-}
-async function assertCommitAgentIdle(projectID: string, sessionID: string) {
-  const [sessions, permissions, forms] = await Promise.all([
-    adapter.sessions(projectID), adapter.permissions(projectID, sessionID), adapter.forms(projectID, sessionID)
-  ])
-  const session = sessions.find(session => session.id === sessionID)
-  if (!session || session.status === 'running') throw new Error('COMMIT_AGENT_SESSION_RUNNING')
-  if (permissions.length || forms.length) throw new Error('COMMIT_AGENT_SESSION_PENDING_APPROVAL')
-}
-async function commitAgentFeature(projectID: string): Promise<{ skill: { name: string; instructions: string; directory?: string } | null; model?: string; rawSkillName?: string } | null> {
+async function commitAnalysisFeature(projectID: string): Promise<{ skill: { name: string; instructions: string; directory?: string } | null; model?: string; rawSkillName?: string } | null> {
   return account.readCommitEnhanceFeature
     ? account.readCommitEnhanceFeature(projectID)
     : { skill: (await account.readCommitEnhanceSkill?.(projectID)) ?? null, model: undefined, rawSkillName: undefined }
 }
-async function commitAgentGitStatus(projectID: string) {
+async function commitAnalysisGitStatus(projectID: string) {
   const status = await workspace.status(projectID)
   return {
     branch: status.branch,
@@ -503,7 +462,7 @@ async function call(method: keyof typeof schema, args: unknown[]) {
   if (typeof shuttingDown !== 'undefined' && shuttingDown) throw new Error('APP_SHUTTING_DOWN')
   // Dispatch remains explicit: renderer never chooses arbitrary Node functions or IPC channels.
   const [a, b, c, d, e, f] = parsed
-  if (['commit', 'commitAgentExecutePlan', 'gitFetch', 'gitPull', 'gitPush', 'terminalCreate', 'debugStart'].includes(method)) await assertWorkspaceTrusted(a)
+  if (['commit', 'gitFetch', 'gitPull', 'gitPush', 'terminalCreate', 'debugStart'].includes(method)) await assertWorkspaceTrusted(a)
   switch (method) {
     case 'platform': return process.platform
     case 'artifacts': return adapter.artifacts(a, b)
@@ -581,12 +540,10 @@ async function call(method: keyof typeof schema, args: unknown[]) {
         if (!approved || approved.token !== b || approved.expires < Date.now()) throw new Error('CANCELLED: Xác nhận gỡ dự án đã hết hiệu lực.')
       } else await confirmation(`Gỡ dự án ${project.name} khỏi danh sách? Tệp trên ổ đĩa sẽ KHÔNG bị xóa.`)
       // Migrate legacy IDs before forgetting their association with this directory.
-      if (project.directory && (typeof translationLocks !== 'undefined' && translationLocks || typeof commitAgentLocks !== 'undefined' && commitAgentLocks)) {
+      if (project.directory && (typeof translationLocks !== 'undefined' && translationLocks)) {
         const { scope, legacy } = lockScopes(a, project.directory)
         for (const sessionID of translationLocks?.translationSessionIDs(scope, legacy) ?? []) await translationLocks!.recordSession(scope, sessionID, legacy)
         for (const sessionID of translationLocks?.lockedSessionIDs(scope, legacy) ?? []) await translationLocks!.lockSession(scope, sessionID, legacy)
-        for (const sessionID of commitAgentLocks?.sessionIDs(scope, legacy) ?? []) await commitAgentLocks!.recordSession(scope, sessionID, legacy)
-        for (const sessionID of commitAgentLocks?.lockedSessionIDs(scope, legacy) ?? []) await commitAgentLocks!.lockSession(scope, sessionID, legacy)
       }
       await workspace.remove(a)
       terminals.closeProject(a)
@@ -694,14 +651,12 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       return withAuthority(() => pairing.revokeAll())
     case 'sessions': return adapter.sessions(a)
     case 'createSession': {
-      if (b === 'full') await confirmation('Bật quyền tự động cho phép?', 'Agent sẽ tự động chấp thuận lệnh shell và ghi tệp mà không hỏi lại. Chỉ tiếp tục khi bạn tin cậy agent và workspace.')
       const orchestrator = await account.readOrchestrator?.()
       return orchestrator ? adapter.createSession(a, b, orchestrator.id) : adapter.createSession(a, b)
     }
     case 'sessionPermissionMode': return adapter.sessionPermissionMode(a, b)
     case 'updateSessionPermissionMode':
       await assertRegularSession(a, b)
-      if (c === 'full') await confirmation('Bật quyền tự động cho phép?', 'Agent sẽ tự động chấp thuận lệnh shell và ghi tệp mà không hỏi lại. Chỉ tiếp tục khi bạn tin cậy agent và workspace.')
       return adapter.updateSessionPermissionMode(a, b, c)
     case 'renameSession': return adapter.renameSession(a, b, c)
     case 'archiveSession': return adapter.archiveSession(a, b, c)
@@ -767,162 +722,32 @@ async function call(method: keyof typeof schema, args: unknown[]) {
         ...(skill ? { skill: skill.name } : {}),
       } satisfies BuildNotesResult
     }
-    case 'commitAgentSessionState': return commitAgentLockState(a)
-    case 'commitAgentInfo': {
-      const [git, feature, status] = await Promise.all([
-        commitAgentGitStatus(a), commitAgentFeature(a).catch(() => null),
-        (account.readStatus ? account.readStatus() : account.call('status', {})).catch(() => null),
-      ])
-      const catalog = (status as { models?: FeatureCatalog } | null)?.models
-      const configured = resolveCatalogFeatureModel(catalog, feature?.model)
-      const fallback = configured ?? resolveCatalogFeatureModel(catalog, catalog?.default_model)
-      const runtime = !fallback ? (await adapter.models(a).catch(() => [])).find(model => model.providerID === 'amecode') : undefined
-      const effective = fallback ?? (runtime ? { id: runtime.modelID ?? runtime.id, name: runtime.name } : undefined)
-      return {
-        configured: true, skill: feature?.skill?.name ?? feature?.rawSkillName,
-        configuredModelID: feature?.model, effectiveModelID: effective?.id, effectiveModelName: effective?.name ?? effective?.id,
-        fallbackToDefault: !configured, branch: git.branch, stagedCount: git.stagedFiles.length, workingCount: git.workingFiles.length,
-        ...commitAgentLockState(a),
-        plans: Object.fromEntries([...commitAgentPlans.values()].filter(plan => plan.projectID === a).map(({ planID, snapshot, status }) => [planID, { planID, snapshot, status }])),
-        messagePlanIDs: Object.fromEntries([...commitAgentPlans.values()].filter(plan => plan.projectID === a && plan.userMessageID).map(plan => [plan.userMessageID!, plan.planID]))
-      } satisfies CommitAgentInfo
+    case 'pinnedSessionModels': {
+      const models = pinnedModels?.models(lockScopes(a).scope) ?? {}
+      // Restore the feature entitlement before the renderer reloads its catalog.
+      // Only recover the selected session: an unavailable pin in another chat
+      // must not prevent this chat from opening.
+      if (b && models[b]) await withAuthority(() => resolvePinnedModel(a, models[b]))
+      return models
     }
-    case 'commitAgentPrompt': {
-      const { scope, legacy } = lockScopes(a)
-      if (!commitAgentLocks) throw new Error('COMMIT_AGENT_LOCK_STORE_UNAVAILABLE')
-      if (b && commitAgentLocks.isLocked(scope, b, legacy)) throw new Error('COMMIT_AGENT_SESSION_LOCKED')
-      if (b && !commitAgentLocks.isSession(scope, b, legacy)) throw new Error('COMMIT_AGENT_SESSION_REQUIRED')
-      const feature = await commitAgentFeature(a)
-      const selected = await resolveModel(a).catch(error => {
-        if (b && error instanceof Error && error.message === 'AMEKIT_MODEL_REQUIRED') throw new Error('COMMIT_AGENT_MODEL_UNAVAILABLE')
-        throw error
-      })
-      const model = b ? await resolveCommitAgentModel(a, b, selected, feature?.model) : await resolveFeatureModel(a, selected, feature?.model)
-      const git = await commitAgentGitStatus(a)
-      const session = b ? (await adapter.sessions(a)).find(session => session.id === b) : await adapter.createSession(a, 'readonly')
-      if (!session) throw new Error('SESSION_NOT_FOUND')
-      await ensureCommitAgentReadonly(a, session)
-      const priorMessages = b ? await adapter.messages(a, b) : []
-      const isFirstTurn = !b || priorMessages.length === 0
-      const priorUserIDs = new Set(priorMessages.filter(m => m.role === 'user').map(m => m.id))
-      // Only prioritize files in the selected scope; the Git reader rejects out-of-scope focus paths.
-      const focusFiles = (git.stagedFiles.length ? git.stagedFiles : git.workingFiles).filter(file => c.includes(file))
-      const fullSnapshot = await workspace.commitPlanSnapshot?.(a, 48_000, { includeDiff: true, focusFiles })
-      const sessionKey = translationKey(a, session.id)
-      const prevFingerprint = commitAgentLastFingerprint.get(sessionKey)
-      const includeSnapshot = isFirstTurn || !prevFingerprint || !!(fullSnapshot && prevFingerprint !== fullSnapshot.fingerprint) || /lập lại|tạo lại|phân tích lại|chia lại|tách lại|replan|refresh|cập nhật|diff/i.test(c)
-      let planID: string | undefined, storedSnapshot: CommitAgentSnapshot | undefined
-      if (fullSnapshot) {
-        planID = randomUUID()
-        storedSnapshot = Object.freeze({
-          head: fullSnapshot.head, branchRef: fullSnapshot.branchRef, branch: fullSnapshot.branch,
-          indexHash: fullSnapshot.indexHash, workingHash: fullSnapshot.workingHash,
-          ...(fullSnapshot.untrackedHashes ? { untrackedHashes: Object.freeze({ ...fullSnapshot.untrackedHashes }) } : {}),
-          scope: fullSnapshot.scope, fingerprint: fullSnapshot.fingerprint,
-          stagedFiles: [...fullSnapshot.stagedFiles], workingFiles: [...fullSnapshot.workingFiles],
-        })
-        Object.freeze(storedSnapshot.stagedFiles)
-        Object.freeze(storedSnapshot.workingFiles)
-      }
-      await commitAgentLocks.recordSession(scope, session.id, legacy)
-      commitAgentModels.set(translationKey(a, session.id), model.modelID ?? model.id)
-      // Legacy commit readers verify instructions but do not expose the skill directory.
-      // Never invent a filesystem path for bundled resources in that case.
-      const skill = feature?.skill ? {
-        ...feature.skill,
-        directory: feature.skill.directory ?? '(unavailable: do not resolve or execute bundled scripts, references or assets)'
-      } : null
-      const prompt = buildCommitAgentPrompt({ userText: c, mode: d, isFirstTurn, skill, ...git, snapshotID: planID, includeSnapshot, snapshot: fullSnapshot })
+    case 'startCommitAnalysis': {
+      if (!pinnedModels) throw new Error('PINNED_MODEL_STORE_UNAVAILABLE')
+      const feature = await commitAnalysisFeature(a)
+      const status = await (account.readStatus ? account.readStatus() : account.call('status', {})) as { models?: FeatureCatalog } | null
+      const target = resolveCatalogFeatureModel(status?.models, feature?.model || status?.models?.default_model)
+      if (!target) throw new Error('COMMIT_ANALYSIS_MODEL_UNAVAILABLE')
+      const model = await resolvePinnedModel(a, target.id)
+      const git = await commitAnalysisGitStatus(a)
+      const orchestrator = await account.readOrchestrator?.()
+      const session = await adapter.createSession(a, b, orchestrator?.id)
+      await pinnedModels.pin(lockScopes(a).scope, session.id, model.modelID ?? model.id)
       let nativeSkills: { id: string }[] | undefined
-      if (isFirstTurn && feature?.skill) {
-        const skillName = feature.skill.name
-        try {
-          const matched = (await adapter.skills(a)).find(skill => skill.name === skillName || skill.id === skillName)
-          if (matched) nativeSkills = [{ id: matched.id }]
-        } catch { /* Native skills may be unavailable; retain the scoped text prompt. */ }
+      if (feature?.skill) {
+        const matched = (await adapter.skills(a).catch(() => [])).find(skill => skill.name === feature.skill!.name || skill.id === feature.skill!.name)
+        if (matched) nativeSkills = [{ id: matched.id }]
       }
-      try {
-        await adapter.prompt(a, session.id, prompt, model, undefined, undefined, nativeSkills)
-      } catch (error) {
-        for (const plan of commitAgentPlans.values()) {
-          if (fullSnapshot && plan.projectID === a && plan.sessionID === session.id && plan.status === 'active' && plan.snapshot.fingerprint !== fullSnapshot.fingerprint) plan.status = 'stale'
-        }
-        throw error
-      }
-      for (const plan of commitAgentPlans.values()) {
-        if (plan.projectID === a && plan.sessionID === session.id && plan.status === 'active') plan.status = 'superseded'
-      }
-      if (planID && storedSnapshot) {
-        const afterMessages = await adapter.messages(a, session.id).catch(() => [])
-        const userMessageID = ([...afterMessages].reverse().find(m => m.role === 'user' && m.id && !priorUserIDs.has(m.id))
-          ?? [...afterMessages].reverse().find(m => m.role === 'user' && m.id && extractCommitSnapshotID(m.text) === planID))?.id
-        commitAgentPlans.set(planID, { projectID: a, sessionID: session.id, planID, snapshot: storedSnapshot, status: 'active', ...(userMessageID ? { userMessageID } : {}) })
-        while (commitAgentPlans.size > 100) commitAgentPlans.delete(commitAgentPlans.keys().next().value!)
-        commitAgentLastFingerprint.set(sessionKey, storedSnapshot.fingerprint)
-      }
-      return { session, model, locked: false, ...(planID && storedSnapshot ? { planID, snapshot: storedSnapshot } : {}) } satisfies CommitAgentPromptResult
-    }
-    case 'commitAgentLock': {
-      const { scope, legacy } = lockScopes(a)
-      if (!commitAgentLocks?.isSession(scope, b, legacy)) throw new Error('COMMIT_AGENT_SESSION_REQUIRED')
-      await assertCommitAgentIdle(a, b)
-      await commitAgentLocks.lockSession(scope, b, legacy)
-      notify({ type: 'opencode', projectID: a, sessionID: b })
-      return commitAgentLockState(a)
-    }
-    case 'commitAgentExecutePlan': {
-      const { scope, legacy } = lockScopes(a)
-      if (!commitAgentLocks?.isSession(scope, b, legacy)) throw new Error('COMMIT_AGENT_SESSION_REQUIRED')
-      if (commitAgentLocks.isLocked(scope, b, legacy)) throw new Error('COMMIT_AGENT_SESSION_LOCKED')
-      await assertCommitAgentIdle(a, b)
-      const stored = commitAgentPlans.get(c.planID)
-      if (!stored || stored.projectID !== a || stored.sessionID !== b || stored.status !== 'active') throw new Error('COMMIT_PLAN_STALE')
-      const sessionMessages = await adapter.messages(a, b)
-      let userIdx = stored.userMessageID ? sessionMessages.findIndex(m => m.role === 'user' && m.id === stored.userMessageID) : -1
-      if (userIdx < 0) {
-        for (let i = sessionMessages.length - 1; i >= 0; i--) {
-          if (sessionMessages[i].role === 'user' && extractCommitSnapshotID(sessionMessages[i].text) === stored.planID) {
-            userIdx = i
-            break
-          }
-        }
-      }
-      if (userIdx < 0) throw new Error('COMMIT_PLAN_UNVERIFIED')
-      let authoritative: ReturnType<typeof parseCommitAgentPlan> = null
-      for (const message of sessionMessages.slice(userIdx + 1)) {
-        if (message.role === 'user') break
-        if (message.role === 'assistant' && (!message.kind || message.kind === 'text')) authoritative = parseCommitAgentPlan(message.text) ?? authoritative
-      }
-      if (!authoritative) throw new Error('COMMIT_PLAN_UNVERIFIED')
-      const authoritativeScope = authoritative.scope ?? stored.snapshot.scope
-      if (c.scope !== authoritativeScope || c.commits.length !== authoritative.commits.length || c.commits.some((group: { message: string; files: string[] }, i: number) => {
-        const approved = authoritative.commits[i]
-        return group.message.trim() !== approved.message || group.files.length !== approved.files.length || group.files.some((file: string, j: number) => file !== approved.files[j])
-      })) throw new Error('COMMIT_PLAN_MISMATCH')
-      // Recheck after the message fetch so concurrent approvals cannot execute twice.
-      if (stored.status !== 'active') throw new Error('COMMIT_PLAN_STALE')
-      stored.status = 'executing'
-      try {
-        const result = await workspace.executeCommitPlan(a, { planID: stored.planID, scope: authoritativeScope, snapshot: stored.snapshot, commits: authoritative.commits })
-        stored.status = 'executed'
-        return result
-      } catch (error) {
-        const partialCommits = Array.isArray((error as { commits?: unknown[] })?.commits) ? (error as { commits: CommitAgentExecuteResult['commits'] }).commits : []
-        if (partialCommits.length > 0) {
-          stored.status = 'stale'
-          return {
-            commits: partialCommits,
-            partialFailure: {
-              code: typeof (error as { code?: unknown })?.code === 'string' ? (error as { code: string }).code : 'COMMIT_PLAN_ABORTED',
-              message: error instanceof Error ? error.message : String(error),
-              failedGroupIndex: typeof (error as { failedGroupIndex?: unknown })?.failedGroupIndex === 'number' ? (error as { failedGroupIndex: number }).failedGroupIndex : partialCommits.length,
-              failedSubject: typeof (error as { failedSubject?: unknown })?.failedSubject === 'string' ? (error as { failedSubject: string }).failedSubject : ''
-            }
-          } satisfies CommitAgentExecuteResult
-        }
-        stored.status = /COMMIT_PLAN_STALE|COMMIT_PLAN_ABORTED|COMMIT_PLAN_HOOK_MODIFIED_TREE/.test(String(error)) ? 'stale' : 'active'
-        throw error
-      }
+      await adapter.prompt(a, session.id, buildCommitAnalysisPrompt({ ...git, skill: feature?.skill }), model, undefined, undefined, nativeSkills)
+      return { session, model }
     }
     case 'androidTranslationInfo': {
       const { directory } = workspace.get(a)
@@ -996,7 +821,27 @@ async function call(method: keyof typeof schema, args: unknown[]) {
       const pricing = await (account.readUsagePrices ? account.readUsagePrices() : account.call('usage-prices', {})).catch(() => ({ origin: null, prices: {} })) as { origin: string | null; prices: UsagePrices }
       return adapter.sessionUsage(a, b, pricing.prices, pricing.origin)
     }
-    case 'models': return adapter.models(a)
+    case 'models': {
+      const models = await adapter.models(a)
+      if (models.some(model => model.providerID === 'amecode')) return models
+      try {
+        const status = await (account.readStatus ? account.readStatus() : account.call('status', {})) as { account?: unknown; reconnecting?: boolean; models?: { models?: unknown[] } } | null
+        if (!(status?.reconnecting || (status?.account && status.models?.models?.length))) return models
+        // Share recovery across locations and start cooldown after the attempt settles.
+        if (!modelPolicyRecovery && Date.now() >= modelPolicyRecoveryAfter) {
+          modelPolicyRecovery = withAuthority(() => account.call('refresh', {})).finally(() => {
+            modelPolicyRecoveryAfter = Date.now() + 15_000
+            modelPolicyRecovery = undefined
+          })
+        }
+        if (modelPolicyRecovery) await modelPolicyRecovery
+        // Another caller may have finished recovery while this status read was pending.
+        return await adapter.models(a)
+      } catch {
+        // Keep model discovery usable during account/network outages; allow a later retry.
+        return models
+      }
+    }
     case 'agents': return adapter.agents(a)
     case 'resolveDroppedPaths': return resolveDroppedPaths(workspace.get(a).directory, b)
     case 'pickAttachmentFiles': {
@@ -1014,7 +859,8 @@ async function call(method: keyof typeof schema, args: unknown[]) {
     case 'prompt': {
       assertRegularSession(a, b)
       await validatePromptFiles(a, f)
-      const selected = await resolveModel(a, d, true)
+      const pinned = pinnedModels?.models(lockScopes(a).scope)[b]
+      const selected = pinned ? await resolvePinnedModel(a, pinned) : await resolveModel(a, d, true)
       return adapter.prompt(a, b, c, selected, e, f)
     }
     case 'cancel': return adapter.cancel(a, b)
@@ -1043,7 +889,7 @@ function withAuthority<T>(operation: () => Promise<T>) {
   return task
 }
 function dispatch(method: keyof typeof schema, args: unknown[]) {
-  if (!['startBackend', 'connect', 'discover', 'createSession', 'prompt', 'stageRevert', 'clearRevert', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'commitAgentPrompt', 'commitAgentLock', 'commitAgentExecutePlan', 'btwAsk', 'petGenerateDialogue', 'account'].includes(method)) return call(method, args)
+  if (!['startBackend', 'connect', 'discover', 'createSession', 'prompt', 'stageRevert', 'clearRevert', 'generateCommitMessage', 'generateBuildNotes', 'androidTranslationPrompt', 'androidTranslationLock', 'startCommitAnalysis', 'btwAsk', 'petGenerateDialogue', 'account'].includes(method)) return call(method, args)
   // Fresh policy checks and model requests cannot straddle an endpoint switch.
   const task = authority.catch(() => {}).then(() => call(method, args))
   authority = task
@@ -1085,8 +931,8 @@ void app.whenReady().then(async () => {
   await loadWorkspaceTrust()
   translationLocks = createTranslationLockStore(path.join(app.getPath('userData'), 'translation-locks.json'))
   await translationLocks.load()
-  commitAgentLocks = createCommitAgentLockStore(path.join(app.getPath('userData'), 'commit-agent-locks.json'))
-  await commitAgentLocks.load()
+  pinnedModels = createPinnedSessionModelStore(path.join(app.getPath('userData'), 'pinned-session-models.json'))
+  await pinnedModels.load()
   terminals = new Terminals(projectID => workspace.get(projectID).directory, notifyTerminal)
   adapter = new OpenCodeAdapter(notify)
   for (const project of workspace.list()) adapter.attach(project.id, project.directory)

@@ -1,6 +1,14 @@
 import type { ReactNode } from 'react'
 
 const paths: Record<string, ReactNode> = {
+  info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v6M12 7h.01" /></>,
+  alert: <><path d="m12 3 10 18H2Z" /><path d="M12 9v5m0 3h.01" /></>,
+  zap: <path d="m13 2-9 12h7l-1 8 10-13h-7Z" />,
+  clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+  dollar: <><path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></>,
+  arrowDown: <path d="M12 4v16m-6-6 6 6 6-6" />,
+  arrowUp: <path d="M12 20V4m-6 6 6-6 6 6" />,
+  xCircle: <><circle cx="12" cy="12" r="9" /><path d="m9 9 6 6m0-6-6 6" /></>,
   sidebar: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>,
   panel: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></>,
   overview: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M14 4v16M14 10h7" /></>,

@@ -47,6 +47,36 @@ test('timed out requests reject all pending work and restart the worker', async 
   } finally { service.dispose(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('diagnostics wait for both the active and coalesced workspace refresh', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-refresh-order-'))
+  const service = createTsLanguageService(root)
+  const requests: { worker: Worker; message: { id: number; serviceID: number; method: string } }[] = []
+  t.mock.method(Worker.prototype, 'postMessage', function (this: Worker, message: any) {
+    if (message.id) requests.push({ worker: this, message })
+  })
+  const respond = (index: number, result?: unknown) => {
+    const { worker, message } = requests[index]
+    worker.emit('message', { id: message.id, serviceID: message.serviceID, ok: true, result })
+  }
+  try {
+    const first = service.refreshFiles(), queued = service.refreshFiles()
+    const diagnostics = service.diagnostics()
+    // Attach handlers before assertions so cleanup can reject pending operations safely.
+    void first.catch(() => {}); void queued.catch(() => {}); void diagnostics.catch(() => {})
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(requests.map(request => request.message.method), ['refreshFiles'])
+    respond(0)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(requests.map(request => request.message.method), ['refreshFiles', 'refreshFiles'])
+    respond(1)
+    await Promise.all([first, queued])
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(requests.map(request => request.message.method), ['refreshFiles', 'refreshFiles', 'diagnostics'])
+    respond(2, [])
+    assert.deepEqual(await diagnostics, [])
+  } finally { service.dispose(); await rm(root, { recursive: true, force: true }) }
+})
+
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-ts-lsp-'))
   await mkdir(path.join(root, 'src'))

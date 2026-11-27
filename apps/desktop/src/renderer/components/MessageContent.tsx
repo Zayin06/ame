@@ -1,6 +1,7 @@
 import { type ReactNode } from 'react'
 import { parseFileRef, parseMarkdown, type BlockNode, type InlineNode } from '../markdown-parser'
 import { CopyButton } from './ToolCard'
+import { selectionToMarkdown } from '../markdown-copy'
 
 type OpenFile = (path: string, line?: number) => void
 
@@ -11,7 +12,14 @@ function inline(nodes: InlineNode[], onOpenFile?: OpenFile): ReactNode[] {
       case 'code': {
         const ref = onOpenFile ? parseFileRef(node.text) : null
         return ref && onOpenFile
-          ? <button type="button" className="file-chip" key={index} aria-label={`Mở tệp ${node.text}`} onClick={() => onOpenFile(ref.path, ref.line)}>{node.text}</button>
+          ? <code role="button" tabIndex={0} className="file-chip" key={index} aria-label={`Mở tệp ${node.text}`} onClick={() => {
+            if (!window.getSelection()?.toString()) onOpenFile(ref.path, ref.line)
+          }} onKeyDown={event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              onOpenFile(ref.path, ref.line)
+            }
+          }}>{node.text}</code>
           : <code className="inline-code" key={index}>{node.text}</code>
       }
       case 'strong': return <strong key={index}>{inline(node.children, onOpenFile)}</strong>
@@ -35,7 +43,7 @@ function renderBlocks(blocks: BlockNode[], onOpenFile?: OpenFile): ReactNode[] {
       }
       case 'hr': return <hr key={index} />
       case 'blockquote': return <blockquote key={index}>{renderBlocks(block.blocks, onOpenFile)}</blockquote>
-      case 'code': return <div className="code-block" key={index}>
+      case 'code': return <div className="code-block" data-language={block.language || ''} key={index}>
         <div className="code-block__header"><span>{block.language || 'code'} {!block.closed && <span className="code-block__streaming">streaming</span>}</span><CopyButton text={block.code} label="Sao chép khối mã" /></div>
         <pre><code>{block.code}</code></pre>
       </div>
@@ -54,5 +62,12 @@ function renderBlocks(blocks: BlockNode[], onOpenFile?: OpenFile): ReactNode[] {
   })
 }
 export function MessageContent({ text, onOpenFile }: { text: string; onOpenFile?: OpenFile }) {
-  return <div className="chat-markdown">{renderBlocks(parseMarkdown(text), onOpenFile)}</div>
+  return <div className="chat-markdown" onCopy={event => {
+    const selection = window.getSelection()
+    if (!event.clipboardData || !selection || selection.rangeCount !== 1 || !selection.toString()) return
+    const markdown = selectionToMarkdown(event.currentTarget, selection.getRangeAt(0), text)
+    if (markdown === null) return
+    event.clipboardData.setData('text/plain', markdown)
+    event.preventDefault()
+  }}>{renderBlocks(parseMarkdown(text), onOpenFile)}</div>
 }

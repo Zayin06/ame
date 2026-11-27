@@ -16,6 +16,7 @@ import * as rendererState from '../apps/desktop/src/renderer/state'
 import * as editorSplit from '../apps/desktop/src/renderer/editor-split'
 import * as editorModelLifecycle from '../apps/desktop/src/renderer/editor-model-lifecycle'
 import * as workspacePaths from '../apps/desktop/src/renderer/workspace-paths'
+import * as chatFilePaths from '../apps/desktop/src/renderer/chat-file-paths'
 import * as terminalControls from '../apps/desktop/src/renderer/terminal-controls'
 import * as projectRemoval from '../apps/desktop/src/renderer/project-removal'
 import * as petSessionMapping from '../apps/desktop/src/renderer/pet-sessions'
@@ -37,9 +38,9 @@ import { GIT_COMMIT_HASH_PATTERN, type BuildNotesRequest, type DesktopApi } from
 import type { BuildNotesSummary } from '../packages/ide-core/src/git-ops'
 import type { AmeKit } from '../packages/amekit/src/index'
 import { canonicalWorkspaceScope, buildAndroidTranslationPrompt, createTranslationLockStore } from '../packages/amekit/src/android-translation'
+import { createPinnedSessionModelStore, buildCommitAnalysisPrompt } from '../packages/amekit/src/commit-analysis'
 import { Workspaces } from '../packages/ide-core/src/workspace'
 import simpleGit from 'simple-git'
-import { buildCommitAgentPrompt, createCommitAgentLockStore, extractCommitSnapshotID, parseCommitAgentPlan, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH } from '../packages/amekit/src/commit-agent'
 
 type Invocation = { method: string; args: unknown[] }
 const examples: Invocation[] = [
@@ -103,27 +104,6 @@ test('workspace transfer IPC rejects malformed tuples and NUL target directories
   }
   for (const args of [['p', 'dir\0'], ['p'], ['p', '', '/host/path']]) await assert.rejects(h.dispatch('pasteClipboardFiles', args))
   await assert.rejects(h.dispatch('clipboardFiles', ['/host/path']))
-  assert.deepEqual(h.calls, [])
-})
-
-test('Rewind IPC validates schemas, delegates, and rejects protected sessions', async () => {
-  const h = await harness()
-  h.setAdapterMethod('stageRevert', async (...args) => { h.calls.push({ method: 'stageRevert', args }); return { messageID: args[2] } })
-  h.setAdapterMethod('clearRevert', async (...args) => { h.calls.push({ method: 'clearRevert', args }) })
-  assert.deepEqual(plain(await h.dispatch('stageRevert', ['p', 's', 'm', false])), { messageID: 'm' })
-  await h.dispatch('clearRevert', ['p', 's'])
-  assert.deepEqual(plain(h.calls), [{ method: 'stageRevert', args: ['p', 's', 'm', false] }, { method: 'clearRevert', args: ['p', 's'] }])
-  h.calls.length = 0
-  for (const args of [['p', 's', '', true], ['p', 's', 'x'.repeat(201), true], ['p', 's', 'm', 'true'], ['p', 's', 'm'], ['', 's', 'm', true]]) await assert.rejects(h.dispatch('stageRevert', args))
-  for (const args of [['p'], ['p', ''], ['p', 's', true]]) await assert.rejects(h.dispatch('clearRevert', args))
-  for (const method of ['stageRevert', 'clearRevert']) {
-    const session = `locked-${method}`
-    const args = method === 'stageRevert' ? ['p', session, 'm', true] : ['p', session]
-    await h.translationLocks.lockSession('p', session)
-    await assert.rejects(h.dispatch(method, args), /TRANSLATION_SESSION_LOCKED/)
-    await h.commitAgentLocks.lockSession('p', session)
-    await assert.rejects(h.dispatch(method, args), /COMMIT_AGENT_SESSION_LOCKED/)
-  }
   assert.deepEqual(h.calls, [])
 })
 
@@ -240,12 +220,7 @@ const translationExamples: Invocation[] = [
   { method: 'androidTranslationLock', args: ['p', 'translation-1'] }
 ]
 
-const commitAgentExamples: Invocation[] = [
-  { method: 'commitAgentInfo', args: ['p'] },
-  { method: 'commitAgentSessionState', args: ['p'] },
-  { method: 'commitAgentPrompt', args: ['p', undefined, 'Analyze changes', 'analyze'] },
-  { method: 'commitAgentLock', args: ['p', 'commit-1'] }
-]
+
 
 const smartExamples: Invocation[] = [
   { method: 'lspUpdateDocument', args: ['p', 'src/app.ts', 'export const value = 1', 7] },
@@ -333,7 +308,6 @@ async function harness(directory = 'workspace', userData = directory) {
   const adapter: Record<string, (...args: any[]) => any> = Object.fromEntries(['forms', 'replyForm', 'cancelForm', 'sessionPermissionMode', 'updateSessionPermissionMode', 'renameSession', 'archiveSession', 'deleteSession', 'commands', 'skills', 'generateCommitMessage', 'sessionUsage', 'agentMap', 'artifacts', 'artifact', 'deleteArtifact', 'btwAsk', 'forkSession', 'prompt', 'cancel'].map(method => [method, async (...args: unknown[]) => {
     calls.push({ method, args })
     if (operationGate) await operationGate
-    if (method === 'prompt' && extractCommitSnapshotID(String(args[2]))) sessionMessages = [...sessionMessages, { id: randomUUID(), role: 'user', text: args[2] }]
     return method === 'generateCommitMessage' ? { message: 'feat: change', truncated: summary.truncated } : method
   }]))
   for (const method of ['stageRevert', 'clearRevert']) adapter[method] = async (...args: unknown[]) => { calls.push({ method, args }); if (operationGate) await operationGate; return method }
@@ -385,17 +359,10 @@ async function harness(directory = 'workspace', userData = directory) {
     translationSessionIDs: (projectID: string) => [...(translationSessions.get(projectID) ?? [])],
     lockedSessionIDs: (projectID: string) => [...(lockedSessions.get(projectID) ?? [])]
   }
-  const commitSessions = new Map<string, Set<string>>(), commitLocked = new Map<string, Set<string>>()
-  const commitAgentLocks = {
-    recordSession: async (project: string, session: string) => { const ids = commitSessions.get(project) ?? new Set(); ids.add(session); commitSessions.set(project, ids) },
-    lockSession: async (project: string, session: string) => { const ids = commitLocked.get(project) ?? new Set(); ids.add(session); commitLocked.set(project, ids) },
-    isSession: (project: string, session: string) => commitSessions.get(project)?.has(session) ?? false,
-    isLocked: (project: string, session: string) => commitLocked.get(project)?.has(session) ?? false,
-    sessionIDs: (project: string) => [...(commitSessions.get(project) ?? [])],
-    lockedSessionIDs: (project: string) => [...(commitLocked.get(project) ?? [])]
-  }
+  const pins: Record<string, Record<string,string>> = {}
+  const pinnedModels = { models: (scope: string) => ({ ...pins[scope] }), pin: async (scope: string, session: string, model: string) => { pins[scope] = { ...pins[scope], [session]: model } } }
   // In-memory fixtures expose the same directory-scoped API as the persistent stores.
-  for (const store of [translationLocks, commitAgentLocks]) {
+  for (const store of [translationLocks]) {
     for (const method of Object.keys(store)) {
       const methods = store as Record<string, (...args: any[]) => any>
       const original = methods[method]
@@ -418,7 +385,7 @@ async function harness(directory = 'workspace', userData = directory) {
   adapter.sessions = async (...args: unknown[]) => { calls.push({ method: 'sessions', args }); return sessions }
   adapter.messages = async (...args: unknown[]) => { calls.push({ method: 'messages', args }); return sessionMessages }
   const context = {
-    z, URL, Buffer, process, randomUUID, Error, resolveModelLevel, GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
+    z, URL, Buffer, process, randomUUID, Error, resolveModelLevel, GIT_COMMIT_HASH_PATTERN,
     fs: { ...fs, promises: { ...fs.promises, realpath: async (value: string) => fs.promises.realpath(value).catch(() => path.resolve(value)) } }, path, readOsClipboardFiles,
     readFile, writeFile, fileURLToPath, setTimeout, clearTimeout,
     app: { getPath: () => userData },
@@ -426,7 +393,7 @@ async function harness(directory = 'workspace', userData = directory) {
     isHeadPushed: async () => pushed,
     clipboard: { availableFormats: () => ['text/uri-list'], read: () => clipboardText },
     window: parent, workspace, adapter, account, petHost, sprite: 'data:image/png;base64,test', shuttingDown: false, validateWorkspacePath,
-    translationLocks, buildAndroidTranslationPrompt, commitAgentLocks, buildCommitAgentPrompt, extractCommitSnapshotID, parseCommitAgentPlan, canonicalWorkspaceScope,
+    translationLocks, buildAndroidTranslationPrompt, pinnedModels, buildCommitAnalysisPrompt, canonicalWorkspaceScope,
     resolveDroppedPaths: async (...args: unknown[]) => { calls.push({ method: 'resolveDroppedPaths', args }); return resolved },
     detectAndroidProject: async (...args: unknown[]) => { calls.push({ method: 'detectAndroidProject', args }); return detected },
     pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }).strict(),
@@ -478,6 +445,7 @@ async function harness(directory = 'workspace', userData = directory) {
     setBuildNotesFeatureReader: (reader: NonNullable<typeof account.readBuildNotesFeature>) => { account.readBuildNotesFeature = reader },
     setBuildNotesSummary: (value: BuildNotesSummary) => { notesSummary = value },
     setReadStatus: (reader: NonNullable<typeof account.readStatus>) => { account.readStatus = reader },
+    setNow: (now: number) => { (context as Record<string, unknown>).Date = class extends Date { static now() { return now } } },
     setAndroidTranslationReader: (reader: NonNullable<typeof account.readAndroidTranslationFeature>) => { account.readAndroidTranslationFeature = reader },
     setSkillsReader: (reader: (...args: any[]) => Promise<unknown>) => { adapter.skills = reader },
     setFeatureAuthorizer: (authorize: NonNullable<typeof account.authorizeFeatureModel>) => { account.authorizeFeatureModel = authorize },
@@ -492,8 +460,8 @@ async function harness(directory = 'workspace', userData = directory) {
     setTerminalMethod: (method: string, handler: (...args: any[]) => any) => { (context.terminals as Record<string, (...args: any[]) => any>)[method] = handler },
     translationLocks,
     useLockStore: (store: ReturnType<typeof createTranslationLockStore>) => { context.translationLocks = store },
-    commitAgentLocks,
-    useCommitLockStore: (store: ReturnType<typeof createCommitAgentLockStore>) => { context.commitAgentLocks = store },
+    pinnedModels,
+    usePinnedModelStore: (store: ReturnType<typeof createPinnedSessionModelStore>) => { (context as any).pinnedModels = store },
     failRemove: () => { workspace.remove = async (...args: unknown[]) => { calls.push({ method: 'remove', args }); throw new Error('REMOVE_FAILED') } },
     setProjectDirectory: (id: string, value: string) => { const previous = workspace.get; workspace.get = key => key === id ? { directory: value } : previous(key) },
     invalidateProject: () => { workspace.get = () => { throw new Error('UNKNOWN_PROJECT') } }, setPricing: (value: typeof pricing) => { pricing = value },
@@ -565,7 +533,7 @@ async function rendererModule(file: string, hooks: ReturnType<typeof rendererHoo
   const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'renderer', file), 'utf8')
   const modules: Record<string, unknown> = {
     react: hooks.react, 'react/jsx-runtime': jsxRuntime, './state': rendererState, './editor-split': editorSplit,
-    './workspace-paths': workspacePaths, './terminal-controls': terminalControls, './platform': platform, './project-removal': projectRemoval,
+    './workspace-paths': workspacePaths, './chat-file-paths': chatFilePaths, './terminal-controls': terminalControls, './platform': platform, './project-removal': projectRemoval,
     './pet-sessions': petSessionMapping, '../chat-refresh': chatRefresh, './editor-model-lifecycle': editorModelLifecycle,
     './buffer-recovery': { syncDirtyBuffers() {}, hasUnsavedBuffers: () => false, takeRecoveredBuffers: () => ({}), clearRecoveredBuffers() {} },
     'monaco-editor': { editor: { getModels: () => [] }, Uri: { parse: (uri: string) => ({ toString: () => uri }) } },
@@ -668,7 +636,7 @@ async function appRenderer(overrides: Record<string, (...args: any[]) => any> = 
       if (method === 'platform') return 'win32'
       if (method === 'connection') return { connected: false, url: '' }
       if (method === 'debugState') return debugStates.get(args[0]) ?? { status: 'idle', frames: [], variables: [], breakpoints: [] }
-      if (method === 'lspDiagnostics') return []
+      if (method === 'lspDiagnostics' || method === 'listFiles') return []
       if (method === 'read' || method === 'save') return { path: args[1], content: method === 'save' ? args[2] : 'original', revision: 'revision', language: 'plaintext' }
       return undefined
     }
@@ -798,22 +766,6 @@ test('permission IPC validates enum-only inputs and forwards create/update/read 
   await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's', 'full', []]))
 })
 
-test('full permission mode requires native consent and permission updates reject protected sessions', async () => {
-  const h = await harness()
-  h.cancel()
-  await assert.rejects(h.dispatch('createSession', ['p', 'full']), /CANCELLED/)
-  await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 's', 'full']), /CANCELLED/)
-  assert.equal(h.calls.filter(call => call.method !== 'confirm').length, 0)
-  assert.equal(h.messages.length, 2)
-  assert.match(String(h.calls[0].args[1]), /shell.*ghi tệp/)
-  h.approve()
-  for (const store of [h.translationLocks, h.commitAgentLocks]) {
-    await store.recordSession('p', 'protected')
-    await assert.rejects(h.dispatch('updateSessionPermissionMode', ['p', 'protected', 'full']), /SESSION_REQUIRED/)
-  }
-  assert.equal(h.messages.length, 2)
-})
-
 test('undo commit confirms natively with distinct pushed and unpushed warnings', async () => {
   for (const pushed of [false, true]) {
     const h = await harness()
@@ -826,35 +778,6 @@ test('undo commit confirms natively with distinct pushed and unpushed warnings',
     await h.dispatch('gitUndoLastCommit', ['p'])
     assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'gitUndoLastCommit'])
   }
-})
-
-test('workspace trust rejects declined active operations, leaves reads open, and persists approvals', async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'ame-workspace-trust-'))
-  try {
-    const h = await harness(directory)
-    h.setUntrustedEntries(['core.hooksPath', 'hooks/pre-commit'])
-    h.cancel()
-    for (const [method, args] of [
-      ['commit', ['p', 'message']], ['commitAgentExecutePlan', ['p', 'commit-1', approvedPlan]],
-      ['gitFetch', ['p']], ['gitPull', ['p']], ['gitPush', ['p']], ['terminalCreate', ['p']],
-      ['debugStart', ['p', { entry: 'app.ts' }]],
-    ] as [string, unknown[]][]) await assert.rejects(h.dispatch(method, args), /WORKSPACE_UNTRUSTED/)
-    assert.ok(h.calls.every(call => call.method === 'confirm'))
-    assert.match(String(h.calls[0].args[1]), /\.git\/config.*hooks[\s\S]*core.hooksPath[\s\S]*hooks\/pre-commit/)
-    h.calls.length = 0
-    await h.dispatch('git', ['p']); await h.dispatch('listFiles', ['p']); await h.dispatch('diff', ['p', 'a.txt'])
-    assert.equal(h.calls.some(call => call.method === 'confirm'), false)
-    await assert.rejects(readFile(path.join(directory, 'trusted-workspaces.json'), 'utf8'))
-    h.approve(); h.calls.length = 0
-    await h.dispatch('commit', ['p', 'message'])
-    assert.deepEqual(h.calls.map(call => call.method), ['confirm', 'commit'])
-    assert.deepEqual(JSON.parse(await readFile(path.join(directory, 'trusted-workspaces.json'), 'utf8')), [await fs.promises.realpath(directory)])
-    const restored = await harness(directory)
-    restored.setUntrustedEntries(['hooks/pre-commit']); restored.cancel()
-    await restored.loadWorkspaceTrust()
-    await restored.dispatch('commit', ['p', 'message'])
-    assert.deepEqual(restored.calls.map(call => call.method), ['commit'])
-  } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
 test('pairing native dialogs do not hold authority while their mutations remain serialized', async () => {
@@ -1136,6 +1059,23 @@ test('App edits, saves and closes non-source files without LSP document calls wh
         assert.deepEqual(plain(closes), [{ method: 'lspCloseDocument', args: ['p', file] }])
       }
     }
+  } finally { h.dispose() }
+})
+
+test('App refreshes diagnostics after file events without repeating the main-process LSP scan', async () => {
+  const h = await appRenderer()
+  try {
+    h.props('Inspector').onOpen('src/main.ts'); await h.settle()
+    await h.tick(450)
+    h.calls.length = 0
+    h.emit({ type: 'files', projectID: 'p' })
+    h.emit({ type: 'files', projectID: 'p' })
+    await h.tick(180)
+    assert.equal(h.calls.filter(call => call.method === 'lspRefresh').length, 0)
+    assert.deepEqual(plain(h.calls.filter(call => call.method === 'lspDiagnostics')), [
+      { method: 'lspDiagnostics', args: ['p', 'src/main.ts'] },
+    ])
+    assert.ok(h.calls.some(call => call.method === 'read' && call.args[1] === 'src/main.ts'))
   } finally { h.dispose() }
 })
 
@@ -1529,162 +1469,6 @@ test('shutdown blocks queued AI work and requests already awaiting model authori
   await assert.rejects(queued, /APP_SHUTTING_DOWN/)
   await assert.rejects(h.dispatch('petConfigure', [{ enabled: true }]), /APP_SHUTTING_DOWN/)
   assert.deepEqual(h.calls.map(call => call.method), ['models', 'account', 'account'])
-})
-
-test('desktop lifecycle stays lazy, refreshes existing LSP on files, and awaits all service disposal before quit', async () => {
-  const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'main', 'index.ts'), 'utf8')
-  for (const platform of ['darwin', 'win32']) {
-    const events = new Map<string, (...args: any[]) => any>(), sequence: string[] = [], windows: any[] = []
-    let boot!: Promise<void>, options: any, accountOptions: any, spritePath = '', release!: () => void
-    const bundleTimers: (() => void)[] = [], bundleEvents: unknown[] = []
-    const pending = new Promise<void>(resolve => { release = resolve })
-    let onFiles!: (projectID: string) => void, releaseDebugger!: () => void
-    const debugPending = new Promise<void>(resolve => { releaseDebugger = resolve })
-    const lspServices = new Map<string, any>(), debuggers = new Map<string, any>()
-    const pet = { init: async () => { sequence.push('pet:init') }, reconcile: () => { sequence.push('pet:reconcile') }, dispose: () => { sequence.push('pet:dispose') } }
-    class MockWindow {
-      options: any; events = new Map<string, (...args: any[]) => any>()
-      webContents = { setWindowOpenHandler: () => {}, on: () => {}, mainFrame: {}, send: () => {} }
-      constructor(value: any) { this.options = value; windows.push(this); sequence.push('window') }
-      on(name: string, callback: (...args: any[]) => any) { this.events.set(name, callback) }
-      isDestroyed() { return false }
-      async loadFile() { sequence.push('load') }
-    }
-    const context = {
-      process: { platform, env: {}, resourcesPath: 'resources' }, path, here: 'main', window: undefined,
-      renderer: rendererSource(false, path.resolve('main')), isRendererDocument,
-      workspace: undefined, terminals: undefined, adapter: undefined, runtime: undefined, account: undefined, pairing: undefined,
-      petHost: undefined, sprite: '', managed: true, shuttingDown: false, authority: Promise.resolve(), lspServices, debuggers,
-      translationLocks: undefined,
-      commitAgentLocks: undefined,
-      createCommitAgentLockStore: (file: string) => {
-        assert.equal(file, path.join('userData', 'commit-agent-locks.json'))
-        return { load: async () => { sequence.push('commit-agent-locks:load') } }
-      },
-      createTranslationLockStore: (file: string) => {
-        assert.equal(file, path.join('userData', 'translation-locks.json'))
-        return { load: async () => { sequence.push('translation-locks:load') } }
-      },
-      app: { requestSingleInstanceLock: () => true, on: (name: string, callback: (...args: any[]) => any) => { events.set(name, callback) },
-        whenReady: () => ({ then: (callback: () => Promise<void>) => { boot = callback(); return boot } }),
-        isPackaged: false, getAppPath: () => process.cwd(), getPath: () => 'userData', quit: () => { sequence.push('quit') } },
-      BrowserWindow: MockWindow, screen: {},
-      session: { defaultSession: { setPermissionRequestHandler: (handler: (...args: any[]) => void) => {
-        for (const permission of ['media', 'geolocation', 'notifications', 'unknown']) {
-          handler({}, permission, (allowed: boolean) => assert.equal(allowed, false))
-        }
-        sequence.push('permissions:denied')
-      }, setPermissionCheckHandler: (handler: () => boolean) => { assert.equal(handler(), false); sequence.push('permission-checks:denied') } } },
-      Menu: { buildFromTemplate: (template: any[]) => { assert.deepEqual(plain(template).map((item: any) => item.role), ['appMenu', 'fileMenu', 'editMenu', 'viewMenu', 'windowMenu']); return template }, setApplicationMenu: () => { sequence.push('menu') } },
-      Workspaces: class {
-        constructor(_file: string, changed: (projectID: string) => void) { onFiles = changed }
-        async load() {} list() { return [] } dispose() { sequence.push('workspace:dispose') }
-      },
-      Terminals: class { dispose() { sequence.push('terminals:dispose') } },
-      OpenCodeAdapter: class { abortRequests() { sequence.push('adapter:abort'); release() } dispose() { sequence.push('adapter:dispose') } },
-      PrivateRuntime: class { constructor() { sequence.push('runtime:create') } executable() { return 'opencode' } async stop() { sequence.push('runtime:stop') } },
-      PairingHost: class {
-        constructor(_endpoint: unknown, store: unknown) {
-          assert.ok(store)
-          assert.ok(sequence.includes('pairing-devices:ready'))
-          sequence.push('pairing:create')
-        }
-      }, RemotePairing: class { async stop() { sequence.push('pairing:stop') } }, automaticTunnel: (directory: string) => {
-        assert.equal(directory, path.join('userData', 'remote-access'))
-        return {}
-      },
-      PairingDeviceStore: class {
-        constructor(file: string) { assert.equal(file, path.join('userData', 'remote-access', 'devices.json')) }
-        async ready() { sequence.push('pairing-devices:ready') }
-      },
-      createAmeKit: (value: any) => { accountOptions = value; return { generatePetDialogue: (model: string, signal: AbortSignal) => ({ model, signal }), dispose: async () => { sequence.push('account:dispose') } } },
-      setTimeout: (callback: () => void, ms: number) => {
-        if (ms === 8_000) return setTimeout(callback, ms)
-        assert.equal(ms, 500); bundleTimers.push(callback); return { unref() {} }
-      },
-      clearTimeout,
-      loadPetSprite: async (value: string) => { spritePath = value; throw new Error('missing sprite') },
-      createPetHost: (value: any) => { options = value; sequence.push('pet:create'); return pet },
-      loadWorkspaceTrust: async () => {}, notifyTerminal() {}, flushTerminalOutput() {},
-      notify: (event: any) => { sequence.push(`notify:${event.type}:${event.projectID}`); if (event.type === 'amekit-bundle') bundleEvents.push(plain(event)) }, pickImport: () => {}, ipcMain: { handle: () => {} }, schema: {},
-      dispatch: async () => { sequence.push('backend:start') },
-      readFile: async () => { throw new Error('no saved pairing') }, screenActive: () => {},
-      dialog: { showErrorBox: () => { assert.fail('startup failed') } }
-    }
-    runInNewContext(ts.transpileModule(source.slice(source.indexOf('async function openWindow()')), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
-    await boot
-    assert.ok(sequence.includes('permissions:denied'))
-    assert.ok(sequence.includes('permission-checks:denied'))
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(accountOptions.globalConfigDir, path.join('userData', 'backend', 'config', 'opencode'))
-    assert.equal(accountOptions.autoSync, true)
-    accountOptions.onBundleChanged({ version: '1.2.3', releaseId: 'fixture', auto: true, action: 'synced' })
-    assert.equal(bundleTimers.length, 1)
-    assert.equal(sequence.some(item => item.startsWith('notify:amekit-bundle')), false)
-    bundleTimers.shift()!()
-    assert.equal(sequence.at(-1), 'notify:amekit-bundle:')
-    assert.deepEqual(bundleEvents, [{ type: 'amekit-bundle', version: '1.2.3', releaseId: 'fixture', auto: true, action: 'synced', projectID: '' }])
-    accountOptions.onBundleChanged({ version: '', releaseId: '', auto: false, action: 'uninstalled' })
-    context.shuttingDown = true
-    bundleTimers.shift()!()
-    assert.equal(bundleEvents.length, 1)
-    context.shuttingDown = false
-    assert.equal(options.defaultEnabled, true)
-    assert.equal(options.sprite, '')
-    assert.equal(options.electron.screen, context.screen)
-    assert.equal(options.hasMainWindow(), true)
-    assert.equal(spritePath, path.join(process.cwd(), 'packages/amekit/src/assets/ame-chibi.png'))
-    assert.ok(sequence.indexOf('pet:create') < sequence.indexOf('runtime:create'))
-    assert.ok(sequence.indexOf('translation-locks:load') < sequence.indexOf('window'))
-    assert.ok(sequence.indexOf('commit-agent-locks:load') < sequence.indexOf('window'))
-    assert.ok(sequence.indexOf('pet:init') < sequence.indexOf('window'))
-    assert.ok(sequence.indexOf('pet:init') < sequence.indexOf('backend:start'))
-    const signal = new AbortController().signal
-    assert.deepEqual(options.generateDialogue('canonical', signal), { model: 'canonical', signal })
-    assert.equal(windows[0].options.frame, platform === 'win32' ? false : undefined)
-    assert.equal(windows[0].options.titleBarStyle, platform === 'darwin' ? 'hiddenInset' : undefined)
-    if (platform === 'darwin') assert.deepEqual(plain(windows[0].options.trafficLightPosition), { x: 14, y: 12 })
-    assert.equal(sequence.includes('menu'), platform === 'darwin')
-    windows[0].events.get('closed')!()
-    assert.equal(options.hasMainWindow(), false)
-    assert.equal(sequence.at(-1), 'pet:reconcile')
-    events.get('activate')!()
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(windows.length, 2)
-    assert.equal(sequence.at(-1), 'pet:reconcile')
-    assert.equal(lspServices.size, 0); assert.equal(debuggers.size, 0)
-    onFiles('unopened')
-    assert.equal(sequence.at(-1), 'notify:files:unopened')
-    assert.equal(lspServices.size, 0); assert.equal(debuggers.size, 0)
-    lspServices.set('p', {
-      refreshFiles: async () => { sequence.push('lsp:refresh'); throw new Error('refresh failed') },
-      dispose: () => { sequence.push('lsp:dispose'); throw new Error('dispose failed') }
-    })
-    lspServices.set('q', { dispose: () => { sequence.push('lsp:q:dispose') } })
-    debuggers.set('p', { dispose: async () => { sequence.push('debug:dispose'); await debugPending; sequence.push('debug:disposed') } })
-    debuggers.set('q', { dispose: async () => { sequence.push('debug:q:dispose'); throw new Error('dispose failed') } })
-    onFiles('p')
-    assert.deepEqual(sequence.slice(-2), ['lsp:refresh', 'notify:files:p'])
-    await new Promise(resolve => setImmediate(resolve))
-    context.authority = pending
-    events.get('will-quit')!({ preventDefault: () => { sequence.push('preventQuit') } })
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(context.shuttingDown, true)
-    assert.ok(sequence.includes('adapter:abort'), 'abort network calls before waiting for authority')
-    assert.ok(sequence.includes('account:dispose'), 'abort Account requests before waiting for authority')
-    assert.ok(sequence.includes('lsp:dispose')); assert.ok(sequence.includes('lsp:q:dispose'))
-    assert.ok(sequence.includes('debug:dispose')); assert.ok(sequence.includes('debug:q:dispose'))
-    assert.equal(lspServices.size, 0)
-    assert.equal(sequence.includes('quit'), false)
-    events.get('will-quit')!({ preventDefault: () => { assert.fail('reentrant quit must not restart cleanup') } })
-    releaseDebugger()
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(debuggers.size, 0)
-    assert.ok(sequence.indexOf('debug:disposed') < sequence.indexOf('quit'))
-    assert.ok(sequence.indexOf('pet:dispose') < sequence.indexOf('pairing:stop'))
-    assert.ok(sequence.indexOf('account:dispose') < sequence.indexOf('quit'))
-    assert.equal(sequence.at(-1), 'quit')
-  }
 })
 
 test('desktop shutdown always quits after cleanup rejection or the overall deadline', async () => {
@@ -2420,21 +2204,6 @@ test('translation lock serializes after pending prompts and permanently rejects 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
-const commitSkill = { name: 'git-commit', instructions: 'Inspect every diff before proposing commits.', directory: 'workspace/.opencode/skills/git-commit' }
-const approvedPlan = { planID: 'registered-in-test', scope: 'staged' as const, snapshot: { head: 'head', indexHash: 'index' }, commits: [{ message: 'feat: cập nhật', files: ['new.txt'] }] }
-const assistantPlan = (plan: { scope?: string; commits: typeof approvedPlan.commits } = approvedPlan) => ({ role: 'assistant', kind: 'text', text: '```commit-plan\n' + JSON.stringify({ scope: plan.scope, commits: plan.commits }) + '\n```' })
-function approveTurn(h: Awaited<ReturnType<typeof harness>>, planID: string) {
-  const prompt = h.calls.filter(call => call.method === 'prompt' && extractCommitSnapshotID(String(call.args[2])) === planID).at(-1)!
-  h.setSessionMessages([{ id: `user-${planID}`, role: 'user', text: prompt.args[2] }, assistantPlan()])
-}
-async function registerPlan(h: Awaited<ReturnType<typeof harness>>, sessionID = 'commit-1') {
-  h.setSessions([{ id: sessionID, title: 'Commit', status: 'idle' }])
-  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
-  const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
-  approveTurn(h, result.planID)
-  return { ...approvedPlan, planID: result.planID }
-}
-
 test('stage and every diff target forward rename origins and reject malformed origin paths', async () => {
   const h = await harness()
   for (const staged of [true, false]) {
@@ -2450,466 +2219,6 @@ test('stage and every diff target forward rename origins and reject malformed or
   assert.equal(h.calls.length, 0)
 })
 
-const commitSnapshot = () => ({ ...approvedPlan.snapshot, branchRef: 'refs/heads/main', workingHash: 'working', fingerprint: 'fingerprint-1', stagedFiles: ['new.txt'], workingFiles: ['untracked.txt'], untrackedHashes: { 'untracked.txt': 'hash' }, scope: 'staged' as const, stat: 'new.txt | 1 +', diffPreview: '+snapshot-only', truncated: false })
-
-test('commit planning creates readonly sessions and includes backend snapshot only in planning prompts', async () => {
-  const h = await harness()
-  const snapshot = commitSnapshot()
-  h.setWorkspaceMethod('commitPlanSnapshot', async id => { assert.equal(id, 'p'); return snapshot })
-  h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
-  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).snapshot, undefined)
-  await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
-  assert.deepEqual(plain(h.calls.find(call => call.method === 'createSession')), { method: 'createSession', args: ['p', 'readonly'] })
-  assert.match(String(h.calls.find(call => call.method === 'prompt')!.args[2]), /\+snapshot-only/)
-})
-
-test('commit lock and execution reject missing/running sessions or pending approvals without writing locks or cancelling', async () => {
-  for (const method of ['commitAgentLock', 'commitAgentExecutePlan']) {
-    for (const state of ['missing', 'running', 'permission', 'form', 'idle']) {
-      const h = await harness()
-      const plan = await registerPlan(h)
-      h.calls.length = 0
-      await h.commitAgentLocks.recordSession('p', 'commit-1')
-      h.setSessions(state === 'missing' ? [] : [{ id: 'commit-1', title: 'Commit', status: state === 'running' ? 'running' : 'idle' }])
-      h.setPending(state === 'permission' ? [{}] : [], state === 'form' ? [{}] : [])
-      let executions = 0
-      const result = { commits: [{ hash: 'abc', subject: 'feat: cập nhật', files: ['new.txt'] }] }
-      h.setWorkspaceMethod('executeCommitPlan', async (id, actual) => { executions++; assert.equal(id, 'p'); assert.equal(actual.planID, plan.planID); assert.deepEqual(plain(actual.commits), approvedPlan.commits); return result })
-      const args = method === 'commitAgentLock' ? ['p', 'commit-1'] : ['p', 'commit-1', plan]
-      if (state === 'idle') {
-        const actual = await h.dispatch(method, args)
-        assert.deepEqual(plain(actual), method === 'commitAgentLock' ? { commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'] } : result)
-      } else await assert.rejects(h.dispatch(method, args), state === 'missing' || state === 'running' ? /COMMIT_AGENT_SESSION_RUNNING/ : /COMMIT_AGENT_SESSION_PENDING_APPROVAL/)
-      assert.equal(h.commitAgentLocks.isLocked('p', 'commit-1'), state === 'idle' && method === 'commitAgentLock')
-      assert.equal(executions, state === 'idle' && method === 'commitAgentExecutePlan' ? 1 : 0)
-      for (const check of ['sessions', 'permissions', 'forms']) assert.ok(h.calls.some(call => call.method === check), check)
-      assert.equal(h.calls.some(call => call.method === 'cancel'), false)
-      assert.equal(h.calls.some(call => call.method === 'ame:event'), state === 'idle' && method === 'commitAgentLock')
-    }
-  }
-})
-
-test('commit plan IDs bind immutable backend snapshots, supersede old plans and reject foreign ownership', async () => {
-  const h = await harness(), snapshot = commitSnapshot()
-  h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
-  h.setWorkspaceMethod('commitPlanSnapshot', async () => snapshot)
-  const first = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
-  assert.match(first.planID, /^[a-f0-9-]{36}$/)
-  assert.equal(Object.isFrozen(first.snapshot), true)
-  assert.equal(Object.isFrozen(first.snapshot.stagedFiles), true)
-  assert.equal(Object.isFrozen(first.snapshot.untrackedHashes), true)
-  for (const key of ['stat', 'diffPreview', 'truncated']) assert.equal(key in first.snapshot, false)
-  snapshot.stagedFiles.push('injected.ts'); snapshot.untrackedHashes['untracked.txt'] = 'mutated'
-  assert.deepEqual(plain(first.snapshot.stagedFiles), ['new.txt'])
-  assert.equal(first.snapshot.untrackedHashes['untracked.txt'], 'hash')
-  const second = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any
-  approveTurn(h, second.planID)
-  let executions = 0
-  h.setWorkspaceMethod('executeCommitPlan', async (_id, plan) => {
-    executions++
-    assert.equal(plan.snapshot, second.snapshot)
-    return { commits: [] }
-  })
-  const info = await h.dispatch('commitAgentInfo', ['p']) as any
-  assert.equal(info.plans[first.planID].status, 'superseded')
-  for (const planID of [first.planID, 'unknown']) await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID }]), /COMMIT_PLAN_STALE/)
-  await h.commitAgentLocks.recordSession('p', 'foreign')
-  h.setSessions([{ id: 'foreign', title: 'Foreign' }])
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'foreign', { ...approvedPlan, planID: second.planID }]), /COMMIT_PLAN_STALE/)
-  h.setProjectDirectory('q', 'other')
-  await h.commitAgentLocks.recordSession(canonicalWorkspaceScope('other'), 'foreign')
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['q', 'foreign', { ...approvedPlan, planID: second.planID }]), /COMMIT_PLAN_STALE/)
-  assert.deepEqual(plain((await h.dispatch('commitAgentInfo', ['q']) as any).plans), {})
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-  await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: second.planID, snapshot: { head: 'forged', indexHash: 'forged' } }])
-  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[second.planID].status, 'executed')
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: second.planID }]), /COMMIT_PLAN_STALE/)
-  assert.equal(executions, 1)
-})
-
-test('stale commit plan IDs remain invalid even with a replacement renderer snapshot', async () => {
-  const h = await harness()
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
-  const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
-  approveTurn(h, result.planID)
-  let executions = 0
-  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; throw new Error('COMMIT_PLAN_STALE: changed') })
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: result.planID }]), /COMMIT_PLAN_STALE/)
-  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[result.planID].status, 'stale')
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: result.planID, snapshot: { head: 'fresh', indexHash: 'fresh' } }]), /COMMIT_PLAN_STALE/)
-  assert.equal(executions, 1)
-})
-
-test('commit plan history retains only the latest 100 records and evicted IDs cannot execute', async () => {
-  const h = await harness()
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
-  const first = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
-  let latest = first
-  for (let i = 0; i < 100; i++) latest = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue'])
-  const { plans } = await h.dispatch('commitAgentInfo', ['p']) as any
-  assert.equal(Object.keys(plans).length, 100)
-  assert.equal(plans[first.planID], undefined)
-  assert.equal(plans[latest.planID].status, 'active')
-  assert.equal(Object.values(plans).filter((plan: any) => plan.status === 'superseded').length, 99)
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: first.planID }]), /COMMIT_PLAN_STALE/)
-})
-
-test('commit execution requires a plan ID and the exact authoritative assistant plan for its turn', async () => {
-  const h = await harness(), plan = await registerPlan(h)
-  let executions = 0
-  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
-  const { planID: _omitted, ...missingID } = plan
-  h.calls.length = 0
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', missingID]))
-  assert.deepEqual(h.calls, [])
-  for (const modified of [
-    { ...plan, scope: 'working' },
-    { ...plan, commits: [{ ...plan.commits[0], message: 'forged' }] },
-    { ...plan, commits: [{ ...plan.commits[0], files: ['forged.txt'] }] },
-    { ...plan, commits: [...plan.commits, ...plan.commits] },
-  ]) await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', modified]), /COMMIT_PLAN_MISMATCH/)
-  const user = { role: 'user', text: `[Commit snapshot: ${plan.planID}]` }
-  for (const messages of [[], [user], [user, { ...assistantPlan(), kind: 'reasoning' }], [user, { role: 'user', text: 'next turn' }, assistantPlan()]]) {
-    h.setSessionMessages(messages)
-    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_UNVERIFIED/)
-  }
-  assert.equal(executions, 0)
-  h.setSessionMessages([user, assistantPlan({ commits: [{ message: 'outdated', files: ['old.txt'] }] }), assistantPlan({ commits: plan.commits }), { role: 'assistant', text: 'not a plan' }])
-  await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan])
-  assert.equal(executions, 1)
-})
-
-test('concurrent commit execution rejects an executing plan without a second workspace call', async () => {
-  const h = await harness(), plan = await registerPlan(h)
-  let release!: () => void, started!: () => void, executions = 0
-  const gate = new Promise<void>(resolve => { release = resolve })
-  const ready = new Promise<void>(resolve => { started = resolve })
-  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; started(); await gate; return { commits: [] } })
-  // Exercise the handler directly; dispatch additionally serializes authority operations.
-  const first = h.call('commitAgentExecutePlan', ['p', 'commit-1', plan])
-  await ready
-  try {
-    assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[plan.planID].status, 'executing')
-    await assert.rejects(h.call('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_STALE/)
-    assert.equal(executions, 1)
-  } finally { release(); await first }
-})
-
-test('failed planning preserves executable active plans unless the computed snapshot drifted', async () => {
-  for (const state of ['unchanged', 'absent', 'drifted']) {
-    const h = await harness(), plan = await registerPlan(h)
-    h.setWorkspaceMethod('commitPlanSnapshot', async () => state === 'absent' ? undefined : { ...commitSnapshot(), fingerprint: state === 'drifted' ? 'changed' : 'fingerprint-1' })
-    h.setAdapterMethod('prompt', async () => { throw new Error('PROMPT_FAILED') })
-    await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /PROMPT_FAILED/)
-    const info = await h.dispatch('commitAgentInfo', ['p']) as any
-    assert.deepEqual(Object.keys(info.plans), [plan.planID])
-    assert.equal(info.plans[plan.planID].status, state === 'drifted' ? 'stale' : 'active')
-    let executions = 0
-    h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
-    if (state === 'drifted') await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_STALE/)
-    else await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan])
-    assert.equal(executions, state === 'drifted' ? 0 : 1)
-  }
-})
-
-test('messagePlanIDs binds user requests containing nested User request markers and executes by message ID', async () => {
-  const h = await harness()
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-  h.setWorkspaceMethod('commitPlanSnapshot', async () => commitSnapshot())
-  let user: any
-  h.setAdapterMethod('prompt', async (_project, _session, text) => {
-    user = { id: 'nested-request', role: 'user', text }
-    h.setSessionMessages([user, assistantPlan()])
-  })
-  const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze\n\nUser request:\nexample']) as any
-  assert.ok(user.text.includes('\n\nUser request:\nexample'))
-  assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).messagePlanIDs[user.id], result.planID)
-  h.setWorkspaceMethod('executeCommitPlan', async () => ({ commits: [] }))
-  await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: result.planID }])
-})
-
-test('execution errors invalidate unsafe plans and restore active plans after retryable failures without partial commits', async () => {
-  for (const error of [new Error('temporary'), new Error('COMMIT_PLAN_ABORTED'), new Error('COMMIT_PLAN_HOOK_MODIFIED_TREE'), Object.assign(new Error('temporary'), { commits: { length: 1 } }), Object.assign(new Error('temporary'), { commits: [] })]) {
-    const h = await harness(), plan = await registerPlan(h)
-    h.setWorkspaceMethod('executeCommitPlan', async () => { throw error })
-    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), error)
-    assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[plan.planID].status, error.message === 'temporary' ? 'active' : 'stale')
-  }
-})
-
-test('commit execution returns partial results and makes the plan stale with explicit or fallback failure metadata', async () => {
-  const commits = [{ hash: 'a'.repeat(64), subject: 'feat: first group', files: ['new.txt'] }]
-  const failures = [
-    Object.assign(new Error('hook changed tree'), { commits, code: 'COMMIT_PLAN_HOOK_MODIFIED_TREE', failedGroupIndex: 2, failedSubject: 'feat: next group' }),
-    Object.assign(new Error('partial failure'), { commits, code: 42, failedGroupIndex: 'bad', failedSubject: null }),
-    { commits, toString: () => 'non-Error failure' },
-  ]
-  for (const error of failures) {
-    const h = await harness(), plan = await registerPlan(h)
-    let executions = 0
-    h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; throw error })
-    const result = await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan])
-    assert.deepEqual(plain(result), {
-      commits,
-      partialFailure: error === failures[0]
-        ? { code: 'COMMIT_PLAN_HOOK_MODIFIED_TREE', message: 'hook changed tree', failedGroupIndex: 2, failedSubject: 'feat: next group' }
-        : { code: 'COMMIT_PLAN_ABORTED', message: error instanceof Error ? error.message : String(error), failedGroupIndex: 1, failedSubject: '' },
-    })
-    assert.equal((await h.dispatch('commitAgentInfo', ['p']) as any).plans[plan.planID].status, 'stale')
-    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', plan]), /COMMIT_PLAN_STALE/)
-    assert.equal(executions, 1)
-  }
-})
-
-test('commit planning without a permission getter requires a confirmed readonly update, including new sessions', async () => {
-  for (const confirmed of [true, false]) {
-    const h = await harness()
-    h.setAdapterMethod('sessionPermissionMode', undefined as any)
-    h.setAdapterMethod('updateSessionPermissionMode', async () => confirmed ? 'readonly' : 'default')
-    if (confirmed) await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
-    else await assert.rejects(h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']), /COMMIT_AGENT_READONLY_REQUIRED/)
-    assert.equal(h.calls.some(call => call.method === 'prompt'), confirmed)
-  }
-})
-
-test('every commit planning turn upgrades legacy default permissions and fails closed on failed confirmation', async () => {
-  for (const failure of ['none', 'throws', 'wrong', 'unconfirmed', 'read-fails']) {
-    const h = await harness(), order: string[] = []
-    await h.commitAgentLocks.recordSession('p', 'commit-1')
-    h.setSessions([{ id: 'commit-1', title: 'Legacy Commit' }])
-    h.setSessionModel('server-model'); h.setSessionMessages([{}])
-    let mode = 'default'
-    h.setAdapterMethod('sessionPermissionMode', async () => { order.push(`read:${mode}`); if (failure === 'read-fails') throw new Error('offline'); return mode })
-    h.setAdapterMethod('updateSessionPermissionMode', async (project, session, next) => {
-      assert.deepEqual([project, session, next], ['p', 'commit-1', 'readonly']); order.push('update')
-      if (failure === 'throws') throw new Error('denied')
-      if (failure !== 'wrong' && failure !== 'unconfirmed') mode = next
-      return failure === 'wrong' ? 'default' : 'readonly'
-    })
-    h.setAdapterMethod('prompt', async () => { assert.equal(mode, 'readonly'); order.push('prompt') })
-    if (failure === 'none') {
-      await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue'])
-      assert.deepEqual(order, ['read:default', 'update', 'read:readonly', 'prompt'])
-      mode = 'default'; order.length = 0
-      await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue again'])
-      assert.deepEqual(order, ['read:default', 'update', 'read:readonly', 'prompt'])
-    } else {
-      await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /COMMIT_AGENT_READONLY_REQUIRED/)
-      assert.equal(order.includes('prompt'), false)
-    }
-  }
-})
-
-test('commit planning refreshes diff on fingerprint changes and explicit replans, prioritizing mentioned scoped files', async () => {
-  const h = await harness()
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-  let snapshot = commitSnapshot()
-  const reads: unknown[][] = []
-  h.setWorkspaceMethod('commitPlanSnapshot', async (...args) => { reads.push(args); return snapshot })
-  await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
-  h.setSessionMessages([{}])
-  await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue'])
-  assert.doesNotMatch(String(h.calls.filter(call => call.method === 'prompt').at(-1)!.args[2]), /Backend snapshot/)
-  for (const request of ['Review staged.ts', 'lập lại kế hoạch']) {
-    snapshot = { ...snapshot, fingerprint: request.startsWith('Review') ? 'fingerprint-2' : snapshot.fingerprint, diffPreview: `+latest ${request}` }
-    await h.dispatch('commitAgentPrompt', ['p', 'commit-1', request])
-    const prompt = String(h.calls.filter(call => call.method === 'prompt').at(-1)!.args[2])
-    assert.match(prompt, /Backend snapshot/); assert.ok(prompt.includes(snapshot.diffPreview))
-    assert.deepEqual(plain(reads.at(-1)), ['p', 48_000, { includeDiff: true, focusFiles: request.startsWith('Review') ? ['staged.ts'] : [] }])
-  }
-})
-
-test('commit session state performs no Git or snapshot reads and info never reads full diffs', async () => {
-  const h = await harness()
-  await h.commitAgentLocks.recordSession('p', 'commit-1'); await h.commitAgentLocks.lockSession('p', 'commit-1')
-  h.setWorkspaceMethod('status', async () => { throw new Error('UNEXPECTED_GIT') })
-  h.setWorkspaceMethod('commitPlanSnapshot', async () => { throw new Error('UNEXPECTED_SNAPSHOT') })
-  assert.deepEqual(plain(await h.dispatch('commitAgentSessionState', ['p'])), { commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'] })
-  assert.deepEqual(h.calls, [])
-  h.setWorkspaceMethod('status', async () => ({ branch: 'main', changes: [] }))
-  assert.deepEqual(plain((await h.dispatch('commitAgentInfo', ['p']) as any).plans), {})
-})
-
-test('commit execution rejects foreign/locked sessions and serializes with authority operations', async () => {
-  const h = await harness()
-  h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
-  let executions = 0
-  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'foreign', approvedPlan]), /COMMIT_AGENT_SESSION_REQUIRED/)
-  await h.commitAgentLocks.recordSession('p', 'commit-1')
-  await h.commitAgentLocks.lockSession('p', 'commit-1')
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', approvedPlan]), /COMMIT_AGENT_SESSION_LOCKED/)
-  await h.commitAgentLocks.recordSession('p', 'commit-2')
-  h.setSessions([{ id: 'commit-2', title: 'Commit', status: 'idle' }])
-  const plan = await registerPlan(h, 'commit-2')
-  h.calls.length = 0
-  let release!: () => void
-  h.gatePolicy(new Promise<void>(resolve => { release = resolve }))
-  const policy = h.dispatch('account', ['refresh', {}])
-  await new Promise(resolve => setImmediate(resolve))
-  const execute = h.dispatch('commitAgentExecutePlan', ['p', 'commit-2', plan])
-  const lock = h.dispatch('commitAgentLock', ['p', 'commit-2'])
-  await new Promise(resolve => setImmediate(resolve))
-  assert.equal(executions, 0)
-  assert.equal(h.calls.some(call => call.method === 'sessions'), false)
-  release(); await policy; await execute; await lock
-  assert.equal(executions, 1)
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-2', approvedPlan]), /COMMIT_AGENT_SESSION_LOCKED/)
-})
-
-test('commit execution rejects a 201-file group at the schema before workspace execution', async () => {
-  const h = await harness(), plan = await registerPlan(h)
-  let executions = 0
-  h.setWorkspaceMethod('executeCommitPlan', async () => { executions++; return { commits: [] } })
-  h.calls.length = 0
-  await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', {
-    ...plan, commits: [{ ...plan.commits[0], files: Array.from({ length: 201 }, (_, index) => `file-${index}.txt`) }],
-  }]), (error: any) => error.issues?.some((issue: any) => issue.code === 'too_big' && issue.path.join('.') === '2.commits.0.files'))
-  assert.equal(executions, 0)
-  assert.deepEqual(h.calls, [])
-})
-
-test('commit execute plan validates bounded strict payloads before any side effects', async () => {
-  const h = await harness()
-  const group = approvedPlan.commits[0]
-  const invalid = [
-    null, {}, { ...approvedPlan, extra: true }, { ...approvedPlan, scope: 'all' },
-    ...['', ' ', 'bad\0id', 'x'.repeat(513)].flatMap(value => [
-      { ...approvedPlan, snapshot: { head: value, indexHash: 'index' } },
-      { ...approvedPlan, snapshot: { head: 'head', indexHash: value } },
-      { ...approvedPlan, snapshot: { ...approvedPlan.snapshot, workingHash: value } }
-    ]),
-    { ...approvedPlan, snapshot: { ...approvedPlan.snapshot, extra: true } },
-    ...[[], Array(31).fill(group), [{ ...group, extra: true }],
-      ...['', ' ', 'bad\0message', 'x'.repeat(10001)].map(message => [{ ...group, message }]),
-      ...[[], Array(201).fill('new.txt'), [''], ['bad\0path'], ['x'.repeat(4097)]].map(files => [{ ...group, files }])
-    ].map(commits => ({ ...approvedPlan, commits }))
-  ]
-  for (const plan of invalid) await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 's', plan]))
-  for (const args of [[], ['p', 's'], ['p', 's', approvedPlan, 'extra'], ['', 's', approvedPlan], ['p', 'bad\0id', approvedPlan]]) await assert.rejects(h.dispatch('commitAgentExecutePlan', args))
-  assert.deepEqual(h.calls, [])
-})
-
-test('IPC execution rejects a stale real Git index then commits an approved fresh snapshot', async () => {
-  const root = await mkdtemp(path.join(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'commit-stale-ipc-'))
-  const workspace = new Workspaces(path.join(root, 'projects.json'), () => {})
-  try {
-    const directory = path.join(root, 'repo'); await mkdir(directory)
-    const git = simpleGit(directory)
-    await git.init(); await git.addConfig('user.name', 'IPC Test'); await git.addConfig('user.email', 'ipc@example.test')
-    await writeFile(path.join(directory, 'new.txt'), 'initial\n'); await git.add('new.txt'); await git.commit('initial')
-    await writeFile(path.join(directory, 'new.txt'), 'first change\n'); await git.add('new.txt')
-    const project = await workspace.add(directory)
-    const head = await git.revparse(['HEAD'])
-    const h = await harness(directory)
-    await h.commitAgentLocks.recordSession('p', 'commit-1')
-    h.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
-    h.setWorkspaceMethod('commitPlanSnapshot', () => workspace.commitPlanSnapshot(project.id))
-    const first = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze']) as any
-    approveTurn(h, first.planID)
-    await writeFile(path.join(directory, 'new.txt'), 'changed index\n'); await git.add('new.txt')
-    h.setWorkspaceMethod('executeCommitPlan', (_id, plan) => workspace.executeCommitPlan(project.id, plan))
-    await assert.rejects(h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', { ...approvedPlan, planID: first.planID }]), /COMMIT_PLAN_STALE/)
-    assert.equal(await git.revparse(['HEAD']), head)
-    assert.equal(await git.show([':new.txt']), 'changed index\n')
-    const fresh = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Refresh']) as any
-    approveTurn(h, fresh.planID)
-    const result = await h.dispatch('commitAgentExecutePlan', ['p', 'commit-1', {
-      ...approvedPlan, planID: fresh.planID
-    }]) as any
-    assert.equal(result.commits.length, 1)
-    assert.equal(result.commits[0].subject, approvedPlan.commits[0].message)
-    assert.equal(await git.revparse([result.commits[0].hash]), await git.revparse(['HEAD']))
-    assert.equal((await git.status()).isClean(), true)
-  } finally { await workspace.dispose(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('directory-scoped special sessions and permanent locks survive removal, re-add and legacy migration for both features', async () => {
-  const root = await mkdtemp(path.join(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'scope-ipc-'))
-  try {
-    for (const legacy of [false, true]) {
-      const directory = path.join(root, 'repo'), scope = canonicalWorkspaceScope(directory)
-      const translationFile = path.join(root, `translation-${legacy}.json`), commitFile = path.join(root, `commit-${legacy}.json`)
-      const translations = createTranslationLockStore(translationFile), commits = createCommitAgentLockStore(commitFile)
-      await translations.load(); await commits.load()
-      const key = legacy ? 'p' : scope
-      await translations.recordSession(key, 'translation-1'); await translations.recordSession(key, 'translation-open'); await translations.lockSession(key, 'translation-1')
-      await commits.recordSession(key, 'commit-1'); await commits.recordSession(key, 'commit-open'); await commits.lockSession(key, 'commit-1')
-      const h = await harness(directory); h.useLockStore(translations); h.useCommitLockStore(commits)
-      assert.deepEqual(plain((await h.dispatch('commitAgentInfo', ['p']) as any).commitSessionIDs), ['commit-1', 'commit-open'])
-      assert.deepEqual(plain((await h.dispatch('androidTranslationInfo', ['p']) as any).translationSessionIDs), ['translation-1', 'translation-open'])
-      await h.dispatch('removeProject', ['p'])
-      h.setWorkspaceMethod('add', async () => ({ id: 'new-project', directory }))
-      h.setWorkspaceMethod('get', id => { if (id !== 'new-project') throw new Error('UNKNOWN_PROJECT'); return { id, directory } })
-      h.setWorkspaceMethod('list', () => [])
-      h.setPicked({ canceled: false, filePaths: [directory] })
-      assert.equal((await h.dispatch('pickProject', []) as any).id, 'new-project')
-      const reloadedTranslations = createTranslationLockStore(translationFile), reloadedCommits = createCommitAgentLockStore(commitFile)
-      await reloadedTranslations.load(); await reloadedCommits.load()
-      h.useLockStore(reloadedTranslations); h.useCommitLockStore(reloadedCommits)
-      const commitInfo = await h.dispatch('commitAgentInfo', ['new-project']) as any
-      const translationInfo = await h.dispatch('androidTranslationInfo', ['new-project']) as any
-      assert.deepEqual(plain(commitInfo.commitSessionIDs), ['commit-1', 'commit-open']); assert.deepEqual(plain(commitInfo.lockedSessionIDs), ['commit-1'])
-      assert.deepEqual(plain(translationInfo.translationSessionIDs), ['translation-1', 'translation-open']); assert.deepEqual(plain(translationInfo.lockedSessionIDs), ['translation-1'])
-      for (const [session, error] of [['commit-1', /COMMIT_AGENT_SESSION_LOCKED/], ['commit-open', /COMMIT_AGENT_SESSION_REQUIRED/], ['translation-1', /TRANSLATION_SESSION_LOCKED/], ['translation-open', /ANDROID_TRANSLATION_SESSION_REQUIRED/]] as const) await assert.rejects(h.dispatch('prompt', ['new-project', session, 'Code', selectedModel]), error)
-      assert.deepEqual(reloadedCommits.sessionIDs('p'), []); assert.deepEqual(reloadedTranslations.translationSessionIDs('p'), [])
-      if (legacy) for (const file of [translationFile, commitFile]) assert.equal(Object.hasOwn(JSON.parse(await readFile(file, 'utf8')).sessions, 'p'), false)
-    }
-  } finally { await rm(root, { recursive: true, force: true }) }
-})
-
-test('commit agent info reports feature policy, Git counts and independent lock state with a usable default skill', async () => {
-  const h = await harness()
-  h.setReadStatus(async () => ({ models: { default_model: 'server-model', active_models: [{ id: 'server-model', name: 'Default' }, { id: 'feature', name: 'Feature' }] } }) as any)
-  h.setCommitEnhanceFeatureReader(async () => ({ skill: commitSkill, model: 'feature' }))
-  await h.commitAgentLocks.recordSession('p', 'commit-1')
-  await h.commitAgentLocks.lockSession('p', 'commit-1')
-  assert.deepEqual(plain(await h.dispatch('commitAgentInfo', ['p'])), {
-    configured: true, skill: 'git-commit', configuredModelID: 'feature', effectiveModelID: 'feature', effectiveModelName: 'Feature',
-    fallbackToDefault: false, branch: 'feature/commit', stagedCount: 2, workingCount: 3,
-    commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'], plans: {}, messagePlanIDs: {}
-  })
-  h.setCommitEnhanceFeatureReader(async () => ({ skill: null, rawSkillName: 'missing-skill', model: 'inactive' }))
-  const fallback = await h.dispatch('commitAgentInfo', ['p']) as any
-  assert.equal(fallback.configured, true); assert.equal(fallback.skill, 'missing-skill')
-  assert.equal(fallback.effectiveModelID, 'server-model'); assert.equal(fallback.fallbackToDefault, true)
-  const defaults = await harness()
-  assert.equal((await defaults.dispatch('commitAgentInfo', ['p']) as any).configured, true)
-  defaults.setCommitEnhanceReader(async () => commitSkill)
-  assert.equal((await defaults.dispatch('commitAgentInfo', ['p']) as any).skill, commitSkill.name)
-})
-
-test('feature info endpoints resolve haiku aliases and survive unreadable bundles or missing status', async () => {
-  for (const endpoint of ['buildNotesPreview', 'commitAgentInfo', 'androidTranslationInfo']) {
-    const h = await harness()
-    const read = endpoint === 'buildNotesPreview' ? h.setBuildNotesFeatureReader : endpoint === 'commitAgentInfo' ? h.setCommitEnhanceFeatureReader : h.setAndroidTranslationReader
-    read(async () => ({ skill: null, model: 'amecode/haiku' }))
-    h.setReadStatus(async () => ({ models: { default_model: 'server-model', model_levels: { default: 'server-model', haiku: 'fast', sonnet: 'server-model', opus: 'server-model' }, active_models: [{ id: 'server-model' }, { id: 'fast', name: 'Fast' }] } }) as any)
-    const args = endpoint === 'buildNotesPreview' ? ['p', buildNotesRequest] : ['p']
-    const info = await h.dispatch(endpoint, args) as any
-    assert.equal(info.configuredModelID, 'amecode/haiku', endpoint)
-    assert.equal(info.effectiveModelID, 'fast', endpoint)
-    assert.equal(info.fallbackToDefault, false, endpoint)
-    read(async () => { throw new Error('BUNDLE_UNREADABLE') })
-    assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, 'server-model', endpoint)
-    h.setReadStatus(async () => { throw new Error('STATUS_UNAVAILABLE') })
-    h.setModels([{ id: 'foreign', modelID: 'foreign', name: 'Foreign', providerID: 'external' }, { id: 'runtime-default', modelID: 'api-default', name: 'API default', providerID: 'amecode' }])
-    const fallback = await h.dispatch(endpoint, args) as any
-    assert.equal(fallback.effectiveModelID, endpoint === 'buildNotesPreview' ? undefined : 'api-default', endpoint)
-    assert.equal(fallback.fallbackToDefault, true, endpoint)
-    if (endpoint !== 'buildNotesPreview') assert.equal(fallback.effectiveModelName, 'API default', endpoint)
-    for (const status of [null, {}]) {
-      h.setReadStatus(async () => status as any)
-      assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, endpoint === 'buildNotesPreview' ? undefined : 'api-default', `${endpoint}: missing status catalog`)
-    }
-    h.setReadStatus(async () => ({ models: { default_model: 'server-model', active_models: [], models: [{ id: 'server-model' }] } }) as any)
-    assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, endpoint === 'buildNotesPreview' ? undefined : 'api-default', `${endpoint}: empty active list must not use stale catalog models`)
-    h.setAdapterMethod('models', async () => { throw new Error('RUNTIME_UNAVAILABLE') })
-    assert.equal((await h.dispatch(endpoint, args) as any).effectiveModelID, undefined, endpoint)
-  }
-})
 
 test('feature generation authorizes canonical haiku models rather than tier aliases', async () => {
   const h = await harness()
@@ -2921,195 +2230,190 @@ test('feature generation authorizes canonical haiku models rather than tier alia
   assert.equal((await h.dispatch('generateBuildNotes', ['p', buildNotesRequest]) as any).modelID, 'fast')
 })
 
-test('feature followups migrate disabled pins to the configured model and persist the new session pin', async () => {
-  for (const kind of ['translation', 'commit']) {
+test('commit analysis creates a normal chat, persists its model and enforces it for admin and user prompts', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ame-analysis-ipc-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  for (const role of ['admin', 'user']) {
     const h = await harness()
-    const endpoint = kind === 'translation' ? 'androidTranslationPrompt' : 'commitAgentPrompt'
-    const read = kind === 'translation' ? h.setAndroidTranslationReader : h.setCommitEnhanceFeatureReader
-    const skill = kind === 'translation' ? translationSkill : commitSkill
-    const original = { id: 'old-runtime', modelID: 'old', name: 'Old', providerID: 'amecode' }
-    const replacement = { id: 'new-runtime', modelID: 'new', name: 'New', providerID: 'amecode' }
-    const defaultModel = { ...selectedModel, modelID: 'server-model' }
-    h.setModels([defaultModel, original, replacement])
-    read(async () => ({ skill, model: 'old' }))
+    const fast = { id: 'fast-runtime', modelID: 'fast', name: 'Fast', providerID: 'amecode' }
+    h.setModels([{ ...selectedModel, modelID: 'server-model' }, fast])
+    h.setStatus({ account: { role }, models: { default_model: 'server-model', models: [{ id: 'server-model' }] } })
+    h.setReadStatus(async () => ({ models: { default_model: 'server-model', model_levels: { default: 'server-model', haiku: 'fast', sonnet: 'server-model', opus: 'server-model' }, active_models: [{ id: 'server-model' }, { id: 'fast' }] } }) as any)
+    h.setCommitEnhanceFeatureReader(async () => ({ skill: { name: 'git-commit', instructions: 'Verified commit skill', directory: 'skills/git-commit' }, model: 'haiku' }))
     h.setFeatureAuthorizer(async id => id)
-    await h.dispatch(endpoint, ['p', undefined, 'Start'])
-    read(async () => ({ skill, model: 'new' }))
-    const authorized: string[] = []
-    // Even stale successful authorization cannot preserve a pin absent from runtime models.
-    h.setFeatureAuthorizer(async id => { authorized.push(id); return id })
-    h.setModels([defaultModel, replacement])
-    assert.equal((await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any).model.modelID, 'new')
-    assert.deepEqual(authorized, ['old', 'new'])
-    read(async () => ({ skill, model: 'changed-again' }))
-    authorized.length = 0
-    assert.equal((await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any).model.modelID, 'new')
-    assert.deepEqual(authorized, ['new'], 'the session map must contain the migrated canonical pin')
-  }
-})
-
-test('feature followups retain pins equal to the selected API default without feature authorization', async () => {
-  for (const endpoint of ['androidTranslationPrompt', 'commitAgentPrompt']) {
-    const h = await harness()
-    h.setAndroidTranslationReader(async () => ({ skill: translationSkill }))
-    h.setFeatureAuthorizer(async () => { assert.fail('The selected API default is already authorized') })
-    await h.dispatch(endpoint, ['p', undefined, 'Start'])
-    assert.equal((await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any).model.modelID, 'server-model')
-  }
-})
-
-test('feature followups recover metadata and authorization failures but report unavailable when no API models remain', async () => {
-  for (const kind of ['translation', 'commit']) {
-    for (const metadata of ['missing', 'failed', 'disabled']) {
-      const h = await harness()
-      const endpoint = kind === 'translation' ? 'androidTranslationPrompt' : 'commitAgentPrompt'
-      if (kind === 'translation') await h.translationLocks.recordSession('p', 'translation-1')
-      else await h.commitAgentLocks.recordSession('p', 'translation-1')
-      const read = kind === 'translation' ? h.setAndroidTranslationReader : h.setCommitEnhanceFeatureReader
-      read(async () => ({ skill: kind === 'translation' ? translationSkill : commitSkill, model: 'broken-config' }))
-      if (metadata === 'failed') h.setAdapterMethod('agentMap', async () => { throw new Error('READ_FAILED') })
-      if (metadata === 'disabled') h.setSessionModel('disabled')
-      h.setFeatureAuthorizer(async () => { throw new Error('AUTHORIZATION_FAILED') })
-      const result = await h.dispatch(endpoint, ['p', 'translation-1', 'Continue']) as any
-      assert.equal(result.model.modelID, 'server-model', `${kind}/${metadata}`)
-      h.setModels([])
-      await assert.rejects(h.dispatch(endpoint, ['p', 'translation-1', 'Continue']), kind === 'translation' ? /TRANSLATION_MODEL_UNAVAILABLE/ : /COMMIT_AGENT_MODEL_UNAVAILABLE/)
-    }
-  }
-})
-
-test('commit agent creates its own session, pins the authorized feature model and attaches native skills only on first turns', async () => {
-  for (const matchBy of ['name', 'id']) {
-    const h = await harness()
-    h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-    const featureModel = { id: 'feature', modelID: 'feature', name: 'Feature', providerID: 'amecode' }
-    h.setModels([{ id: 'model', modelID: 'server-model', name: 'Default', providerID: 'amecode' }, featureModel])
-    h.setFeatureAuthorizer(async id => id === 'feature' ? id : null)
-    h.setCommitEnhanceFeatureReader(async () => ({ skill: commitSkill, model: 'feature' }))
-    let lookups = 0
-    h.setSkillsReader(async () => { lookups++; return [{ id: matchBy === 'id' ? commitSkill.name : 'native-commit', name: matchBy === 'name' ? commitSkill.name : 'Other' }] })
-    const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Review changes', 'split']) as any
-    assert.equal(result.session.id, 'commit-1'); assert.equal(result.locked, false)
-    assert.deepEqual(plain(result.model), featureModel)
-    assert.equal(h.commitAgentLocks.isSession('p', 'commit-1'), true)
-    assert.equal(h.translationLocks.isTranslationSession('p', 'commit-1'), false)
+    h.setSkillsReader(async () => [{ id: 'native-commit', name: 'git-commit' }])
+    const file = path.join(root, `${role}.json`)
+    const store = createPinnedSessionModelStore(file); await store.load(); h.usePinnedModelStore(store)
+    const result = await h.dispatch('startCommitAnalysis', ['p', 'full']) as any
+    assert.equal(result.model.modelID, 'fast')
+    assert.equal(h.calls.find(call => call.method === 'createSession')?.args[1], 'full')
+    assert.equal(h.calls.some(call => call.method === 'confirm'), false, 'reuse selected permissions without asking again')
+    assert.equal(h.calls.some(call => call.method === 'updateSessionPermissionMode'), false)
     const first = h.calls.find(call => call.method === 'prompt')!
-    assert.deepEqual(plain(first.args[6]), [{ id: matchBy === 'id' ? commitSkill.name : 'native-commit' }])
-    for (const fragment of [commitSkill.instructions, commitSkill.directory, 'feature/commit', 'staged.ts', 'working.ts', 'new.ts', '[Commit mode: split]', 'Review changes']) assert.ok(String(first.args[2]).includes(fragment), fragment)
-    h.setSessionMessages([{}])
-    h.setCommitEnhanceFeatureReader(async () => ({ skill: null, model: 'changed' }))
-    h.setStatus({ account: { role: 'admin' }, models: { default_model: 'feature', models: [{ id: 'feature' }] } })
-    const next = await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue', 'custom']) as any
-    assert.equal(next.model.modelID, 'feature'); assert.equal(lookups, 1)
-    const prompt = h.calls.filter(call => call.method === 'prompt').at(-1)!
-    assert.equal(prompt.args[6], undefined)
-    assert.match(String(prompt.args[2]), /STRICT SCOPE: GIT COMMIT ASSISTANT ONLY/)
-    assert.equal(String(prompt.args[2]).includes(commitSkill.instructions), false)
-    await assert.rejects(h.dispatch('prompt', ['p', 'commit-1', 'Code', selectedModel]), /COMMIT_AGENT_SESSION_REQUIRED/)
-    await assert.rejects(h.dispatch('btwAsk', ['p', 'commit-1', 'Code', selectedModel]), /COMMIT_AGENT_SESSION_REQUIRED/)
-    assert.equal(h.calls.filter(call => call.method === 'createSession').length, 1)
-  }
-})
-
-test('commit agent defaults work without custom skills and native lookup failures retain verified instructions', async () => {
-  for (const native of ['none', 'miss', 'fail']) {
-    const h = await harness()
-    h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-    if (native !== 'none') h.setCommitEnhanceFeatureReader(async () => ({ skill: commitSkill, model: 'inactive' }))
+    assert.match(String(first.args[2]), /Verified commit skill/)
+    assert.match(String(first.args[2]), /không tự chạy git commit/)
+    assert.deepEqual(plain(first.args[6]), [{ id: 'native-commit' }])
+    const reloaded = createPinnedSessionModelStore(file); await reloaded.load(); h.usePinnedModelStore(reloaded)
+    assert.equal((await h.dispatch('pinnedSessionModels', ['p']) as any)[result.session.id], 'fast')
+    h.calls.length = 0
+    await h.dispatch('prompt', ['p', result.session.id, 'Continue', selectedModel])
+    assert.equal((h.calls.find(call => call.method === 'prompt')?.args[3] as any).modelID, 'fast')
+    await h.dispatch('updateSessionPermissionMode', ['p', result.session.id, 'default'])
     h.setFeatureAuthorizer(async () => null)
-    h.setSkillsReader(async () => { if (native === 'fail') throw new Error('offline'); return [] })
-    const result = await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze', 'analyze']) as any
-    assert.equal(result.model.modelID, 'server-model')
-    const prompt = h.calls.find(call => call.method === 'prompt')!
-    assert.equal(prompt.args[6], undefined)
-    assert.match(String(prompt.args[2]), /Conventional Commits/)
-    if (native !== 'none') assert.ok(String(prompt.args[2]).includes(commitSkill.instructions))
+    await assert.rejects(h.dispatch('prompt', ['p', result.session.id, 'Continue', selectedModel]), /COMMIT_ANALYSIS_MODEL_UNAVAILABLE/)
   }
 })
 
-test('commit agent recovers model pins on restart, rejects foreign sessions and migrates unavailable pins to the API default', async () => {
+test('opening a persisted analysis pin restores user feature access before fetching models, without recovering other pins', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ame-analysis-recovery-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const file = path.join(root, 'pins.json')
+  const store = createPinnedSessionModelStore(file); await store.load()
+  await store.pin(canonicalWorkspaceScope('workspace'), 'analysis', 'enhance')
+  await store.pin(canonicalWorkspaceScope('workspace'), 'unrelated', 'unavailable')
+  const reloaded = createPinnedSessionModelStore(file); await reloaded.load()
   const h = await harness()
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-  await h.commitAgentLocks.recordSession('p', 'commit-1')
-  h.setSessionModel('server-model'); h.setSessionMessages([{}])
-  h.setCommitEnhanceFeatureReader(async () => ({ skill: null, model: 'new-config' }))
-  assert.equal((await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any).model.modelID, 'server-model')
-  for (const method of ['commitAgentPrompt', 'commitAgentLock']) {
-    await assert.rejects(h.dispatch(method, method === 'commitAgentPrompt' ? ['p', 'main-chat', 'Analyze'] : ['p', 'main-chat']), /COMMIT_AGENT_SESSION_REQUIRED/)
-  }
-  h.setProjectDirectory('q', 'other')
-  await assert.rejects(h.dispatch('commitAgentPrompt', ['q', 'commit-1', 'Analyze']), /COMMIT_AGENT_SESSION_REQUIRED/)
-  await assert.rejects(h.dispatch('commitAgentLock', ['q', 'commit-1']), /COMMIT_AGENT_SESSION_REQUIRED/)
-  h.setSessions([])
-  await assert.rejects(h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /SESSION_NOT_FOUND/)
-  h.setModels([{ id: 'other', modelID: 'other', name: 'Other', providerID: 'amecode' }])
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
+  h.usePinnedModelStore(reloaded)
+  const normal = { ...selectedModel, modelID: 'server-model' }
+  const enhanced = { id: 'enhance-runtime', modelID: 'enhance', name: 'Enhance', providerID: 'amecode' }
+  h.setModels([normal])
+  h.setStatus({ account: { role: 'user' }, models: { default_model: 'server-model', models: [{ id: 'server-model' }] } })
+  const authorizations: string[] = []
+  h.setFeatureAuthorizer(async id => { authorizations.push(id); h.setModels([normal, enhanced]); return id })
+  assert.equal((await h.dispatch('pinnedSessionModels', ['p', 'analysis']) as any).analysis, 'enhance')
+  assert.deepEqual(authorizations, ['enhance'])
+  assert.ok((await h.dispatch('models', ['p']) as any[]).some(model => model.modelID === 'enhance'))
   h.setFeatureAuthorizer(async () => null)
-  assert.equal((await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any).model.modelID, 'other')
+  await assert.rejects(h.dispatch('pinnedSessionModels', ['p', 'analysis']), /COMMIT_ANALYSIS_MODEL_UNAVAILABLE/)
+  assert.equal(reloaded.models(canonicalWorkspaceScope('workspace')).analysis, 'enhance')
 })
 
-test('commit agent preserves legacy verified skill instructions without guessing a directory and pins the API default', async () => {
+const recoveryStatus = { account: { role: 'user' }, models: { default_model: 'recovered', models: [{ id: 'recovered' }] } }
+const recoveredModel = { id: 'amecode/recovered', modelID: 'recovered', name: 'Recovered', providerID: 'amecode' }
+const recoveryCalls = (h: Awaited<ReturnType<typeof harness>>) => h.calls.filter(call => call.method === 'account' && call.args[0] === 'refresh')
+
+test('models IPC restores lost plugin policy from cached status or the status RPC', async () => {
+  for (const cached of [false, true]) for (const foreign of [false, true]) {
+    const h = await harness()
+    h.setModels(foreign ? [{ ...recoveredModel, providerID: 'external' }] : [])
+    h.setStatus(cached ? null : recoveryStatus)
+    if (cached) h.setReadStatus(async () => recoveryStatus)
+    h.setAccountRefresh(() => { h.setModels([recoveredModel]); return recoveryStatus })
+    assert.deepEqual(plain(await h.dispatch('models', ['p'])), [recoveredModel])
+    assert.equal(recoveryCalls(h).length, 1)
+    assert.deepEqual(plain(recoveryCalls(h)[0].args), ['refresh', {}])
+    assert.equal(h.calls.filter(call => call.method === 'models').length, 2)
+    if (cached) assert.equal(h.calls.some(call => call.method === 'account' && call.args[0] === 'status'), false)
+  }
+})
+
+test('models IPC shares in-flight recovery across concurrent locations', async () => {
   const h = await harness()
-  h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-  h.setCommitEnhanceReader(async () => ({ name: 'legacy-commit', instructions: 'Legacy verified guidance' }))
-  h.setSkillsReader(async () => [])
-  await h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
-  const first = h.calls.find(call => call.method === 'prompt')!
-  assert.match(String(first.args[2]), /Legacy verified guidance/)
-  assert.match(String(first.args[2]), /unavailable: do not resolve or execute bundled/)
-  const changed = { id: 'changed', modelID: 'changed', name: 'Changed', providerID: 'amecode' }
-  h.setModels([changed, { id: 'model', modelID: 'server-model', name: 'Original', providerID: 'amecode' }])
-  h.setFeatureAuthorizer(async id => id === 'server-model' ? id : null)
-  h.setSessionMessages([{}])
-  assert.equal((await h.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']) as any).model.modelID, 'server-model')
-  await h.dispatch('prompt', ['p', 'main-chat', 'Code', changed])
-  assert.equal((h.calls.filter(call => call.method === 'prompt').at(-1)!.args[3] as any).modelID, 'changed')
-})
-
-test('commit agent lock queues after prompts, persists across restart and never cancels generation', async () => {
-  const root = await mkdtemp(path.join(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'commit-ipc-'))
+  h.setModels([]); h.setStatus(recoveryStatus)
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  h.setAccountRefresh(async () => { await gate; h.setModels([recoveredModel]); return recoveryStatus })
+  const requests = Array.from({ length: 8 }, (_, i) => h.dispatch('models', [`p${i}`]))
   try {
-    const file = path.join(root, 'commit-agent-locks.json')
-    const store = createCommitAgentLockStore(file); await store.load()
-    const h = await harness(); h.useCommitLockStore(store)
-    h.setSessions([{ id: 'commit-1', title: 'Commit' }])
-    let release!: () => void
-    h.gateOperation(new Promise<void>(resolve => { release = resolve }))
-    const pending = h.dispatch('commitAgentPrompt', ['p', undefined, 'Analyze'])
     await new Promise(resolve => setImmediate(resolve))
-    const lock = h.dispatch('commitAgentLock', ['p', 'commit-1'])
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(store.isLocked('p', 'commit-1'), false)
-    release(); await pending
-    assert.deepEqual(plain(await lock), { commitSessionIDs: ['commit-1'], lockedSessionIDs: ['commit-1'] })
-    assert.deepEqual(plain(h.calls.filter(call => call.method === 'cancel')), [])
-    assert.deepEqual(plain(h.calls.at(-1)), { method: 'ame:event', args: [{ type: 'opencode', projectID: 'p', sessionID: 'commit-1' }] })
-    const reloaded = createCommitAgentLockStore(file); await reloaded.load()
-    const restarted = await harness(); restarted.useCommitLockStore(reloaded)
-    await assert.rejects(restarted.dispatch('prompt', ['p', 'commit-1', 'Code', selectedModel]), /COMMIT_AGENT_SESSION_LOCKED/)
-    await assert.rejects(restarted.dispatch('commitAgentPrompt', ['p', 'commit-1', 'Continue']), /COMMIT_AGENT_SESSION_LOCKED/)
-    await restarted.dispatch('prompt', ['p', 'main-chat', 'Code', selectedModel])
-    restarted.failInterrupt()
-    restarted.setSessions([{ id: 'commit-1', title: 'Commit', status: 'idle' }])
-    await restarted.dispatch('commitAgentLock', ['p', 'commit-1'])
-    assert.equal(reloaded.isLocked(canonicalWorkspaceScope('workspace'), 'commit-1'), true)
-    assert.equal(reloaded.isSession('q', 'commit-1'), false)
-    assert.deepEqual(plain(restarted.calls.at(-1)), { method: 'ame:event', args: [{ type: 'opencode', projectID: 'p', sessionID: 'commit-1' }] })
-  } finally { await rm(root, { recursive: true, force: true }) }
+    assert.equal(recoveryCalls(h).length, 1)
+  } finally { release() }
+  for (const result of await Promise.all(requests)) assert.deepEqual(plain(result), [recoveredModel])
+  assert.equal(recoveryCalls(h).length, 1)
 })
 
-test('commit agent IPC rejects malformed IDs, text, modes and extra arguments before side effects', async () => {
+test('models IPC re-reads models if another caller recovers policy during a delayed status read', async () => {
   const h = await harness()
-  const invalid: Invocation[] = [
-    ...commitAgentExamples.flatMap(({ method, args }) => [[], ['', ...args.slice(1)], ['bad\0id', ...args.slice(1)], ['  ', ...args.slice(1)], ['x'.repeat(513), ...args.slice(1)], [...args, 'extra']].map(args => ({ method, args }))),
-    ...['', '  ', '\0', 42, 'x'.repeat(200001)].map(value => ({ method: 'commitAgentPrompt', args: ['p', undefined, value] })),
-    ...['', null, 42, 'bad\0id', '  '].flatMap(value => [
-      { method: 'commitAgentPrompt', args: ['p', value, 'Analyze'] }, { method: 'commitAgentLock', args: ['p', value] }
-    ]),
-    { method: 'commitAgentPrompt', args: ['p', undefined, 'Analyze', 'invalid'] }
-  ]
-  for (const { method, args } of invalid) await assert.rejects(h.dispatch(method, args), method)
-  assert.deepEqual(h.calls, [])
+  h.setModels([])
+  let release!: (status: unknown) => void
+  const pending = new Promise(resolve => { release = resolve })
+  let reads = 0
+  h.setReadStatus(() => ++reads === 1 ? pending : Promise.resolve(recoveryStatus))
+  h.setAccountRefresh(() => { h.setModels([recoveredModel]); return recoveryStatus })
+  const delayed = h.dispatch('models', ['p'])
+  try {
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(plain(await h.dispatch('models', ['p'])), [recoveredModel])
+  } finally { release(recoveryStatus) }
+  assert.deepEqual(plain(await delayed), [recoveredModel])
+  assert.equal(recoveryCalls(h).length, 1)
+})
+
+test('models IPC cooldown starts when recovery completes and permits another attempt after 15 seconds', async () => {
+  const h = await harness()
+  h.setNow(100_000)
+  h.setModels([]); h.setStatus(recoveryStatus)
+  h.setAccountRefresh(() => { h.setNow(130_000); return recoveryStatus })
+  assert.deepEqual(plain(await h.dispatch('models', ['p'])), [])
+  h.setNow(144_999)
+  for (const result of await Promise.all(Array.from({ length: 5 }, () => h.dispatch('models', ['p'])))) assert.deepEqual(plain(result), [])
+  assert.equal(recoveryCalls(h).length, 1)
+  h.setNow(145_000)
+  h.setAccountRefresh(() => { h.setModels([recoveredModel]); return recoveryStatus })
+  assert.deepEqual(plain(await h.dispatch('models', ['p'])), [recoveredModel])
+  assert.equal(recoveryCalls(h).length, 2)
+  // A successful attempt must release its in-flight slot for a later restart.
+  h.setModels([]); h.setStatus(recoveryStatus); h.setNow(160_000)
+  assert.deepEqual(plain(await h.dispatch('models', ['p'])), [recoveredModel])
+  assert.equal(recoveryCalls(h).length, 3)
+})
+
+test('models IPC handles refresh failures without spamming and retries after cooldown', async () => {
+  const h = await harness()
+  h.setNow(100_000)
+  const foreign = { ...recoveredModel, providerID: 'external' }
+  h.setModels([foreign]); h.setStatus(recoveryStatus)
+  h.setAccountRefresh(() => { throw new Error('NETWORK_UNAVAILABLE') })
+  for (let i = 0; i < 3; i++) assert.deepEqual(plain(await h.dispatch('models', ['p'])), [foreign])
+  assert.equal(recoveryCalls(h).length, 1)
+  h.setNow(115_000)
+  h.setAccountRefresh(() => { h.setModels([recoveredModel]); return recoveryStatus })
+  assert.deepEqual(plain(await h.dispatch('models', ['p'])), [recoveredModel])
+  assert.equal(recoveryCalls(h).length, 2)
+})
+
+test('models IPC skips recovery when signed out, without a catalog, or already populated', async () => {
+  for (const status of [null, { account: {} }, { account: {}, models: { models: [] } }, { models: recoveryStatus.models }]) {
+    const h = await harness()
+    h.setModels([]); h.setStatus(status)
+    assert.deepEqual(plain(await h.dispatch('models', ['p'])), [])
+    assert.equal(recoveryCalls(h).length, 0)
+  }
+  const h = await harness()
+  assert.equal((await h.dispatch('models', ['p']) as unknown[]).length, 1)
+  assert.deepEqual(h.calls.map(call => call.method), ['models'])
+})
+
+test('models IPC recovers reconnecting accounts and tolerates unreadable account status', async () => {
+  const h = await harness()
+  h.setModels([]); h.setStatus({ reconnecting: true })
+  h.setAccountRefresh(() => { h.setModels([recoveredModel]); return recoveryStatus })
+  assert.deepEqual(plain(await h.dispatch('models', ['p'])), [recoveredModel])
+  assert.equal(recoveryCalls(h).length, 1)
+  h.setModels([])
+  h.setReadStatus(async () => { throw new Error('STATUS_UNAVAILABLE') })
+  assert.deepEqual(plain(await h.dispatch('models', ['p'])), [])
+  assert.equal(recoveryCalls(h).length, 1)
+})
+
+test('models IPC recovery waits for the authority queue without blocking ordinary model reads', async () => {
+  const h = await harness()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  h.setAdapterMethod('prompt', async () => { await gate })
+  const prompt = h.dispatch('prompt', ['p', 's', 'hello', selectedModel])
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal((await h.dispatch('models', ['p']) as unknown[]).length, 1)
+  h.setModels([]); h.setStatus(recoveryStatus)
+  h.setAccountRefresh(() => { h.setModels([recoveredModel]); return recoveryStatus })
+  const recovery = h.dispatch('models', ['p'])
+  try {
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(recoveryCalls(h).length, 0)
+  } finally { release() }
+  await prompt
+  assert.deepEqual(plain(await recovery), [recoveredModel])
+  assert.equal(recoveryCalls(h).length, 1)
 })
 
 test('model resolution refreshes an expired runtime catalog before prompting or generating a commit', async () => {
@@ -3367,75 +2671,4 @@ test('prompt IPC forwards bounded file parts and rejects malformed parts before 
   await h.translationLocks.recordSession('p', 'translation')
   await assert.rejects(h.dispatch('prompt', ['p', 'translation', '', selectedModel, undefined, [file]]), /TRANSLATION/)
   } finally { await rm(directory, { recursive: true, force: true }) }
-})
-
-test('preload forwards all new methods, optional arguments, return values and rejections', async () => {
-  const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'preload', 'index.ts'), 'utf8')
-  let api: DesktopApi | undefined, rejected = false
-  const calls: Invocation[] = []
-  const result = { value: 'IPC response' }
-  const context = {
-    exports: {},
-    require: (name: string) => {
-      assert.equal(name, 'electron')
-      return {
-        contextBridge: { exposeInMainWorld: (name: string, value: DesktopApi) => { assert.equal(name, 'ame'); api = value } },
-        webUtils: { getPathForFile: (file: { path?: string }) => file.path ?? '' },
-        ipcRenderer: { invoke: async (channel: string, method: string, args: unknown[]) => {
-          assert.equal(channel, 'ame:call'); calls.push({ method, args: Array.from(args) })
-          if (rejected) throw new Error('CANCELLED')
-          return result
-        } }
-      }
-    }
-  }
-  runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, context)
-  assert.ok(api)
-  const methods = api as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
-  for (const { method, args } of [...examples, ...nativeExamples, ...smartExamples, ...translationExamples, ...commitAgentExamples, ...buildNotesExamples,
-    { method: 'stage', args: ['p', 'new.txt', true] },
-    { method: 'stage', args: ['p', 'new.txt', false, 'old.txt'] },
-    { method: 'diff', args: ['p', 'new.txt', { kind: 'staged', from: 'old.txt' }] },
-    { method: 'commitAgentExecutePlan', args: ['p', 'commit-1', approvedPlan] },
-    { method: 'openExternal', args: ['https://example.com/answer'] },
-    { method: 'pairingRevokeDevice', args: ['device-id'] },
-    { method: 'pairingRevokeAll', args: [] },
-    { method: 'confirmProjectRemoval', args: ['p', ['visible.txt', 'hidden.txt']] },
-    { method: 'removeProject', args: ['p'] },
-    { method: 'removeProject', args: ['p', randomUUID()] },
-    { method: 'resolveDroppedPaths', args: ['p', ['C:\\images\\shot.png']] },
-    { method: 'pickAttachmentFiles', args: ['p'] },
-    { method: 'prompt', args: ['p', 's', '', selectedModel, undefined, [{ uri: 'data:image/png;base64,YQ==', name: 'shot.png', source: { type: 'inline' } }]] }
-  ]) {
-    assert.equal(await methods[method](...args), result)
-    assert.deepEqual(calls.pop(), { method, args })
-    rejected = true
-    await assert.rejects(methods[method](...args), /CANCELLED/)
-    calls.length = 0; rejected = false
-  }
-  assert.equal(api.filePath({ path: 'C:\\images\\shot.png' } as unknown as File), 'C:\\images\\shot.png')
-  assert.equal(api.filePath({} as File), '')
-  assert.equal(api.filePath(null as unknown as File), '')
-  await api.prompt('p', 's', 'text')
-  assert.deepEqual(calls.pop(), { method: 'prompt', args: ['p', 's', 'text', undefined, undefined, undefined] })
-  await api.createFile('p', 'empty.txt')
-  assert.deepEqual(calls.pop(), { method: 'createFile', args: ['p', 'empty.txt', undefined] })
-  await api.createBranch('p', 'feature')
-  assert.deepEqual(calls.pop(), { method: 'createBranch', args: ['p', 'feature', undefined] })
-  await api.generateCommitMessage('p')
-  assert.deepEqual(calls.pop(), { method: 'generateCommitMessage', args: ['p', undefined] })
-  await api.androidTranslationPrompt('p', undefined, 'Translate strings')
-  assert.deepEqual(calls.pop(), { method: 'androidTranslationPrompt', args: ['p', undefined, 'Translate strings', undefined] })
-  await api.artifacts('p')
-  assert.deepEqual(calls.pop(), { method: 'artifacts', args: ['p', undefined] })
-  await api.btwAsk('p', 's', 'question')
-  assert.deepEqual(calls.pop(), { method: 'btwAsk', args: ['p', 's', 'question', undefined] })
-  await api.petGenerateDialogue()
-  assert.deepEqual(calls.pop(), { method: 'petGenerateDialogue', args: [undefined] })
-  await api.lspUpdateDocument('p', 'app.ts', '')
-  assert.deepEqual(calls.pop(), { method: 'lspUpdateDocument', args: ['p', 'app.ts', '', undefined] })
-  await api.lspDiagnostics('p')
-  assert.deepEqual(calls.pop(), { method: 'lspDiagnostics', args: ['p', undefined] })
-  await api.debugEvaluate('p', '1 + 1')
-  assert.deepEqual(calls.pop(), { method: 'debugEvaluate', args: ['p', '1 + 1', undefined] })
 })

@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { formatRelativeTime, projectsByChatActivity, visibleProjectSessions } from '../project-order'
+import { formatRelativeTime, projectsByChatActivity, resolveRootSessionID, runningRootSessionIDs, visibleProjectSessions } from '../project-order'
 import type { GitState, Project, Session } from '../../../../../packages/protocol/src/index'
 import { Icon } from './Icon'
 import { Empty, errorText, IconButton } from './Primitives'
 
-function SessionRow({ projectID, session, now, active, connected, onSelect, onRefresh, onRemoved }: { projectID: string; session: Session; now: number; active: boolean; connected: boolean; onSelect: () => void; onRefresh: () => Promise<void>; onRemoved: () => void }) {
+function SessionRow({ projectID, session, now, active, running, connected, onSelect, onRefresh, onRemoved }: { projectID: string; session: Session; now: number; active: boolean; running: boolean; connected: boolean; onSelect: () => void; onRefresh: () => Promise<void>; onRemoved: () => void }) {
   const [renaming, setRenaming] = useState(false)
   const [title, setTitle] = useState(session.title)
   const [busy, setBusy] = useState(false)
@@ -33,7 +33,7 @@ function SessionRow({ projectID, session, now, active, connected, onSelect, onRe
         <button type="button" aria-label="Hủy" title="Hủy" disabled={busy} onClick={() => setRenaming(false)}><Icon name="close" /></button>
       </form> : <>
         <button type="button" className={`nav-item ${active ? 'is-active' : ''}`} title={session.title} onClick={onSelect}>
-          <span className="nav-item__left">{session.status === 'running' && <span className="status-dot status-dot--active" />}<span className="nav-item__title">{session.parentID ? '↳ ' : ''}{session.title || 'Cuộc trò chuyện'}</span></span>
+          <span className="nav-item__left">{running && <span className="status-dot status-dot--active" />}<span className="nav-item__title">{session.title || 'Cuộc trò chuyện'}</span></span>
           {timeLabel && <span className="session-time">{timeLabel}</span>}
         </button>
         <div className="session-hover-actions" role="group" aria-label={`Thao tác: ${session.title || 'Cuộc trò chuyện'}`}>
@@ -57,7 +57,7 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
   const [filter, setFilter] = useState('all')
   const [filterOpen, setFilterOpen] = useState(false)
   const [projectMenu, setProjectMenu] = useState<string | null>(null)
-  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({})
+  const [sessionLimits, setSessionLimits] = useState<Record<string, number>>({})
   const [now, setNow] = useState(() => Date.now())
   const headerRef = useRef<HTMLDivElement>(null)
   const filterButtonRef = useRef<HTMLButtonElement>(null)
@@ -67,7 +67,13 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
   const [folded, setFolded] = useState<Record<string, boolean>>({})
   const [metadata, setMetadata] = useState<Record<string, { dirty: boolean }>>({})
   const onSessionsRef = useRef(onSessions); onSessionsRef.current = onSessions
+  const projectIDRef = useRef(projectID); projectIDRef.current = projectID
   const sessionLoads = useRef(new Map<string, number>())
+  useEffect(() => {
+    if (!projectID || !git) return
+    const dirty = !!git.changes.length
+    setMetadata(current => current[projectID]?.dirty === dirty ? current : { ...current, [projectID]: { dirty } })
+  }, [projectID, git])
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 60_000)
     return () => clearInterval(timer)
@@ -125,15 +131,19 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
     }
     void Promise.all(Array.from({ length: Math.min(2, projects.length) }, worker))
     const unsubscribe = window.ame.onEvent(event => {
-      if ((event.type !== 'opencode' && event.type !== 'files') || timers.has(event.projectID)) return
+      if (event.type !== 'files' || event.projectID === projectIDRef.current || timers.has(event.projectID)) return
       const id = event.projectID
-      timers.set(id, setTimeout(() => { timers.delete(id); void load(id) }, 300))
+      timers.set(id, setTimeout(() => {
+        timers.delete(id)
+        if (!alive || id === projectIDRef.current) return
+        void window.ame.git(id).then(state => { if (alive) setMetadata(current => ({ ...current, [id]: { dirty: !!state.changes.length } })) }).catch(() => {})
+      }, 300))
     })
     return () => { alive = false; unsubscribe(); for (const timer of timers.values()) clearTimeout(timer) }
   }, [projects, connected])
   const normalized = query.trim().toLocaleLowerCase()
   const visible = projectsByChatActivity(projects, sessionCache).filter(project => {
-    const items = sessionCache[project.id] || []
+    const items = (sessionCache[project.id] || []).filter(session => !session.parentID)
     const dirty = project.id === projectID ? !!git?.changes.length : metadata[project.id]?.dirty
     return (!normalized || project.name.toLocaleLowerCase().includes(normalized) || items.some(s => s.title.toLocaleLowerCase().includes(normalized))) && (filter !== 'chat' || items.length > 0) && (filter !== 'diff' || dirty)
   })
@@ -164,10 +174,13 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
       {loading ? <Empty>Đang đọc dự án…</Empty> : !projects.length ? <Empty>Chưa có dự án.<br /><button disabled={!window.ame} onClick={onPick}>Mở thư mục</button></Empty> : !visible.length ? <Empty>Không có kết quả.</Empty> : visible.map(project => {
         const active = project.id === projectID
         const items = sessionCache[project.id] || []
+        const resolvedActiveSessionID = active ? resolveRootSessionID(items, sessionID) : undefined
+        const runningRoots = runningRootSessionIDs(items)
         const dirty = active ? !!git?.changes.length : metadata[project.id]?.dirty
         const shown = normalized && !project.name.toLocaleLowerCase().includes(normalized) ? items.filter(s => s.title.toLocaleLowerCase().includes(normalized)) : items
         const isFolded = !!folded[project.id] && !normalized
-        const { items: visibleSessions, total, hiddenCount } = visibleProjectSessions(shown, { expanded: !!expandedProjects[project.id], activeSessionID: active ? sessionID : undefined, query: normalized, limit: 3 })
+        const sessionLimit = sessionLimits[project.id] ?? 4
+        const { items: visibleSessions, total, hiddenCount } = visibleProjectSessions(shown, { query: normalized, limit: sessionLimit })
         return <section key={project.id} className={`proj-group ${active ? 'is-active-proj' : ''} ${isFolded ? 'is-folded' : ''}`}>
           <div className={`proj-row ${projectMenu === project.id ? 'is-menu-open' : ''}`}>
             <button type="button" className="proj-folder-btn" aria-label={isFolded ? `Mở rộng ${project.name}` : `Thu gọn ${project.name}`} title={isFolded ? 'Mở thư mục' : 'Đóng thư mục'} aria-expanded={!isFolded} onClick={() => setFolded(value => ({ ...value, [project.id]: !value[project.id] }))}><Icon name={isFolded ? 'folder' : 'folderOpen'} /></button>
@@ -193,8 +206,16 @@ export function ProjectRail({ projects, projectID, sessions, sessionID, loading,
             <button type="button" role="menuitem" className="proj-menu-danger" aria-label={`Gỡ dự án: ${project.name}`} title={`Gỡ dự án ${project.name} khỏi danh sách (không xóa tệp)`} onClick={() => { setProjectMenu(null); onRemove(project.id) }}><Icon name="trash" />Gỡ dự án</button>
           </div>}
           <div className="proj-chats">{active && error ? <div className="inline-error">{error}<button onClick={onRetry}>Thử lại</button></div> : active && sessionsLoading && !items.length ? <p className="rail-note muted">Đang tải…</p> : <>
-            {visibleSessions.map(session => <SessionRow key={session.id} projectID={project.id} session={session} now={now} active={active && sessionID === session.id} connected={connected} onSelect={() => onSession(project.id, session.id)} onRefresh={() => refreshSessions(project.id)} onRemoved={() => onSessionRemoved?.(project.id, session.id)} />)}
-            {hiddenCount > 0 ? <button type="button" className="proj-see-all" onClick={() => setExpandedProjects(value => ({ ...value, [project.id]: true }))}>See all ({total})</button> : expandedProjects[project.id] && total > 3 && !normalized && <button type="button" className="proj-see-all" onClick={() => setExpandedProjects(value => ({ ...value, [project.id]: false }))}>Show less</button>}
+            {visibleSessions.map(session => <SessionRow key={session.id} projectID={project.id} session={session} now={now} active={active && resolvedActiveSessionID === session.id} running={runningRoots.has(session.id)} connected={connected} onSelect={() => onSession(project.id, session.id)} onRefresh={() => refreshSessions(project.id)} onRemoved={() => onSessionRemoved?.(project.id, session.id)} />)}
+            {!normalized && (hiddenCount > 0 || (sessionLimit > 4 && total > 4)) && <div className="proj-session-controls">
+              {hiddenCount > 0 && <button type="button" className="proj-see-all" onClick={() => setSessionLimits(value => ({ ...value, [project.id]: (value[project.id] ?? 4) + 4 }))}>Xem thêm {Math.min(4, hiddenCount)} ({hiddenCount})</button>}
+              {sessionLimit > 4 && total > 4 && <button type="button" className="proj-see-all proj-collapse" aria-label="Thu gọn về 4 cuộc trò chuyện" title="Thu gọn về 4 cuộc trò chuyện" onClick={event => {
+                const group = event.currentTarget.closest('.proj-group')
+                setSessionLimits(value => ({ ...value, [project.id]: 4 }))
+                group?.querySelector<HTMLButtonElement>('.project-select')?.focus({ preventScroll: true })
+                group?.scrollIntoView({ block: 'nearest' })
+              }}>↑</button>}
+            </div>}
           </>}</div>
         </section>
       })}

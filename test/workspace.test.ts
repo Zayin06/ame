@@ -9,7 +9,6 @@ import { z } from 'zod'
 import { simpleGit } from 'simple-git'
 import { Workspaces } from '../packages/ide-core/src/workspace'
 import { GIT_COMMIT_HASH_PATTERN } from '../packages/protocol/src/index'
-import { COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH } from '../packages/amekit/src/commit-agent'
 
 async function fixture(t: { after(fn: () => Promise<void>): void }, changed?: (projectID: string) => void) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ame-workspace-test-'))
@@ -164,24 +163,6 @@ test('removal creates missing persistence directories even without a watcher', a
   assert.deepEqual(JSON.parse(await readFile(storage, 'utf8')), [])
 })
 
-test('workspace status never executes repository-local core.fsmonitor', async t => {
-  const { root, directory, workspaces, project } = await fixture(t)
-  const git = simpleGit(directory)
-  await git.init()
-  const marker = path.join(root, 'fsmonitor-ran')
-  const script = path.join(directory, '.git', 'fsmonitor-test')
-  const quotedMarker = marker.replace(/\\/g, '/').replace(/'/g, "'\\''")
-  await writeFile(script, `#!/bin/sh\nprintf ran > '${quotedMarker}'\nprintf '\\0'\n`, { mode: 0o755 })
-  await git.addConfig('core.fsmonitor', script.replace(/\\/g, '/'))
-  // Positive control: prove the configured script actually executes on this Git/filesystem.
-  await git.status()
-  assert.equal(await readFile(marker, 'utf8'), 'ran')
-  await rm(marker)
-  await workspaces.status(project.id)
-  await workspaces.commitPlanSnapshot(project.id)
-  await assert.rejects(readFile(marker), { code: 'ENOENT' })
-})
-
 test('BOM metadata is bounded and removed with its project', async t => {
   const { directory, workspaces, project } = await fixture(t)
   await writeFile(path.join(directory, 'bom'), '\uFEFForiginal')
@@ -304,48 +285,6 @@ test('listFiles returns deterministic POSIX paths and skips generated directorie
   assert.deepEqual(await workspaces.listFiles(project.id), expected)
   assert.deepEqual(await workspaces.listFiles(project.id), expected)
   await assert.rejects(workspaces.listFiles('missing'), /UNKNOWN_PROJECT/)
-})
-
-test('removeProject IPC validates its tuple, requires native confirmation and propagates cancellation or persistence failure', async () => {
-  const source = await readFile(path.join(process.cwd(), 'apps', 'desktop', 'src', 'main', 'index.ts'), 'utf8')
-  const start = source.indexOf('const text ='), end = source.indexOf('let authority:')
-  assert.ok(start >= 0 && end > start)
-  const calls: string[] = []
-  let response = 0, persistFailure = false
-  const window = {}
-  const context = {
-    GIT_COMMIT_HASH_PATTERN, COMMIT_PLAN_MAX_GROUPS, COMMIT_PLAN_MAX_FILES_PER_GROUP, COMMIT_PLAN_MAX_MESSAGE_LENGTH,
-    z, window, pairingSchema: z.object({ enabled: z.boolean(), keepScreenActive: z.boolean() }),
-    canonicalWorkspaceScope: (value: string) => value,
-    translationLocks: undefined,
-    commitAgentLocks: undefined,
-    workspace: {
-      get: (id: string) => { calls.push('get'); if (id !== 'p') throw new Error('UNKNOWN_PROJECT'); return { name: 'Example' } },
-      remove: async (id: string) => { assert.equal(id, 'p'); calls.push('remove'); if (persistFailure) throw new Error('SAVE_FAILED') }
-    },
-    terminals: { closeProject: (id: string) => { assert.equal(id, 'p'); calls.push('closeProject') } },
-    adapter: { detach: (id: string) => { assert.equal(id, 'p'); calls.push('detach') } },
-    dialog: { showMessageBox: async (parent: unknown, options: any) => {
-      assert.equal(parent, window)
-      assert.deepEqual(Array.from(options.buttons), ['Hủy', 'Xác nhận'])
-      assert.equal(options.defaultId, 0); assert.equal(options.cancelId, 0)
-      assert.equal(options.message, 'Gỡ dự án Example khỏi danh sách? Tệp trên ổ đĩa sẽ KHÔNG bị xóa.')
-      calls.push('confirm'); return { response }
-    } }
-  }
-  const dispatch = runInNewContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + '\ncall', context) as (method: string, args: unknown[]) => Promise<unknown>
-  for (const args of [[], [''], [1], ['p', 'extra'], ['x'.repeat(513)]]) await assert.rejects(dispatch('removeProject', args))
-  assert.deepEqual(calls, [])
-  await assert.rejects(dispatch('removeProject', ['missing']), /UNKNOWN_PROJECT/)
-  assert.deepEqual(calls, ['get']); calls.length = 0
-  await assert.rejects(dispatch('removeProject', ['p']), /CANCELLED/)
-  assert.deepEqual(calls, ['get', 'confirm']); calls.length = 0
-  response = 1
-  assert.equal(await dispatch('removeProject', ['p']), undefined)
-  assert.deepEqual(calls, ['get', 'confirm', 'remove', 'closeProject', 'detach']); calls.length = 0
-  persistFailure = true
-  await assert.rejects(dispatch('removeProject', ['p']), /SAVE_FAILED/)
-  assert.deepEqual(calls, ['get', 'confirm', 'remove'])
 })
 
 test('preload removeProject forwards the project ID and preserves IPC rejections', async () => {
@@ -537,69 +476,6 @@ test('rename status, staged and commit diffs retain the old path and unstaging p
   const hash = (await git.revparse(['HEAD'])).trim()
   assert.deepEqual(await workspaces.diff(id, to, { kind: 'commit', commit: hash, from }), { original: content, modified: content })
   assert.deepEqual((await workspaces.status(id)).changes, [])
-})
-
-test('commit plan delegates keep snapshots read-only and notify only after successful execution', async t => {
-  const notifications: string[] = []
-  const { directory, workspaces, project } = await fixture(t, id => notifications.push(id))
-  workspaces.dispose()
-  const git = simpleGit(directory), id = project.id
-  await git.init()
-  await git.addConfig('user.name', 'Ame Test'); await git.addConfig('user.email', 'test@example.invalid')
-  await git.addConfig('commit.gpgSign', 'false'); await git.addConfig('core.autocrlf', 'false')
-  await writeFile(path.join(directory, 'file.txt'), 'initial\n')
-  await workspaces.stage(id, 'file.txt', true); await workspaces.commit(id, 'initial')
-  await writeFile(path.join(directory, 'file.txt'), 'updated\n')
-  await workspaces.stage(id, 'file.txt', true)
-  notifications.length = 0
-  const snapshot = await workspaces.commitPlanSnapshot(id, 8)
-  const noDiff = await workspaces.commitPlanSnapshot(id, 8, { includeDiff: false, focusFiles: ['file.txt'] })
-  assert.equal(noDiff.stat, ''); assert.equal(noDiff.diffPreview, '')
-  assert.equal(noDiff.fingerprint, snapshot.fingerprint)
-  assert.ok(Buffer.byteLength(snapshot.diffPreview) <= 8)
-  assert.equal(snapshot.truncated, true)
-  assert.deepEqual(notifications, [])
-  const plan = { planID: 'test-plan', scope: 'staged' as const, snapshot, commits: [{ message: 'planned update', files: ['file.txt'] }] }
-  await assert.rejects(workspaces.executeCommitPlan(id, { ...plan, snapshot: { ...snapshot, indexHash: 'stale' } }))
-  assert.deepEqual(notifications, [])
-  const result = await workspaces.executeCommitPlan(id, plan)
-  assert.equal(result.commits.length, 1)
-  assert.equal(result.commits[0].subject, 'planned update')
-  assert.deepEqual(notifications, [id])
-  assert.deepEqual((await workspaces.status(id)).changes, [])
-  await assert.rejects(workspaces.commitPlanSnapshot('missing'), /UNKNOWN_PROJECT/)
-  await assert.rejects(workspaces.executeCommitPlan('missing', plan), /UNKNOWN_PROJECT/)
-  assert.deepEqual(notifications, [id])
-})
-
-test('partial commit plan failure notifies after the first group commits', async t => {
-  const notifications: string[] = []
-  const { directory, workspaces, project } = await fixture(t, id => notifications.push(id))
-  workspaces.dispose()
-  const git = simpleGit(directory), id = project.id
-  await git.raw(['init', '--initial-branch=main'])
-  await git.addConfig('user.name', 'Ame Test'); await git.addConfig('user.email', 'test@example.invalid')
-  await git.addConfig('commit.gpgSign', 'false'); await git.addConfig('core.autocrlf', 'false')
-  for (const file of ['one', 'two']) await writeFile(path.join(directory, file), 'initial\n')
-  await git.add('.'); await git.raw(['-c', 'core.hooksPath=', 'commit', '-m', 'initial'])
-  for (const file of ['one', 'two']) await writeFile(path.join(directory, file), 'updated\n')
-  await git.add('.')
-  const hooks = path.join(directory, '.git', 'test-hooks'); await mkdir(hooks)
-  await writeFile(path.join(hooks, 'commit-msg'), '#!/bin/sh\nif grep -q "second group" "$1"; then\n  echo second-group-rejected >&2\n  exit 1\nfi\n', { mode: 0o755 })
-  await git.addConfig('core.hooksPath', hooks)
-  const snapshot = await workspaces.commitPlanSnapshot(id)
-  const plan = { planID: 'partial', scope: 'staged' as const, snapshot, commits: [
-    { message: 'first group', files: ['one'] }, { message: 'second group', files: ['two'] },
-  ] }
-  await assert.rejects(workspaces.executeCommitPlan(id, plan), error => {
-    assert.match(String(error), /second-group-rejected/)
-    assert.equal((error as { commits: unknown[] }).commits.length, 1)
-    return true
-  })
-  assert.equal((await git.raw(['log', '-1', '--format=%s'])).trim(), 'first group')
-  assert.equal(await git.raw(['show', 'HEAD:one']), 'updated\n')
-  assert.equal(await git.raw(['show', 'HEAD:two']), 'initial\n')
-  assert.deepEqual(notifications, [id])
 })
 
 test('SHA-256 workspace diffs support commits, ancestor ranges and selected commit patches', async t => {

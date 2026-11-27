@@ -13,7 +13,6 @@ import { ProjectRail } from './components/ProjectRail'
 import type { CSSProperties } from 'react'
 import { Chat, cleanupAbandonedNewChatDraft, cleanupProjectChatDrafts, cleanupSessionChatDraft } from './components/Chat'
 import { AndroidTranslationModal } from './components/AndroidTranslationModal'
-import { CommitAgentModal } from './components/CommitAgentModal'
 import type { ModelLevels } from './model-selection'
 import { EditorStage, type EditorStatus } from './components/EditorStage'
 import { disposeOrphanedFileModels, reconcileDiffResources } from './editor-model-lifecycle'
@@ -32,6 +31,7 @@ import { TerminalPanel, type BottomPanelTab } from './components/TerminalPanel'
 import { createProjectTerminal, isTerminalKey, newTerminalShortcut } from './terminal-controls'
 import { removeProjectSafely } from './project-removal'
 import { changePathDocuments, deleteFromView, renameBuffers, renamedPath, renameView, resolveExactWorkspacePath, resolveWorkspaceFilePath, sanitizeProjectView, type NavigationTarget } from './workspace-paths'
+import { resolveChatFilePath } from './chat-file-paths'
 
 const storageKey = 'ame.ide.layout.v1'
 const readPreferences = () => { try { return parsePreferences(localStorage.getItem(storageKey)) } catch { return defaults() } }
@@ -103,6 +103,23 @@ export function App() {
   const [accountDefaultModel, setAccountDefaultModel] = useState('')
   const [accountModelLevels, setAccountModelLevels] = useState<Partial<ModelLevels>>()
   const [gitError, setGitError] = useState('')
+  const [chatPermissionMode, setChatPermissionMode] = useState<import('../../../../packages/protocol/src/index').PermissionMode>()
+  const [analysisStarting, setAnalysisStarting] = useState(false)
+  async function startCommitAnalysis() {
+    if (!projectID || analysisStarting || !connection.connected) return
+    const id = projectID
+    setAnalysisStarting(true)
+    try {
+      const { session, model } = await window.ame.startCommitAnalysis(id, chatPermissionMode)
+      if (preferencesRef.current.project !== id || removedProjects.current.has(id)) return
+      draftProjects.current.delete(id)
+      setGitWorkspaceOpen(false)
+      setSelectedModel(model)
+      updateView(id, current => ({ ...current, session: session.id }))
+      setSessionCache(current => ({ ...current, [id]: [session, ...(current[id] || []).filter(s => s.id !== session.id)] }))
+      refreshSessions()
+    } catch (error) { report(error) } finally { setAnalysisStarting(false) }
+  }
   const [gitWorkspaceOpen, setGitWorkspaceOpen] = useState(false)
   const [gitWorkspaceTab, setGitWorkspaceTab] = useState<GitWorkspaceTab>('commit')
   const [commitDrafts, setCommitDrafts] = useState<Record<string, { message: string; amend: boolean; noVerify: boolean }>>({})
@@ -113,8 +130,6 @@ export function App() {
   const [error, setError] = useState('')
   const [modal, setModalState] = useState<'settings' | 'account' | 'palette' | null>(null)
   const [translationModalOpen, setTranslationModalOpen] = useState(false)
-  const [commitAgentModal, setCommitAgentModal] = useState<{ open: boolean; sessionID?: string }>({ open: false })
-  useEffect(() => { setCommitAgentModal({ open: false }) }, [preferences.project])
   useEffect(() => { setTranslationModalOpen(false) }, [preferences.project])
   const [isMac, setIsMac] = useState(false)
   const [pet, setPet] = useState<PetHostState | null>(null)
@@ -423,6 +438,7 @@ export function App() {
         return
       }
       if (event.type === 'opencode') {
+        if (event.kind === 'stream') return
         if (event.projectID === preferencesRef.current.project && !chatTimer) chatTimer = setTimeout(() => { chatTimer = undefined; refreshSessions() }, 300)
         else if (event.projectID !== preferencesRef.current.project && sessionCacheRef.current[event.projectID] && !sessionTimers.has(event.projectID)) {
           sessionTimers.set(event.projectID, setTimeout(() => {
@@ -439,7 +455,9 @@ export function App() {
         fileTimers.delete(event.projectID)
         if (event.projectID === preferencesRef.current.project) {
           refresh()
-          if (problemsOpenRef.current || openSourcePathsRef.current.length) void requestDiagnostics(event.projectID, true, problemsOpenRef.current ? undefined : openSourcePathsRef.current)
+          // Main queues the workspace refresh before emitting this event. The
+          // worker serializes diagnostics after it, so a second scan is redundant.
+          if (problemsOpenRef.current || openSourcePathsRef.current.length) void requestDiagnostics(event.projectID, false, problemsOpenRef.current ? undefined : openSourcePathsRef.current)
         }
         for (const [id, buffer] of Object.entries(buffersRef.current)) {
           if (buffer.projectID !== event.projectID) continue
@@ -475,7 +493,7 @@ export function App() {
     void window.ame.sessions(projectID).then(items => {
       if (!alive || removedProjects.current.has(projectID)) return
       setSessionCache(current => ({ ...current, [projectID]: items })); setSessionError('')
-      updateView(projectID, current => ({ ...current, session: !current.session && (draftProjects.current.has(projectID) || sessionCacheRef.current[projectID] !== undefined) ? undefined : items.some(s => s.id === current.session) ? current.session : items[0]?.id }))
+      updateView(projectID, current => ({ ...current, session: !current.session && (draftProjects.current.has(projectID) || sessionCacheRef.current[projectID] !== undefined) ? undefined : items.some(s => s.id === current.session) ? current.session : items.find(s => !s.parentID)?.id ?? items[0]?.id }))
     }).catch(e => { if (alive) setSessionError(errorText(e)) }).finally(() => { if (alive) setSessionsLoading(false) })
     return () => { alive = false }
   }, [projectID, connection.connected, sessionGeneration, updateView])
@@ -551,7 +569,6 @@ export function App() {
       removedProjects.current.add(id)
       cleanupProjectChatDrafts(id)
       delete chatDraftIDs.current[id]
-      if (preferencesRef.current.project === id) setCommitAgentModal({ open: false })
       for (const key of bufferEditVersion.current.keys()) if (JSON.parse(key)[0] === id) bufferEditVersion.current.delete(key)
       draftProjects.current.delete(id)
       const remaining = projectsRef.current.filter(project => project.id !== id)
@@ -633,8 +650,21 @@ export function App() {
     setPreferences(p => ({ ...p, project: id, stage: true, panel: mode === 'diff' ? 'diff' : 'files', layoutMode: mode === 'diff' ? 'swe' : p.layoutMode }))
   }
   const openTab = (path: string, mode: Tab['mode'], line?: number, column?: number, target?: DiffTarget, options?: { literal?: boolean }) => { if (projectID) openProjectTab(projectID, path, mode, line, column, target, options) }
-  const chatOpenFileRef = useRef(openTab); chatOpenFileRef.current = openTab
-  const onChatOpenFile = useCallback((path: string, line?: number) => chatOpenFileRef.current(path, 'file', line), [])
+  const chatOpenNonce = useRef(0)
+  const chatOpenFileRef = useRef<(path: string, line?: number) => void>(() => {})
+  chatOpenFileRef.current = (path, line) => {
+    if (!projectID) return
+    const id = projectID, nonce = ++chatOpenNonce.current
+    const directory = projectsRef.current.find(project => project.id === id)?.directory
+    void resolveChatFilePath(path, directory, () => window.ame.listFiles(id)).then(ref => {
+      if (nonce !== chatOpenNonce.current || preferencesRef.current.project !== id || removedProjects.current.has(id)) return
+      if (!ref) { setError('Không thể mở đường dẫn thư mục hoặc tệp nằm ngoài dự án.'); return }
+      openProjectTab(id, ref.path, 'file', line ?? ref.line)
+    }).catch(error => {
+      if (nonce === chatOpenNonce.current && preferencesRef.current.project === id && !removedProjects.current.has(id)) report(error)
+    })
+  }
+  const onChatOpenFile = useCallback((path: string, line?: number) => chatOpenFileRef.current(path, line), [])
   navigateRef.current = (id, path, line, column) => openProjectTab(id, path, 'file', line, column, undefined, { literal: true })
   const closeOverlay = (id: string, path: string) => {
     if (!isSourceFile(path)) return
@@ -811,7 +841,7 @@ export function App() {
   ]
   const keyHandler = useRef<(event: KeyboardEvent) => void>(() => {})
   keyHandler.current = event => {
-    if (translationModalOpen || commitAgentModal.open) return
+    if (translationModalOpen) return
     if (!(event.ctrlKey || event.metaKey)) return
     const key = event.key.toLowerCase()
     const editing = !!(event.target as HTMLElement | null)?.closest?.('.monaco-editor, input, textarea, [contenteditable]:not([contenteditable="false"])')
@@ -854,23 +884,23 @@ export function App() {
     <header className="titlebar" data-region="Titlebar"><div className="titlebar__left"><span className="brand-mark brand-mark--icon-only" title="Ame"><span className="brand-mark__icon"><Icon name="brand" /></span></span><IconButton label="Tài khoản & AmeKit" onClick={() => setModal('account')}><Icon name="account" /></IconButton><IconButton label="Settings" onClick={() => setModal('settings')}><Icon name="settings" /></IconButton><IconButton label={`Projects & Chats (${formatShortcut('Ctrl+B', isMac)})`} active={preferences.rail} onClick={() => toggle('rail')}><Icon name="sidebar" /></IconButton></div><div className="titlebar__center"><button className="cmd-trigger" onClick={() => { setQuery(''); setModal('palette') }}><span className="cmd-trigger__label"><Icon name="search" /><span className="truncate">{activeSession?.title || 'Lệnh & điều hướng'}</span></span><span className="kbd">{formatShortcut('Ctrl+K', isMac)}</span></button></div><div className="titlebar__right">{import.meta.env.DEV && <button className={`pill-btn ${xray ? 'is-active' : ''}`} onClick={() => setXray(value => !value)}><Icon name="grid" />Layout X-Ray</button>}<IconButton label={`Project Inspector (${formatShortcut('Ctrl+Shift+E', isMac)})`} active={preferences.inspector} onClick={() => toggle('inspector')}><Icon name="folder" /></IconButton><IconButton label={`Bottom Panel (${formatShortcut('Ctrl+J', isMac)})`} active={preferences.terminalOpen && preferences.stage} onClick={() => setPreferences(p => ({ ...p, terminalOpen: !p.terminalOpen, stage: true }))}><Icon name="bottom" /></IconButton><IconButton label={`File Stage (${formatShortcut('Ctrl+Alt+B', isMac)})`} active={preferences.stage} onClick={() => toggle('stage')}><Icon name="panel" /></IconButton><span className="titlebar__divider" /><div className="win-controls">{(['minimize', 'maximize', 'close'] as const).map((action, index) => <button key={action} className={`win-btn ${action === 'close' ? 'win-btn--close' : ''}`} aria-label={['Thu nhỏ', 'Phóng to / khôi phục', 'Đóng cửa sổ'][index]} onClick={() => void window.ame?.window(action).catch(report)}><Icon name={action} /></button>)}</div></div></header>
     {error && <div className="error-banner" role="alert"><span>{error}</span><IconButton label="Đóng thông báo" onClick={() => setError('')}><Icon name="close" /></IconButton></div>}
     <div className={`workspace-body ${!preferences.rail ? 'is-sidebar-collapsed' : ''} ${!preferences.inspector ? 'is-inspector-collapsed' : ''} ${!preferences.stage ? 'is-sidepanel-collapsed' : ''} ${maximized && preferences.stage ? 'is-sidepanel-maximized' : ''} ${gitWorkspaceOpen && projectID ? 'is-git-workspace' : ''}`} style={{ '--sidebar-w': `${preferences.widths.rail}px`, '--inspector-w': `${preferences.widths.inspector}px`, '--sidepanel-w': `${preferences.widths.stage}px` } as CSSProperties}>
-      {preferences.rail && <><ErrorBoundary title="Danh sách dự án gặp lỗi hiển thị" resetKey={JSON.stringify([projectID, view.session])}><ProjectRail projects={projects} projectID={projectID} sessions={sessions} sessionCache={sessionCache} onRemove={id => void removeProject(id)} onSessionRemoved={sessionRemoved} onSessions={(id, items) => { setSessionCache(current => removedProjects.current.has(id) ? current : ({ ...current, [id]: items })); updateView(id, current => ({ ...current, session: !current.session && (draftProjects.current.has(id) || sessionCacheRef.current[id] !== undefined) ? undefined : items.some(item => item.id === current.session) ? current.session : items[0]?.id })) }} sessionID={view.session} loading={projectsLoading} sessionsLoading={sessionsLoading} error={sessionError} connected={connection.connected} git={git} generation={generation} onSelect={id => setPreferences(p => ({ ...p, project: id }))} onSession={(id, session) => { setGitWorkspaceOpen(false); draftProjects.current.delete(id); setPreferences(p => ({ ...p, project: id })); updateView(id, current => ({ ...current, session })) }} onTool={(id, tab) => setPreferences(p => ({ ...p, project: id, inspector: true, inspectorTab: tab }))} onCreate={id => void createSession(id)} onPick={() => void pickProject()} onRetry={refreshSessions} /></ErrorBoundary><Resizer pane="rail" width={preferences.widths.rail} onChange={w => setWidth('rail', w)} /></>}
+      {preferences.rail && <><ErrorBoundary title="Danh sách dự án gặp lỗi hiển thị" resetKey={JSON.stringify([projectID, view.session])}><ProjectRail projects={projects} projectID={projectID} sessions={sessions} sessionCache={sessionCache} onRemove={id => void removeProject(id)} onSessionRemoved={sessionRemoved} onSessions={(id, items) => { setSessionCache(current => removedProjects.current.has(id) ? current : ({ ...current, [id]: items })); updateView(id, current => ({ ...current, session: !current.session && (draftProjects.current.has(id) || sessionCacheRef.current[id] !== undefined) ? undefined : items.some(item => item.id === current.session) ? current.session : items.find(s => !s.parentID)?.id ?? items[0]?.id })) }} sessionID={view.session} loading={projectsLoading} sessionsLoading={sessionsLoading} error={sessionError} connected={connection.connected} git={git} generation={generation} onSelect={id => setPreferences(p => ({ ...p, project: id }))} onSession={(id, session) => { setGitWorkspaceOpen(false); draftProjects.current.delete(id); setPreferences(p => ({ ...p, project: id })); updateView(id, current => ({ ...current, session })) }} onTool={(id, tab) => setPreferences(p => ({ ...p, project: id, inspector: true, inspectorTab: tab }))} onCreate={id => void createSession(id)} onPick={() => void pickProject()} onRetry={refreshSessions} /></ErrorBoundary><Resizer pane="rail" width={preferences.widths.rail} onChange={w => setWidth('rail', w)} /></>}
       {preferences.inspector && <><ErrorBoundary title="Bảng kiểm tra dự án gặp lỗi hiển thị" resetKey={JSON.stringify([projectID, preferences.inspectorTab])}><Inspector projectID={projectID} name={project?.name} connected={connection.connected} tab={preferences.inspectorTab} setTab={tab => setPreferences(p => ({ ...p, inspectorTab: tab }))} generation={generation} git={git} gitError={gitError} refresh={refresh} onOpen={(path, line, column) => openTab(path, 'file', line, column, undefined, { literal: true })} onRename={(from, to) => { if (projectID) renameOpenPath(projectID, from, to) }} onDelete={(path, targetProjectID) => { const id = targetProjectID ?? projectID; if (id) deleteOpenPath(id, path) }} onDiff={(path, target) => openTab(path, 'diff', undefined, undefined, target, { literal: true })} onHide={() => toggle('inspector')} report={report}
         dirtyPaths={projectDirtyPaths(buffers, projectID)} commitMessage={currentCommitDraft.message} onCommitMessageChange={message => updateCommitDraft({ message })}
-        onOpenCommitAgent={() => setCommitAgentModal({ open: true })}
+        analysisStarting={analysisStarting} onStartCommitAnalysis={() => void startCommitAnalysis()}
         gitWorkspaceOpen={gitWorkspaceOpen} onOpenGitWorkspace={(tab = 'commit') => {
           if (gitWorkspaceOpen && tab === 'commit' && gitWorkspaceTab === 'commit') { setGitWorkspaceOpen(false); return }
           setGitWorkspaceTab(tab); setGitWorkspaceOpen(true)
           setPreferences(p => ({ ...p, inspector: true, inspectorTab: 'git' }))
         }} onCommitEnhanceSkillChange={setCommitEnhanceSkill} /></ErrorBoundary><Resizer pane="inspector" width={preferences.widths.inspector} onChange={w => setWidth('inspector', w)} /></>}
       <ErrorBoundary title="Khung chat gặp lỗi hiển thị" resetKey={`${projectID}:${view.session ?? ''}:${chatDraftID}`}>
-      <Chat onOpenCommitAgent={sessionID => setCommitAgentModal({ open: true, sessionID })} draftID={chatDraftID} focusNonce={composerFocusNonce} onOpenAndroidTranslation={() => setTranslationModalOpen(true)} timelineDetail={preferences.timelineDetail} projectDirectory={project?.directory} accountRole={accountRole} defaultModelID={accountDefaultModel} modelLevels={accountModelLevels} connectionUrl={connection.url} onModelChange={setSelectedModel} key={JSON.stringify([projectID, chatDraftID])} files={files} activeFile={activeTab?.mode === 'file' ? activeTab.path : undefined} onRequestFiles={requestFiles} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!view.session || !!activeSession) && !sessionError} onCreated={session => { if (projectID && (chatDraftIDs.current[projectID] || 0) === chatDraftID && !removedProjects.current.has(projectID)) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={onChatOpenFile} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: id })) } }} />
+      <Chat onPermissionModeChange={setChatPermissionMode} draftID={chatDraftID} focusNonce={composerFocusNonce} onOpenAndroidTranslation={() => setTranslationModalOpen(true)} timelineDetail={preferences.timelineDetail} projectDirectory={project?.directory} accountRole={accountRole} defaultModelID={accountDefaultModel} modelLevels={accountModelLevels} connectionUrl={connection.url} onModelChange={setSelectedModel} key={JSON.stringify([projectID, chatDraftID])} files={files} activeFile={activeTab?.mode === 'file' ? activeTab.path : undefined} onRequestFiles={requestFiles} ready={!!projectID && sessionCache[projectID] !== undefined && !sessionsLoading && (!view.session || !!activeSession) && !sessionError} onCreated={session => { if (projectID && (chatDraftIDs.current[projectID] || 0) === chatDraftID && !removedProjects.current.has(projectID)) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: session.id })); setSessionCache(current => ({ ...current, [projectID]: [session, ...(current[projectID] || []).filter(s => s.id !== session.id)] })) } }} projectID={projectID} sessionID={view.session} title={activeSession?.title} connected={connection.connected} onCreate={() => void createSession()} report={report} onActivity={refreshSessions} onOpenPanel={selectPanel} onOpenFile={onChatOpenFile} sessions={sessions} tabs={view.tabs} changes={changesState.status === 'ready' ? changesState.files.length : 0} changesStatus={changesState.status} theme={preferences.theme} projectName={project?.name} branch={git?.branch} onSelectSession={id => { if (projectID) { draftProjects.current.delete(projectID); updateView(projectID, current => ({ ...current, session: id })) } }} />
       </ErrorBoundary>
       {gitWorkspaceOpen && projectID && <ErrorBoundary title="Không gian Git gặp lỗi hiển thị" resetKey={JSON.stringify([projectID, gitWorkspaceTab])}><GitWorkspace
         projectID={projectID} projectName={project?.name} connected={connection.connected}
         git={git} gitError={gitError} generation={generation}
         activeTab={gitWorkspaceTab} onSelectTab={setGitWorkspaceTab}
-        onOpenCommitAgent={() => setCommitAgentModal({ open: true })}
+        analysisStarting={analysisStarting} onStartCommitAnalysis={() => void startCommitAnalysis()}
         message={currentCommitDraft.message} onMessageChange={message => updateCommitDraft({ message })}
         amend={currentCommitDraft.amend} onAmendChange={amend => updateCommitDraft({ amend })}
         noVerify={currentCommitDraft.noVerify} onNoVerifyChange={noVerify => updateCommitDraft({ noVerify })}
@@ -903,7 +933,6 @@ export function App() {
       </section></>}
     </div>
     {translationModalOpen && projectID && <ErrorBoundary key={projectID} title="Hộp dịch Android gặp lỗi hiển thị" resetKey={projectID}><AndroidTranslationModal key={projectID} projectID={projectID} projectName={project?.name} projectDirectory={project?.directory} connected={connection.connected} theme={preferences.theme} timelineDetail={preferences.timelineDetail} onClose={() => setTranslationModalOpen(false)} onActivity={refreshSessions} onOpenFile={(path, line) => openTab(path, 'file', line)} /></ErrorBoundary>}
-    {commitAgentModal.open && projectID && <ErrorBoundary key={`${projectID}:${commitAgentModal.sessionID ?? ''}`} title="Trợ lý Commit gặp lỗi hiển thị" resetKey={JSON.stringify([projectID, commitAgentModal.sessionID])}><CommitAgentModal key={`${projectID}:${commitAgentModal.sessionID ?? ''}`} initialSessionID={commitAgentModal.sessionID} projectID={projectID} projectName={project?.name} projectDirectory={project?.directory} connected={connection.connected} theme={preferences.theme} timelineDetail={preferences.timelineDetail} onClose={() => setCommitAgentModal({ open: false })} onActivity={refreshSessions} onGitRefresh={refresh} onApplyCommitMessage={msg => { updateCommitDraft({ message: msg }); setCommitAgentModal({ open: false }) }} onOpenFile={(path, line) => openTab(path, 'file', line)} /></ErrorBoundary>}
     {(modal === 'settings' || modal === 'account') && <ErrorBoundary title="Cài đặt gặp lỗi hiển thị" resetKey={modal}><Settings isMac={isMac} pet={pet} sprite={sprite} selectedModel={selectedModel?.modelID ?? selectedModel?.id} onPet={setPet} initialSection={modal === 'account' ? 'amekit' : 'appearance'} preferences={preferences} setLayout={patch => setPreferences(p => ({ ...p, ...patch, panel: patch.layoutMode === 'knowledge' && ['diff', 'terminal', 'subagents'].includes(p.panel) ? 'files' : p.panel }))} theme={preferences.theme} setTheme={theme => setPreferences(p => ({ ...p, theme }))} connection={connection} setConnection={setConnection} close={() => setModal(null)} /></ErrorBoundary>}
     <ErrorBoundary title="Hộp mở tệp nhanh gặp lỗi hiển thị" resetKey={JSON.stringify([!!quickOpen, quickOpen || 'files'])}><QuickOpen open={!!quickOpen} mode={quickOpen || 'files'} files={files} recentPaths={recentPaths} activeFile={activeTab?.mode === 'file' ? activeTab.path : undefined} activeLineCount={editorStatus?.lineCount || activeBuffer?.text.split('\n').length} loading={fileIndex?.key !== fileIndexKey || fileIndex.loading} onSelectFile={(path, line, column) => openTab(path, 'file', line, column, undefined, { literal: true })} onGoToLine={(line, column) => { if (activeTab?.mode === 'file') openTab(activeTab.path, 'file', line, column, undefined, { literal: true }) }} onClose={() => setQuickOpen(undefined)} /></ErrorBoundary>
     {quickOpen && fileIndex?.key === fileIndexKey && fileIndex.error && <div className="error-banner" role="alert">{fileIndex.error}</div>}

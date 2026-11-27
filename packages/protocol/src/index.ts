@@ -119,30 +119,6 @@ export type AndroidTranslationInfo = SessionLockState & {
   stringsFiles: string[]
 }
 export type AndroidTranslationPromptResult = { session: Session; model: Model; locked: boolean }
-export type CommitAgentMode = 'analyze' | 'split' | 'single' | 'custom'
-export type CommitAgentSessionState = { commitSessionIDs: string[]; lockedSessionIDs: string[] }
-export type CommitAgentSnapshot = { head: string; branchRef: string; branch?: string; indexHash: string; workingHash: string; untrackedHashes?: Record<string, string>; scope: 'staged' | 'working'; fingerprint: string; stagedFiles: string[]; workingFiles: string[] }
-export type CommitAgentPlanGroup = { message: string; files: string[] }
-export type CommitAgentPlan = { planID: string; scope: 'staged' | 'working'; snapshot: { head: string; branchRef?: string; indexHash: string; workingHash?: string; untrackedHashes?: Record<string, string> }; commits: CommitAgentPlanGroup[] }
-export type CommitAgentPlanStatus = 'active' | 'executing' | 'stale' | 'executed' | 'superseded'
-export type CommitAgentStoredPlan = { planID: string; snapshot: CommitAgentSnapshot; status: CommitAgentPlanStatus }
-export type CommitAgentExecuteFailure = { code: string; message: string; failedGroupIndex: number; failedSubject: string }
-export type CommitAgentExecuteResult = { commits: { hash: string; subject: string; files: string[] }[]; partialFailure?: CommitAgentExecuteFailure }
-export type CommitAgentInfo = CommitAgentSessionState & {
-  configured: boolean
-  skill?: string
-  configuredModelID?: string
-  effectiveModelID?: string
-  effectiveModelName?: string
-  fallbackToDefault: boolean
-  branch?: string
-  stagedCount: number
-  workingCount: number
-  snapshot?: CommitAgentSnapshot
-  plans?: Record<string, CommitAgentStoredPlan>
-  messagePlanIDs?: Record<string, string>
-}
-export type CommitAgentPromptResult = { session: Session; model: Model; locked: boolean; planID?: string; snapshot?: CommitAgentSnapshot }
 export type Agent = { id: string; name: string }
 export type Permission = { id: string; sessionID: string; title: string }
 export type { SessionForm, SessionFormField, SessionFormOption, SessionFormWhen, SessionFormAnswer, SessionFormValue } from './session-form'
@@ -157,7 +133,7 @@ export type TerminalProfile = { id: string; name: string; executable: string; ar
 export type TerminalInfo = { id: string; projectID: string; title: string; cols: number; rows: number; exitCode?: number }
 export type TerminalSnapshot = TerminalInfo & { output: string; sequence: number }
 export type TerminalEvent = { type: 'terminal'; projectID: string; terminalID: string; sequence: number; data?: string; exitCode?: number }
-export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string } | { type: 'catalog'; projectID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState } | { type: 'debug'; projectID: string; event: DebugEvent }
+export type IdeEvent = { type: 'files'; projectID: string } | { type: 'opencode'; projectID: string; sessionID?: string; kind?: 'stream' | 'session' } | { type: 'catalog'; projectID?: string } | { type: 'connection'; connection: Connection } | TerminalEvent | { type: 'pet'; state: PetHostState } | { type: 'debug'; projectID: string; event: DebugEvent }
   // Empty scope keeps legacy file-event consumers from treating a global update as a project change.
   | { type: 'amekit-bundle'; version: string; releaseId: string; auto: boolean; action: 'synced' | 'uninstalled'; projectID: '' }
 export type AgentMapTokens = {
@@ -312,15 +288,12 @@ export interface DesktopApi {
   deleteSession(projectID: string, sessionID: string): Promise<void>
   commands(projectID: string): Promise<SlashCommand[]>
   skills(projectID: string): Promise<SkillSummary[]>
+  startCommitAnalysis(projectID: string, permissionMode?: PermissionMode): Promise<{ session: Session; model: Model }>
+  pinnedSessionModels(projectID: string, sessionID?: string): Promise<Record<string, string>>
   generateCommitMessage(projectID: string, model?: Model): Promise<{ message: string; truncated: boolean }>
   androidTranslationInfo(projectID: string): Promise<AndroidTranslationInfo>
   androidTranslationPrompt(projectID: string, sessionID: string | undefined, text: string, mode?: 'update' | 'full' | 'scan' | 'custom'): Promise<AndroidTranslationPromptResult>
   androidTranslationLock(projectID: string, sessionID: string): Promise<SessionLockState>
-  commitAgentInfo(projectID: string): Promise<CommitAgentInfo>
-  commitAgentSessionState(projectID: string): Promise<CommitAgentSessionState>
-  commitAgentPrompt(projectID: string, sessionID: string | undefined, text: string, mode?: CommitAgentMode): Promise<CommitAgentPromptResult>
-  commitAgentLock(projectID: string, sessionID: string): Promise<CommitAgentSessionState>
-  commitAgentExecutePlan(projectID: string, sessionID: string, plan: CommitAgentPlan): Promise<CommitAgentExecuteResult>
   messages(projectID: string, sessionID: string): Promise<ChatItem[]>
   sessionDiff(projectID: string, sessionID: string, from?: string): Promise<SessionDiff[]>
   stageRevert(id: string, session: string, messageID: string, files: boolean): Promise<SessionRevert>

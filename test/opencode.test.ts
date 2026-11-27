@@ -1409,6 +1409,33 @@ test('artifacts use project location, map native summaries and files, validate i
   } finally { adapter.dispose() }
 })
 
+test('SSE notifications mark only streaming content, preserving lifecycle event shapes', async () => {
+  const notifications: IdeEvent[] = [], directory = process.cwd()
+  let stream!: ReadableStreamDefaultController<Uint8Array>
+  const adapter = new OpenCodeAdapter(event => notifications.push(event), async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/info') return json({ version: '2.3.2' })
+    if (url.pathname === '/api/event') return new Response(new ReadableStream({ start(c) { stream = c; init.signal?.addEventListener('abort', () => c.close()) } }), { headers: { 'content-type': 'text/event-stream' } })
+    throw new Error('Unexpected ' + url.pathname)
+  })
+  adapter.attach('p', directory)
+  try {
+    await adapter.connect('http://localhost:4096'); await waitFor(() => !!stream)
+    for (const [types, isStream] of [
+      [['session.text.delta', 'session.text.ended', 'session.reasoning.delta', 'session.reasoning.ended', 'session.tool.input.delta', 'session.tool.input.ended', 'session.tool.progress', 'future.content.delta'], true],
+      [['session.created', 'session.updated', 'session.deleted', 'session.execution.started', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted', 'session.idle', 'session.status', 'session.tool.called', 'session.tool.success', 'session.tool.failed', 'permission.asked', 'permission.replied', 'form.created', 'form.replied', 'server.connected'], false],
+    ] as const) {
+      for (const type of types) {
+        notifications.length = 0
+        const data = { sessionID: 's1', assistantMessageID: 'a', ordinal: 0, delta: 'live', text: 'done', status: { type: 'idle' }, form: { sessionID: 's1' } }
+        stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type, location: { directory }, data })}\n\n`))
+        await waitFor(() => notifications.length > 0)
+        assert.deepEqual(notifications.filter(event => event.type === 'opencode'), [{ type: 'opencode', projectID: 'p', ...(type === 'server.connected' ? {} : { sessionID: 's1' }), ...(isStream ? { kind: 'stream' } : {}) }], type)
+      }
+    }
+  } finally { adapter.dispose() }
+})
+
 test('artifact.updated SSE refreshes only matching attached projects and broadcasts when location is absent', async () => {
   const notifications: IdeEvent[] = [], directory = process.cwd(), other = directory + '-other'
   let stream: ReadableStreamDefaultController<Uint8Array> | undefined

@@ -114,7 +114,7 @@ test('Inspector SSR renders only an accessible wand in the commit input bar and 
     assert.ok(bar.includes('m15 4 5 5L7 22l-5-5Z'))
     assert.equal(bar.replace(/<[^>]*>/g, '').trim(), '')
     assert.doesNotMatch(html, /Skill \/git-commit/)
-    assert.equal(bar.includes('disabled=""'), disabled)
+    assert.equal(bar.split('</button>')[0].includes('disabled=""'), disabled)
   }
 })
 
@@ -276,7 +276,7 @@ test('Inspector controlled drafts, Enhance, commits and workspace shortcuts noti
   assert.match(syncBar, /aria-label="Mô tả bản build \(QC\)"/)
   const commitBar = h.render().match(/<div class="scm-commit-input-bar">([\s\S]*?)<\/div>/)![1]
   assert.doesNotMatch(commitBar, /Mô tả bản build/)
-  assert.equal((commitBar.match(/<button/g) ?? []).length, 2)
+  assert.equal((commitBar.match(/<button/g) ?? []).length, 3)
   assert.equal(commitBar.replace(/<[^>]*>/g, '').trim(), '')
   h.render({ gitWorkspaceOpen: true, connected: false, git: { branch: 'main', changes: [] } })
   const expand = h.find(node => node.props['data-testid'] === 'scm-expand-commit-btn')

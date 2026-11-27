@@ -182,28 +182,6 @@ test('Enhance updates the controlled message, counter and skill; blocks concurre
   h.unmount()
 })
 
-test('Commit Agent opens for unstaged changes and respects connection, busy state and callback availability', async () => {
-  let opened = 0
-  const request = deferred<{ message: string }>()
-  const h = harness({ onOpenCommitAgent() { opened++ } }, { generateCommitMessage() { return request.promise } })
-  try {
-    h.render(); await h.flush()
-    const id = 'git-workspace-commit-agent-btn'
-    assert.equal(h.byID(id).props.disabled, false)
-    h.invoke(h.byID(id)); assert.equal(opened, 1)
-    h.invoke(h.byID('git-workspace-enhance-btn')); h.render()
-    assert.equal(h.byID(id).props.disabled, true)
-    request.resolve({ message: 'feat: generated' }); await h.flush()
-    h.render({ git: { branch: 'main', changes: [{ path: 'unstaged.ts', index: ' ', working: 'M' }] } })
-    assert.equal(h.byID(id).props.disabled, false)
-    assert.equal(h.byID('git-workspace-enhance-btn').props.disabled, true)
-    h.invoke(h.byID(id)); assert.equal(opened, 2)
-    h.render({ connected: false }); assert.equal(h.byID(id).props.disabled, true)
-    h.render({ connected: true, onOpenCommitAgent: undefined }); assert.equal(h.byID(id).props.disabled, true)
-    h.render({ onOpenCommitAgent() {}, git: { branch: 'main', changes: [] } }); assert.equal(h.byID(id).props.disabled, true)
-  } finally { h.unmount() }
-})
-
 test('Enhance tooltip explains readiness, active configuration and every disabled state', async () => {
   const request = deferred<{ message: string }>()
   const h = harness({ commitEnhanceSkill: 'team-commit', commitEnhanceModel: 'haiku' }, { generateCommitMessage() { return request.promise } })

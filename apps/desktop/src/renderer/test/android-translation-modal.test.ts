@@ -18,7 +18,7 @@ const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 const model = { id: 'gemini', modelID: 'gemini', providerID: 'amecode', name: 'Gemini Translation' }
 const baseInfo: AndroidTranslationInfo = { configured: true, isAndroid: true, skill: 'android-strings-translation', effectiveModelID: 'gemini', effectiveModelName: 'Gemini Translation', fallbackToDefault: false, stringsFiles: ['app/src/main/res/values/strings.xml'], translationSessionIDs: [], lockedSessionIDs: [] }
 
-function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 'AndroidTranslationModal' | 'CommitAgentModal' | 'Chat'; props?: Record<string, unknown>; onSubscribe?: (emit: (event: IdeEvent) => void) => void } = {}) {
+function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 'AndroidTranslationModal' | 'Chat'; props?: Record<string, unknown>; onSubscribe?: (emit: (event: IdeEvent) => void) => void } = {}) {
   const slots: unknown[] = [], effects: { deps: unknown[]; cleanup?: () => void }[] = [], pending: (() => void)[] = []
   let cursor = 0, effectIndex = 0, writes = 0, tree: ReactNode, closed = 0, activity = 0, focused = 0
   let info = { ...baseInfo, ...options.info }, items: ChatItem[] = [], permissions: Permission[] = [], sessions: Session[] = []
@@ -51,8 +51,6 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
   }
   const api = {
     async androidTranslationInfo() { infoLoads++; return info },
-    async commitAgentInfo() { infoLoads++; return { ...info, commitSessionIDs: options.component === 'CommitAgentModal' ? info.translationSessionIDs : [], lockedSessionIDs: options.component === 'CommitAgentModal' ? info.lockedSessionIDs : [] } },
-    async commitAgentPrompt(...args: unknown[]) { return api.androidTranslationPrompt(...args) },
     async androidTranslationPrompt(...args: unknown[]) {
       calls.push({ method: 'prompt', args })
       if (nextPrompt) return nextPrompt
@@ -478,8 +476,51 @@ test('resumed sessions display their pinned model rather than a changed feature 
   h.unmount()
 })
 
+test('Full mode resets when cleared or explicitly toggled but survives nonempty edits', async () => {
+  const h = harness()
+  try {
+    h.render(); await h.flush(); h.click('Thêm ngôn ngữ mới'); h.render()
+    h.change('Dịch ja'); assert.match(h.render(), /Full ×/)
+    h.change('   '); assert.doesNotMatch(h.render(), /Full ×/)
+    h.change('Dịch bổ sung'); h.render(); h.submit(); await h.flush()
+    assert.equal(h.calls[0].args[3], 'custom')
+    h.click('Phiên dịch mới'); h.render(); h.click('Thêm ngôn ngữ mới'); h.render()
+    h.click('Chuyển về dịch bổ sung'); assert.doesNotMatch(h.render(), /Full ×/)
+    h.submit(); await h.flush(); assert.equal(h.calls[1].args[3], 'custom')
+  } finally { h.unmount() }
+})
+
+test('unlocked translation session hides regular composer and routes continuation back to translation', async () => {
+  let opened = 0, created = 0
+  const h = harness({ component: 'Chat', props: { sessionID: 'translation-open', onOpenAndroidTranslation() { opened++ }, onCreate() { created++ } }, info: { translationSessionIDs: ['translation-open'] } })
+  h.render(); const html = await h.flush()
+  assert.match(html, /Đây là phiên Dịch Android riêng/)
+  assert.doesNotMatch(html, /<textarea/)
+  h.click('Dịch Android'); assert.equal(opened, 1)
+  const btw = h.find(node => node.type === 'button' && node.props['aria-label'] === '/btw')
+  ;(btw.props.onClick as () => void)(); h.render()
+  assert.doesNotMatch(h.render(), /<textarea/)
+  h.click('Cuộc trò chuyện mới'); assert.equal(created, 1)
+  h.unmount()
+})
+
+test('regular Chat filters authorized feature models and renders locked translation banner without composer', async () => {
+  const h = harness({ component: 'Chat', props: { sessionID: 'translation-locked' }, info: { lockedSessionIDs: ['translation-locked'], translationSessionIDs: ['translation-locked'] } })
+  h.render(); const html = await h.flush()
+  assert.match(html, /translation-locked-banner/); assert.match(html, /được khóa để tránh dùng nhầm model/)
+  assert.doesNotMatch(html, /<textarea/); assert.match(html, /android-translate-trigger/)
+  const filter = h.exports.chatModelsForPolicy as (models: unknown[], role?: string, defaultModel?: string) => { id: string }[]
+  const models = [{ id: 'default', providerID: 'amecode' }, model, { id: 'other', providerID: 'external' }]
+  assert.deepEqual(Array.from(filter(models, 'user', 'default'), item => item.id), ['default'])
+  assert.equal(filter([model], 'user', 'missing').length, 0)
+  assert.equal(filter(models, 'user', undefined).length, 0)
+  assert.deepEqual(Array.from(filter(models, 'admin'), item => item.id), ['default', 'gemini'])
+  h.unmount()
+})
+
+
 test('feature modal unsent drafts survive close/remount, stay project-scoped and clear on new session', async () => {
-  for (const component of ['AndroidTranslationModal', 'CommitAgentModal'] as const) {
+  for (const component of ['AndroidTranslationModal'] as const) {
     const h = harness({ component })
     try {
       h.render(); await h.flush(); h.change('unsent draft'); h.render()
@@ -497,22 +538,8 @@ test('feature modal unsent drafts survive close/remount, stay project-scoped and
   }
 })
 
-test('Full mode resets when cleared or explicitly toggled but survives nonempty edits', async () => {
-  const h = harness()
-  try {
-    h.render(); await h.flush(); h.click('Thêm ngôn ngữ mới'); h.render()
-    h.change('Dịch ja'); assert.match(h.render(), /Full ×/)
-    h.change('   '); assert.doesNotMatch(h.render(), /Full ×/)
-    h.change('Dịch bổ sung'); h.render(); h.submit(); await h.flush()
-    assert.equal(h.calls[0].args[3], 'custom')
-    h.click('Phiên dịch mới'); h.render(); h.click('Thêm ngôn ngữ mới'); h.render()
-    h.click('Chuyển về dịch bổ sung'); assert.doesNotMatch(h.render(), /Full ×/)
-    h.submit(); await h.flush(); assert.equal(h.calls[1].args[3], 'custom')
-  } finally { h.unmount() }
-})
-
 test('feature modals refresh info and active session pins on account and bundle updates without blocking continuation', async () => {
-  for (const component of ['AndroidTranslationModal', 'CommitAgentModal'] as const) for (const event of ['ame-account-changed', 'ame-bundle-updated']) {
+  for (const component of ['AndroidTranslationModal'] as const) for (const event of ['ame-account-changed', 'ame-bundle-updated']) {
     const h = harness({ component, info: { translationSessionIDs: ['old'], effectiveModelID: 'default', effectiveModelName: 'Default' } })
     try {
       h.updateSession({ id: 'old', title: 'Existing', status: 'idle' })
@@ -542,7 +569,7 @@ test('feature modals refresh info and active session pins on account and bundle 
 })
 
 test('active pins survive refreshes and missing pins use the effective model ID when its name is absent', async () => {
-  for (const component of ['AndroidTranslationModal', 'CommitAgentModal'] as const) {
+  for (const component of ['AndroidTranslationModal'] as const) {
     const h = harness({ component, info: { translationSessionIDs: ['old'], effectiveModelID: 'replacement', effectiveModelName: undefined } })
     try {
       h.updateSessionModel('gemini')
@@ -558,32 +585,4 @@ test('active pins survive refreshes and missing pins use the effective model ID 
       assert.doesNotMatch(h.render(), /Model trước đó của phiên/)
     } finally { h.unmount() }
   }
-})
-
-test('unlocked translation session hides regular composer and routes continuation back to translation', async () => {
-  let opened = 0, created = 0
-  const h = harness({ component: 'Chat', props: { sessionID: 'translation-open', onOpenAndroidTranslation() { opened++ }, onCreate() { created++ } }, info: { translationSessionIDs: ['translation-open'] } })
-  h.render(); const html = await h.flush()
-  assert.match(html, /Đây là phiên Dịch Android riêng/)
-  assert.doesNotMatch(html, /<textarea/)
-  h.click('Dịch Android'); assert.equal(opened, 1)
-  const btw = h.find(node => node.type === 'button' && node.props['aria-label'] === '/btw')
-  ;(btw.props.onClick as () => void)(); h.render()
-  assert.doesNotMatch(h.render(), /<textarea/)
-  h.click('Cuộc trò chuyện mới'); assert.equal(created, 1)
-  h.unmount()
-})
-
-test('regular Chat filters authorized feature models and renders locked translation banner without composer', async () => {
-  const h = harness({ component: 'Chat', props: { sessionID: 'translation-locked' }, info: { lockedSessionIDs: ['translation-locked'], translationSessionIDs: ['translation-locked'] } })
-  h.render(); const html = await h.flush()
-  assert.match(html, /translation-locked-banner/); assert.match(html, /được khóa để tránh dùng nhầm model/)
-  assert.doesNotMatch(html, /<textarea/); assert.match(html, /android-translate-trigger/)
-  const filter = h.exports.chatModelsForPolicy as (models: unknown[], role?: string, defaultModel?: string) => { id: string }[]
-  const models = [{ id: 'default', providerID: 'amecode' }, model, { id: 'other', providerID: 'external' }]
-  assert.deepEqual(Array.from(filter(models, 'user', 'default'), item => item.id), ['default'])
-  assert.equal(filter([model], 'user', 'missing').length, 0)
-  assert.equal(filter(models, 'user', undefined).length, 0)
-  assert.deepEqual(Array.from(filter(models, 'admin'), item => item.id), ['default', 'gemini'])
-  h.unmount()
 })
