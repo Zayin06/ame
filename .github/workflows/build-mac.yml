@@ -3,15 +3,6 @@ on:
   push:
     tags: ['mac-*']
   workflow_dispatch:
-    inputs:
-      arch:
-        description: macOS target architecture
-        type: choice
-        default: arm64
-        options:
-          - all
-          - arm64
-          - x64
 
 permissions:
   contents: read
@@ -21,71 +12,32 @@ concurrency:
 
 jobs:
   package-mac:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-arm64.zip
-            archive_sha: 31ab5a06a29edc7e49b895f35c2b64ebfe7c7f0437b0f2581b006efcd79fee1a
-          - arch: x64
-            archive_url: https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-x64-baseline.zip
-            archive_sha: 6dc5deb4554df035d27dbb3a4663d96954969a33079aeb6b01dd9de2d9092545
     runs-on: macos-latest
     steps:
-      - name: Check architecture filter
-        id: filter
-        shell: bash
-        run: |
-          selected="${{ inputs.arch }}"
-          if [ -z "$selected" ]; then
-            case "$GITHUB_REF_NAME" in
-              mac-x64-*) selected="x64" ;;
-              mac-all-*) selected="all" ;;
-              *) selected="arm64" ;;
-            esac
-          fi
-          if [ "$selected" = "all" ] || [ "$selected" = "${{ matrix.arch }}" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
       - uses: actions/checkout@v4
-        if: steps.filter.outputs.enabled == 'true'
-      - name: Enable x64 execution on Apple Silicon
-        if: steps.filter.outputs.enabled == 'true' && matrix.arch == 'x64'
-        shell: bash
-        run: |
-          if [ "$(uname -m)" = arm64 ]; then
-            sudo softwareupdate --install-rosetta --agree-to-license
-          fi
       - uses: actions/setup-node@v4
-        if: steps.filter.outputs.enabled == 'true'
         with:
           node-version: '22'
-          architecture: ${{ matrix.arch }}
+          architecture: arm64
           cache: npm
           cache-dependency-path: package-lock.json
       - name: Verify Node architecture
-        if: steps.filter.outputs.enabled == 'true'
         shell: bash
-        run: node -e "if (process.arch !== '${{ matrix.arch }}') throw new Error('Target Node architecture is required')"
+        run: node -e "if (process.arch !== 'arm64') throw new Error('Target Node architecture is required')"
       - name: Install dependencies
-        if: steps.filter.outputs.enabled == 'true'
         run: npm ci
       - name: Typecheck
-        if: steps.filter.outputs.enabled == 'true'
         run: npm run typecheck
       - name: Download and verify pinned OpenCode 2.3.2 macOS runtime
-        if: steps.filter.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/opencode-runtime.zip"
-          curl -fsSL --retry 3 --max-time 180 "${{ matrix.archive_url }}" -o "$archive"
+          archive_sha="31ab5a06a29edc7e49b895f35c2b64ebfe7c7f0437b0f2581b006efcd79fee1a"
+          curl -fsSL --retry 3 --max-time 180 "https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-arm64.zip" -o "$archive"
           actual="$(shasum -a 256 "$archive" | awk '{print tolower($1)}')"
-          if [ "$actual" != "${{ matrix.archive_sha }}" ]; then
-            echo "Archive SHA-256 mismatch: expected ${{ matrix.archive_sha }}, got $actual" >&2
+          if [ "$actual" != "$archive_sha" ]; then
+            echo "Archive SHA-256 mismatch: expected $archive_sha, got $actual" >&2
             exit 1
           fi
           extract_dir="$RUNNER_TEMP/opencode-extracted"
@@ -95,34 +47,27 @@ jobs:
           echo "AME_OPENCODE_CLI=$extract_dir/opencode" >> "$GITHUB_ENV"
           echo "AME_OPENCODE_SHA256=$(shasum -a 256 "$extract_dir/opencode" | awk '{print tolower($1)}')" >> "$GITHUB_ENV"
       - name: Stage and verify OpenCode 2.3.2 macOS runtime
-        if: steps.filter.outputs.enabled == 'true'
         run: npm run runtime:prepare
       - name: Build backend plugin before tests
-        if: steps.filter.outputs.enabled == 'true'
         run: npm run build:server
       - name: Unit tests
-        if: steps.filter.outputs.enabled == 'true'
         env:
           AME_REQUIRE_BACKEND_TESTS: '1'
         run: npm test
       - name: Rebuild native modules for Electron target architecture
-        if: steps.filter.outputs.enabled == 'true'
-        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
+        run: npx electron-builder install-app-deps --arch=arm64
       - name: Build server plugin and Electron app
-        if: steps.filter.outputs.enabled == 'true'
         env:
           NODE_OPTIONS: --max-old-space-size=6144
         run: npx electron-vite build
       - name: Package macOS DMG only
-        if: steps.filter.outputs.enabled == 'true'
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
           NODE_OPTIONS: --max-old-space-size=6144
-        run: npx electron-builder --mac dmg --${{ matrix.arch }} --publish never
+        run: npx electron-builder --mac dmg --arm64 --publish never
       - uses: actions/upload-artifact@v4
-        if: steps.filter.outputs.enabled == 'true'
         with:
-          name: ame-ide-mac-${{ matrix.arch }}-${{ github.run_id }}
+          name: ame-ide-mac-arm64-${{ github.run_id }}
           if-no-files-found: error
           compression-level: 0
           path: release/*.dmg

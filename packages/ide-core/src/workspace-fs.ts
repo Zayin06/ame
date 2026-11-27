@@ -163,7 +163,7 @@ async function externalSource(absolute: string) {
     current = path.join(current, part)
     const info = await existing(current)
     if (!info) fail('NOT_FOUND')
-    if (info.isSymbolicLink()) fail('SYMLINK_NOT_ALLOWED')
+    if (info.isSymbolicLink() && !(process.platform === 'darwin' && (current === '/var' || current === '/tmp' || current === '/etc'))) fail('SYMLINK_NOT_ALLOWED')
   }
   return realpath(absolute)
 }

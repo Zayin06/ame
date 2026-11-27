@@ -16,8 +16,8 @@ export function canonicalWorkspaceScope(directory: string): string {
 
 export async function detectAndroidProject(projectDir: string, signal?: AbortSignal): Promise<{ isAndroid: boolean; stringsFiles: string[] }> {
   signal?.throwIfAborted()
-  await safeDirectory(projectDir)
-  const root = path.resolve(projectDir), stringsFiles: string[] = []
+  const root = await safeDirectory(projectDir)
+  const stringsFiles: string[] = []
   let isAndroid = false, directories = 0, entries = 0
   const walk = async (directory: string, depth: number): Promise<void> => {
     signal?.throwIfAborted()

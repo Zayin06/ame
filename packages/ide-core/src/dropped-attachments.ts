@@ -81,17 +81,17 @@ async function checkedPath(value: string) {
   const { default: path } = await import('node:path')
   if (typeof value !== 'string' || !value || value.includes('\0') || !path.isAbsolute(value)) throw new Error(invalidPath)
   const absolute = path.resolve(value)
+  const isMacOsSystemAlias = (p: string) => process.platform === 'darwin' && (p === '/var' || p === '/tmp' || p === '/etc')
   let current = path.parse(absolute).root
   const segments = absolute.slice(current.length).split(path.sep).filter(Boolean)
   let info = await lstat(current)
-  if (info.isSymbolicLink()) throw new Error(linkedPath)
+  if (info.isSymbolicLink() && !isMacOsSystemAlias(current)) throw new Error(linkedPath)
   for (const segment of segments) {
     current = path.join(current, segment)
     info = await lstat(current)
-    if (info.isSymbolicLink()) throw new Error(linkedPath)
+    if (info.isSymbolicLink() && !isMacOsSystemAlias(current)) throw new Error(linkedPath)
   }
   const real = await realpath(absolute)
-  if (comparable(real) !== comparable(absolute)) throw new Error(linkedPath)
   return { info, real }
 }
 

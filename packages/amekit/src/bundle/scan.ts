@@ -10,7 +10,8 @@ export async function scanWithSource(root: string, signal?: AbortSignal, options
   if (!path.isAbsolute(root)) throw new Error("SELECT_ABSOLUTE_FOLDER")
   const absolute = path.resolve(root)
   const stat = await lstat(absolute)
-  if (!stat.isDirectory() || stat.isSymbolicLink() || (await realpath(absolute)).toLowerCase() !== absolute.toLowerCase()) throw new Error("UNSAFE_SOURCE_ROOT")
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("UNSAFE_SOURCE_ROOT")
+  const rootReal = await realpath(absolute)
   const files: InputFile[] = [], issues: Issue[] = []
   let visited = 0, expanded = 0
   async function walk(folder: string, prefix: string) {
@@ -36,7 +37,7 @@ export async function scanWithSource(root: string, signal?: AbortSignal, options
       files.push({ path: name, data })
     }
   }
-  await walk(absolute, "")
+  await walk(rootReal, "")
   return { files, inheritedIssues: issues, preview: preview(files.map(file => ({ path: file.path, data: file.data.slice() })), issues, options) }
 }
 

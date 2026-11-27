@@ -120,10 +120,12 @@ async function validatePromptFiles(projectID: string, files: z.infer<typeof prom
       if (!uri || !/^file:/i.test(uri)) continue
       try {
         const directory = workspace.get(projectID).directory
+        const rootReal = await fs.promises.realpath(directory)
         const url = new URL(uri)
         if (url.search || url.hash) throw new Error('INVALID_FILE_URI')
         const absolute = fileURLToPath(url)
-        const { target } = await validateWorkspacePath(directory, path.relative(directory, absolute))
+        const candidate = process.platform === 'darwin' ? absolute.replace(/^\/(?:var|tmp|etc)(?=\/|$)/, m => '/private' + m) : absolute
+        const { target } = await validateWorkspacePath(rootReal, path.relative(rootReal, candidate))
         const info = await fs.promises.lstat(target)
         if (info.isSymbolicLink() || !info.isFile() || info.size > 10 * 1024 * 1024) throw new Error('INVALID_ATTACHMENT')
       } catch { throw new Error('INVALID_ATTACHMENT: file URI must reference a regular workspace file outside .git, without symlinks, at most 10 MiB') }
