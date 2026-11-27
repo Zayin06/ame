@@ -5,7 +5,7 @@ import JsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker'
 import CssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker'
 import HtmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker'
 import TsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import type { LspDiagnostic, LspRange } from '../../../../../packages/ide-core/src/ts-lsp'
 import { dirty, languageFor, tabID, tabTitle, tabIsDirty, type Buffer, type Tab } from '../state'
 import { Empty, IconButton } from './Primitives'
@@ -14,6 +14,9 @@ import { navigationPosition, type NavigationTarget } from '../workspace-paths'
 import { modelUri, synchronizeCleanFileModel } from '../editor-model-lifecycle'
 import type { DiffContent } from '../../../../../packages/protocol/src/index'
 import { ensureMonacoShikiLanguage, shikiThemeName } from '../monaco-shiki'
+import { isMarkdownFile } from '../markdown-files'
+
+const LazyMarkdownViewer = lazy(() => import('./MarkdownViewerPane'))
 
 self.MonacoEnvironment = { getWorker(_moduleID: string, label: string) {
   if (label === 'json') return new JsonWorker()
@@ -161,6 +164,37 @@ export function EditorStage({ projectID, tabs, active, buffer, loadError, diff, 
   }), [])
   const [mounted, setMounted] = useState(0)
   const [split, setSplit] = useState(true)
+  const [markdownPreviewTabs, setMarkdownPreviewTabs] = useState<ReadonlySet<string>>(() => new Set())
+  const revealedTargetNonce = useRef<number | undefined>(undefined)
+  const activeTabId = active ? tabID(active) : ''
+  const canPreviewMarkdown = active?.mode === 'file' && isMarkdownFile(active.path)
+  const isMarkdownPreview = !!(canPreviewMarkdown && buffer && markdownPreviewTabs.has(activeTabId))
+  useEffect(() => {
+    const position = navigationPosition(target, projectID, active?.path, active?.mode)
+    if (!position || !target || revealedTargetNonce.current === target.nonce) return
+    revealedTargetNonce.current = target.nonce
+    if (markdownPreviewTabs.has(activeTabId)) {
+      setMarkdownPreviewTabs(current => {
+        if (!current.has(activeTabId)) return current
+        const next = new Set(current)
+        next.delete(activeTabId)
+        return next
+      })
+    }
+  }, [target, projectID, active?.path, active?.mode, activeTabId, markdownPreviewTabs])
+  useEffect(() => {
+    setMarkdownPreviewTabs(current => {
+      if (current.size === 0) return current
+      const openIds = new Set(tabs.map(tabID))
+      let changed = false
+      const next = new Set<string>()
+      for (const id of current) {
+        if (openIds.has(id)) next.add(id)
+        else changed = true
+      }
+      return changed ? next : current
+    })
+  }, [tabs])
   const applied = useRef<{ editor: monaco.editor.IStandaloneCodeEditor; nonce: number } | undefined>(undefined)
   useEffect(() => {
     const position = navigationPosition(target, projectID, active?.path, active?.mode)
@@ -241,9 +275,9 @@ export function EditorStage({ projectID, tabs, active, buffer, loadError, diff, 
   return <section data-testid="editor" className="stage" data-region="File & Diff">
 
     <div className="editor-tabs" role="tablist" aria-label="Tệp đang mở">{tabs.map(tab => <div className={`editor-tab ${active && tabID(active) === tabID(tab) ? 'selected' : ''}`} key={tabID(tab)}><button role="tab" data-tab-id={tabID(tab)} data-tab-path={tab.path} data-tab-mode={tab.mode} aria-selected={!!active && tabID(active) === tabID(tab)} onClick={() => onSelect(tab)} title={tab.mode === 'file' ? tab.path : `${tab.path} · ${tabTitle(tab)}`}>{tab.mode === 'diff' ? '± ' : ''}{tabTitle(tab)}{tabIsDirty(tab, dirtyPaths) ? ' ●' : ''}</button><IconButton label={`Đóng ${tabTitle(tab)}`} onClick={() => onClose(tab)}>×</IconButton></div>)}</div>
-    {active ? <><div className="editor-toolbar"><span className="truncate" title={active.path}>{active.path}</span>{active.mode === 'file' && <><button onClick={onSave} disabled={!buffer || !dirty(buffer)}>Lưu</button><button onClick={onReload} disabled={!buffer}>Nạp lại</button><button onClick={onToggleSplit}>{isSplit ? 'Gộp' : 'Chia đôi'}</button></>}{active.mode === 'diff' && diff?.patch === undefined && <button aria-label="Chế độ diff" aria-pressed={split} title="Chuyển Split / Inline" onClick={() => setSplit(value => !value)}>{split ? 'Split' : 'Inline'}</button>}</div>
+    {active ? <><div className="editor-toolbar"><span className="truncate" title={active.path}>{active.path}</span>{active.mode === 'file' && <>{canPreviewMarkdown && <button type="button" className={isMarkdownPreview ? 'is-active' : undefined} data-testid="editor-md-viewer-btn" aria-pressed={isMarkdownPreview} title={isMarkdownPreview ? 'Chuyển sang sửa mã nguồn' : 'Mở MD Viewer'} disabled={!buffer} onClick={() => setMarkdownPreviewTabs(current => { const next = new Set(current); if (next.has(activeTabId)) next.delete(activeTabId); else next.add(activeTabId); return next })}>{isMarkdownPreview ? 'Mã nguồn' : 'MD Viewer'}</button>}<button onClick={onSave} disabled={!buffer || !dirty(buffer)}>Lưu</button><button onClick={onReload} disabled={!buffer}>Nạp lại</button><button onClick={onToggleSplit}>{isSplit ? 'Gộp' : 'Chia đôi'}</button></>}{active.mode === 'diff' && diff?.patch === undefined && <button aria-label="Chế độ diff" aria-pressed={split} title="Chuyển Split / Inline" onClick={() => setSplit(value => !value)}>{split ? 'Split' : 'Inline'}</button>}</div>
       {buffer?.conflict && active.mode === 'file' && <div className="warning" role="alert">Tệp trên đĩa đã thay đổi. Bản sửa được giữ lại; nạp lại để bỏ bản sửa và lấy phiên bản mới. Không ghi đè tự động.<button type="button" onClick={onOverwrite}>Lưu đè</button><button type="button" onClick={onReload}>Nạp lại</button></div>}
-      <div className="editor-surface">{active.mode === 'diff' && unavailable ? <Empty><strong>Không có bản xem trước: {active.path}</strong><p>Gốc: {diff.originalSize ?? 0} bytes · Thay đổi: {diff.modifiedSize ?? 0} bytes</p><p>{diff.reason || (diff.tooLarge ? 'Tệp vượt giới hạn 4 MiB.' : 'Tệp nhị phân không thể hiển thị dưới dạng văn bản.')}</p>{onReveal && <div className="button-row"><button type="button" className="editor-reveal-btn" data-testid="editor-reveal-btn" onClick={() => onReveal(active.path)}><Icon name="folder" /><span>{revealLabel}</span></button></div>}</Empty> : active.mode === 'diff' ? diff?.patch !== undefined ? <pre className="git-commit-patch" data-testid="diff-patch-view">{diff.patch}</pre> : diff ? <DiffEditor key={uri(tabID(active), 'diff')} keepCurrentOriginalModel keepCurrentModifiedModel original={diff.original} modified={diff.modified} originalModelPath={uri(tabID(active), 'original')} modifiedModelPath={uri(tabID(active), 'modified')} language={activeLang} theme={shikiThemeName(theme, shikiReady)} options={{ ...options, readOnly: true, originalEditable: false, renderSideBySide: split, useInlineViewWhenSpaceIsLimited: false }} loading={<Empty>Đang tải Monaco…</Empty>} /> : <Empty>Đang tải diff…</Empty> : buffer ? <Editor key={uri(active.path)} path={uri(active.path)} value={buffer.text} language={activeLang} theme={shikiThemeName(theme, shikiReady)} options={{ ...options, glyphMargin: true }} beforeMount={api => {
+      <div className="editor-surface">{active.mode === 'diff' && unavailable ? <Empty><strong>Không có bản xem trước: {active.path}</strong><p>Gốc: {diff.originalSize ?? 0} bytes · Thay đổi: {diff.modifiedSize ?? 0} bytes</p><p>{diff.reason || (diff.tooLarge ? 'Tệp vượt giới hạn 4 MiB.' : 'Tệp nhị phân không thể hiển thị dưới dạng văn bản.')}</p>{onReveal && <div className="button-row"><button type="button" className="editor-reveal-btn" data-testid="editor-reveal-btn" onClick={() => onReveal(active.path)}><Icon name="folder" /><span>{revealLabel}</span></button></div>}</Empty> : active.mode === 'diff' ? diff?.patch !== undefined ? <pre className="git-commit-patch" data-testid="diff-patch-view">{diff.patch}</pre> : diff ? <DiffEditor key={uri(tabID(active), 'diff')} keepCurrentOriginalModel keepCurrentModifiedModel original={diff.original} modified={diff.modified} originalModelPath={uri(tabID(active), 'original')} modifiedModelPath={uri(tabID(active), 'modified')} language={activeLang} theme={shikiThemeName(theme, shikiReady)} options={{ ...options, readOnly: true, originalEditable: false, renderSideBySide: split, useInlineViewWhenSpaceIsLimited: false }} loading={<Empty>Đang tải Monaco…</Empty>} /> : <Empty>Đang tải diff…</Empty> : buffer ? isMarkdownPreview ? <Suspense fallback={<Empty>Đang tải MD Viewer…</Empty>}><LazyMarkdownViewer content={buffer.text} theme={theme} filePath={active.path} onOpenFile={onNavigateLocation ? targetPath => onNavigateLocation(targetPath, 1, 1) : undefined} /></Suspense> : <Editor key={uri(active.path)} path={uri(active.path)} value={buffer.text} language={activeLang} theme={shikiThemeName(theme, shikiReady)} options={{ ...options, glyphMargin: true }} beforeMount={api => {
         const current = bufferRef.current
         if (current) synchronizeCleanFileModel(api.editor.getModel(api.Uri.parse(modelUri(current.projectID, current.path))), current)
       }} onMount={instance => { editor.current = instance; instance.onDidDispose(() => { if (editor.current === instance) editor.current = null }); setMounted(value => value + 1) }} onChange={value => onChange(value ?? '')} keepCurrentModel saveViewState loading={<Empty>Đang tải Monaco…</Empty>} /> : loadError ? <div className="editor-load-error" role="alert"><strong>Không thể mở tệp</strong><p>{loadError}</p><div className="button-row"><button type="button" onClick={onReload}>Thử lại</button>{onReveal && <button type="button" className="editor-reveal-btn" data-testid="editor-reveal-btn" onClick={() => onReveal(active.path)}><Icon name="folder" /><span>{revealLabel}</span></button>}<button type="button" onClick={() => onClose(active)}>Đóng tab</button></div></div> : <Empty>Đang đọc tệp…</Empty>}</div></> : <Empty><strong>Không có tệp đang mở</strong><p>Chọn tệp trong Explorer hoặc thay đổi trong Git.</p></Empty>}

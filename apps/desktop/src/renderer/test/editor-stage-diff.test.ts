@@ -9,16 +9,28 @@ import * as state from '../state'
 import * as lifecycle from '../editor-model-lifecycle'
 import type { DiffContent } from '../../../../../packages/protocol/src/index'
 
-function render(diff?: DiffContent, tabs: state.Tab[] = [{ path: 'README.md', mode: 'file' }, { path: 'assets/data.bin', mode: 'diff', target: { kind: 'commit', commit: 'abcdef1' } }], props: { active?: state.Tab; loadError?: string; isMac?: boolean; onReveal?: (path: string) => void; onReload?: () => void; onClose?: (tab: state.Tab) => void } = {}) {
+function render(diff?: DiffContent, tabs: state.Tab[] = [{ path: 'README.md', mode: 'file' }, { path: 'assets/data.bin', mode: 'diff', target: { kind: 'commit', commit: 'abcdef1' } }], props: { active?: state.Tab; buffer?: state.Buffer; loadError?: string; isMac?: boolean; onReveal?: (path: string) => void; onReload?: () => void; onClose?: (tab: state.Tab) => void } = {}) {
   const require = createRequire(import.meta.url), exports: Record<string, any> = {}
   let diffMounts = 0
   let diffProps: Record<string, any> | undefined
   const source = readFileSync(new URL('../components/EditorStage.tsx', import.meta.url), 'utf8')
   const noop = () => {}
+  const slots: unknown[] = []
+  let cursor = 0
   runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 } }).outputText, {
     exports, self: {},
     require(id: string) {
-      if (id === 'react') return { useRef: (current: unknown) => ({ current }), useEffect: noop, useState: (value: unknown) => [value, noop] }
+      if (id === 'react') return {
+        useRef: (initial: unknown) => { const index = cursor++; if (!(index in slots)) slots[index] = { current: initial }; return slots[index] },
+        useEffect: noop,
+        useState: (initial: unknown) => {
+          const index = cursor++
+          if (!(index in slots)) slots[index] = typeof initial === 'function' ? (initial as () => unknown)() : initial
+          return [slots[index], (next: unknown) => { slots[index] = typeof next === 'function' ? (next as (prev: unknown) => unknown)(slots[index]) : next }]
+        },
+        lazy: () => (props: any) => `MarkdownViewer:${props.content}`,
+        Suspense: ({ children }: any) => children,
+      }
       if (id === '@monaco-editor/react') return { default: () => null, loader: { config: noop }, DiffEditor: (props: Record<string, any>) => { diffMounts++; diffProps = props; return 'DiffEditor' } }
       if (id === 'monaco-editor') return { languages: { CompletionItemKind: {} }, typescript: { typescriptDefaults: { setDiagnosticsOptions: noop }, javascriptDefaults: { setDiagnosticsOptions: noop } } }
       if (id.includes('?worker')) return { default: class {} }
@@ -28,12 +40,22 @@ function render(diff?: DiffContent, tabs: state.Tab[] = [{ path: 'README.md', mo
       if (id === '../workspace-paths') return { navigationPosition: noop }
       if (id === './Primitives') return { Empty: ({ children }: any) => children, IconButton: () => null }
       if (id === './Icon') return { Icon: ({ name }: any) => name }
+      if (id === '../markdown-files') return {
+        isMarkdownFile: (filePath: string) => /\.(?:md|mdx|markdown)$/i.test(filePath),
+      }
+      if (id === './MarkdownViewerPane') return {
+        default: ({ content }: any) => `MarkdownViewer:${content}`,
+      }
       return require(id)
     },
   })
-  const tree = exports.EditorStage({ projectID: 'p', tabs, active: tabs.find(tab => tab.mode === 'diff'), diff, dirtyPaths: new Set(), theme: 'dark', ...props })
-  const html = renderToStaticMarkup(tree)
-  return { html, tree, diffMounts, diffProps }
+  const renderCurrent = () => {
+    cursor = 0
+    const tree = exports.EditorStage({ projectID: 'p', tabs, active: tabs.find(tab => tab.mode === 'diff'), diff, dirtyPaths: new Set(), theme: 'dark', ...props })
+    return { tree, html: renderToStaticMarkup(tree) }
+  }
+  const { tree, html } = renderCurrent()
+  return { html, tree, diffMounts, diffProps, rerender: renderCurrent }
 }
 
 function findElements(tree: any, matches: (element: any) => boolean): any[] {
@@ -216,4 +238,32 @@ test('diff language and fallback theme preserve both retained model paths', () =
     assert.equal(diffProps.options.readOnly, true)
     assert.equal(diffProps.options.originalEditable, false)
   }
+})
+
+
+test('EditorStage exposes MD Viewer toggle only on markdown files and switches preview state', () => {
+  const mdTab: state.Tab = { path: 'docs/guide.md', mode: 'file' }
+  const tsTab: state.Tab = { path: 'src/index.ts', mode: 'file' }
+  const diffTab: state.Tab = { path: 'docs/guide.md', mode: 'diff', target: { kind: 'working' } }
+  const buffer: state.Buffer = { projectID: 'p', path: 'docs/guide.md', content: '# Hello', text: '# Hello', revision: 'rev-1', conflict: false }
+
+  const nonMd = render(undefined, [tsTab], { active: tsTab, buffer: { ...buffer, path: tsTab.path } })
+  assert.doesNotMatch(nonMd.html, /editor-md-viewer-btn/)
+
+  const diff = render({ original: '# A', modified: '# B' }, [diffTab], { active: diffTab })
+  assert.doesNotMatch(diff.html, /editor-md-viewer-btn/)
+
+  const md = render(undefined, [mdTab], { active: mdTab, buffer })
+  const [btn] = findElements(md.tree, element => element.props['data-testid'] === 'editor-md-viewer-btn')
+  assert.ok(btn, 'expected MD Viewer toggle button on markdown file')
+  assert.equal(btn.props['aria-pressed'], false)
+  assert.equal(btn.props.children, 'MD Viewer')
+  assert.doesNotMatch(md.html, /MarkdownViewer:/)
+
+  btn.props.onClick()
+  const afterToggle = md.rerender()
+  assert.match(afterToggle.html, /MarkdownViewer:# Hello/)
+  const [activeBtn] = findElements(afterToggle.tree, element => element.props['data-testid'] === 'editor-md-viewer-btn')
+  assert.equal(activeBtn.props['aria-pressed'], true)
+  assert.equal(activeBtn.props.children, 'Mã nguồn')
 })

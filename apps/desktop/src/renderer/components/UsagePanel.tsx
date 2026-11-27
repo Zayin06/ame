@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { aggregateUsageTree, cacheHitLevel, formatCacheHitRate, formatTokenCount, formatUsageCost, type UsageNode, type UsageTreeSummary } from "../../../../../packages/amekit/src/usage"
+import { aggregateUsageTree, cacheHitLevel, formatCacheHitRate, formatTokenCount, formatUsageCost, usageDiagnostics, type UsageNode, type UsageTreeSummary } from "../../../../../packages/amekit/src/usage"
 import { tokenValues, type UsageTokens } from "../../../../../packages/amekit/src/usage-pricing"
 
 export type UsagePanelRow = {
@@ -81,7 +81,7 @@ export function UsagePanel({ nodes, loading = false, error, origin, selectedSess
       <div className="usage-kpi"><span>Ước tính chi phí USD</span><strong>{totalCostText}</strong><small>Ước tính API, không phải hóa đơn</small></div>
       <div className="usage-kpi"><span>Tổng Token</span><strong>{formatTokenCount(tokenValues(summary.tokens).reduce((sum, value) => sum + value, 0))}</strong><TokenBreakdown tokens={summary.tokens} /></div>
       <div className="usage-kpi"><span>Cache Hit</span><strong className={`usage-cache-hit usage-cache-hit-${cacheHitLevel(summary.tokens)}`}>{formatCacheHitRate(summary.tokens)}</strong><small>Đọc {formatTokenCount(summary.tokens.cache.read)} / {formatTokenCount(summary.tokens.input + summary.tokens.cache.read + summary.tokens.cache.write)} prompt{summary.tokens.cache.write > 0 && ` · Ghi ${formatTokenCount(summary.tokens.cache.write)}`}</small></div>
-      <div className="usage-kpi"><span>Cây Subagent</span><strong>{summary.nodeCount} phiên · tối đa L{summary.maxDepth}</strong></div>
+      <div className="usage-kpi"><span>Cây Subagent</span><strong>{summary.nodeCount} phiên · tối đa L{summary.maxDepth}</strong>{summary.maxPromptTokens > 0 && <small>Max context {formatTokenCount(summary.maxPromptTokens)}{summary.cacheMissDrops > 0 && ` · ${summary.cacheMissDrops} tụt cache`}</small>}</div>
       <div className="usage-kpi"><span>Lượt gọi API</span><strong>{summary.requests} req · {summary.errors} lỗi</strong><small>{summary.pending} đang chờ</small></div>
     </div>
     {origin && <p className="usage-origin">Bảng giá: {origin}</p>}
@@ -90,31 +90,34 @@ export function UsagePanel({ nodes, loading = false, error, origin, selectedSess
     {summary.incomplete && <p className="usage-notice">Chưa đầy đủ: có lịch sử chưa tải hoặc model chưa có bảng giá — Unknown không đồng nghĩa miễn phí</p>}
     {!rows.length && <p className="usage-empty">Chưa có dữ liệu usage.</p>}
     <div className="usage-nodes">
-      {rows.map(({ node, label, depthBadge, costText, totalTokens, hasChildren, cacheHitText, cacheHitLevel: hitLevel }) => <article
-        className={`usage-node${node.id === selectedSessionID ? " usage-node-selected" : ""}`}
-        key={node.id} style={{ marginInlineStart: node.depth * 14 }}>
-        <header className="usage-node-header">
-          {hasChildren && <button type="button" aria-expanded={!collapsed.has(node.id)} aria-label={`${collapsed.has(node.id) ? "Mở rộng" : "Thu gọn"} ${label}`} onClick={() => toggle(node.id)}>{collapsed.has(node.id) ? "Mở rộng" : "Thu gọn"}</button>}
-          <span className="usage-depth">{depthBadge}</span><h3>{label}</h3>
-          <button type="button" disabled={!onSelectSession} aria-current={node.id === selectedSessionID ? "true" : undefined} onClick={() => onSelectSession?.(node.id)}>Mở session</button>
-        </header>
-        <p className="usage-session-id">{node.id}</p>
-        <p className="usage-node-summary"><strong>{costText}</strong> · {formatTokenCount(totalTokens)} token <span className={`usage-cache-badge usage-cache-hit usage-cache-hit-${hitLevel}`}>Cache hit {cacheHitText}</span></p>
-        <TokenBreakdown tokens={node.tokens} />
-        {(node.partial || node.unassigned || node.unknown > 0) && <p className="usage-node-notice">Breakdown chưa đầy đủ · {node.unknown} lượt chưa rõ giá / token</p>}
-        <div className="usage-groups">{node.groups.map(group => <div className="usage-group" key={JSON.stringify([group.agent, group.provider, group.model, group.variant])}>
-          <strong>{group.agent} · {group.provider} / {group.model}{group.variant ? ` · ${group.variant}` : ""}</strong>
-          <p>{formatUsageCost(group.knownCost, group.priced, node.partial || node.unassigned || group.unknown > 0)} · {group.requests} req · {group.errors} lỗi · {group.pending} đang chờ · {group.retries} thử lại</p>
-          <span className={`usage-cache-badge usage-cache-hit usage-cache-hit-${cacheHitLevel(group.tokens)}`}>Cache hit {formatCacheHitRate(group.tokens)}</span>
-          <TokenBreakdown tokens={group.tokens} />
-          <small>Thời gian hoàn tất: {(group.duration / 1000).toFixed(1)}s (tổng)</small>
-          {group.sources.map(source => <small key={source}>{source}</small>)}
-        </div>)}</div>
-        <div className="usage-pills" aria-label="Skill và tool đã quan sát">
-          {node.skills.map(skill => <span className="usage-pill" key={`skill:${skill.name}`}>Skill: {skill.name} ×{skill.count}</span>)}
-          {node.tools.map(tool => <span className="usage-pill" key={`tool:${tool.name}`}>Tool: {tool.name} ×{tool.calls} · {tool.errors} lỗi · {tool.running} đang chạy · {(tool.duration / 1000).toFixed(1)}s</span>)}
-        </div>
-      </article>)}
+      {rows.map(({ node, label, depthBadge, costText, totalTokens, hasChildren, cacheHitText, cacheHitLevel: hitLevel }) => {
+        const diagnostics = usageDiagnostics(node)
+        return <article
+          className={`usage-node${node.id === selectedSessionID ? " usage-node-selected" : ""}`}
+          key={node.id} style={{ marginInlineStart: node.depth * 14 }}>
+          <header className="usage-node-header">
+            {hasChildren && <button type="button" aria-expanded={!collapsed.has(node.id)} aria-label={`${collapsed.has(node.id) ? "Mở rộng" : "Thu gọn"} ${label}`} onClick={() => toggle(node.id)}>{collapsed.has(node.id) ? "Mở rộng" : "Thu gọn"}</button>}
+            <span className="usage-depth">{depthBadge}</span><h3>{label}</h3>
+            <button type="button" disabled={!onSelectSession} aria-current={node.id === selectedSessionID ? "true" : undefined} onClick={() => onSelectSession?.(node.id)}>Mở session</button>
+          </header>
+          <p className="usage-session-id">{node.id}</p>
+          <p className="usage-node-summary"><strong>{costText}</strong> · {formatTokenCount(totalTokens)} token{node.requests > 0 && ` · ${node.requests} bước`} <span className={`usage-cache-badge usage-cache-hit usage-cache-hit-${hitLevel}`}>Cache hit {cacheHitText}</span>{diagnostics.highContext && <span className="usage-diag-badge usage-diag-danger">Context lớn {formatTokenCount(node.maxPromptTokens)} (≥272K)</span>}{diagnostics.cacheDropWarning && <span className="usage-diag-badge usage-diag-warn">{node.cacheMissDrops} lần tụt cache</span>}{diagnostics.lowSampleShortSession && <span className="usage-diag-badge usage-diag-muted">Phiên ngắn ({node.requests} bước)</span>}</p>
+          <TokenBreakdown tokens={node.tokens} />
+          {(node.partial || node.unassigned || node.unknown > 0) && <p className="usage-node-notice">Breakdown chưa đầy đủ · {node.unknown} lượt chưa rõ giá / token</p>}
+          <div className="usage-groups">{node.groups.map(group => <div className="usage-group" key={JSON.stringify([group.agent, group.provider, group.model, group.variant])}>
+            <strong>{group.agent} · {group.provider} / {group.model}{group.variant ? ` · ${group.variant}` : ""}</strong>
+            <p>{formatUsageCost(group.knownCost, group.priced, node.partial || node.unassigned || group.unknown > 0)} · {group.requests} req · {group.errors} lỗi · {group.pending} đang chờ · {group.retries} thử lại</p>
+            <span className={`usage-cache-badge usage-cache-hit usage-cache-hit-${cacheHitLevel(group.tokens)}`}>Cache hit {formatCacheHitRate(group.tokens)}</span>
+            <TokenBreakdown tokens={group.tokens} />
+            <small>Thời gian hoàn tất: {(group.duration / 1000).toFixed(1)}s (tổng)</small>
+            {group.sources.map(source => <small key={source}>{source}</small>)}
+          </div>)}</div>
+          <div className="usage-pills" aria-label="Skill và tool đã quan sát">
+            {node.skills.map(skill => <span className="usage-pill" key={`skill:${skill.name}`}>Skill: {skill.name} ×{skill.count}</span>)}
+            {node.tools.map(tool => <span className="usage-pill" key={`tool:${tool.name}`}>Tool: {tool.name} ×{tool.calls} · {tool.errors} lỗi · {tool.running} đang chạy · {(tool.duration / 1000).toFixed(1)}s</span>)}
+          </div>
+        </article>
+      })}
     </div>
     <footer>Giá ước tính theo bảng giá hiện tại. Skill/tool thuộc lượt gọi model, không cộng phí trùng. Chỉ thống kê lịch sử đã tải.</footer>
   </section>

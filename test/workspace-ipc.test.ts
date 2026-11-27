@@ -941,9 +941,11 @@ test('Chat permission picker replaces Agent, persists drafts, updates sessions i
       ['default', 'Mặc định'], ['ask', 'Hỏi trước'], ['readonly', 'Chỉ đọc'], ['full', 'Tự động cho phép'],
     ])
     picker().onChange({ target: { value: 'full' } }); await settle()
-    assert.match(rendererElements(tree, node => node.type === 'label' && String(node.props.className).includes('composer-picker--permission'))[0].props.title, /Cảnh báo.*không hỏi/)
+    assert.match(rendererElements(tree, node => node.type === 'label' && String(node.props.className).includes('composer-picker--permission'))[0].props.title, /Tự động cho phép.*Cảnh báo.*không hỏi/)
     assert.equal(calls.length, 0)
-    props = { ...props, draftID: 2 }; await settle(); assert.equal(picker().value, 'default')
+    props = { ...props, draftID: 2 }; await settle(); assert.equal(picker().value, 'full', 'subsequent new drafts inherit the last chosen permission mode')
+    picker().onChange({ target: { value: 'readonly' } }); await settle()
+    props = { ...props, draftID: 3 }; await settle(); assert.equal(picker().value, 'readonly')
     props = { ...props, draftID: 1 }; await settle(); assert.equal(picker().value, 'full')
     enter(); await settle(); await send()
     assert.deepEqual(plain(calls.find(call => call.method === 'createSession')), { method: 'createSession', args: ['permission-project', 'full'] })

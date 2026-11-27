@@ -359,7 +359,7 @@ async function pickImport() {
 async function resolveModel(projectID: string, requested?: Model | string, requireRequested = false): Promise<Model> {
   let models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')
   let status = await account.call('status', {}) as { account?: { role?: string }; reconnecting?: boolean; models?: { default_model?: string; models?: { id: string }[] } } | null
-  if (!models.length && (status?.reconnecting || status?.account)) {
+  if (status?.reconnecting || (!models.length && status?.account)) {
     const refreshed = await account.call('refresh', {}) as typeof status
     if (refreshed) status = refreshed
     models = (await adapter.models(projectID)).filter(model => model.providerID === 'amecode')

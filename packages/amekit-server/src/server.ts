@@ -9,6 +9,8 @@ import { OrchestratorConfig } from "../../amekit/src/orchestrator"
 import { applyOrchestrator } from "./orchestrator"
 import { createRootTodoGuard, AME_TODO_TOOL_DESCRIPTION, TODO_TOOL_NAME } from "./todo-policy"
 import { createManagedCatalogGuard, EMPTY_MANAGED_CATALOG, ManagedCatalogSchema, normalizeManagedCatalog, type ManagedCatalog } from "./managed-catalog"
+import { createToolOutputGuard } from "./tool-output-guard"
+import { decideSessionRetry } from "./retry-policy"
 
 type RuntimePolicy = { models: ReturnType<typeof modelPolicy>["models"]; default_model: string; model_levels: ModelLevels; chat_models?: ReturnType<typeof modelPolicy>["chat_models"]; feature_models?: readonly string[] }
 type AgentModel = { id: string; model?: Model.Ref }
@@ -46,6 +48,17 @@ export function resolveSubagentInputModel(input: { tool: string; input?: unknown
     if ((ref.providerID === undefined || ref.providerID === managedProvider) && typeof ref.id === "string" && parseModelLevel(ref.id)) {
       args.model = { ...ref, providerID: managedProvider, id: resolveModelLevel(policy, ref.id) }
     }
+  }
+}
+
+export function applyModelRequestHeaders(input: { sessionID: string; headers: Record<string, string> }) {
+  for (const name of Object.keys(input.headers)) {
+    if (["authorization", "api-key", "x-api-key"].includes(name.toLowerCase())) delete input.headers[name]
+  }
+  const hasSessionHeader = Object.keys(input.headers).some(name => name.toLowerCase() === "x-session-id")
+  const sessionID = input.sessionID.trim()
+  if (!hasSessionHeader && sessionID && sessionID.length <= 256 && !/[\r\n\x00]/.test(sessionID)) {
+    input.headers["x-session-id"] = sessionID
   }
 }
 
@@ -92,6 +105,7 @@ export default Plugin.define({
       getSession: sessionID => ctx.session.get({ sessionID: sessionID as Session.ID }),
       listAgents: () => ctx.agent.list().then(r => r.data),
     })
+    const toolOutputGuard = createToolOutputGuard()
     const gateway = await modelGateway(() => { const policy = active(); return policy && state.provider ? { policy, provider: state.provider } : undefined })
     const registrations: { dispose(): Promise<void> }[] = []
     let agentTransformReg: { dispose(): Promise<void> } | undefined
@@ -141,7 +155,7 @@ export default Plugin.define({
         variants: [], time: { released: 0 }, cost: [], status: "active", enabled: true,
         limit: { context: model.context, output: model.output },
       }))
-      editor.add({ info: { id: managedProvider as Model.Info["providerID"], name: "AMECODE", activation: "enabled", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: gateway.baseURL } }, models })
+      editor.add({ info: { id: managedProvider as Model.Info["providerID"], name: "AMECODE", activation: "enabled", package: "@opencode/ai/providers/openai-compatible", compatibility: { supportsPromptCacheKey: true }, settings: { baseURL: gateway.baseURL } }, models })
     }))
     registrations.push(await ctx.model.transform(editor => {
       const policy = active()
@@ -156,6 +170,9 @@ export default Plugin.define({
       await todoGuard.assertBeforeExecute(input)
       await catalogGuard.assertBeforeExecute(input)
       resolveSubagentInputModel(input, active())
+    }))
+    registrations.push(await ctx.tool.hook("execute.after", async input => {
+      toolOutputGuard.truncateAfterExecute(input)
     }))
     registrations.push(await ctx.session.hook("context", async input => {
       const policy = active()
@@ -172,7 +189,10 @@ export default Plugin.define({
     registrations.push(await ctx.session.hook("model.request", async input => {
       check(input.model)
       input.baseURL = gateway.baseURL
-      for (const name of Object.keys(input.headers)) if (["authorization", "api-key", "x-api-key"].includes(name.toLowerCase())) delete input.headers[name]
+      applyModelRequestHeaders(input)
+    }))
+    registrations.push(await ctx.session.hook("retry", async input => {
+      decideSessionRetry(input)
     }))
     registrations.push(await ctx.session.hook("http.request", async input => {
       check(input.model)

@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { SessionInfo, SessionMessageAssistant, SessionMessageInfo } from "@opencode/client"
 import { estimateUsage, readUsagePrices, tokenValues, validTokens, type UsagePrice, type UsageTokens } from "../src/usage-pricing"
-import { aggregateUsageTree, cacheHitLevel, cacheHitRate, emptyTokens, formatCacheHitRate, formatTokenCount, formatUsageCost, summarizeUsage, usageFamily } from "../src/usage"
+import { aggregateUsageTree, cacheHitLevel, cacheHitRate, emptyTokens, formatCacheHitRate, formatTokenCount, formatUsageCost, HIGH_CONTEXT_THRESHOLD, LOW_CACHE_MIN_REQUESTS, LOW_CACHE_MIN_UNCACHED, summarizeUsage, usageDiagnostics, usageFamily } from "../src/usage"
 
 function price(overrides: Partial<UsagePrice> = {}): UsagePrice {
   return { model_id: "catalog-model", upstream_model_id: "model", provider_route: "amecode", status: "priced",
@@ -203,13 +203,13 @@ test("aggregateUsageTree sums every generation without SDK costs or tool double 
   const nodes = usageFamily(sessions, "root").map(node => summarize([assistant(node.id)], { ...node, info: { ...node.info!, tokens: assistant("a").tokens! } }))
   const before = JSON.stringify(nodes)
   const summary = aggregateUsageTree(nodes)
-  assert.deepEqual({ ...summary, knownCost: 0 }, { nodeCount: 4, maxDepth: 3, tokens: { input: 400, output: 80, reasoning: 20, cache: { read: 40, write: 8 } }, knownCost: 0, priced: 4, unknown: 0, requests: 4, errors: 0, pending: 0, incomplete: false })
+  assert.deepEqual({ ...summary, knownCost: 0 }, { nodeCount: 4, maxDepth: 3, tokens: { input: 400, output: 80, reasoning: 20, cache: { read: 40, write: 8 } }, knownCost: 0, priced: 4, unknown: 0, requests: 4, errors: 0, pending: 0, incomplete: false, maxPromptTokens: 112, cacheMissDrops: 0 })
   close(summary.knownCost, 4 * 0.000163)
   assert.equal(JSON.stringify(nodes), before)
   for (const flag of ["partial", "unassigned"] as const) assert.equal(aggregateUsageTree([{ ...nodes[0], [flag]: true }]).incomplete, true)
   assert.equal(aggregateUsageTree([{ ...nodes[0], groups: [{ ...nodes[0].groups[0], pending: 1, errors: 1 }] }]).errors, 1)
   assert.equal(aggregateUsageTree([{ ...nodes[0], groups: [{ ...nodes[0].groups[0], pending: 1 }] }]).incomplete, true)
-  assert.deepEqual(aggregateUsageTree([]), { nodeCount: 0, maxDepth: 0, tokens: emptyTokens(), knownCost: 0, priced: 0, unknown: 0, requests: 0, errors: 0, pending: 0, incomplete: false })
+  assert.deepEqual(aggregateUsageTree([]), { nodeCount: 0, maxDepth: 0, tokens: emptyTokens(), knownCost: 0, priced: 0, unknown: 0, requests: 0, errors: 0, pending: 0, incomplete: false, maxPromptTokens: 0, cacheMissDrops: 0 })
 })
 
 test("formatters distinguish unknown, free and partial cost and compact token magnitudes", () => {
@@ -219,4 +219,46 @@ test("formatters distinguish unknown, free and partial cost and compact token ma
   assert.equal(formatUsageCost(0.0000001, 1, false), "<$0.000001")
   for (const [count, expected] of [[0, "0"], [999, "999"], [1000, "1K"], [12400, "12.4K"], [999999, "1M"], [1250000, "1.25M"]] as const)
     assert.equal(formatTokenCount(count), expected)
+})
+
+
+test("summarizeUsage, aggregateUsageTree and usageDiagnostics track maxPromptTokens, cacheMissDrops and threshold flags", () => {
+  const highContextMessages = [
+    assistant("step-1", { tokens: { input: 2_000, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    assistant("step-2", { tokens: { input: 500, output: 50, reasoning: 0, cache: { read: 4_000, write: 0 } } }),
+    assistant("step-3", { tokens: { input: 10_000, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    assistant("step-4", { tokens: { input: 8_000, output: 50, reasoning: 0, cache: { read: 10_000, write: 0 } } }),
+    assistant("step-5", { tokens: { input: 50_000, output: 50, reasoning: 0, cache: { read: 5_000, write: 0 } } }),
+    assistant("step-6", { tokens: { input: 2_000, output: 50, reasoning: 0, cache: { read: HIGH_CONTEXT_THRESHOLD - 2_000, write: 0 } } }),
+  ]
+  const rootNode = summarize(highContextMessages, { info: session("root") })
+  assert.equal(rootNode.requests, 6)
+  assert.equal(rootNode.maxPromptTokens, HIGH_CONTEXT_THRESHOLD)
+  assert.equal(rootNode.cacheMissDrops, 2)
+  assert.deepEqual(usageDiagnostics(rootNode), {
+    highContext: true,
+    cacheDropWarning: true,
+    lowSampleShortSession: false,
+  })
+
+  const shortMessages = [
+    assistant("short-1", { tokens: { input: 1_500, output: 20, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    assistant("short-2", { tokens: { input: 900, output: 20, reasoning: 0, cache: { read: 1_400, write: 0 } } }),
+    assistant("short-3", { tokens: { input: 13_000, output: 20, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  ]
+  const childNode = summarize(shortMessages, { depth: 1, id: "child", info: session("child", "root") })
+  assert.equal(childNode.requests, 3)
+  assert.ok(childNode.requests < LOW_CACHE_MIN_REQUESTS)
+  assert.ok(childNode.tokens.input < LOW_CACHE_MIN_UNCACHED)
+  assert.equal(childNode.maxPromptTokens, 13_000)
+  assert.equal(childNode.cacheMissDrops, 1)
+  assert.deepEqual(usageDiagnostics(childNode), {
+    highContext: false,
+    cacheDropWarning: false,
+    lowSampleShortSession: true,
+  })
+
+  const tree = aggregateUsageTree([rootNode, childNode])
+  assert.equal(tree.maxPromptTokens, HIGH_CONTEXT_THRESHOLD)
+  assert.equal(tree.cacheMissDrops, 3)
 })

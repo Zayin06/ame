@@ -216,6 +216,9 @@
   .composer-picker--model:not(.composer-picker--locked) .composer-picker__label { display: none; }
   .composer-picker--model:not(.composer-picker--locked) .composer-picker__face { padding: 0 5px; gap: 2px; }
   .composer-picker--locked { max-width: 118px; }
+  .composer-picker--permission { max-width: none; }
+  .composer-picker--permission .composer-picker__label { display: none; }
+  .composer-picker--permission .composer-picker__face { padding: 0 5px; gap: 2px; }
 }
 @container composer (max-width: 280px) { .composer-picker--locked .composer-picker__label { display: none; } }
 .scm-commit-textarea { resize: none; }
@@ -432,6 +435,7 @@
 .editor-group .editor-toolbar { gap: 4px; min-width: 0; }
 .editor-group .editor-toolbar > .truncate { flex: 1; min-width: 0; }
 .editor-group .editor-toolbar button { flex-shrink: 0; padding-inline: 5px; }
+.editor-toolbar button.is-active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
 .composer-popover { position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 30; max-height: 260px; overflow: auto; padding: 5px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-elevated); box-shadow: var(--shadow-md); }
 .composer-popover [role="option"] { display: flex; width: 100%; gap: 8px; min-width: 0; padding: 6px 8px; text-align: left; border: 0; background: transparent; }
 .composer-popover [role="option"][aria-selected="true"] { background: var(--accent-soft); color: var(--accent); }

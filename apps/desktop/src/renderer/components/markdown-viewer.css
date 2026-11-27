@@ -1,0 +1,177 @@
+@import "github-markdown-css/github-markdown.css";
+
+.md-viewer {
+  height: 100%;
+  width: 100%;
+  overflow: auto;
+  padding: 24px 32px 48px;
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+}
+
+.md-viewer__content.markdown-body {
+  max-width: 920px;
+  margin: 0 auto;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.md-viewer[data-theme="dark"] .md-viewer__content.markdown-body {
+  color-scheme: dark;
+  --fgColor-default: var(--text-primary);
+  --fgColor-muted: var(--text-muted);
+  --fgColor-accent: var(--accent);
+  --bgColor-default: var(--bg-canvas);
+  --bgColor-muted: var(--bg-code);
+  --bgColor-neutral-muted: var(--bg-hover);
+  --bgColor-attention-muted: var(--accent-soft);
+  --borderColor-default: var(--border-default);
+  --borderColor-muted: var(--border-subtle);
+  --borderColor-accent-emphasis: var(--accent);
+}
+
+.md-viewer[data-theme="light"] .md-viewer__content.markdown-body {
+  color-scheme: light;
+  --fgColor-default: var(--text-primary);
+  --fgColor-muted: var(--text-muted);
+  --fgColor-accent: var(--accent);
+  --bgColor-default: var(--bg-canvas);
+  --bgColor-muted: var(--bg-code);
+  --bgColor-neutral-muted: var(--bg-hover);
+  --bgColor-attention-muted: var(--accent-soft);
+  --borderColor-default: var(--border-default);
+  --borderColor-muted: var(--border-subtle);
+  --borderColor-accent-emphasis: var(--accent);
+}
+
+.md-viewer__content.markdown-body a {
+  color: var(--accent);
+}
+
+.md-viewer__content.markdown-body pre {
+  position: relative;
+  background: var(--bg-code);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm, 6px);
+  padding: 14px 16px;
+}
+
+.md-viewer__content.markdown-body code {
+  font-family: var(--font-mono);
+}
+
+.md-viewer__pre-wrap {
+  position: relative;
+  margin-bottom: 16px;
+}
+
+.md-viewer__pre-wrap > pre {
+  margin-bottom: 0;
+}
+
+.md-viewer__copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.md-viewer__pre-wrap:hover .md-viewer__copy-btn,
+.md-viewer__pre-wrap:focus-within .md-viewer__copy-btn {
+  opacity: 1;
+}
+
+.md-viewer__copy-btn > button {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+}
+
+.md-viewer__copy-btn > button:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover-strong);
+}
+
+.md-viewer[data-theme="dark"] .hljs {
+  color: #e6edf3;
+  background: transparent;
+}
+.md-viewer[data-theme="dark"] .hljs-doctag,
+.md-viewer[data-theme="dark"] .hljs-keyword,
+.md-viewer[data-theme="dark"] .hljs-meta .hljs-keyword,
+.md-viewer[data-theme="dark"] .hljs-template-tag,
+.md-viewer[data-theme="dark"] .hljs-template-variable,
+.md-viewer[data-theme="dark"] .hljs-type,
+.md-viewer[data-theme="dark"] .hljs-variable.language_ { color: #ff7b72; }
+.md-viewer[data-theme="dark"] .hljs-title,
+.md-viewer[data-theme="dark"] .hljs-title.class_,
+.md-viewer[data-theme="dark"] .hljs-title.class_.inherited__,
+.md-viewer[data-theme="dark"] .hljs-title.function_ { color: #d2a8ff; }
+.md-viewer[data-theme="dark"] .hljs-attr,
+.md-viewer[data-theme="dark"] .hljs-attribute,
+.md-viewer[data-theme="dark"] .hljs-literal,
+.md-viewer[data-theme="dark"] .hljs-meta,
+.md-viewer[data-theme="dark"] .hljs-number,
+.md-viewer[data-theme="dark"] .hljs-operator,
+.md-viewer[data-theme="dark"] .hljs-variable,
+.md-viewer[data-theme="dark"] .hljs-selector-attr,
+.md-viewer[data-theme="dark"] .hljs-selector-class,
+.md-viewer[data-theme="dark"] .hljs-selector-id { color: #79c0ff; }
+.md-viewer[data-theme="dark"] .hljs-regexp,
+.md-viewer[data-theme="dark"] .hljs-string,
+.md-viewer[data-theme="dark"] .hljs-meta .hljs-string { color: #a5d6ff; }
+.md-viewer[data-theme="dark"] .hljs-built_in,
+.md-viewer[data-theme="dark"] .hljs-symbol { color: #ffa657; }
+.md-viewer[data-theme="dark"] .hljs-comment,
+.md-viewer[data-theme="dark"] .hljs-code,
+.md-viewer[data-theme="dark"] .hljs-formula { color: #8b949e; }
+.md-viewer[data-theme="dark"] .hljs-name,
+.md-viewer[data-theme="dark"] .hljs-quote,
+.md-viewer[data-theme="dark"] .hljs-selector-tag,
+.md-viewer[data-theme="dark"] .hljs-selector-pseudo { color: #7ee787; }
+
+.md-viewer[data-theme="light"] .hljs {
+  color: #24292f;
+  background: transparent;
+}
+.md-viewer[data-theme="light"] .hljs-doctag,
+.md-viewer[data-theme="light"] .hljs-keyword,
+.md-viewer[data-theme="light"] .hljs-meta .hljs-keyword,
+.md-viewer[data-theme="light"] .hljs-template-tag,
+.md-viewer[data-theme="light"] .hljs-template-variable,
+.md-viewer[data-theme="light"] .hljs-type,
+.md-viewer[data-theme="light"] .hljs-variable.language_ { color: #cf222e; }
+.md-viewer[data-theme="light"] .hljs-title,
+.md-viewer[data-theme="light"] .hljs-title.class_,
+.md-viewer[data-theme="light"] .hljs-title.class_.inherited__,
+.md-viewer[data-theme="light"] .hljs-title.function_ { color: #8250df; }
+.md-viewer[data-theme="light"] .hljs-attr,
+.md-viewer[data-theme="light"] .hljs-attribute,
+.md-viewer[data-theme="light"] .hljs-literal,
+.md-viewer[data-theme="light"] .hljs-meta,
+.md-viewer[data-theme="light"] .hljs-number,
+.md-viewer[data-theme="light"] .hljs-operator,
+.md-viewer[data-theme="light"] .hljs-variable,
+.md-viewer[data-theme="light"] .hljs-selector-attr,
+.md-viewer[data-theme="light"] .hljs-selector-class,
+.md-viewer[data-theme="light"] .hljs-selector-id { color: #0550ae; }
+.md-viewer[data-theme="light"] .hljs-regexp,
+.md-viewer[data-theme="light"] .hljs-string,
+.md-viewer[data-theme="light"] .hljs-meta .hljs-string { color: #0a3069; }
+.md-viewer[data-theme="light"] .hljs-built_in,
+.md-viewer[data-theme="light"] .hljs-symbol { color: #953800; }
+.md-viewer[data-theme="light"] .hljs-comment,
+.md-viewer[data-theme="light"] .hljs-code,
+.md-viewer[data-theme="light"] .hljs-formula { color: #6e7781; }
+.md-viewer[data-theme="light"] .hljs-name,
+.md-viewer[data-theme="light"] .hljs-quote,
+.md-viewer[data-theme="light"] .hljs-selector-tag,
+.md-viewer[data-theme="light"] .hljs-selector-pseudo { color: #116329; }

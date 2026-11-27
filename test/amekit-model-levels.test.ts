@@ -258,7 +258,8 @@ test('plugin reloads agents and skills after providers/models and adds one polic
     tool: {
       transform: async (callback: ToolTransform) => { toolTransform = callback; return { dispose: async () => { disposedTools.push('transform') } } },
       hook: async (name: string, callback: typeof beforeExecute) => {
-        assert.equal(name, 'execute.before'); beforeExecute = callback
+        assert.ok(name === 'execute.before' || name === 'execute.after', `unexpected tool hook: ${name}`)
+        if (name === 'execute.before') beforeExecute = callback
         return { dispose: async () => { disposedTools.push(name) } }
       },
     },
@@ -376,7 +377,7 @@ test('plugin reloads agents and skills after providers/models and adds one polic
   assert.deepEqual(disposedAgents, [1, 2, 3, 4])
   assert.equal(agentTransform, undefined)
   assert.deepEqual([...agentTransforms.keys()], ['markdown'])
-  assert.deepEqual(disposedTools, ['execute.before', 'transform'])
+  assert.deepEqual(disposedTools, ['execute.after', 'execute.before', 'transform'])
 })
 
 test('gateway rewrites managed tier request bodies and rejects disallowed or unauthenticated requests before proxying', async () => {

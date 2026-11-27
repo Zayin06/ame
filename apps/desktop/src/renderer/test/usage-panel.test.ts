@@ -126,3 +126,45 @@ test("cache hit KPI handles an empty prompt and omits writes when zero", () => {
   assert.match(markup, /<span>Cache Hit<\/span><strong class="usage-cache-hit usage-cache-hit-none">—<\/strong><small>Đọc 0 \/ 0 prompt<\/small>/)
   assert.ok(!markup.includes("· Ghi"))
 })
+
+test("summarizeUsage and UsagePanel surface step counts, cache drops, high context (>=272K) and short sessions", () => {
+  const highCtx = {
+    ...summarizeUsage({
+      id: "res", depth: 1,
+      messages: [
+        { id: "m1", type: "assistant", agent: "ame-explorer", model: { providerID: "amecode", id: "gpt-6-luna" }, content: [], time: { created: 0, completed: 10 }, tokens: { input: 20_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } },
+        { id: "m2", type: "assistant", agent: "ame-explorer", model: { providerID: "amecode", id: "gpt-6-luna" }, content: [], time: { created: 10, completed: 20 }, tokens: { input: 302_000, output: 100, reasoning: 0, cache: { read: 20_000, write: 0 } } },
+        { id: "m3", type: "assistant", agent: "ame-explorer", model: { providerID: "amecode", id: "gpt-6-luna" }, content: [], time: { created: 20, completed: 30 }, tokens: { input: 2_000, output: 100, reasoning: 0, cache: { read: 5_000, write: 0 } } },
+      ],
+      prices: {}, historyComplete: true,
+    }),
+    parentID: "root",
+  }
+  assert.equal(highCtx.requests, 3)
+  assert.equal(highCtx.maxPromptTokens, 322_000)
+  assert.equal(highCtx.cacheMissDrops, 1)
+
+  const shortNode = {
+    ...summarizeUsage({
+      id: "glue", depth: 1,
+      messages: [
+        { id: "g1", type: "assistant", agent: "ame-explorer", model: { providerID: "amecode", id: "gpt-6-luna" }, content: [], time: { created: 0, completed: 10 }, tokens: { input: 1_500, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } },
+        { id: "g2", type: "assistant", agent: "ame-explorer", model: { providerID: "amecode", id: "gpt-6-luna" }, content: [], time: { created: 10, completed: 20 }, tokens: { input: 900, output: 50, reasoning: 0, cache: { read: 1_400, write: 0 } } },
+        { id: "g3", type: "assistant", agent: "ame-explorer", model: { providerID: "amecode", id: "gpt-6-luna" }, content: [], time: { created: 20, completed: 30 }, tokens: { input: 13_800, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } },
+        { id: "g4", type: "assistant", agent: "ame-explorer", model: { providerID: "amecode", id: "gpt-6-luna" }, content: [], time: { created: 30, completed: 40 }, tokens: { input: 9_400, output: 50, reasoning: 0, cache: { read: 13_600, write: 0 } } },
+      ],
+      prices: {}, historyComplete: true,
+    }),
+    parentID: "root",
+  }
+  assert.equal(shortNode.requests, 4)
+  assert.equal(shortNode.cacheMissDrops, 1)
+
+  const root = { ...node("root", 0), requests: 6 }
+  const markup = renderToStaticMarkup(createElement(UsagePanel, { nodes: [root, highCtx, shortNode] }))
+  assert.match(markup, /Max context 322K · 2 tụt cache/)
+  assert.match(markup, /3 bước/)
+  assert.match(markup, /Context lớn 322K \(≥272K\)/)
+  assert.match(markup, /1 lần tụt cache/)
+  assert.match(markup, /Phiên ngắn \(4 bước\)/)
+})

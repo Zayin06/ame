@@ -47,6 +47,10 @@
 .usage-cache-hit-warn { --usage-cache-color: var(--warning, var(--text-primary, inherit)); --usage-cache-bg: var(--warning-soft, transparent); }
 .usage-cache-hit-low { --usage-cache-color: var(--danger, var(--text-primary, inherit)); --usage-cache-bg: var(--danger-soft, transparent); }
 .usage-cache-badge { align-self: flex-start; display: inline-block; padding: 2px 7px; border-radius: var(--radius-pill, 999px); background: var(--usage-cache-bg, var(--bg-elevated, transparent)); font-size: 11px; }
+.usage-diag-badge { display: inline-block; padding: 2px 7px; border-radius: var(--radius-pill, 999px); font-size: 11px; font-variant-numeric: tabular-nums; }
+.usage-diag-danger { color: var(--danger); background: var(--danger-soft); }
+.usage-diag-warn { color: var(--warning); background: var(--warning-soft); }
+.usage-diag-muted { color: var(--text-secondary); background: var(--bg-elevated); }
 .usage-node-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
 .usage-notice, .usage-error { padding: 10px 12px; border-radius: var(--radius-sm); }
 .usage-notice { color: var(--warning); background: var(--warning-soft); }

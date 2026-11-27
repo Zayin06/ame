@@ -7,6 +7,7 @@ import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
 import type { AndroidTranslationInfo, ChatItem, IdeEvent, Model, Permission, Session, SessionForm, SkillSummary } from '../../../../../packages/protocol/src/index'
+import * as chatTimeline from '../chat-timeline'
 import { extractCommitMessagesFromText, extractUserDisplayText, projectChatTimeline } from '../chat-timeline'
 import { projectSessionTodos } from '../chat-todo'
 import * as modelSelection from '../model-selection'
@@ -97,7 +98,7 @@ function harness(options: { info?: Partial<AndroidTranslationInfo>; component?: 
     './TodoProgressCard': { TodoProgressCard: marker },
     './SessionFormCard': { SessionFormCard: ({ form }: { form: SessionForm }) => `Pending form: ${form.title}` },
     './TurnWorkGroup': { TurnWorkGroup: marker, ActiveToolsView: ({ items }: { items: ChatItem[] }) => `Active tools: ${items.map(item => item.tool?.name).join(', ')}`, LiveTurnStatus: ({ label }: { label: string }) => label },
-    '../chat-timeline': { extractCommitMessagesFromText, extractUserDisplayText, projectChatTimeline }, '../model-selection': modelSelection, '../amekit-ui': amekitUI,
+    '../chat-timeline': chatTimeline, '../model-selection': modelSelection, '../amekit-ui': amekitUI,
     '../chat-todo': { projectSessionTodos },
     './AgentList': { AgentList: marker }, './AgentMap': { AgentMap: marker },
     '../agent-map-model': { familySummaryFromSessions: () => ({ runningCount: 0, subagentCount: 0 }) },
@@ -180,7 +181,7 @@ test('translation and Chat user bubbles display only the original request withou
       h.updateMessages([item])
       h.render(); const html = await h.flush()
       const bubble = h.find(node => node.type === 'article' && node.props.className === 'msg-user')
-      assert.equal(renderToStaticMarkup(bubble.props.children as ReactNode), request)
+      assert.equal(renderToStaticMarkup(bubble.props.children as ReactNode), component === 'Chat' ? `<div class="msg-user__body" data-user-bubble-body="user">${request}</div>` : request)
       assert.doesNotMatch(html, /\[STRICT SCOPE: ANDROID STRINGS TRANSLATION ONLY\]|\[Translation mode: full\]|SKILL\.md/)
       assert.equal(item.text, wrapped, 'display cleanup must not mutate backend history')
     } finally { h.unmount() }

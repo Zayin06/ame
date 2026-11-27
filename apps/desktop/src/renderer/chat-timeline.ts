@@ -29,6 +29,22 @@ export type TimelineBlock =
 export type ChatTurn = { id: string; user?: ChatItem; live: boolean; blocks: TimelineBlock[] }
 export type CompletedTurnCache = Map<string, { mode: TimelineDetailMode; user?: ChatItem; items: readonly ChatItem[]; turn: ChatTurn }>
 
+export const USER_BUBBLE_COLLAPSED_HEIGHT = 130
+
+export function isLikelyLongUserText(text: string): boolean {
+  return text.length > 420 || text.split(/\r?\n/).length > 6
+}
+
+export function formatUserMessageTime(createdAt?: number, now = Date.now()): string {
+  if (createdAt === undefined || !Number.isFinite(createdAt) || createdAt <= 0) return ''
+  const deltaMs = Math.max(0, now - createdAt)
+  if (deltaMs < 60_000) return 'Vừa xong'
+  if (deltaMs < 3_600_000) return `${Math.floor(deltaMs / 60_000)} phút trước`
+  if (deltaMs < 86_400_000) return `${Math.floor(deltaMs / 3_600_000)} giờ trước`
+  if (deltaMs < 30 * 86_400_000) return `${Math.floor(deltaMs / 86_400_000)} ngày trước`
+  return new Date(createdAt).toLocaleDateString('vi-VN')
+}
+
 export function extractUserDisplayText(text: string): string {
   const normalized = text.replace(/\r\n/g, '\n')
   const marker = '\n\nUser request:\n'

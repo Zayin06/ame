@@ -124,9 +124,14 @@ test('chooser stages both chat-only and file rewinds, autofills empty draft and 
       h.render(); await h.flush(); h.change(draft); h.render()
       // Select the target user turn rather than the first historical turn.
       const trigger = h.find(node => typeof node.type === 'function' && node.type.name === 'ChatTurnView' && String(node.key) === 'target')
-      const children = (trigger.type as any)(trigger.props).props.children as ReactElement<Record<string, unknown>>[]
-      const actions = children.find(node => isValidElement(node) && node.props.className === 'rewind-turn-actions')!
-      ;((actions.props.children as ReactElement<Record<string, unknown>>[])[0].props.onClick as () => void)()
+      const findInSubtree = (node: ReactNode): ReactElement<Record<string, unknown>> | undefined => {
+        if (Array.isArray(node)) { for (const child of node) { const hit = findInSubtree(child); if (hit) return hit } return undefined }
+        if (!isValidElement<Record<string, unknown>>(node)) return undefined
+        if (node.props['data-testid'] === 'rewind-trigger') return node
+        return findInSubtree(node.props.children as ReactNode)
+      }
+      const rewindButton = findInSubtree((trigger.type as any)(trigger.props))!
+      ;(rewindButton.props.onClick as () => void)()
       const html = h.render(); assert.match(html, /Chỉ quay lui hội thoại/); assert.match(html, /Quay lui hội thoại &amp; tệp/)
       h.click(files ? 'Quay lui hội thoại &amp; tệp' : 'Chỉ quay lui hội thoại'); await h.flush()
       assert.deepEqual(h.calls.find(call => call.method === 'stageRevert')?.args, ['project', 'session', 'target', files])

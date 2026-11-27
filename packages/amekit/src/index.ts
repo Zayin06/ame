@@ -2,6 +2,7 @@ import path from "node:path"
 import { lstat, open, realpath, rename, unlink } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { constants } from "node:fs"
+import { setTimeout as delay } from "node:timers/promises"
 import { AmeApi, ClientError, isTransientError } from "./api"
 import { assertModel, assertChatModel, resolveModelLevel, managedProvider, modelPolicy, providerURL } from "./model-policy"
 import { openSessionVault, type Encryption } from "./session-vault"
@@ -69,8 +70,9 @@ type ElectronMain = { safeStorage: Encryption; dialog: Pick<typeof import("elect
 const MAX_POLICY_LEASE_MS = 24 * 60 * 60_000
 const LEASE_RENEW_LEAD_MS = 15 * 60_000
 const LEASE_RETRY_MS = 5 * 60_000
+const DEFAULT_RPC_RETRY_DELAYS_MS = [250, 500, 1000, 1500, 2000] as const
 /** Main-process test seams; never accept these dependencies over renderer IPC. */
-export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number; now?: () => number }
+export type AmeKitDependencies = { fetch?: typeof fetch; electron?: () => Promise<ElectronMain>; discover?: Discover; refreshIntervalMs?: number; now?: () => number; rpcRetryDelaysMs?: readonly number[] }
 
 export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDependencies = {}): AmeKit {
   const globalConfigDir = options.globalConfigDir ?? path.join(options.userData, "backend", "config", "opencode")
@@ -202,7 +204,9 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
       url = new URL(endpoint.url)
       if (url.username || url.password || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) || !["http:", "https:"].includes(url.protocol)) throw new Error()
     } catch { throw new Error("LOCAL_SERVER_REQUIRED") }
-    let response: Response
+    const retryDelays = dependencies.rpcRetryDelaysMs ?? DEFAULT_RPC_RETRY_DELAYS_MS
+    for (let attempt = 0; ; attempt++) {
+      let response: Response
     try {
       response = await fetcher(new URL("/api/rpc/amekit-models/update", url), {
         method: "POST", headers: { ...endpoint.headers, "content-type": "application/json" },
@@ -210,10 +214,20 @@ export function createAmeKit(options: AmeKitOptions, dependencies: AmeKitDepende
         signal: cleanup ? AbortSignal.timeout(1500) : AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
       })
     } catch { throw new Error("MODEL_POLICY_UNAVAILABLE") }
-    if ([400, 404, 503].includes(response.status)) { await response.body?.cancel(); throw new Error("MODEL_POLICY_PLUGIN_REQUIRED") }
+      if ([400, 404, 503].includes(response.status)) {
+        await response.body?.cancel()
+        if (!cleanup && input !== null && attempt < retryDelays.length) {
+          try { await delay(retryDelays[attempt], undefined, { signal }) }
+          catch { throw new Error("MODEL_POLICY_UNAVAILABLE") }
+          continue
+        }
+        throw new Error("MODEL_POLICY_PLUGIN_REQUIRED")
+      }
     if (!response.ok) { await response.body?.cancel(); throw new Error("MODEL_POLICY_UNAVAILABLE") }
     const result = await response.json().catch(() => null) as { output?: unknown } | null
-    if (result?.output !== true) throw new Error("MODEL_POLICY_UNAVAILABLE")
+      if (result?.output !== true) throw new Error("MODEL_POLICY_UNAVAILABLE")
+      return
+    }
   }
   let leaseTimer: ReturnType<typeof setTimeout> | undefined
   const clearLeaseTimer = () => { if (leaseTimer) { clearTimeout(leaseTimer); leaseTimer = undefined } }

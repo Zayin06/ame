@@ -3,7 +3,7 @@ import type { AndroidTranslationInfo, CommitAgentSessionState, ChatItem, Model, 
 import { Icon } from './Icon'
 import { MessageContent } from './MessageContent'
 import { type Preferences, type Tab, type TimelineDetailMode } from '../state'
-import { extractUserDisplayText, projectChatTimeline, type CompletedTurnCache } from '../chat-timeline'
+import { extractUserDisplayText, formatUserMessageTime, isLikelyLongUserText, projectChatTimeline, USER_BUBBLE_COLLAPSED_HEIGHT, type CompletedTurnCache } from '../chat-timeline'
 import { projectSessionTodos } from '../chat-todo'
 import { describeRevertSummary, formatRevertError, partitionRevertedMessages, type RevertState } from '../chat-rewind'
 import { TodoProgressCard } from './TodoProgressCard'
@@ -32,6 +32,25 @@ const chatDrafts = new Map<string, DraftThread>()
 const inFlightDraftKeys = new Set<string>()
 const deferredCleanupKeys = new Set<string>()
 const draftPermissionModes = new Map<string, PermissionMode>()
+// NOTE (có chủ đích): chế độ quyền chọn gần nhất — kể cả 'full' (Tự động cho phép) — được lưu vào localStorage
+// và áp dụng cho mọi draft/chat mới, kể cả sau khi khởi động lại app. Đổi quyền của session đang mở cũng cập nhật giá trị này.
+// Nếu sau này muốn an toàn hơn: bỏ qua 'full' khi rememberPermissionMode, hoặc chỉ ghi nhớ khi chọn ở draft.
+const LAST_PERMISSION_MODE_KEY = 'ame.chat.lastPermissionMode'
+const VALID_PERMISSION_MODES = new Set<PermissionMode>(['default', 'ask', 'readonly', 'full'])
+let lastPermissionModeMemory: PermissionMode | undefined
+function readLastPermissionMode(): PermissionMode {
+  try {
+    const saved = typeof window !== 'undefined' ? window.localStorage?.getItem(LAST_PERMISSION_MODE_KEY) : null
+    if (saved && VALID_PERMISSION_MODES.has(saved as PermissionMode)) return saved as PermissionMode
+  } catch { /* Storage may be unavailable in restricted environments. */ }
+  return lastPermissionModeMemory ?? 'default'
+}
+function rememberPermissionMode(mode: PermissionMode) {
+  lastPermissionModeMemory = mode
+  try {
+    if (typeof window !== 'undefined') window.localStorage?.setItem(LAST_PERMISSION_MODE_KEY, mode)
+  } catch { /* Ignore storage errors and keep in-memory fallback. */ }
+}
 const draftKey = (project: string | undefined, session: string | undefined, draftID: number) => JSON.stringify([project, session ?? `draft:${draftID}`])
 function cleanupDraftKey(key: string) {
   if (inFlightDraftKeys.has(key)) { deferredCleanupKeys.add(key); return }
@@ -91,22 +110,91 @@ type ChatTurnViewProps = {
   todo: ReturnType<typeof projectSessionTodos>['byTurnID'][string] | undefined
   projectID?: string; sessionID?: string; projectDirectory?: string
   theme: 'dark' | 'light'; canRewindSession: boolean; rewindDisabled: boolean; pickerOpen: boolean; waitingForForm: boolean
+  userExpanded: boolean; userOverflow?: boolean; userCopied: boolean
   onOpenFile: (path: string, line?: number) => void
   onOpenAgentMap: () => void
   onTogglePicker: (id: string | null) => void
   onRewind: (id: string, files: boolean) => Promise<void>
+  onExpandUserTurn: (id: string) => void
+  onCopyUserTurn: (id: string, text: string) => Promise<void>
 }
 
-const ChatTurnView = memo(function ChatTurnView({ turn, todo, projectID, sessionID, projectDirectory, theme, canRewindSession, rewindDisabled, pickerOpen, waitingForForm, onOpenFile, onOpenAgentMap, onTogglePicker, onRewind }: ChatTurnViewProps) {
+let relativeNow = Date.now()
+const relativeTimeListeners = new Set<() => void>()
+let relativeTimeTimer: ReturnType<typeof setInterval> | undefined
+function subscribeRelativeTime(listener: () => void) {
+  relativeTimeListeners.add(listener)
+  if (!relativeTimeTimer && typeof setInterval === 'function') {
+    if (Date.now() - relativeNow >= 30_000) {
+      queueMicrotask(() => {
+        if (relativeTimeListeners.size === 0) return
+        relativeNow = Date.now()
+        relativeTimeListeners.forEach(fn => fn())
+      })
+    }
+    relativeTimeTimer = setInterval(() => {
+      relativeNow = Date.now()
+      relativeTimeListeners.forEach(fn => fn())
+    }, 30_000)
+  }
+  return () => {
+    relativeTimeListeners.delete(listener)
+    if (relativeTimeListeners.size === 0 && relativeTimeTimer && typeof clearInterval === 'function') {
+      clearInterval(relativeTimeTimer)
+      relativeTimeTimer = undefined
+    }
+  }
+}
+const getRelativeNow = () => relativeNow
+
+function RelativeTime({ createdAt }: { createdAt?: number }) {
+  const now = useSyncExternalStore(subscribeRelativeTime, getRelativeNow, getRelativeNow)
+  const label = formatUserMessageTime(createdAt, now)
+  if (!label) return null
+  const valid = createdAt !== undefined && Number.isFinite(createdAt) && createdAt > 0
+  return <time className="msg-user-meta__time" dateTime={valid ? new Date(createdAt!).toISOString() : undefined} title={valid ? new Date(createdAt!).toLocaleString('vi-VN') : undefined}>{label}</time>
+}
+
+const ChatTurnView = memo(function ChatTurnView({ turn, todo, projectID, sessionID, projectDirectory, theme, canRewindSession, rewindDisabled, pickerOpen, waitingForForm, userExpanded, userOverflow, userCopied, onOpenFile, onOpenAgentMap, onTogglePicker, onRewind, onExpandUserTurn, onCopyUserTurn }: ChatTurnViewProps) {
   const actions = { projectDirectory, onOpenFile, onOpenAgentMap }
+  const user = turn.user
+  const rawDisplayText = user ? extractUserDisplayText(user.text) : ''
+  const displayText = rawDisplayText || '…'
+  const collapsible = !!user && (userOverflow ?? isLikelyLongUserText(rawDisplayText))
   return <section className="chat-turn">
-    {turn.user && <article className="msg-user"><MessageContent text={extractUserDisplayText(turn.user.text) || '…'} onOpenFile={onOpenFile} /><MessageAttachmentList attachments={turn.user.attachments} /></article>}
-    {turn.user && canRewindSession && <div className="rewind-turn-actions">
-      <button type="button" className="rewind-trigger" data-testid="rewind-trigger" aria-expanded={pickerOpen} disabled={rewindDisabled} onClick={() => onTogglePicker(turn.user!.id)}>Quay lại từ đây</button>
-      {pickerOpen && <div className="rewind-chooser" data-testid="rewind-chooser">
-        <div className="button-row"><button type="button" disabled={rewindDisabled} onClick={() => void onRewind(turn.user!.id, false)}>Chỉ quay lui hội thoại</button><button type="button" disabled={rewindDisabled} onClick={() => void onRewind(turn.user!.id, true)}>Quay lui hội thoại &amp; tệp</button><button type="button" onClick={() => onTogglePicker(null)}>Đóng</button></div>
+    {user && <div className={`msg-user-group${pickerOpen ? ' is-picker-open' : ''}${userCopied ? ' is-copied' : ''}`} data-user-group={user.id}>
+      <article
+        className={`msg-user${collapsible ? ' is-collapsible' : ''}${collapsible && userExpanded ? ' is-expanded' : ''}`}
+        data-testid="msg-user"
+        data-user-bubble={user.id}
+        role={collapsible ? 'button' : undefined}
+        aria-expanded={collapsible ? userExpanded : undefined}
+        tabIndex={collapsible && !userExpanded ? 0 : undefined}
+        onClick={event => {
+          if (!collapsible || userExpanded) return
+          const target = event.target as HTMLElement | null
+          if (target?.closest?.('a, button, input, textarea, summary')) return
+          if (typeof window !== 'undefined' && window.getSelection?.()?.toString()) return
+          onExpandUserTurn(user.id)
+        }}
+        onKeyDown={event => {
+          if (!collapsible || userExpanded) return
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onExpandUserTurn(user.id)
+          }
+        }}>
+        <div className="msg-user__body" data-user-bubble-body={user.id}><MessageContent text={displayText} onOpenFile={onOpenFile} /><MessageAttachmentList attachments={user.attachments} /></div>
+      </article>
+      <div className="msg-user-meta" data-testid="user-msg-meta">
+        <RelativeTime createdAt={user.createdAt} />
+        <button type="button" className={`msg-user-action${userCopied ? ' is-active' : ''}`} data-testid="user-msg-copy" data-tooltip={userCopied ? 'Đã sao chép' : 'Sao chép'} aria-label={userCopied ? 'Đã sao chép' : 'Sao chép câu hỏi'} title={userCopied ? 'Đã sao chép' : 'Sao chép'} onClick={() => void onCopyUserTurn(user.id, rawDisplayText)}><Icon name={userCopied ? 'check' : 'copy'} /></button>
+        {canRewindSession && <button type="button" className="msg-user-action rewind-trigger" data-testid="rewind-trigger" data-tooltip="Quay lại từ đây" aria-label="Quay lại từ đây" title="Quay lại từ đây" aria-expanded={pickerOpen} disabled={rewindDisabled} onClick={() => onTogglePicker(user.id)}><Icon name="undo" /><span className="sr-only">Quay lại từ đây</span></button>}
+      </div>
+      {canRewindSession && pickerOpen && <div className="rewind-turn-actions"><div className="rewind-chooser" data-testid="rewind-chooser">
+        <div className="button-row"><button type="button" disabled={rewindDisabled} onClick={() => void onRewind(user.id, false)}>Chỉ quay lui hội thoại</button><button type="button" disabled={rewindDisabled} onClick={() => void onRewind(user.id, true)}>Quay lui hội thoại &amp; tệp</button><button type="button" onClick={() => onTogglePicker(null)}>Đóng</button></div>
         <p>Tạm quay lui tới trước lượt này (chưa xóa vĩnh viễn cho tới khi gửi tin nhắn mới). Khôi phục tệp phụ thuộc Git/snapshot và không hoàn tác DB, tiến trình, commit hay tệp ngoài snapshot.</p>
-      </div>}
+      </div></div>}
     </div>}
     <div className="msg-turn-body">{todo && <TodoProgressCard key={`${sessionID}:${turn.id}:todo`} snapshot={todo} />}{turn.blocks.map(block => {
       if (block.kind === 'work-group') return <TurnWorkGroup key={block.id} id={block.id} items={block.items} summary={block.summary} live={block.live} defaultOpen={block.defaultOpen} {...actions} />
@@ -199,8 +287,8 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const key = draftKey(projectID, sessionID, draftID)
   const permissionScope = JSON.stringify([connectionUrl, key])
   const [permissionAttempt, setPermissionAttempt] = useState(0)
-  const [modeState, setModeState] = useState<{ scope: string; mode: PermissionMode; status: 'loading' | 'ready' | 'error'; error?: string }>(() => ({ scope: permissionScope, mode: 'default', status: sessionID ? 'loading' : 'ready' }))
-  const permissionMode = modeState.scope === permissionScope ? modeState.mode : !sessionID ? draftPermissionModes.get(key) ?? 'default' : 'default'
+  const [modeState, setModeState] = useState<{ scope: string; mode: PermissionMode; status: 'loading' | 'ready' | 'error'; error?: string }>(() => ({ scope: permissionScope, mode: sessionID ? 'default' : (draftPermissionModes.get(key) ?? readLastPermissionMode()), status: sessionID ? 'loading' : 'ready' }))
+  const permissionMode = modeState.scope === permissionScope ? modeState.mode : !sessionID ? draftPermissionModes.get(key) ?? readLastPermissionMode() : 'default'
   const permissionStatus = modeState.scope === permissionScope ? modeState.status : sessionID ? 'loading' : 'ready'
   const permissionLoading = permissionStatus !== 'ready'
   const [updatingPermission, setUpdatingPermission] = useState(false)
@@ -212,7 +300,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     let alive = true
     const request = ++permissionRequest.current
     if (!sessionID) {
-      setModeState({ scope: permissionScope, mode: draftPermissionModes.get(key) ?? 'default', status: 'ready' })
+      setModeState({ scope: permissionScope, mode: draftPermissionModes.get(key) ?? readLastPermissionMode(), status: 'ready' })
       return
     }
     if (!projectID || !connected) return
@@ -226,12 +314,14 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     if (!projectID || permissionPending.current || busy || permissionLoading) return
     if (!sessionID) {
       draftPermissionModes.set(key, mode)
+      rememberPermissionMode(mode)
       setModeState({ scope: permissionScope, mode, status: 'ready' })
       return
     }
     permissionPending.current = true; setUpdatingPermission(true)
     try {
       const saved = await window.ame.updateSessionPermissionMode(projectID, sessionID, mode)
+      rememberPermissionMode(saved)
       if (currentPermissionScope.current === permissionScope) setModeState({ scope: permissionScope, mode: saved, status: 'ready' })
     } catch (e) { report(e) }
     finally { permissionPending.current = false; setUpdatingPermission(false) }
@@ -265,9 +355,16 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const [rewindRequestedFiles, setRewindRequestedFiles] = useState<Record<string, boolean>>({})
   const [pendingPromptRestore, setPendingPromptRestore] = useState<{ sessionID: string; messageID: string; text: string } | null>(null)
   const [rewindError, setRewindError] = useState('')
+  const [expandedUserTurnID, setExpandedUserTurnID] = useState<string | null>(null)
+  const [userBubbleOverflow, setUserBubbleOverflow] = useState<Record<string, boolean>>({})
+  const [copiedUserTurnID, setCopiedUserTurnID] = useState<string | null>(null)
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const mounted = useRef(true)
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
-  useEffect(() => { setRewindPickerTurnID(null); setRewindError(''); setPendingPromptRestore(null) }, [projectID, sessionID])
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; clearTimeout(copyTimerRef.current) } }, [])
+  useEffect(() => {
+    setRewindPickerTurnID(null); setRewindError(''); setPendingPromptRestore(null)
+    setExpandedUserTurnID(null); setUserBubbleOverflow({}); setCopiedUserTurnID(null); clearTimeout(copyTimerRef.current)
+  }, [projectID, sessionID])
   const [replying, setReplying] = useState(false)
   const [error, setError] = useState('')
   const [drawer, setDrawer] = useState<'artifacts' | 'agents' | 'btw' | null>(null)
@@ -332,6 +429,57 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
   const completedTurns = useRef<CompletedTurnCache>(new Map())
   const turns = useMemo(() => projectChatTimeline(activeMessages, { running, mode: timelineDetail }, completedTurns.current), [activeMessages, running, timelineDetail])
   const todoView = useMemo(() => projectSessionTodos(activeMessages, { running, sessionOutcome: activeSession?.outcome, isChildSession: !!activeSession?.parentID }), [activeMessages, running, activeSession?.outcome, !!activeSession?.parentID])
+  const escapeBlockedRef = useRef(false)
+  escapeBlockedRef.current = !!(attachmentPicker || trigger || rewindPickerTurnID)
+  useEffect(() => {
+    const root = timeline.current
+    if (!root || typeof root.querySelectorAll !== 'function') return
+    const measure = () => {
+      const nodes = root.querySelectorAll<HTMLElement>('[data-user-bubble-body]')
+      setUserBubbleOverflow(current => {
+        const next: Record<string, boolean> = {}
+        for (const el of nodes) {
+          const id = el.dataset?.userBubbleBody
+          if (id) next[id] = el.scrollHeight > USER_BUBBLE_COLLAPSED_HEIGHT + 4
+        }
+        const currentKeys = Object.keys(current)
+        const nextKeys = Object.keys(next)
+        if (currentKeys.length === nextKeys.length && nextKeys.every(id => current[id] === next[id])) return current
+        return next
+      })
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(measure)
+    observer.observe(root)
+    return () => observer.disconnect()
+  }, [turns, projectID, sessionID])
+  useEffect(() => {
+    if (!expandedUserTurnID || typeof window === 'undefined' || typeof window.addEventListener !== 'function') return
+    const escaped = (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') ? CSS.escape(expandedUserTurnID) : expandedUserTurnID.replace(/["\\]/g, '\\$&')
+    const collapse = () => {
+      const body = timeline.current?.querySelector?.<HTMLElement>(`[data-user-bubble-body="${escaped}"]`)
+      if (body) body.scrollTop = 0
+      setExpandedUserTurnID(null)
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      const group = timeline.current?.querySelector?.<HTMLElement>(`[data-user-group="${escaped}"]`)
+      if (group && event.target && typeof (group as { contains?: unknown }).contains === 'function' && group.contains(event.target as Node)) return
+      collapse()
+    }
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || composing.current || escapeBlockedRef.current) return
+      const target = event.target as HTMLElement | null
+      if (target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable)) return
+      collapse()
+    }
+    window.addEventListener('pointerdown', onPointerDown, true)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown, true)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [expandedUserTurnID])
   const runningRef = useRef(running); runningRef.current = running
   const permissionsCountRef = useRef(permissions.length + forms.length); permissionsCountRef.current = permissions.length + forms.length
   const fallbackTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -593,6 +741,15 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     }
   }, [projectID, sessionID, connected, running, busy, canRewindSession, onActivity])
   const toggleRewindPicker = useCallback((id: string | null) => setRewindPickerTurnID(current => current === id ? null : id), [])
+  const expandUserTurn = useCallback((id: string) => setExpandedUserTurnID(id), [])
+  const copyUserTurn = useCallback(async (id: string, value: string) => {
+    if (typeof navigator === 'undefined' || typeof navigator.clipboard?.writeText !== 'function') return
+    try { await navigator.clipboard.writeText(value) } catch { return }
+    if (!mounted.current) return
+    clearTimeout(copyTimerRef.current)
+    setCopiedUserTurnID(id)
+    copyTimerRef.current = setTimeout(() => { if (mounted.current) setCopiedUserTurnID(current => current === id ? null : current) }, 1500)
+  }, [])
   const openAgentMap = useCallback(() => { setTrigger(null); setAttachmentPicker(false); setAgentMapOpen(true) }, [])
   const cancelRewind = async () => {
     if (!projectID || !sessionID || !connected || running || busy || rewindingRef.current || !activeRevert) return
@@ -689,7 +846,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
     <div className="chat-pane__body">{menu && <div className="chat-corner-drawer is-open" role="menu"><button className="chat-drawer__row" role="menuitem" onClick={() => { onCreate(); setMenu(false) }}>Cuộc trò chuyện mới</button><button className="chat-drawer__row" role="menuitem" onClick={() => { void navigator.clipboard.writeText(messages.map(item => `${item.role}: ${item.text}`).join('\n\n')).catch(report); setMenu(false) }}>Copy conversation</button></div>}
       <aside className={`chat-corner-drawer ${drawer ? 'is-open' : ''}`} data-testid="chat-drawer" data-drawer={drawer || ''}><div className="chat-drawer__head"><span>{drawer === 'agents' ? 'Subagents' : drawer === 'btw' ? '/btw' : 'Artifacts'}</span><div className="chat-drawer__head-actions">{drawer === 'agents' && projectID && sessionID && <button type="button" className="chat-drawer__action" onClick={() => { setDrawer(null); setAgentMapOpen(true) }}>Agent map</button>}<IconButton label="Đóng công cụ Chat" onClick={() => setDrawer(null)}><Icon name="close" /></IconButton></div></div>{drawer === 'agents' ? <AgentList sessions={sessions} selected={sessionID} loading={false} error="" connected={connected} onRetry={onActivity} onSelect={onSelectSession} /> : drawer === 'btw' ? lockedTranslation || translationSession ? <Empty>Dùng Chat chính mới cho /btw; phiên dịch Android chỉ dành cho bản địa hóa.</Empty> : projectID && sessionID ? <BtwPanel key={JSON.stringify([projectID, sessionID])} projectID={projectID} sessionID={sessionID} connected={connected} ready={ready} model={activeModel} onCreated={onCreated} onSelectSession={onSelectSession} onActivity={onActivity} /> : <Empty>Chọn một phiên để mở luồng phụ /btw.</Empty> : <>{drawer === 'artifacts' && (projectID ? <ArtifactViewer projectID={projectID} sessionID={sessionID} /> : <Empty>Mở dự án để xem artifacts.</Empty>)}<button className="chat-drawer__row" onClick={() => onOpenPanel('artifact')}>Mở bảng Artifacts</button><button className="chat-drawer__row" onClick={() => onOpenPanel('changes')}>{changesStatus === 'loading' ? 'Đang tải thay đổi session…' : changesStatus === 'error' ? 'Không tải được thay đổi session' : `${changes} files modified · session`}</button>{[...new Set(tabs.map(tab => tab.path))].map(path => <button className="chat-drawer__row" key={path} onClick={() => onOpenFile(path)}><Icon name="file" /><span className="truncate">{path}</span></button>)}</>}</aside><div className="chat-column">
       <div ref={timeline} className="chat-stream" onScroll={e => { const el = e.currentTarget; follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}><div className="chat-stream__inner">
-        {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty> : turns.map(turn => <ChatTurnView key={turn.id} turn={turn} todo={todoView.byTurnID[turn.id]} projectID={projectID} sessionID={sessionID} projectDirectory={projectDirectory} theme={theme} canRewindSession={canRewindSession} rewindDisabled={!connected || running || busy || rewinding} pickerOpen={!!turn.user && rewindPickerTurnID === turn.user.id} waitingForForm={!!forms.length} onOpenFile={onOpenFile} onOpenAgentMap={openAgentMap} onTogglePicker={toggleRewindPicker} onRewind={startRewind} />)}
+        {!projectID ? <Empty><span className="welcome-mark">A</span><h1>Không gian làm việc của bạn</h1><p>Mở một dự án để duyệt mã nguồn và trò chuyện với agent.</p></Empty> : !sessionID ? <Empty><h1>Bắt đầu từ dự án thật.</h1><p>Nhập yêu cầu bên dưới để bắt đầu. Cuộc trò chuyện sẽ được tạo khi gửi.</p></Empty> : (!loaded || previousSession.current !== sessionID) && connected ? <Empty>Đang tải lịch sử…</Empty> : !messages.length ? <Empty><h1>Bạn muốn làm gì tiếp theo?</h1><p>Gửi yêu cầu bên dưới. Phản hồi và công cụ sẽ hiển thị từ máy chủ.</p></Empty> : turns.map(turn => <ChatTurnView key={turn.id} turn={turn} todo={todoView.byTurnID[turn.id]} projectID={projectID} sessionID={sessionID} projectDirectory={projectDirectory} theme={theme} canRewindSession={canRewindSession} rewindDisabled={!connected || running || busy || rewinding} pickerOpen={!!turn.user && rewindPickerTurnID === turn.user.id} waitingForForm={!!forms.length} userExpanded={!!turn.user && expandedUserTurnID === turn.user.id} userOverflow={turn.user ? userBubbleOverflow[turn.user.id] : undefined} userCopied={!!turn.user && copiedUserTurnID === turn.user.id} onOpenFile={onOpenFile} onOpenAgentMap={openAgentMap} onTogglePicker={toggleRewindPicker} onRewind={startRewind} onExpandUserTurn={expandUserTurn} onCopyUserTurn={copyUserTurn} />)}
         {forms.map(form => <SessionFormCard key={`${projectID}:${sessionID}:${form.id}`} projectID={projectID!} form={form} disabled={!connected || lockedTranslation || commitSession || lockedCommit} onResolved={id => { setForms(current => current.filter(form => form.id !== id)); refresh.current() }} />)}
         {permissions.map(permission => <section className="permission" key={permission.id} role="alert"><h3>Yêu cầu quyền</h3><p>{permission.title}</p><div className="button-row"><button disabled={replying} onClick={() => void reply(permission, 'once')}>Cho phép một lần</button><button disabled={replying} onClick={() => void reply(permission, 'always')}>Luôn cho phép</button><button disabled={replying} onClick={() => void reply(permission, 'reject')}>Từ chối</button></div></section>)}
       </div></div>
@@ -724,7 +881,7 @@ export function Chat({ draftID = 0, focusNonce, timelineDetail = 'compact', proj
         </span> : <label className="composer-picker composer-picker--model" title={activeModel ? `Model: ${formatModelOptionLabel(activeModel, effectiveModelLevels)}` : 'Chọn model'}>
           <span className="composer-picker__face" aria-hidden="true"><Icon name="sparkles" /><span className="composer-picker__label">{activeModel?.name || 'Chọn model'}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Mô hình" value={model} onChange={e => { userPickedModel.current = true; setModel(e.target.value) }} disabled={!connected || busy}><option value="">Chọn model</option>{models.map(m => <option key={modelKey(m)} value={modelKey(m)}>{formatModelOptionLabel(m, effectiveModelLevels)}</option>)}</select>
-        </label>}</div><div className="composer-toolbar__right"><label className={`composer-picker composer-picker--permission${permissionMode === 'full' ? ' is-full' : ''}`} title={permissionModeOptions.find(option => option.value === permissionMode)?.description}>
+        </label>}</div><div className="composer-toolbar__right"><label className={`composer-picker composer-picker--permission${permissionMode === 'full' ? ' is-full' : ''}`} title={(() => { const opt = permissionModeOptions.find(option => option.value === permissionMode); return opt ? `${opt.label} — ${opt.description}` : undefined })()}>
           <span className="composer-picker__face" aria-hidden="true"><Icon name="shield" /><span className="composer-picker__label">{permissionStatus === 'error' ? 'Lỗi tải quyền' : permissionLoading || updatingPermission ? 'Đang tải quyền…' : permissionModeOptions.find(option => option.value === permissionMode)?.label}</span><Icon name="down" /></span>
           <select className="composer-picker__native" aria-label="Quyền thực thi" value={permissionMode} onChange={e => void changePermissionMode(e.target.value as PermissionMode)} disabled={!projectID || !connected || busy || permissionLoading || updatingPermission}>{permissionModeOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
         </label>{running && <button className="icon-btn" type="button" disabled={!sessionID || !connected} title="Dừng phản hồi" onClick={() => { if (projectID && sessionID) void window.ame.cancel(projectID, sessionID).then(() => refresh.current()).catch(report) }}><Icon name="stop" /></button>}<button className="send-btn" aria-label="Gửi yêu cầu" disabled={!projectID || !connected || !ready || busy || permissionLoading || updatingPermission || (!text.trim() && !attachments.length) || !activeModel}><Icon name="send" /></button></div></div>

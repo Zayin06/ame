@@ -42,7 +42,7 @@ async function bundle(mode: "native" | "raw" = "native", commitEnhanceSkill?: st
   const release: Release = { releaseId: "ef2b4502-3b3f-4ac7-a223-81fdb4b77557", version: "1.2.3", channel: "stable", sha256: packed.sha256, size: packed.bytes.length, manifest: packed.summary as Release["manifest"], publishedAt: 1, downloadUrl: "/ignored" }
   return { packed, release, latest: { release, revision: 1, activatedAt: 1 } }
 }
-async function fixture(settings: { orchestrator?: unknown; catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; commitEnhanceSkill?: string; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number; autoSync?: boolean; reloadRuntime?: AmeKitOptions["reloadRuntime"]; onBundleChanged?: AmeKitOptions["onBundleChanged"] } = {}) {
+async function fixture(settings: { orchestrator?: unknown; catalog?: unknown; role?: unknown; plugin?: boolean; confirm?: boolean; encryption?: Encryption; mode?: "native" | "raw"; commitEnhanceSkill?: string; discover?: AmeKitDependencies["discover"]; refreshIntervalMs?: number; rpcRetryDelaysMs?: readonly number[]; autoSync?: boolean; reloadRuntime?: AmeKitOptions["reloadRuntime"]; onBundleChanged?: AmeKitOptions["onBundleChanged"] } = {}) {
   const folder = await area(), project = path.join(folder, "project"), imported = path.join(folder, "source"), data = path.join(folder, "data")
   await mkdir(project); await mkdir(imported)
   for (const file of input()) { const target = path.join(imported, ...file.path.split("/")); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, file.data) }
@@ -93,7 +93,7 @@ async function fixture(settings: { orchestrator?: unknown; catalog?: unknown; ro
     return Response.json({ session: { token: "fixture-session-token", expires_at: new Date(expiresAt ?? Date.now() + 3600_000).toISOString() }, user: { id: accountId, name: "Fixture", username, role }, provider: { base_url: "http://localhost:3212/v1", api_key: "fixture-provider-key" }, catalog: settings.catalog ?? catalog, registry: {}, ...(orchestrator === undefined ? {} : { orchestrator }) })
   }
   const dependencies: AmeKitDependencies = {
-    fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs,
+    fetch: fetcher, refreshIntervalMs: settings.refreshIntervalMs, rpcRetryDelaysMs: settings.rpcRetryDelaysMs ?? [],
     electron: async () => ({ safeStorage: { ...(settings.encryption ?? encryption), encryptString(text: string) { if (failStorage) throw new Error("contains-sensitive-material"); return (settings.encryption ?? encryption).encryptString(text) } }, dialog: { showMessageBox: async (options: { message?: string; detail?: string }) => { dialogs.push(options.detail ?? options.message ?? ""); messages.push(options.message ?? ""); events.push("confirm"); return { response: accepted ? 1 : 0, checkboxChecked: false } } } as never }),
     discover: settings.discover ?? (async (directory, _signal, _expected, options) => {
       const config = options?.scope === "global" ? directory : path.join(directory, ".opencode")
@@ -3540,4 +3540,38 @@ test("AI fix rejects provider echoes even outside assignment syntax and strips e
       assert.equal(JSON.stringify(f.fixRequests).includes(syntheticSecret), false)
     } finally { await f.cleanup() }
   })
+})
+
+
+test("rpc retries transient 400/404/503 plugin reload races after location eviction and still fails closed when missing", async () => {
+  const f = await fixture({ rpcRetryDelaysMs: [10, 20, 40] })
+  try {
+    await login(f.service)
+    const beforeSync = f.rpc.length
+    let transientCalls = 0
+    f.rpcResponse(async () => {
+      transientCalls++
+      if (transientCalls <= 2) return Response.json({ type: "rpc.unavailable" }, { status: 400 })
+      return undefined
+    })
+
+    await f.service.call("assert-model", { modelID: "default" })
+    assert.equal(transientCalls, 3)
+    assert.equal(f.rpc.length - beforeSync, 3)
+    const readyStatus = await f.service.call("status", {}) as { ready: boolean; account?: unknown; blocker?: string }
+    assert.equal(readyStatus.ready, true)
+    assert.ok(readyStatus.account)
+    assert.equal(readyStatus.blocker, undefined)
+
+    f.rpcResponse(undefined)
+    f.plugin(false)
+    const beforeFail = f.rpc.length
+    await assert.rejects(f.service.call("assert-model", { modelID: "default" }), /MODEL_POLICY_PLUGIN_REQUIRED/)
+    const failedStatus = await f.service.call("status", {}) as { ready: boolean; account?: unknown; blocker?: string; reconnecting?: boolean }
+    assert.equal(failedStatus.ready, false)
+    assert.equal(failedStatus.blocker, "MODEL_POLICY_PLUGIN_REQUIRED")
+    assert.equal(failedStatus.reconnecting, true)
+    // 1 initial attempt + 3 retries with policy payload, followed by 2 fast non-retried null revocations (synchronize + call)
+    assert.deepEqual(f.rpc.slice(beforeFail).map(entry => entry === null), [false, false, false, false, true, true])
+  } finally { await f.cleanup() }
 })
